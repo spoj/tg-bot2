@@ -48,7 +48,7 @@ Optional:
 - `TOOL_TIMEOUT_MS`: default `120000`.
 - `MAX_TOOL_OUTPUT_BYTES`: per-stream capture limit, default `50000`.
 
-The harness uses an isolated Pi resource/config directory below `DATA_DIR/.pi-runtime`; workspace/global extensions, prompts, skills, context files, and project settings are not discovered or trusted. Provider credentials remain in the host process and are resolved by Pi's `ModelRuntime` from environment variables. They are never copied to the sandbox.
+The harness uses an isolated Pi resource/config directory below `DATA_DIR/.pi-runtime`. It automatically loads the exact chat workspace's `AGENTS.md` and discovers workspace skills from `.pi/skills/` and `.agents/skills/`, matching normal Pi project conventions. Prompt templates and themes are disabled because Telegram does not expose their normal UI. Workspace extensions remain disabled: Pi extensions execute as trusted host-process code and would bypass Bubblewrap, so downloaded workspace code must instead run through the sandboxed `bash` tool. Provider credentials remain in the host process and are resolved by Pi's `ModelRuntime` from environment variables. They are never copied to the sandbox.
 
 ## Persistent layout
 

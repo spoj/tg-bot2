@@ -1,7 +1,7 @@
 import { parseConfig } from "./config.js";
 import { AgentManager } from "./agent.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
-import { createTelegramBot } from "./telegram.js";
+import { createTelegramBot, flushTelegramIngress } from "./telegram.js";
 
 async function main(): Promise<void> {
   const config = parseConfig();
@@ -15,6 +15,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`Received ${signal}; shutting down`);
     bot.stop();
+    await flushTelegramIngress(bot);
     await agents.disposeAll(true);
     terminateActiveSandboxes();
   };

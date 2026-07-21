@@ -47,7 +47,12 @@ export type AgentFactory = (options: {
   fresh: boolean;
 }) => Promise<AgentSession>;
 
-type ChatState = { session: AgentSession | undefined; queue: SerialQueue };
+type ChatState = {
+  session: AgentSession | undefined;
+  sessionPromise: Promise<AgentSession> | undefined;
+  activeRun: Promise<string> | undefined;
+  queue: SerialQueue;
+};
 
 export class AgentManager {
   private readonly states = new Map<number, ChatState>();
@@ -66,7 +71,7 @@ export class AgentManager {
   private state(chatId: number): ChatState {
     let state = this.states.get(chatId);
     if (!state) {
-      state = { session: undefined, queue: new SerialQueue() };
+      state = { session: undefined, sessionPromise: undefined, activeRun: undefined, queue: new SerialQueue() };
       this.states.set(chatId, state);
     }
     return state;
@@ -132,25 +137,50 @@ export class AgentManager {
 
   private async ensureSession(chatId: number, state: ChatState): Promise<AgentSession> {
     if (state.session) return state.session;
-    const paths = chatPaths(this.config.dataDir, chatId);
-    state.session = await this.factory({ ...paths, fresh: false });
-    return state.session;
+    if (!state.sessionPromise) {
+      const paths = chatPaths(this.config.dataDir, chatId);
+      state.sessionPromise = this.factory({ ...paths, fresh: false }).then((session) => {
+        state.session = session;
+        return session;
+      }).finally(() => { state.sessionPromise = undefined; });
+    }
+    return state.sessionPromise;
   }
 
-  prompt(chatId: number, text: string): Promise<string> {
+  async prompt(chatId: number, text: string): Promise<string | undefined> {
     const state = this.state(chatId);
-    return state.queue.run(async () => {
+    const action = await state.queue.run(async () => {
       const session = await this.ensureSession(chatId, state);
+      if (state.activeRun) {
+        return { kind: "steer" as const, completion: session.prompt(text, { streamingBehavior: "steer" }) };
+      }
+
       const messageCount = session.messages.length;
-      await session.prompt(text);
-      return extractFinalAssistantText(session.messages.slice(messageCount)) ?? "I completed the turn but produced no text response.";
+      let run!: Promise<string>;
+      run = (async () => {
+        try {
+          await session.prompt(text);
+          return extractFinalAssistantText(session.messages.slice(messageCount)) ?? "I completed the turn but produced no text response.";
+        } finally {
+          if (state.activeRun === run) state.activeRun = undefined;
+        }
+      })();
+      state.activeRun = run;
+      return { kind: "prompt" as const, completion: run };
     });
+    if (action.kind === "steer") {
+      await action.completion;
+      return undefined;
+    }
+    return await action.completion;
   }
 
   newSession(chatId: number): Promise<void> {
     const state = this.state(chatId);
     return state.queue.run(async () => {
-      state.session?.dispose();
+      await state.activeRun;
+      const pendingSession = state.sessionPromise ? await state.sessionPromise : undefined;
+      (state.session ?? pendingSession)?.dispose();
       state.session = undefined;
       const paths = chatPaths(this.config.dataDir, chatId);
       state.session = await this.factory({ ...paths, fresh: true });

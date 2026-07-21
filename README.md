@@ -1,6 +1,6 @@
 # tg-bot2
 
-A small personal Telegram text agent. The trusted TypeScript process owns Telegram/model credentials and Pi JSONL sessions. Every model-facing `read`, `write`, `grep`, and `bash` call starts the same Bubblewrap filesystem sandbox.
+A small personal Telegram agent. The trusted TypeScript process owns Telegram/model credentials and Pi JSONL sessions. Every model-facing `read`, `write`, `grep`, and `bash` call starts the same Bubblewrap filesystem sandbox.
 
 ## Requirements
 
@@ -30,7 +30,9 @@ npm start
 
 Development: `npm run dev`. The service uses Telegram long polling. Private chats are the intended v1 usage. Data is still namespaced by numeric `chat.id`, while authorization always uses numeric `from.id`.
 
-`/new` is serialized behind pending turns for that chat, then disposes the active Pi session and starts a new JSONL file. Older files are retained and visible read-only to tools.
+All non-command updates in a chat share one ingress buffer. Every update resets a two-second quiet timer; once quiet, ordered text, captions, attachments, and any download failures are submitted as one logical request. There is deliberately no `media_group_id` special case. Common Telegram file attachments are saved persistently under `workspace/attachments/YYYY-MM-DD/<message-id>/`, and Pi receives their sandbox-visible `/workspace/...` paths plus type, MIME type, and original-name metadata. Telegram's Bot API download ceiling of 20 MB per file applies. Unsupported non-file messages are described textually rather than silently discarded.
+
+If another assembled request arrives while Pi is running, it is passed through Pi's native steering mechanism as one message; the already-active run sends the eventual response, avoiding a reply per quick update. `/start` bypasses buffering. `/new` first flushes that chat's current buffer, waits behind the active run, then disposes the active Pi session and starts a new JSONL file. Older files are retained and visible read-only to tools.
 
 ## Configuration
 

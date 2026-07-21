@@ -44,6 +44,19 @@ integration("Bubblewrap integration", () => {
       expect(env.stdout).not.toContain("SUPER_SECRET_CANARY");
       const truncated = await runSandbox(f, { executable: "/bin/bash", args: ["-lc", "printf '%0200d' 0"] }, { maxOutputBytes: 20 });
       expect(truncated.truncated).toBe(true); expect(Buffer.byteLength(truncated.stdout)).toBe(20);
+      expect(truncated.stdoutBuffer).toEqual(Buffer.from(truncated.stdout));
+      const perRequestLimit = await runSandbox(
+        f,
+        { executable: "/bin/bash", args: ["-lc", "printf '%040d' 0"], maxOutputBytes: 30 },
+        { maxOutputBytes: 20 },
+      );
+      expect(perRequestLimit.stdoutBuffer).toHaveLength(30);
+      expect(perRequestLimit.truncated).toBe(true);
+      const binary = await runSandbox(f, {
+        executable: "/bin/bash",
+        args: ["-c", "printf '\\211PNG\\r\\n\\032\\n\\377'"],
+      });
+      expect(binary.stdoutBuffer).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff]));
       const timeout = await runSandbox(f, { executable: "/bin/bash", args: ["-lc", "sleep 30"], timeoutMs: 30 });
       expect(timeout.timedOut).toBe(true);
     } finally { delete process.env.SUPER_SECRET_CANARY; await rm(f.root, { recursive: true, force: true }); }

@@ -67,6 +67,8 @@ DATA_DIR/chats/<numeric-chat-id>/
 
 Normal files, workspace-local npm installs, uv environments/tools, scripts, and caches persist. Pi owns conversation context; the application maintains no second transcript or memory database.
 
+The sandboxed `read` tool supports Pi-compatible text pagination (`offset` is 1-indexed and `limit` is a line count) plus inline images detected from file signatures: JPEG, static PNG, GIF, WebP, and BMP. Image bytes are captured through Bubblewrap as binary data, resized to Pi's 2000×2000 / inline-size constraints, and returned as model image content; model-provided paths are never read with host filesystem APIs. Image capture is bounded at 20 MiB. Animated PNG and JPEG XL are intentionally treated as ordinary/non-image files, matching Pi's built-in signature rules.
+
 ## Sandbox boundary
 
 Each tool call directly uses Node `spawn("bwrap", argv, { env: {}, detached: true })`; model commands are never interpolated into a host shell. Only the inner sandbox `bash` tool receives `/bin/bash -lc <exact command>` as distinct arguments.

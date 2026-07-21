@@ -10,10 +10,12 @@ export type SandboxRequest = {
   args: string[];
   stdin?: string | Buffer;
   timeoutMs?: number;
+  maxOutputBytes?: number;
 };
 export type SandboxResult = {
   exitCode: number | null;
   stdout: string;
+  stdoutBuffer: Buffer;
   stderr: string;
   timedOut: boolean;
   truncated: boolean;
@@ -82,8 +84,8 @@ export async function buildBwrapArgs(
 }
 
 function outputCapture(limit: number): {
-  stdout: { add(chunk: Buffer): void; text(): string };
-  stderr: { add(chunk: Buffer): void; text(): string };
+  stdout: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
+  stderr: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
   readonly truncated: boolean;
 } {
   const stdoutChunks: Buffer[] = [];
@@ -98,6 +100,7 @@ function outputCapture(limit: number): {
       chunks.push(accepted);
       remaining -= accepted.length;
     },
+    buffer: () => Buffer.concat(chunks),
     text: () => Buffer.concat(chunks).toString("utf8"),
   });
   return {
@@ -113,7 +116,7 @@ export async function runSandbox(
   options: SandboxOptions = {},
 ): Promise<SandboxResult> {
   const { args } = await buildBwrapArgs(paths, request);
-  const limit = options.maxOutputBytes ?? DEFAULT_LIMIT;
+  const limit = request.maxOutputBytes ?? options.maxOutputBytes ?? DEFAULT_LIMIT;
   if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("maxOutputBytes must be a positive integer");
   const capture = outputCapture(limit);
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT;
@@ -151,6 +154,7 @@ export async function runSandbox(
       resolve({
         exitCode,
         stdout: capture.stdout.text(),
+        stdoutBuffer: capture.stdout.buffer(),
         stderr: capture.stderr.text(),
         timedOut,
         truncated: capture.truncated,

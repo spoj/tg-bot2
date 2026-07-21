@@ -14,8 +14,19 @@ describe("configuration", () => {
     (extra) => expect(() => parseConfig({ ...base, ...extra })).toThrow(),
   );
 
-  it("parses explicit allowed users", () => {
-    expect([...parseConfig(base).allowedUserIds]).toEqual([123, 456]);
+  it("parses explicit allowed users and defaults the session idle timeout", () => {
+    const config = parseConfig(base);
+    expect([...config.allowedUserIds]).toEqual([123, 456]);
+    expect(config.sessionIdleTimeoutMs).toBe(3_600_000);
+  });
+
+  it("parses and validates the session idle timeout", () => {
+    expect(parseConfig({ ...base, SESSION_IDLE_TIMEOUT_MS: "7200000" }).sessionIdleTimeoutMs).toBe(7_200_000);
+    for (const value of ["0", "-1", "1.5", "nope"]) {
+      expect(() => parseConfig({ ...base, SESSION_IDLE_TIMEOUT_MS: value })).toThrow(
+        "SESSION_IDLE_TIMEOUT_MS must be a positive integer",
+      );
+    }
   });
 
   it("derives canonical paths from numeric chat IDs", () => {

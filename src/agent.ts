@@ -1,4 +1,4 @@
-import { chmod, mkdir, realpath } from "node:fs/promises";
+import { chmod, mkdir, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import {
   createAgentSession,
@@ -47,11 +47,39 @@ export type AgentFactory = (options: {
   fresh: boolean;
 }) => Promise<AgentSession>;
 
+export async function newestSessionModifiedAt(sessionsDir: string): Promise<number | undefined> {
+  let names: string[];
+  try {
+    names = (await readdir(sessionsDir, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+      .map((entry) => entry.name);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const modified = await Promise.all(names.map(async (name) => (await stat(path.join(sessionsDir, name))).mtimeMs));
+  return modified.length > 0 ? Math.max(...modified) : undefined;
+}
+
+export function isSessionIdleExpired(
+  lastSettledAt: number | undefined,
+  now: number,
+  timeoutMs: number,
+): boolean {
+  return lastSettledAt !== undefined && now - lastSettledAt >= timeoutMs;
+}
+
 type ChatState = {
   session: AgentSession | undefined;
   sessionPromise: Promise<AgentSession> | undefined;
   activeRun: Promise<string> | undefined;
+  lastSettledAt: number | undefined;
   queue: SerialQueue;
+};
+
+export type AgentManagerOptions = {
+  now?: () => number;
+  newestSessionModifiedAt?: (sessionsDir: string) => Promise<number | undefined>;
 };
 
 export class AgentManager {
@@ -59,19 +87,30 @@ export class AgentManager {
   private readonly modelRuntimePromise: Promise<ModelRuntime>;
   private readonly factory: AgentFactory;
 
-  constructor(private readonly config: Config, factory?: AgentFactory) {
+  private readonly now: () => number;
+  private readonly findNewestSessionModifiedAt: (sessionsDir: string) => Promise<number | undefined>;
+
+  constructor(private readonly config: Config, factory?: AgentFactory, options: AgentManagerOptions = {}) {
     const isolatedAgentDir = path.join(config.dataDir, ".pi-runtime");
     this.modelRuntimePromise = ModelRuntime.create({
       authPath: path.join(isolatedAgentDir, "auth.json"),
       modelsPath: path.join(isolatedAgentDir, "models.json"),
     });
     this.factory = factory ?? ((options) => this.createPiSession(options));
+    this.now = options.now ?? Date.now;
+    this.findNewestSessionModifiedAt = options.newestSessionModifiedAt ?? newestSessionModifiedAt;
   }
 
   private state(chatId: number): ChatState {
     let state = this.states.get(chatId);
     if (!state) {
-      state = { session: undefined, sessionPromise: undefined, activeRun: undefined, queue: new SerialQueue() };
+      state = {
+        session: undefined,
+        sessionPromise: undefined,
+        activeRun: undefined,
+        lastSettledAt: undefined,
+        queue: new SerialQueue(),
+      };
       this.states.set(chatId, state);
     }
     return state;
@@ -139,20 +178,38 @@ export class AgentManager {
     if (state.session) return state.session;
     if (!state.sessionPromise) {
       const paths = chatPaths(this.config.dataDir, chatId);
-      state.sessionPromise = this.factory({ ...paths, fresh: false }).then((session) => {
+      state.sessionPromise = (async () => {
+        const lastModifiedAt = await this.findNewestSessionModifiedAt(paths.sessions);
+        const fresh = isSessionIdleExpired(lastModifiedAt, this.now(), this.config.sessionIdleTimeoutMs);
+        const session = await this.factory({ ...paths, fresh });
         state.session = session;
+        state.lastSettledAt = fresh ? undefined : lastModifiedAt;
         return session;
-      }).finally(() => { state.sessionPromise = undefined; });
+      })().finally(() => { state.sessionPromise = undefined; });
     }
     return state.sessionPromise;
+  }
+
+  private async replaceWithFreshSession(chatId: number, state: ChatState): Promise<AgentSession> {
+    const pendingSession = state.sessionPromise ? await state.sessionPromise : undefined;
+    (state.session ?? pendingSession)?.dispose();
+    state.session = undefined;
+    state.lastSettledAt = undefined;
+    const paths = chatPaths(this.config.dataDir, chatId);
+    const session = await this.factory({ ...paths, fresh: true });
+    state.session = session;
+    return session;
   }
 
   async prompt(chatId: number, text: string): Promise<string | undefined> {
     const state = this.state(chatId);
     const action = await state.queue.run(async () => {
-      const session = await this.ensureSession(chatId, state);
+      let session = await this.ensureSession(chatId, state);
       if (state.activeRun) {
         return { kind: "steer" as const, completion: session.prompt(text, { streamingBehavior: "steer" }) };
+      }
+      if (isSessionIdleExpired(state.lastSettledAt, this.now(), this.config.sessionIdleTimeoutMs)) {
+        session = await this.replaceWithFreshSession(chatId, state);
       }
 
       const messageCount = session.messages.length;
@@ -162,7 +219,10 @@ export class AgentManager {
           await session.prompt(text);
           return extractFinalAssistantText(session.messages.slice(messageCount)) ?? "I completed the turn but produced no text response.";
         } finally {
-          if (state.activeRun === run) state.activeRun = undefined;
+          if (state.activeRun === run) {
+            state.activeRun = undefined;
+            state.lastSettledAt = this.now();
+          }
         }
       })();
       state.activeRun = run;
@@ -178,12 +238,8 @@ export class AgentManager {
   newSession(chatId: number): Promise<void> {
     const state = this.state(chatId);
     return state.queue.run(async () => {
-      await state.activeRun;
-      const pendingSession = state.sessionPromise ? await state.sessionPromise : undefined;
-      (state.session ?? pendingSession)?.dispose();
-      state.session = undefined;
-      const paths = chatPaths(this.config.dataDir, chatId);
-      state.session = await this.factory({ ...paths, fresh: true });
+      await state.activeRun?.catch(() => {});
+      await this.replaceWithFreshSession(chatId, state);
     });
   }
 

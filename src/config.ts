@@ -8,6 +8,7 @@ export type Config = {
   thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   toolTimeoutMs: number;
   maxToolOutputBytes: number;
+  sessionIdleTimeoutMs: number;
 };
 
 const THINKING_LEVELS = new Set<Config["thinking"]>([
@@ -55,6 +56,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
     thinking,
     toolTimeoutMs: positiveInteger(env, "TOOL_TIMEOUT_MS", 120_000),
     maxToolOutputBytes: positiveInteger(env, "MAX_TOOL_OUTPUT_BYTES", 50_000),
+    sessionIdleTimeoutMs: positiveInteger(env, "SESSION_IDLE_TIMEOUT_MS", 3_600_000),
   };
 }
 

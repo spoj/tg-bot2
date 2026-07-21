@@ -49,6 +49,9 @@ Optional:
 - `AGENT_THINKING`: `off`, `minimal`, `low`, `medium` (default), `high`, `xhigh`, or `max`.
 - `TOOL_TIMEOUT_MS`: default `120000`.
 - `MAX_TOOL_OUTPUT_BYTES`: per-stream capture limit, default `50000`.
+- `SESSION_IDLE_TIMEOUT_MS`: idle time after a Pi run settles before the next logical request starts a fresh session; default `3600000` (one hour). Must be a positive integer.
+
+Session expiration is checked lazily when the next assembled request arrives; there is no background timer and active work is never expired. Requests arriving during an active run remain steering inputs in that session. After restart, tg-bot2 continues the newest JSONL session only when its modification time is within the configured timeout. `/new` always starts fresh, and old JSONL files remain searchable.
 
 The harness uses an isolated Pi resource/config directory below `DATA_DIR/.pi-runtime`. It automatically loads the exact chat workspace's `AGENTS.md` and discovers workspace skills from `.pi/skills/` and `.agents/skills/`, matching normal Pi project conventions. Prompt templates and themes are disabled because Telegram does not expose their normal UI. Workspace extensions remain disabled: Pi extensions execute as trusted host-process code and would bypass Bubblewrap, so downloaded workspace code must instead run through the sandboxed `bash` tool. Provider credentials remain in the host process and are resolved by Pi's `ModelRuntime` from environment variables. They are never copied to the sandbox.
 

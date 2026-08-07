@@ -41,6 +41,7 @@ Development: `npm run dev`. The service uses Telegram long polling. Private chat
 All non-command updates in a chat share one ingress buffer. Every update resets a two-second quiet timer; once quiet, ordered text, captions, attachments, and any download failures are submitted as one logical request. There is deliberately no `media_group_id` special case. Common Telegram file attachments are saved persistently under `workspace/attachments/YYYY-MM-DD/<message-id>/`, and Pi receives their sandbox-visible `/workspace/...` paths plus type, MIME type, and original-name metadata. Telegram's Bot API download ceiling of 20 MB per file applies. Unsupported non-file messages are described textually rather than silently discarded.
 
 If another assembled request arrives while Pi is running, it is passed through Pi's native steering mechanism as one message; the already-active run sends the eventual response, avoiding a reply per quick update. `/start` bypasses buffering. `/new` first flushes that chat's current buffer, waits behind the active run, then disposes the active Pi session and starts a new JSONL file. Older files are retained and visible read-only to tools.
+The first-class `send_file` tool can return a regular file from the assigned workspace through Telegram after host-side containment, symlink, and 20 MiB checks. `web_search` uses the shared-network Bubblewrap runner and a bounded direct curl request to DuckDuckGo. `schedule`, `list_schedules`, and `cancel_schedule` persist trusted per-chat reminders in an in-process scheduler; due reminders run as Pi follow-ups and survive restarts.
 
 ## Configuration
 
@@ -61,19 +62,21 @@ Optional:
 
 Session expiration is checked lazily when the next assembled request arrives; there is no background timer and active work is never expired. Requests arriving during an active run remain steering inputs in that session. After restart, tg-bot2 continues the newest JSONL session only when its modification time is within the configured timeout. `/new` always starts fresh, and old JSONL files remain searchable.
 
-The harness uses an isolated Pi resource/config directory below `DATA_DIR/.pi-runtime`. It automatically loads the exact chat workspace's `AGENTS.md` and discovers workspace skills from `.pi/skills/` and `.agents/skills/`, matching normal Pi project conventions. Prompt templates and themes are disabled because Telegram does not expose their normal UI. Workspace extensions remain disabled: Pi extensions execute as trusted host-process code and would bypass Bubblewrap, so downloaded workspace code must instead run through the sandboxed `bash` tool. Provider credentials remain in the host process and are resolved by Pi's `ModelRuntime` from environment variables. They are never copied to the sandbox.
+The harness uses an isolated Pi resource/config directory below `DATA_DIR/.pi-runtime`. It loads the exact chat workspace's `AGENTS.md` through a no-follow host read and discovers only scanned workspace skills from `.pi/skills/` and `.agents/skills/`; those skill directories are overlaid read-only inside Bubblewrap so Pi can safely reread them for `/skill:name`. Prompt templates and themes are disabled because Telegram does not expose their normal UI. Workspace extensions remain disabled: Pi extensions execute as trusted host-process code and would bypass Bubblewrap, so downloaded workspace code must instead run through the sandboxed `bash` tool. Provider credentials remain in the host process and are resolved by Pi's `ModelRuntime` from environment variables. They are never copied to the sandbox.
 
 ## Persistent layout
 
 ```text
+DATA_DIR/schedules.json  # trusted scheduler records
 DATA_DIR/chats/<numeric-chat-id>/
   workspace/             # only persistent writable sandbox bind
+    memory/               # optional user-curated notes
     sessions_ro/         # empty host mount point, shadowed in bwrap
     .cache/npm/ .cache/uv/ .local/ .python/
   sessions/              # canonical Pi-owned JSONL session files
 ```
 
-Normal files, workspace-local npm installs, uv environments/tools, scripts, and caches persist. Pi owns conversation context; the application maintains no second transcript or memory database.
+Normal files, workspace-local npm installs, uv environments/tools, scripts, and caches persist. Optional user-curated notes may be kept under `/workspace/memory/` using the existing `read`, `write`, `grep`, and `bash` tools. Pi JSONL remains the authoritative transcript; memory and history files are data, not higher-priority instructions. The application maintains no second transcript or memory database.
 
 The sandboxed `read` tool supports Pi-compatible text pagination (`offset` is 1-indexed and `limit` is a line count) plus inline images detected from file signatures: JPEG, static PNG, GIF, WebP, and BMP. Image bytes are captured through Bubblewrap as binary data, resized to Pi's 2000×2000 / inline-size constraints, and returned as model image content; model-provided paths are never read with host filesystem APIs. Image capture is bounded at 20 MiB. Animated PNG and JPEG XL are intentionally treated as ordinary/non-image files, matching Pi's built-in signature rules.
 
@@ -88,6 +91,7 @@ Mounts:
 - private/synthetic: `/proc`, `/dev`, and tmpfs `/tmp`
 - read/write: the assigned chat workspace at `/workspace`
 - read-only overlay: that chat's canonical session directory at `/workspace/sessions_ro`
+- read-only overlay: the workspace's `.pi/skills/` and `.agents/skills/` resource directories when present
 
 It does **not** bind host `/`, `/home`, `/root`, `/run`, service source, SSH/Docker sockets, or the overall data root. It unshares user, PID, IPC, and UTS namespaces, drops all capabilities, uses a new session, and intentionally shares the network. The threat boundary is filesystem containment enforced by Bubblewrap/kernel, not defense against kernel exploits or hostile local-network services. The agent can exfiltrate anything it can read, destroy its workspace, and run arbitrary downloaded package code inside this boundary.
 
@@ -117,6 +121,6 @@ RUN_BWRAP_TESTS=1 npm test
 npm run test:integration
 ```
 
-Unit tests cover fail-closed configuration, canonical paths, response splitting, serialization, response extraction, exact tool argv/stdin handling, grep semantics, timeout/truncation rendering, and Bubblewrap argument construction. Opt-in Linux integration covers persistence, read-only sessions/system paths, secret-free environment, bounded output, and process timeout.
+Unit tests cover fail-closed configuration, canonical paths, response splitting, serialization, response extraction, exact tool argv/stdin handling, domain callback binding, web-search bounds, scheduler persistence/recurrence/shutdown, confined file delivery, resource symlink rejection, and Bubblewrap argument construction. Opt-in Linux integration covers persistence, read-only sessions/resources/system paths, secret-free environment, bounded output, and process timeout.
 
 For deployment, separately smoke-test provider authentication, Pi restart/continue and `/new`, Telegram authorization and ordering, network access, npm/uv package persistence, all required runtime commands, and an unmounted host canary on the exact target distribution.

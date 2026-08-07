@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 
-export type SandboxPaths = { workspace: string; sessions: string };
+export type SandboxPaths = { workspace: string; sessions: string; readOnlyPaths?: string[] };
 export type SandboxRequest = {
   executable: string;
   args: string[];
@@ -65,9 +65,29 @@ export async function buildBwrapArgs(
   for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
     args.push("--ro-bind", etcPath, etcPath);
   }
+  const protectedMounts: Array<[string, string]> = [];
+  for (const candidate of paths.readOnlyPaths ?? []) {
+    let resolved: string;
+    try {
+      resolved = await realpath(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    const relative = path.relative(workspace, resolved);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error("Sandbox read-only paths must remain under the workspace");
+    }
+    const entry = await lstat(resolved);
+    if (entry.isSymbolicLink()) throw new Error("Sandbox read-only paths must not be symlinks");
+    protectedMounts.push([resolved, path.posix.join("/workspace", relative.split(path.sep).join("/"))]);
+  }
   args.push(
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     "--bind", workspace, "/workspace",
+  );
+  for (const [source, target] of protectedMounts) args.push("--ro-bind", source, target);
+  args.push(
     "--ro-bind", sessions, "/workspace/sessions_ro",
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",

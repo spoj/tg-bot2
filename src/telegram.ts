@@ -1,7 +1,8 @@
+import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { Bot, GrammyError, HttpError, type Context } from "grammy";
+import { lstat, mkdir, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
@@ -9,6 +10,9 @@ import type { AgentManager } from "./agent.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit.
+
+const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
 
 type AttachmentSource = {
   type: string;
@@ -45,6 +49,7 @@ type BufferState = {
 };
 
 export class TelegramIngressBuffer {
+  private closed = false;
   private readonly states = new Map<number, BufferState>();
 
   constructor(
@@ -53,6 +58,7 @@ export class TelegramIngressBuffer {
   ) {}
 
   add(chatId: number, entry: BufferEntry): void {
+    if (this.closed) return;
     let state = this.states.get(chatId);
     if (!state) {
       state = { entries: [], timer: undefined, inFlight: new Set() };
@@ -65,6 +71,7 @@ export class TelegramIngressBuffer {
   }
 
   async flush(chatId: number): Promise<void> {
+    if (this.closed) return;
     const state = this.states.get(chatId);
     if (!state) return;
     if (state.entries.length === 0) {
@@ -81,11 +88,13 @@ export class TelegramIngressBuffer {
       typing.unref();
       try {
         const messages = await Promise.all(entries.map((entry) => entry.value));
+        if (this.closed) return;
         const response = await this.flushBatch(chatId, messages);
+        if (this.closed) return;
         if (response) await latest.respond(response);
       } catch (error) {
         console.error("Buffered Telegram request failed", error);
-        await latest.respond("I could not complete that request. Please try again.").catch(() => {});
+        if (!this.closed) await latest.respond("I could not complete that request. Please try again.").catch(() => {});
       } finally {
         clearInterval(typing);
       }
@@ -96,6 +105,16 @@ export class TelegramIngressBuffer {
     } finally {
       state.inFlight.delete(current);
       if (state.entries.length === 0 && state.inFlight.size === 0) this.states.delete(chatId);
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const [chatId, state] of this.states) {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = undefined;
+      state.entries.splice(0);
+      if (state.inFlight.size === 0) this.states.delete(chatId);
     }
   }
 
@@ -130,8 +149,109 @@ export function splitTelegramText(text: string, limit = 4000): string[] {
 async function replyChunks(ctx: Context, text: string): Promise<void> {
   for (const chunk of splitTelegramText(text)) await ctx.reply(chunk);
 }
-async function sendChunks(bot: Bot, chatId: number, text: string): Promise<void> {
+
+export async function sendTelegramText(bot: Bot, chatId: number, text: string): Promise<void> {
   for (const chunk of splitTelegramText(text)) await bot.api.sendMessage(chatId, chunk);
+}
+
+export type WorkspaceFileRequest = {
+  chatId: number;
+  workspace: string;
+  sandboxPath: string;
+  caption?: string | undefined;
+};
+
+function isWithinWorkspace(workspace: string, candidate: string): boolean {
+  const relative = path.relative(workspace, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function workspaceCandidate(workspace: string, sandboxPath: string): string {
+  if (path.isAbsolute(sandboxPath)) {
+    if (sandboxPath !== "/workspace" && !sandboxPath.startsWith("/workspace/")) {
+      throw new Error("File path must be relative to /workspace.");
+    }
+    const relative = sandboxPath.slice("/workspace".length).replace(/^\/+/, "");
+    return path.resolve(workspace, relative);
+  }
+  return path.resolve(workspace, sandboxPath);
+}
+
+export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest): Promise<string> {
+  let workspace: string;
+  try {
+    workspace = await realpath(request.workspace);
+    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace is not a directory.");
+  } catch (error) {
+    if (error instanceof Error && error.message === "Workspace is not a directory.") throw error;
+    throw new Error("Workspace is unavailable.");
+  }
+
+  const candidate = workspaceCandidate(workspace, request.sandboxPath);
+  if (!isWithinWorkspace(workspace, candidate)) throw new Error("File path escapes the workspace.");
+
+  let resolved: string;
+  try {
+    resolved = await realpath(candidate);
+  } catch {
+    throw new Error("File does not exist.");
+  }
+  if (!isWithinWorkspace(workspace, resolved)) throw new Error("File path resolves outside the workspace.");
+
+  const handle = await open(resolved, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch(() => {
+    throw new Error("File does not exist.");
+  });
+  try {
+    const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
+    if (!isWithinWorkspace(workspace, openedPath)) throw new Error("File path resolves outside the workspace.");
+    const file = await handle.stat();
+    if (!file.isFile()) throw new Error("Path is not a regular file.");
+    if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
+    const bytes = await handle.readFile();
+    if (bytes.length > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
+
+    const caption = request.caption === undefined
+      ? undefined
+      : Array.from(request.caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
+    await bot.api.sendDocument(
+      request.chatId,
+      new InputFile(bytes, path.basename(resolved)),
+      caption === undefined ? undefined : { caption },
+    );
+  } finally {
+    await handle.close();
+  }
+  return `Sent ${path.basename(resolved)}.`;
+}
+type AttachmentDirectory = {
+  path: string;
+  handle: Awaited<ReturnType<typeof open>>;
+};
+
+async function ensureAttachmentDirectory(workspace: string, date: string, messageId: number): Promise<AttachmentDirectory> {
+  await mkdir(workspace, { recursive: true, mode: 0o700 });
+  const root = await realpath(workspace);
+  let directory = root;
+  for (const segment of ["attachments", date, String(messageId)]) {
+    directory = path.join(directory, segment);
+    try {
+      await mkdir(directory, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const entry = await lstat(directory);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Attachment directory is not safe.");
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
+    if (!isWithinWorkspace(root, openedPath)) throw new Error("Attachment directory is not safe.");
+    return { path: `/proc/self/fd/${handle.fd}`, handle };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    throw error;
+  }
 }
 
 function safeFilename(name: string | undefined, fallback: string): string {
@@ -213,21 +333,25 @@ async function downloadAttachment(
     }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
     const workspace = chatPaths(config.dataDir, chatId).workspace;
-    const directory = path.join(workspace, "attachments", date, String(message.message_id));
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const filename = safeFilename(source.originalName, fallbackName(source, file.file_path));
-    const destination = path.join(directory, filename);
-    const temporary = path.join(directory, `.${filename}.${randomUUID()}.part`);
+    const attachmentDirectory = await ensureAttachmentDirectory(workspace, date, message.message_id);
     try {
-      await writeFile(temporary, bytes, { mode: 0o600 });
-      await rename(temporary, destination);
+      const filename = safeFilename(source.originalName, fallbackName(source, file.file_path));
+      const directory = attachmentDirectory.path;
+      const destination = path.join(directory, filename);
+      const temporary = path.join(directory, `.${filename}.${randomUUID()}.part`);
+      try {
+        await writeFile(temporary, bytes, { mode: 0o600 });
+        await rename(temporary, destination);
+      } finally {
+        await rm(temporary, { force: true });
+      }
+      return {
+        ...common,
+        path: `/workspace/attachments/${date}/${message.message_id}/${filename}`,
+      };
     } finally {
-      await rm(temporary, { force: true });
+      await attachmentDirectory.handle.close();
     }
-    return {
-      ...common,
-      path: `/workspace/attachments/${date}/${message.message_id}/${filename}`,
-    };
   } catch {
     return { ...common, failure: "Telegram attachment download failed." };
   }
@@ -273,9 +397,14 @@ export async function flushTelegramIngress(bot: Bot): Promise<void> {
   await ingressByBot.get(bot)?.flushAll();
 }
 
+export function closeTelegramIngress(bot: Bot): void {
+  ingressByBot.get(bot)?.close();
+}
+
 export function createTelegramBot(config: Config, agents: AgentManager): Bot {
   const bot = new Bot(config.token);
-  agents.setAssistantProgress((chatId, text) => sendChunks(bot, chatId, text));
+
+  agents.setAssistantProgress((chatId, text) => sendTelegramText(bot, chatId, text));
   const ingress = new TelegramIngressBuffer(async (chatId, messages) =>
     agents.prompt(chatId, formatBufferedPrompt(messages)));
   ingressByBot.set(bot, ingress);

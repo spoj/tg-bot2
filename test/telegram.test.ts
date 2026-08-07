@@ -1,10 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { tmpdir } from "node:os";
+import type { Bot } from "grammy";
 import {
   formatBufferedPrompt,
+  sendTelegramText,
+  sendWorkspaceFile,
   splitTelegramText,
   TelegramIngressBuffer,
   type BufferedTelegramMessage,
 } from "../src/telegram.js";
+
+function fakeBot() {
+  return {
+    api: {
+      sendDocument: vi.fn(async () => ({})),
+      sendMessage: vi.fn(async () => ({})),
+    },
+  } as unknown as Bot;
+}
+
+async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
+  const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-"));
+  try {
+    await run(workspace);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
 
 it("splits Telegram responses below the limit without losing content", () => {
   const text = `${"a".repeat(30)}\n\n${"b".repeat(30)} ${"c".repeat(30)}`;
@@ -55,6 +79,7 @@ it("buffers all updates until two seconds of quiet and replies only once", async
     const replies: string[] = [];
     const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
       batches.push(messages);
+
       return "combined response";
     }, 2_000);
     const makeEntry = (messageId: number) => ({
@@ -78,4 +103,85 @@ it("buffers all updates until two seconds of quiet and replies only once", async
   } finally {
     vi.useRealTimers();
   }
+});
+it("drops pending ingress after shutdown close", async () => {
+  const batches: BufferedTelegramMessage[][] = [];
+  const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
+    batches.push(messages);
+    return "should not run";
+  }, 2_000);
+  buffer.add(7, {
+    value: Promise.resolve({ messageId: 1, text: "pending", attachments: [] }),
+    respond: async () => {},
+    typing: async () => {},
+  });
+  buffer.close();
+  await buffer.flushAll();
+  expect(batches).toEqual([]);
+});
+it("sends a valid workspace file with a bounded caption", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "report.txt"), "report");
+    const bot = fakeBot();
+    const caption = "caption".repeat(300);
+
+    await expect(sendWorkspaceFile(bot, {
+      chatId: 42,
+      workspace,
+      sandboxPath: "/workspace/report.txt",
+      caption,
+    })).resolves.toBe("Sent report.txt.");
+
+    const sendDocument = bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>;
+    expect(sendDocument).toHaveBeenCalledTimes(1);
+    expect(sendDocument.mock.calls[0]?.[0]).toBe(42);
+    expect(sendDocument.mock.calls[0]?.[2]).toEqual({ caption: Array.from(caption).slice(0, 1_024).join("") });
+  });
+});
+
+it("exports chunked text delivery through the Bot API", async () => {
+  const bot = fakeBot();
+  const text = "a".repeat(4_001);
+  await sendTelegramText(bot, 9, text);
+  const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
+  expect(sendMessage.mock.calls.map(([chatId, chunk]) => [chatId, chunk])).toEqual(
+    splitTelegramText(text).map((chunk) => [9, chunk]),
+  );
+});
+
+it("rejects traversal and symlinks that resolve outside the workspace", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-parent-"));
+  const workspace = path.join(parent, "workspace");
+  const outside = path.join(parent, "outside.txt");
+  try {
+    await mkdir(workspace);
+    await writeFile(outside, "secret");
+    await symlink(outside, path.join(workspace, "link.txt"));
+    const bot = fakeBot();
+
+    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "../outside.txt" }))
+      .rejects.toThrow(/escapes/);
+    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "/workspace/link.txt" }))
+      .rejects.toThrow(/outside/);
+    expect((bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+it("rejects missing files, directories, and files over the upload cap", async () => {
+  await withWorkspace(async (workspace) => {
+    await mkdir(path.join(workspace, "directory"));
+    const oversized = path.join(workspace, "oversized.bin");
+    await writeFile(oversized, "x");
+    await truncate(oversized, 20 * 1024 * 1024 + 1);
+    const bot = fakeBot();
+
+    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "missing.txt" }))
+      .rejects.toThrow(/does not exist/);
+    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "directory" }))
+      .rejects.toThrow(/regular file/);
+    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "oversized.bin" }))
+      .rejects.toThrow(/20 MiB/);
+  });
 });

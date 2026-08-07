@@ -1,14 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { SandboxRequest, SandboxResult } from "../src/sandbox.js";
-import { createTools, detectSupportedImageMimeType } from "../src/tools.js";
+import { createTools, detectSupportedImageMimeType, type ToolHandlers } from "../src/tools.js";
 
 const ok: SandboxResult = { exitCode: 0, stdout: "ok\n", stdoutBuffer: Buffer.from("ok\n"), stderr: "", timedOut: false, truncated: false };
-function harness(result: SandboxResult = ok) {
+function harness(result: SandboxResult = ok, extra: { handlers?: ToolHandlers; chatId?: number } = {}) {
   const calls: SandboxRequest[] = [];
   const tools = createTools({ workspace: "/host/workspace", sessions: "/host/sessions" }, {
     timeoutMs: 123,
     maxOutputBytes: 99,
     runner: async (_paths, request) => { calls.push(request); return result; },
+    ...extra,
   });
   return { tools: Object.fromEntries(tools.map((tool) => [tool.name, tool])), calls };
 }
@@ -120,8 +121,75 @@ describe("custom tools", () => {
     expect(response.content[0].text).toContain("output truncated");
   });
 
-  it("exposes exactly four names", () => {
+  it("conditionally exposes trusted domain handlers and binds every call to chatId", async () => {
+    const received: unknown[] = [];
+    const handlers: ToolHandlers = {
+      sendFile: async (chatId, sandboxPath, caption) => { received.push(["file", chatId, sandboxPath, caption]); return "sent"; },
+      schedule: async (chatId, request) => { received.push(["schedule", chatId, request]); return "scheduled"; },
+      listSchedules: async (chatId) => { received.push(["list", chatId]); return "listed"; },
+      cancelSchedule: async (chatId, id) => { received.push(["cancel", chatId, id]); return "cancelled"; },
+    };
+    const { tools } = harness(ok, { handlers, chatId: 42 });
+    expect(Object.keys(tools)).toEqual(["read", "write", "grep", "bash", "send_file", "schedule", "list_schedules", "cancel_schedule", "web_search"]);
+    await execute(tools.send_file, { path: "../outside", caption: "report" });
+    await execute(tools.schedule, { when: "2030-01-01T00:00:00Z", prompt: "check", recurring: "daily" });
+    await execute(tools.list_schedules, {});
+    await execute(tools.cancel_schedule, { id: "abc" });
+    expect(received).toEqual([
+      ["file", 42, "../outside", "report"],
+      ["schedule", 42, { when: "2030-01-01T00:00:00Z", prompt: "check", recurring: "daily" }],
+      ["list", 42],
+      ["cancel", 42, "abc"],
+    ]);
+  });
+
+  it("omits domain handlers without their callback or trusted chat binding", () => {
+    const callbacks: ToolHandlers = { sendFile: async () => "sent", listSchedules: async () => "listed" };
+    expect(createTools({ workspace: "w", sessions: "s" }, { timeoutMs: 1, maxOutputBytes: 1, handlers: callbacks, runner: async () => ok }).map((x) => x.name))
+      .toEqual(["read", "write", "grep", "bash", "web_search"]);
+    expect(createTools({ workspace: "w", sessions: "s" }, { timeoutMs: 1, maxOutputBytes: 1, handlers: callbacks, chatId: 7, runner: async () => ok }).map((x) => x.name))
+      .toEqual(["read", "write", "grep", "bash", "send_file", "list_schedules", "web_search"]);
+  });
+
+  it("searches through curl argv and formats abstract and nested related results", async () => {
+    const body = JSON.stringify({
+      Heading: "Red Fox",
+      AbstractText: "A fox is a mammal.",
+      AbstractURL: "https://example.test/fox",
+      RelatedTopics: [{ Text: "Fox facts", FirstURL: "https://example.test/facts" }, { Topics: [{ Text: "Fox habitat", FirstURL: "https://example.test/habitat" }] }],
+    });
+    const { tools, calls } = harness({ ...ok, stdout: body, stdoutBuffer: Buffer.from(body) });
+    const response = await execute(tools.web_search, { query: "red fox & habitat" });
+    const request = calls[0];
+    expect(request?.executable).toBe("/usr/bin/curl");
+    expect(request?.args).not.toContain("-c");
+    expect(request?.args).not.toContain("-lc");
+    expect(request?.args.at(-1)).toContain("q=red%20fox%20%26%20habitat");
+    expect(request?.maxOutputBytes).toBe(99);
+    expect(response.content[0].text).toContain("Abstract: A fox is a mammal.");
+    expect(response.content[0].text).toContain("Fox facts (https://example.test/facts)");
+    expect(response.content[0].text).toContain("Fox habitat (https://example.test/habitat)");
+  });
+
+  it("reports no-result searches and bounded curl failures as tool results", async () => {
+    const empty = JSON.stringify({ Heading: "", AbstractText: "", RelatedTopics: [] });
+    const noResult = await execute(harness({ ...ok, stdout: empty, stdoutBuffer: Buffer.from(empty) }).tools.web_search, { query: "nothing" });
+    expect(noResult.isError).toBe(false);
+    expect(noResult.content[0].text).toContain("No results found");
+
+    const timedOut = await execute(harness({ ...ok, exitCode: null, stdout: "partial", stdoutBuffer: Buffer.from("partial"), timedOut: true }).tools.web_search, { query: "slow" });
+    expect(timedOut.isError).toBe(true);
+    expect(timedOut.content[0].text).toContain("tool timed out");
+    const failed = await execute(harness({ ...ok, exitCode: 22, stderr: "bad gateway" }).tools.web_search, { query: "failed" });
+    expect(failed.isError).toBe(true);
+    expect(failed.content[0].text).toContain("bad gateway");
+    const truncated = await execute(harness({ ...ok, truncated: true }).tools.web_search, { query: "large" });
+    expect(truncated.isError).toBe(true);
+    expect(truncated.content[0].text).toContain("output truncated");
+  });
+
+  it("exposes the base tools and web search by default", () => {
     expect(createTools({ workspace: "w", sessions: "s" }, { timeoutMs: 1, maxOutputBytes: 1, runner: async () => ok }).map((x) => x.name))
-      .toEqual(["read", "write", "grep", "bash"]);
+      .toEqual(["read", "write", "grep", "bash", "web_search"]);
   });
 });

@@ -44,6 +44,59 @@ function toolResult(result: SandboxResult, text = render(result)) {
     isError: result.timedOut || result.exitCode !== 0,
   };
 }
+function callbackResult(text: string) {
+  return { content: [{ type: "text" as const, text }], details: undefined, isError: false };
+}
+
+type DuckDuckGoResponse = {
+  Heading?: unknown;
+  AbstractText?: unknown;
+  AbstractURL?: unknown;
+  RelatedTopics?: unknown;
+};
+
+function asText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function collectRelatedTopics(value: unknown, output: Array<{ text: string; url?: string }>): void {
+  if (!Array.isArray(value)) return;
+  for (const topic of value) {
+    if (!topic || typeof topic !== "object") continue;
+    const item = topic as { Text?: unknown; FirstURL?: unknown; Topics?: unknown };
+    const text = asText(item.Text);
+    const url = asText(item.FirstURL);
+    if (text) output.push(url ? { text, url } : { text });
+    collectRelatedTopics(item.Topics, output);
+  }
+}
+
+function formatWebSearch(stdout: string, query: string): string {
+  let data: DuckDuckGoResponse;
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (!parsed || typeof parsed !== "object") return `No results found for ${JSON.stringify(query)}.`;
+    data = parsed as DuckDuckGoResponse;
+  } catch {
+    return `Unable to parse web search results for ${JSON.stringify(query)}.`;
+  }
+
+  const lines: string[] = [];
+  const heading = asText(data.Heading);
+  const abstract = asText(data.AbstractText);
+  const abstractUrl = asText(data.AbstractURL);
+  if (heading) lines.push(`Heading: ${heading}`);
+  if (abstract) lines.push(`Abstract: ${abstract}`);
+  if (abstractUrl) lines.push(`Source: ${abstractUrl}`);
+
+  const related: Array<{ text: string; url?: string }> = [];
+  collectRelatedTopics(data.RelatedTopics, related);
+  if (related.length > 0) {
+    lines.push("Related results:");
+    for (const item of related) lines.push(`- ${item.text}${item.url ? ` (${item.url})` : ""}`);
+  }
+  return lines.length > 0 ? lines.join("\n") : `No results found for ${JSON.stringify(query)}.`;
+}
 
 const IMAGE_SNIFF_BYTES = 4_100;
 
@@ -250,5 +303,87 @@ export function createTools(paths: SandboxPaths, options: ToolOptions): ToolDefi
     })),
   });
 
-  return [readTool, writeTool, grepTool, bashTool];
+  const domainTools: ToolDefinition[] = [];
+  const chatId = options.chatId;
+  const handlers = options.handlers;
+
+  if (typeof chatId === "number" && handlers?.sendFile) {
+    const sendFile = handlers.sendFile;
+    domainTools.push(defineTool({
+      name: "send_file",
+      label: "Send File",
+      description: "Send a file from the assigned workspace to this chat.",
+      parameters: Type.Object({
+        path: Type.String({ minLength: 1, description: "Workspace-relative path of the file to send" }),
+        caption: Type.Optional(Type.String()),
+      }),
+      execute: async (_id, params) => callbackResult(await sendFile(chatId, params.path, params.caption)),
+    }));
+  }
+
+  if (typeof chatId === "number" && handlers?.schedule) {
+    const schedule = handlers.schedule;
+    domainTools.push(defineTool({
+      name: "schedule",
+      label: "Schedule",
+      description: "Schedule a one-time or recurring follow-up message in this chat.",
+      parameters: Type.Object({
+        when: Type.String({ minLength: 1, description: "ISO timestamp or scheduler-recognized due time" }),
+        prompt: Type.String({ minLength: 1 }),
+        recurring: Type.Optional(Type.Union([
+          Type.Literal("hourly"), Type.Literal("daily"), Type.Literal("weekly"),
+        ])),
+      }),
+      execute: async (_id, params) => callbackResult(await schedule(chatId,
+        params.recurring === undefined
+          ? { when: params.when, prompt: params.prompt }
+          : { when: params.when, prompt: params.prompt, recurring: params.recurring },
+      )),
+    }));
+  }
+
+  if (typeof chatId === "number" && handlers?.listSchedules) {
+    const listSchedules = handlers.listSchedules;
+    domainTools.push(defineTool({
+      name: "list_schedules",
+      label: "List Schedules",
+      description: "List scheduled follow-ups for this chat.",
+      parameters: Type.Object({}),
+      execute: async () => callbackResult(await listSchedules(chatId)),
+    }));
+  }
+
+  if (typeof chatId === "number" && handlers?.cancelSchedule) {
+    const cancelSchedule = handlers.cancelSchedule;
+    domainTools.push(defineTool({
+      name: "cancel_schedule",
+      label: "Cancel Schedule",
+      description: "Cancel one of this chat's scheduled follow-ups by id.",
+      parameters: Type.Object({ id: Type.String({ minLength: 1 }) }),
+      execute: async (_id, params) => callbackResult(await cancelSchedule(chatId, params.id)),
+    }));
+  }
+
+  const webSearchTool = defineTool({
+    name: "web_search",
+    label: "Web Search",
+    description: "Search the public web using DuckDuckGo and return an abstract and related results.",
+    promptSnippet: "Search the public web",
+    parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 500 }) }),
+    execute: async (_id, params) => {
+      const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(params.query)}&format=json&no_html=1&no_redirect=1`;
+      const result = await invoke({
+        executable: "/usr/bin/curl",
+        args: ["--fail-with-body", "--silent", "--show-error", "--location", url],
+        maxOutputBytes: options.maxOutputBytes,
+      });
+      if (result.exitCode !== 0 || result.timedOut || result.truncated) {
+        const response = toolResult(result);
+        return result.truncated ? { ...response, isError: true } : response;
+      }
+      return callbackResult(formatWebSearch(result.stdoutBuffer.toString("utf8") || result.stdout, params.query));
+    },
+  });
+
+  return [readTool, writeTool, grepTool, bashTool, ...domainTools, webSearchTool];
 }

@@ -11,8 +11,9 @@ import {
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
-import { createTools } from "./tools.js";
+import { createTools, type ToolHandlers } from "./tools.js";
 import { SerialQueue } from "./queue.js";
+ 
 
 export const SYSTEM_PROMPT = `You are a persistent personal agent reached through Telegram.
 Your writable persistent workspace is /workspace.
@@ -35,16 +36,17 @@ export function extractFinalAssistantText(messages: readonly unknown[]): string 
         .map((block) => block.text)
         .join("")
         .trim();
-      if (text) return text;
+      return text || undefined;
     }
+    return undefined;
   }
   return undefined;
 }
-
 export type AgentFactory = (options: {
   workspace: string;
   sessions: string;
   fresh: boolean;
+  chatId: number;
 }) => Promise<AgentSession>;
 
 export async function newestSessionModifiedAt(sessionsDir: string): Promise<number | undefined> {
@@ -68,7 +70,6 @@ export function isSessionIdleExpired(
 ): boolean {
   return lastSettledAt !== undefined && now - lastSettledAt >= timeoutMs;
 }
-
 type ChatState = {
   session: AgentSession | undefined;
   sessionPromise: Promise<AgentSession> | undefined;
@@ -76,7 +77,9 @@ type ChatState = {
   lastSettledAt: number | undefined;
   queue: SerialQueue;
   unsubscribe: (() => void) | undefined;
+  progressTail: Promise<void>;
 };
+
 
 export type PromptMode = "interactive" | "follow-up";
 
@@ -86,7 +89,9 @@ export type AgentManagerOptions = {
   now?: () => number;
   newestSessionModifiedAt?: (sessionsDir: string) => Promise<number | undefined>;
   assistantProgress?: AssistantProgressCallback;
+  toolHandlers?: ToolHandlers;
 };
+
 
 
 export class AgentManager {
@@ -97,6 +102,7 @@ export class AgentManager {
   private readonly now: () => number;
   private readonly findNewestSessionModifiedAt: (sessionsDir: string) => Promise<number | undefined>;
   private assistantProgress: AssistantProgressCallback | undefined;
+  private readonly toolHandlers: ToolHandlers | undefined;
 
   constructor(private readonly config: Config, factory?: AgentFactory, options: AgentManagerOptions = {}) {
     const isolatedAgentDir = path.join(config.dataDir, ".pi-runtime");
@@ -108,6 +114,8 @@ export class AgentManager {
     this.now = options.now ?? Date.now;
     this.findNewestSessionModifiedAt = options.newestSessionModifiedAt ?? newestSessionModifiedAt;
     this.assistantProgress = options.assistantProgress;
+    this.toolHandlers = options.toolHandlers;
+
   }
 
   setAssistantProgress(callback: AssistantProgressCallback | undefined): void {
@@ -123,13 +131,14 @@ export class AgentManager {
         lastSettledAt: undefined,
         queue: new SerialQueue(),
         unsubscribe: undefined,
+        progressTail: Promise.resolve(),
       };
       this.states.set(chatId, state);
     }
     return state;
   }
 
-  private async createPiSession(options: { workspace: string; sessions: string; fresh: boolean }): Promise<AgentSession> {
+  private async createPiSession(options: { workspace: string; sessions: string; fresh: boolean; chatId: number }): Promise<AgentSession> {
     await mkdir(options.workspace, { recursive: true, mode: 0o700 });
     await mkdir(options.sessions, { recursive: true, mode: 0o700 });
     for (const dir of ["sessions_ro", ".cache/npm", ".cache/uv", ".local", ".python"]) {
@@ -178,6 +187,8 @@ export class AgentManager {
       customTools: createTools(sandboxPaths, {
         timeoutMs: this.config.toolTimeoutMs,
         maxOutputBytes: this.config.maxToolOutputBytes,
+        ...(this.toolHandlers ? { handlers: this.toolHandlers } : {}),
+        chatId: options.chatId,
       }),
       resourceLoader,
       sessionManager: manager,
@@ -199,8 +210,18 @@ export class AgentManager {
       const text = extractFinalAssistantText([message]);
       const callback = this.assistantProgress;
       if (!text || !callback) return;
-      void Promise.resolve().then(() => callback(chatId, text)).catch(() => {});
+      state.progressTail = state.progressTail
+        .then(() => callback(chatId, text))
+        .catch(() => {});
     });
+  }
+
+  private async drainProgress(state: ChatState): Promise<void> {
+    while (true) {
+      const tail = state.progressTail;
+      await tail;
+      if (tail === state.progressTail) return;
+    }
   }
 
   private async ensureSession(chatId: number, state: ChatState): Promise<AgentSession> {
@@ -210,7 +231,7 @@ export class AgentManager {
       state.sessionPromise = (async () => {
         const lastModifiedAt = await this.findNewestSessionModifiedAt(paths.sessions);
         const fresh = isSessionIdleExpired(lastModifiedAt, this.now(), this.config.sessionIdleTimeoutMs);
-        const session = await this.factory({ ...paths, fresh });
+        const session = await this.factory({ ...paths, fresh, chatId });
         state.session = session;
         this.subscribeAssistantProgress(chatId, state, session);
         state.lastSettledAt = fresh ? undefined : lastModifiedAt;
@@ -228,7 +249,7 @@ export class AgentManager {
     state.session = undefined;
     state.lastSettledAt = undefined;
     const paths = chatPaths(this.config.dataDir, chatId);
-    const session = await this.factory({ ...paths, fresh: true });
+    const session = await this.factory({ ...paths, fresh: true, chatId });
     state.session = session;
     this.subscribeAssistantProgress(chatId, state, session);
     return session;
@@ -245,13 +266,21 @@ export class AgentManager {
       if (isSessionIdleExpired(state.lastSettledAt, this.now(), this.config.sessionIdleTimeoutMs)) {
         session = await this.replaceWithFreshSession(chatId, state);
       }
-
       let run!: Promise<string>;
       run = (async () => {
+        const startingMessages = [...session.messages];
+        let runMessages: readonly unknown[] | undefined;
+        const unsubscribeRun = typeof session.subscribe === "function"
+          ? session.subscribe((event) => {
+            if (event.type === "agent_end") runMessages = event.messages;
+          })
+          : undefined;
         try {
           await session.prompt(text);
-          return extractFinalAssistantText(session.messages) ?? "I completed the turn but produced no text response.";
+          const currentMessages = runMessages ?? session.messages.filter((message) => !startingMessages.includes(message));
+          return extractFinalAssistantText(currentMessages) ?? "I completed the turn but produced no text response.";
         } finally {
+          unsubscribeRun?.();
           if (state.activeRun === run) {
             state.activeRun = undefined;
             state.lastSettledAt = this.now();
@@ -262,10 +291,18 @@ export class AgentManager {
       return { kind: "prompt" as const, completion: run };
     });
     if (action.kind === "steer") {
-      await action.completion;
+      try {
+        await action.completion;
+      } finally {
+        await this.drainProgress(state);
+      }
       return undefined;
     }
-    return await action.completion;
+    try {
+      return await action.completion;
+    } finally {
+      await this.drainProgress(state);
+    }
   }
 
   newSession(chatId: number): Promise<void> {

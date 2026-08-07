@@ -117,6 +117,7 @@ it("waits for an active run before starting a distinct follow-up prompt", async 
   const messages: unknown[] = [];
   const prompt = vi.fn(async (text: string) => {
     if (text === "first") {
+      await firstDone;
       messages.push({ role: "assistant", content: [{ type: "text", text: "first response" }] });
     } else {
       messages.push({ role: "assistant", content: [{ type: "text", text: "follow-up response" }] });
@@ -136,28 +137,54 @@ it("waits for an active run before starting a distinct follow-up prompt", async 
   expect(prompt).toHaveBeenNthCalledWith(2, "follow-up");
 });
 
-it("forwards only assistant tool-call progress and unsubscribes replaced sessions", async () => {
-  let listener!: (event: unknown) => void;
+it("forwards ordered async tool-call progress and drains it before the result", async () => {
+  type Listener = (event: unknown) => void;
+  const listeners = new Set<Listener>();
+  let persistentListener: Listener | undefined;
   const unsubscribe = vi.fn();
+  const progressStarted: string[] = [];
+  const progressFinished: string[] = [];
+  let releaseFirst!: () => void;
+  const firstProgress = new Promise<void>((resolve) => { releaseFirst = resolve; });
   const session = {
     messages: [],
-    prompt: vi.fn(async () => { (session.messages as unknown[]).push({ role: "assistant", content: "done" }); }),
-    subscribe: vi.fn((callback: (event: unknown) => void) => { listener = callback; return unsubscribe; }),
+    prompt: vi.fn(async () => {
+      listeners.forEach((callback) => callback({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ignored" }] } }));
+      listeners.forEach((callback) => callback({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working" }, { type: "toolCall", name: "bash" }] } }));
+      listeners.forEach((callback) => callback({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "next" }, { type: "toolCall", name: "bash" }] } }));
+      listeners.forEach((callback) => callback({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "ignored" }, { type: "toolCall" }] } }));
+      (session.messages as unknown[]).push({ role: "assistant", content: "done" });
+    }),
+    subscribe: vi.fn((callback: Listener) => {
+      listeners.add(callback);
+      if (!persistentListener) persistentListener = callback;
+      return vi.fn(() => {
+        listeners.delete(callback);
+        if (callback === persistentListener) unsubscribe();
+      });
+    }),
     dispose: vi.fn(),
     abort: vi.fn(),
   } as unknown as AgentSession;
-  const progress = vi.fn();
+  const progress = vi.fn(async (_chatId: number, text: string) => {
+    progressStarted.push(text);
+    if (text === "working") await firstProgress;
+    progressFinished.push(text);
+  });
   const manager = new AgentManager(config, vi.fn(async () => session), {
     assistantProgress: progress,
     newestSessionModifiedAt: async () => undefined,
   });
-  await manager.prompt(1, "request");
-  listener({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working" }] } });
-  listener({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working " }, { type: "toolCall", name: "bash" }] } });
-  listener({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "ignored" }, { type: "toolCall" }] } });
-  await Promise.resolve();
-  expect(progress).toHaveBeenCalledOnce();
-  expect(progress).toHaveBeenCalledWith(1, "working");
+
+  const completion = manager.prompt(1, "request");
+  await vi.waitFor(() => expect(progress).toHaveBeenCalledOnce());
+  expect(progressStarted).toEqual(["working"]);
+  expect(progressFinished).toEqual([]);
+  releaseFirst();
+  await expect(completion).resolves.toBe("done");
+  expect(progressStarted).toEqual(["working", "next"]);
+  expect(progressFinished).toEqual(["working", "next"]);
+  expect(unsubscribe).not.toHaveBeenCalled();
   await manager.newSession(1);
   expect(unsubscribe).toHaveBeenCalledOnce();
 });
@@ -170,6 +197,14 @@ it("extracts the latest assistant result after compaction", async () => {
   });
   const manager = new AgentManager(config, vi.fn(async () => session), { newestSessionModifiedAt: async () => undefined });
   await expect(manager.prompt(1, "compact")).resolves.toBe("new result");
+});
+
+it("does not reuse prior assistant text for a textless current turn", async () => {
+  const session = fakeSession("old result");
+  (session.messages as unknown[]).push({ role: "assistant", content: "old result" });
+  vi.mocked(session.prompt).mockImplementationOnce(async () => {});
+  const manager = new AgentManager(config, vi.fn(async () => session), { newestSessionModifiedAt: async () => undefined });
+  await expect(manager.prompt(1, "no text")).resolves.toBe("I completed the turn but produced no text response.");
 });
 
 it("continues a recent session but starts fresh for a stale session after restart", async () => {

@@ -1,8 +1,28 @@
 import { constants as fsConstants } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+export type PiWorkerChildProcess = ChildProcess;
+export type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
+export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
+
+/** Spawn a Pi worker; child-process access stays inside the sandbox layer. */
+export function spawnPiWorker(executable: string, args: string[], options: PiWorkerSpawnOptions): ChildProcess {
+  return spawn(executable, args, options);
+}
+/** Terminate a child process group, falling back to the child itself when needed. */
+export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid !== undefined && child.pid !== null && child.pid > 0) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // A process can exit between pid lookup and group signalling.
+    }
+  }
+  try { child.kill(signal); } catch { /* already exited */ }
+}
 
 export type SandboxPaths = { workspace: string; sessions: string; readOnlyPaths?: string[] };
 export type SandboxRequest = {
@@ -35,6 +55,13 @@ async function existing(paths: string[]): Promise<string[]> {
     } catch { /* optional mount absent */ }
   }
   return found;
+}
+async function runtimeLibraryPaths(): Promise<string[]> {
+  const entries = await readdir("/", { withFileTypes: true });
+  const candidates = entries
+    .filter((entry) => entry.name.startsWith("lib") && (entry.isDirectory() || entry.isSymbolicLink()))
+    .map((entry) => path.join("/", entry.name));
+  return await existing(candidates);
 }
 
 export async function buildBwrapArgs(
@@ -103,6 +130,98 @@ export async function buildBwrapArgs(
   return { args, resolved: { workspace, sessions } };
 }
 
+export type PiWorkerSandboxPaths = { workspace: string; appRoot: string; cliPath?: string; appendSystemPrompt?: string };
+export type PiWorkerBwrapResult = { args: string[]; resolved: { workspace: string; appRoot: string; cliPath: string } };
+
+function relativeMountPath(root: string, candidate: string, mountPoint: string, label: string): string {
+  const relative = path.relative(root, candidate);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} must remain under ${root}`);
+  }
+  return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
+}
+
+/**
+ * Build the isolated Pi worker profile. Only the installed dependency tree is
+ * exposed read-only; the host project root (including .env and source) stays
+ * outside the worker namespace.
+ */
+export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promise<PiWorkerBwrapResult> {
+  const workspace = await realpath(paths.workspace);
+  const appRoot = await realpath(paths.appRoot);
+  if (workspace !== path.resolve(paths.workspace) || appRoot !== path.resolve(paths.appRoot)) {
+    throw new Error("Pi worker workspace and appRoot must be resolved canonical directories");
+  }
+  const workspaceStat = await lstat(workspace);
+  const appRootStat = await lstat(appRoot);
+  if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) {
+    throw new Error("Pi worker workspace must be a real directory");
+  }
+  if (!appRootStat.isDirectory() || appRootStat.isSymbolicLink()) {
+    throw new Error("Pi worker appRoot must be a real directory");
+  }
+
+  const nodeModulesPath = path.join(appRoot, "node_modules");
+  const nodeModulesStat = await lstat(nodeModulesPath);
+  if (!nodeModulesStat.isDirectory() || nodeModulesStat.isSymbolicLink()) {
+    throw new Error("Pi worker node_modules must be a real directory");
+  }
+  const nodeModules = await realpath(nodeModulesPath);
+  const nodeModulesRelative = path.relative(appRoot, nodeModules);
+  if (nodeModulesRelative === ".." || nodeModulesRelative.startsWith(`..${path.sep}`) || path.isAbsolute(nodeModulesRelative)) {
+    throw new Error("Pi worker node_modules canonical target must remain under appRoot");
+  }
+  const defaultCli = path.join(nodeModules, "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const requestedCli = paths.cliPath ?? defaultCli;
+  const hostCliPath = requestedCli.startsWith("/app/node_modules/")
+    ? path.join(nodeModules, requestedCli.slice("/app/node_modules/".length))
+    : path.isAbsolute(requestedCli) ? requestedCli : path.resolve(appRoot, requestedCli);
+  const cliPath = await realpath(hostCliPath);
+  const cliStat = await lstat(cliPath);
+  if (!cliStat.isFile() || cliStat.isSymbolicLink()) throw new Error("Pi worker CLI must be a regular file");
+  const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
+
+  const args = [
+    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
+    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
+    "--ro-bind", "/usr", "/usr",
+  ];
+  for (const runtimePath of await existing(["/bin"])) {
+    args.push("--ro-bind", runtimePath, runtimePath);
+  }
+  for (const runtimePath of await runtimeLibraryPaths()) {
+    args.push("--ro-bind", runtimePath, runtimePath);
+  }
+  args.push("--dir", "/etc");
+  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
+    args.push("--ro-bind", etcPath, etcPath);
+  }
+  args.push(
+    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    "--ro-bind", nodeModules, "/app/node_modules", "--bind", workspace, "/workspace",
+    "--setenv", "HOME", "/workspace",
+    "--setenv", "TMPDIR", "/tmp",
+    "--setenv", "PATH", "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
+    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
+    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
+    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
+    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
+    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
+    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
+    "--chdir", "/workspace", "--", "/usr/bin/node", cliMountPath,
+    "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
+    ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
+  );
+  return { args, resolved: { workspace, appRoot, cliPath } };
+}
+
+
+/** Explicit environment passed to the worker's host-side spawn. */
+export function buildPiWorkerEnvironment(): Record<string, string> {
+  return {};
+}
+
 function outputCapture(limit: number): {
   stdout: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
   stderr: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
@@ -152,9 +271,7 @@ export async function runSandbox(
     let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      if (child.pid) {
-        try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-      }
+      terminateProcessGroup(child, "SIGKILL");
     }, timeoutMs);
     timer.unref();
     child.stdout.on("data", (chunk: Buffer) => capture.stdout.add(chunk));
@@ -187,8 +304,7 @@ export async function runSandbox(
 
 export function terminateActiveSandboxes(): void {
   for (const child of activeProcesses) {
-    if (!child.pid) continue;
-    try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+    terminateProcessGroup(child, "SIGKILL");
   }
 }
 

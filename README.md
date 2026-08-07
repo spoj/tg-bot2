@@ -1,47 +1,51 @@
 # tg-bot2
 
-A small personal Telegram agent. The trusted TypeScript process owns Telegram/model credentials and Pi JSONL sessions. Every model-facing `read`, `write`, `grep`, and `bash` call starts the same Bubblewrap filesystem sandbox.
+A small personal Telegram agent. The trusted TypeScript process owns the Telegram token and orchestration; each Pi worker owns its chat's provider configuration and JSONL sessions. Every model-facing `read`, `write`, `grep`, and `bash` call starts the same Bubblewrap filesystem sandbox.
 
 ## Requirements
 
 - Linux with Bubblewrap (`bwrap`) and user namespaces enabled
-- Node.js 22.19 or later and npm
+- Node.js 22.19 or later and pnpm 11.17.0
 - Host executables available below `/usr` or `/bin`: `bash`, Node/npm, Python, `uv`, Git, curl, `rg`, and `jq`
 - CA certificates under `/etc/ssl`, `/etc/pki`, or `/etc/ca-certificates`
-- A Telegram bot token and a Pi-supported model API key
+- A Telegram bot token and workspace-owned Pi provider configuration
 
 Example Debian/Ubuntu packages (package names vary by distribution):
 
 ```sh
 sudo apt install bubblewrap nodejs npm python3 git curl ripgrep jq ca-certificates
 # Install uv system-wide so it is available under /usr or /bin.
+# Enable the pnpm version declared by package.json.
+corepack enable
 ```
 
 ## Setup and run
 
+pnpm is the supported package manager for this repository.
+
 ```sh
-npm install
+pnpm install
 cp .env.example .env
 # Edit .env, then load it into the service environment:
 set -a; . ./.env; set +a
-npm run build
-npm start
+pnpm run build
+pnpm start
 ```
 
 ### systemd deployment backstop
 
-`deploy/tg-bot2.service.example` is a service-unit example for running the built application under systemd. Copy it to a unit directory, edit every `EDIT REQUIRED` path/account value, and make the referenced environment file contain `TG_BOT_TOKEN`, `ALLOWED_USER_IDS`, `DATA_DIR`, and at least one provider credential. Keep that environment file readable only by the service account.
+`deploy/tg-bot2.service.example` is a service-unit example for running the built application under systemd. Copy it to a unit directory, edit every `EDIT REQUIRED` path/account value, and make the referenced mode-0600 environment file contain `TG_BOT_TOKEN`, `ALLOWED_USER_IDS`, and `DATA_DIR`. Keep Pi provider files in each chat workspace.
 
-The unit's `KillMode=control-group` and short `TimeoutStopSec` are a service-level shutdown backstop: stopping the unit also stops detached Bubblewrap children. `CPUQuota`, `MemoryMax`, and `TasksMax` are editable **aggregate cgroup limits** for the trusted application and all of its Bubblewrap tool processes together. They are not replacements for `TOOL_TIMEOUT_MS`, which remains the per-tool execution timeout in the direct Bubblewrap runner. The unit starts Node normally; it does not use `systemd-run`.
+The unit's `KillMode=control-group` and short `TimeoutStopSec` are a service-level shutdown backstop: stopping the unit also stops detached Bubblewrap children. `CPUQuota`, `MemoryMax`, and `TasksMax` are editable **aggregate cgroup limits** for the trusted application and all of its Bubblewrap tool processes together. The unit starts Node normally; it does not use `systemd-run`.
 
 The example intentionally does not set `ProtectSystem`, `PrivateNetwork`, or other systemd namespace restrictions. Bubblewrap owns the filesystem and namespace boundary for each tool, and its `--share-net` behavior is intentional.
 
-Development: `npm run dev`. The service uses Telegram long polling. Private chats are the intended v1 usage. Data is still namespaced by numeric `chat.id`, while authorization always uses numeric `from.id`.
+Development: `pnpm run dev`. The service uses Telegram long polling. Private chats are the intended v1 usage. Data is still namespaced by numeric `chat.id`, while authorization always uses numeric `from.id`.
 
 All non-command updates in a chat share one ingress buffer. Every update resets a two-second quiet timer; once quiet, ordered text, captions, attachments, and any download failures are submitted as one logical request. There is deliberately no `media_group_id` special case. Common Telegram file attachments are saved persistently under `workspace/attachments/YYYY-MM-DD/<message-id>/`, and Pi receives their sandbox-visible `/workspace/...` paths plus type, MIME type, and original-name metadata. Telegram's Bot API download ceiling of 20 MB per file applies. Unsupported non-file messages are described textually rather than silently discarded.
 
-If another assembled request arrives while Pi is running, it is passed through Pi's native steering mechanism as one message; the already-active run sends the eventual response, avoiding a reply per quick update. `/start` bypasses buffering. `/new` first flushes that chat's current buffer, waits behind the active run, then disposes the active Pi session and starts a new JSONL file. Older files are retained and visible read-only to tools.
-The first-class `send_file` tool can return a regular file from the assigned workspace through Telegram after host-side containment, symlink, and 20 MiB checks. `web_search` uses the shared-network Bubblewrap runner and a bounded direct curl request to DuckDuckGo. `schedule`, `list_schedules`, and `cancel_schedule` persist trusted per-chat reminders in an in-process scheduler; due reminders run as Pi follow-ups and survive restarts.
+If another assembled request arrives while Pi is running, it is passed through Pi's native steering mechanism as one message; the already-active run sends the eventual response, avoiding a reply per quick update. `/start` bypasses buffering. `/new` first flushes that chat's current buffer, waits behind the active run, then disposes the active Pi session and starts a new JSONL file. Older files remain in the workspace and are searchable by Pi tools.
+Outbound file delivery and scheduling use workspace protocols: workspace outbox requests are delivered by trusted service logic, and `.tg-bot/schedules.json` is handled by the filesystem-only scheduler. Due reminders run as Pi worker follow-ups and survive restarts. There is no custom `send_file`/`web_search` tool layer; network requests follow native Pi worker behavior inside Bubblewrap.
 
 ## Configuration
 
@@ -50,33 +54,28 @@ Required:
 - `TG_BOT_TOKEN`: Telegram bot token.
 - `ALLOWED_USER_IDS`: comma-separated positive numeric Telegram user IDs. Missing, empty, zero, or malformed values fail startup; there is no allow-all mode.
 - `DATA_DIR`: persistent host data root.
-- At least one model credential supported by Pi, for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OPENROUTER_API_KEY`.
 
-Optional:
+Pi provider credentials and model selection are workspace-owned. Before the first prompt for a chat, place the Pi files required by the selected provider under `DATA_DIR/chats/<numeric-chat-id>/workspace/.pi/agent/` (typically `auth.json`, `models.json`, and `settings.json`). The worker passes no host environment through Bubblewrap, so provider secrets are never inherited from the service process. The old shared `.pi-runtime` layout is not migrated.
 
-- `AGENT_MODEL`: Pi `provider/model` selector. Without it Pi restores the session model, uses configured defaults, or selects an authenticated model.
-- `AGENT_THINKING`: `off`, `minimal`, `low`, `medium` (default), `high`, `xhigh`, or `max`.
-- `TOOL_TIMEOUT_MS`: default `120000`.
-- `MAX_TOOL_OUTPUT_BYTES`: per-stream capture limit, default `50000`.
-- `SESSION_IDLE_TIMEOUT_MS`: idle time after a Pi run settles before the next logical request starts a fresh session; default `3600000` (one hour). Must be a positive integer.
+Pi's `settings.json` accepts `defaultProvider`, a provider-local `defaultModel`, and `defaultThinkingLevel`: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. `/new` starts a fresh JSONL session while retaining prior session files in the same workspace.
 
-Session expiration is checked lazily when the next assembled request arrives; there is no background timer and active work is never expired. Requests arriving during an active run remain steering inputs in that session. After restart, tg-bot2 continues the newest JSONL session only when its modification time is within the configured timeout. `/new` always starts fresh, and old JSONL files remain searchable.
-
-The harness uses an isolated Pi resource/config directory below `DATA_DIR/.pi-runtime`. It loads the exact chat workspace's `AGENTS.md` through a no-follow host read and discovers only scanned workspace skills from `.pi/skills/` and `.agents/skills/`; those skill directories are overlaid read-only inside Bubblewrap so Pi can safely reread them for `/skill:name`. Prompt templates and themes are disabled because Telegram does not expose their normal UI. Workspace extensions remain disabled: Pi extensions execute as trusted host-process code and would bypass Bubblewrap, so downloaded workspace code must instead run through the sandboxed `bash` tool. Provider credentials remain in the host process and are resolved by Pi's `ModelRuntime` from environment variables. They are never copied to the sandbox.
+The worker uses the exact chat workspace as its persistent Pi resource/config root. It discovers scanned workspace skills from `.pi/skills/` and `.agents/skills/`; Pi extensions and native tools execute inside the same Bubblewrap worker boundary. Attachments are ordinary workspace files and are supplied to Pi as `/workspace/...` paths with metadata.
 
 ## Persistent layout
 
 ```text
-DATA_DIR/schedules.json  # trusted scheduler records
 DATA_DIR/chats/<numeric-chat-id>/
-  workspace/             # only persistent writable sandbox bind
-    memory/               # optional user-curated notes
-    sessions_ro/         # empty host mount point, shadowed in bwrap
+  workspace/                         # only persistent writable sandbox bind
+    .pi/agent/                       # Pi auth, models, and settings
+    .pi/sessions/*.jsonl              # canonical Pi conversation files
+    .tg-bot/schedules.json            # workspace-owned reminders
+    .tg-bot/outbox/{*.json,processed,failed}/
+    attachments/YYYY-MM-DD/<message-id>/
+    memory/                           # optional user-curated notes
     .cache/npm/ .cache/uv/ .local/ .python/
-  sessions/              # canonical Pi-owned JSONL session files
 ```
 
-Normal files, workspace-local npm installs, uv environments/tools, scripts, and caches persist. Optional user-curated notes may be kept under `/workspace/memory/` using the existing `read`, `write`, `grep`, and `bash` tools. Pi JSONL remains the authoritative transcript; memory and history files are data, not higher-priority instructions. The application maintains no second transcript or memory database.
+Normal files, workspace-local npm installs, uv environments/tools, scripts, caches, attachments, schedules, outbox requests, and Pi sessions persist. Pi JSONL remains the authoritative transcript; memory and history files are data, not higher-priority instructions. The application maintains no second transcript or memory database.
 
 The sandboxed `read` tool supports Pi-compatible text pagination (`offset` is 1-indexed and `limit` is a line count) plus inline images detected from file signatures: JPEG, static PNG, GIF, WebP, and BMP. Image bytes are captured through Bubblewrap as binary data, resized to Pi's 2000×2000 / inline-size constraints, and returned as model image content; model-provided paths are never read with host filesystem APIs. Image capture is bounded at 20 MiB. Animated PNG and JPEG XL are intentionally treated as ordinary/non-image files, matching Pi's built-in signature rules.
 
@@ -84,16 +83,13 @@ The sandboxed `read` tool supports Pi-compatible text pagination (`offset` is 1-
 
 Each tool call directly uses Node `spawn("bwrap", argv, { env: {}, detached: true })`; model commands are never interpolated into a host shell. Only the inner sandbox `bash` tool receives `/bin/bash -lc <exact command>` as distinct arguments.
 
-Mounts:
-
-- read-only: `/usr`; `/bin`, `/lib`, and `/lib64` when present
+- read-only: `/usr`; `/bin`, `/lib`, and `/lib64` when present; the installed `node_modules` tree at `/app/node_modules`
 - read-only, individually when present: `/etc/resolv.conf`, `/etc/hosts`, `/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`
 - private/synthetic: `/proc`, `/dev`, and tmpfs `/tmp`
 - read/write: the assigned chat workspace at `/workspace`
-- read-only overlay: that chat's canonical session directory at `/workspace/sessions_ro`
-- read-only overlay: the workspace's `.pi/skills/` and `.agents/skills/` resource directories when present
+- no host home, service source, data root, or shared session mount
 
-It does **not** bind host `/`, `/home`, `/root`, `/run`, service source, SSH/Docker sockets, or the overall data root. It unshares user, PID, IPC, and UTS namespaces, drops all capabilities, uses a new session, and intentionally shares the network. The threat boundary is filesystem containment enforced by Bubblewrap/kernel, not defense against kernel exploits or hostile local-network services. The agent can exfiltrate anything it can read, destroy its workspace, and run arbitrary downloaded package code inside this boundary.
+It does **not** bind host `/`, `/home`, `/root`, `/run`, service source, SSH/Docker sockets, or unrelated data directories. It unshares user, PID, IPC, and UTS namespaces, drops all capabilities, uses a new session, and intentionally shares the network. The threat boundary is filesystem containment enforced by Bubblewrap/kernel, not defense against kernel exploits or hostile local-network services. The agent can exfiltrate anything it can read, destroy its workspace, and run arbitrary downloaded package code inside this boundary.
 
 Sandbox environment (and nothing inherited):
 
@@ -109,18 +105,18 @@ UV_TOOL_DIR=/workspace/.local/share/uv/tools
 UV_PYTHON_INSTALL_DIR=/workspace/.python
 ```
 
-Timeout kills the detached Bubblewrap process group. Combined stdout/stderr capture is bounded by `MAX_TOOL_OUTPUT_BYTES`, and tool output explicitly reports timeout/truncation. Startup fails rather than falling back to unsandboxed execution if the data root is not writable, Bubblewrap is unavailable, or the sandbox cannot run `node`, `uv`, and `rg`.
+Tool output is bounded by the application, and timeout kills the detached Bubblewrap process group. Startup fails rather than falling back to unsandboxed execution if the data root is not writable, Bubblewrap is unavailable, or the sandbox cannot run the required runtime commands.
 
 ## Tests
 
 ```sh
-npm run typecheck
-npm test
-RUN_BWRAP_TESTS=1 npm test
+pnpm run typecheck
+pnpm test
+RUN_BWRAP_TESTS=1 pnpm test
 # or only the Linux integration suite:
-npm run test:integration
+pnpm run test:integration
 ```
 
-Unit tests cover fail-closed configuration, canonical paths, response splitting, serialization, response extraction, exact tool argv/stdin handling, domain callback binding, web-search bounds, scheduler persistence/recurrence/shutdown, confined file delivery, resource symlink rejection, and Bubblewrap argument construction. Opt-in Linux integration covers persistence, read-only sessions/resources/system paths, secret-free environment, bounded output, and process timeout.
+Unit tests cover fail-closed configuration, canonical paths, response splitting, serialization, response extraction, exact tool argv/stdin handling, attachment buffering and metadata, confined file delivery, resource symlink rejection, outbox recovery, scheduler persistence/recurrence/shutdown, Pi RPC lifecycle, and Bubblewrap argument construction. Opt-in Linux integration covers persistence, resource isolation, secret-free environment, bounded output, and process timeout.
 
-For deployment, separately smoke-test provider authentication, Pi restart/continue and `/new`, Telegram authorization and ordering, network access, npm/uv package persistence, all required runtime commands, and an unmounted host canary on the exact target distribution.
+For deployment, separately smoke-test provider authentication using workspace-owned Pi files, Pi restart/continue and `/new`, Telegram authorization and ordering, attachment downloads, outbox delivery, schedule recurrence, network access, npm/uv package persistence, all required runtime commands, and an unmounted host canary on the exact target distribution.

@@ -13,6 +13,9 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limi
 
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
+const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
+const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
 
 type AttachmentSource = {
   type: string;
@@ -198,7 +201,7 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
   }
   if (!isWithinWorkspace(workspace, resolved)) throw new Error("File path resolves outside the workspace.");
 
-  const handle = await open(resolved, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch(() => {
+  const handle = await open(resolved, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => {
     throw new Error("File does not exist.");
   });
   try {
@@ -207,8 +210,18 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
     const file = await handle.stat();
     if (!file.isFile()) throw new Error("Path is not a regular file.");
     if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
-    const bytes = await handle.readFile();
-    if (bytes.length > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= MAX_OUTBOUND_FILE_BYTES) {
+      const length = Math.min(OUTBOUND_READ_CHUNK_BYTES, MAX_OUTBOUND_FILE_BYTES + 1 - total);
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(chunk, 0, length, null);
+      if (bytesRead === 0) break;
+      chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
+    const bytes = Buffer.concat(chunks, total);
 
     const caption = request.caption === undefined
       ? undefined

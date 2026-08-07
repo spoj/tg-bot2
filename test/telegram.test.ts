@@ -1,7 +1,11 @@
+import { execFile as execFileCallback } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
-import { mkdtemp, mkdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, open as openFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
+
 import type { Bot } from "grammy";
 import {
   formatBufferedPrompt,
@@ -12,6 +16,7 @@ import {
   type BufferedTelegramMessage,
 } from "../src/telegram.js";
 
+const execFile = promisify(execFileCallback);
 function fakeBot() {
   return {
     api: {
@@ -27,6 +32,16 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
     await run(workspace);
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+}
+async function createFifo(fifoPath: string): Promise<boolean> {
+  try {
+    await execFile("mkfifo", [fifoPath]);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOSYS" || code === "ENOTSUP" || code === "EOPNOTSUPP") return false;
+    throw error;
   }
 }
 
@@ -139,6 +154,41 @@ it("sends a valid workspace file with a bounded caption", async () => {
   });
 });
 
+it("rejects FIFOs without blocking when FIFO creation is supported", async () => {
+  await withWorkspace(async (workspace) => {
+    const fifo = path.join(workspace, "workspace-outbox-fifo");
+    if (!(await createFifo(fifo))) return;
+    const bot = fakeBot();
+    const outcomePromise = sendWorkspaceFile(bot, {
+      chatId: 42,
+      workspace,
+      sandboxPath: "workspace-outbox-fifo",
+    }).then(
+      () => ({ kind: "resolved" as const }),
+      (error: unknown) => ({ kind: "rejected" as const, error }),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      outcomePromise,
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), 250);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === "timeout") {
+      const writer = await openFile(fifo, fsConstants.O_WRONLY);
+      await writer.close();
+      await outcomePromise;
+      throw new Error("sendWorkspaceFile blocked while opening a FIFO.");
+    }
+    expect(outcome.kind).toBe("rejected");
+    if (outcome.kind === "rejected") expect(outcome.error).toEqual(
+      expect.objectContaining({ message: expect.stringMatching(/regular file/) }),
+    );
+    expect((bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  });
+}, 2_000);
+
 it("exports chunked text delivery through the Bot API", async () => {
   const bot = fakeBot();
   const text = "a".repeat(4_001);
@@ -150,6 +200,7 @@ it("exports chunked text delivery through the Bot API", async () => {
 });
 
 it("rejects traversal and symlinks that resolve outside the workspace", async () => {
+
   const parent = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-parent-"));
   const workspace = path.join(parent, "workspace");
   const outside = path.join(parent, "outside.txt");
@@ -183,5 +234,37 @@ it("rejects missing files, directories, and files over the upload cap", async ()
       .rejects.toThrow(/regular file/);
     await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "oversized.bin" }))
       .rejects.toThrow(/20 MiB/);
+  });
+});
+it("rejects a regular file that grows beyond the upload cap after stat", async () => {
+  await withWorkspace(async (workspace) => {
+    const file = path.join(workspace, "growing.bin");
+    await writeFile(file, "");
+    await truncate(file, 20 * 1024 * 1024);
+    const probe = await openFile(file, fsConstants.O_RDONLY);
+    const prototype = Object.getPrototypeOf(probe) as {
+      read: (this: unknown, ...args: any[]) => Promise<any>;
+    };
+    const originalRead = prototype.read;
+    let grew = false;
+    const readSpy = vi.spyOn(prototype, "read").mockImplementation(async function (this: unknown, ...args: any[]) {
+      if (!grew) {
+        grew = true;
+        await appendFile(file, Buffer.from("x"));
+      }
+      return originalRead.apply(this, args);
+    });
+    try {
+      const bot = fakeBot();
+      await expect(sendWorkspaceFile(bot, {
+        chatId: 42,
+        workspace,
+        sandboxPath: "growing.bin",
+      })).rejects.toThrow(/20 MiB/);
+      expect((bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    } finally {
+      readSpy.mockRestore();
+      await probe.close();
+    }
   });
 });

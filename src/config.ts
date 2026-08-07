@@ -4,30 +4,12 @@ export type Config = {
   token: string;
   allowedUserIds: ReadonlySet<number>;
   dataDir: string;
-  model?: string;
-  thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  toolTimeoutMs: number;
-  maxToolOutputBytes: number;
-  sessionIdleTimeoutMs: number;
 };
-
-const THINKING_LEVELS = new Set<Config["thinking"]>([
-  "off", "minimal", "low", "medium", "high", "xhigh", "max",
-]);
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
   if (!value) throw new Error(`${name} is required and must not be empty`);
   return value;
-}
-
-function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
-  const raw = env[name]?.trim();
-  if (!raw) return fallback;
-  if (!/^\d+$/.test(raw) || Number(raw) <= 0 || !Number.isSafeInteger(Number(raw))) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-  return Number(raw);
 }
 
 export function parseAllowedUserIds(value: string): ReadonlySet<number> {
@@ -45,18 +27,10 @@ export function parseAllowedUserIds(value: string): ReadonlySet<number> {
 }
 
 export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const thinking = (env.AGENT_THINKING?.trim() || "medium") as Config["thinking"];
-  if (!THINKING_LEVELS.has(thinking)) throw new Error(`Invalid AGENT_THINKING: ${thinking}`);
-  const model = env.AGENT_MODEL?.trim();
   return {
     token: required(env, "TG_BOT_TOKEN"),
     allowedUserIds: parseAllowedUserIds(required(env, "ALLOWED_USER_IDS")),
     dataDir: path.resolve(required(env, "DATA_DIR")),
-    ...(model ? { model } : {}),
-    thinking,
-    toolTimeoutMs: positiveInteger(env, "TOOL_TIMEOUT_MS", 120_000),
-    maxToolOutputBytes: positiveInteger(env, "MAX_TOOL_OUTPUT_BYTES", 50_000),
-    sessionIdleTimeoutMs: positiveInteger(env, "SESSION_IDLE_TIMEOUT_MS", 3_600_000),
   };
 }
 
@@ -65,7 +39,7 @@ export function canonicalChatId(chatId: number): string {
   return String(chatId);
 }
 
-export function chatPaths(dataDir: string, chatId: number): { workspace: string; sessions: string } {
+export function chatPaths(dataDir: string, chatId: number): { workspace: string } {
   const root = path.join(dataDir, "chats", canonicalChatId(chatId));
-  return { workspace: path.join(root, "workspace"), sessions: path.join(root, "sessions") };
+  return { workspace: path.join(root, "workspace") };
 }

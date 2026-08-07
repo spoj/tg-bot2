@@ -4,10 +4,23 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceRoot = join(projectRoot, "src");
-const sourceFiles = readdirSync(sourceRoot, { withFileTypes: true })
-  .filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
-  .map((entry) => entry.name)
-  .sort();
+
+function listSourceFiles(directory, relativeDirectory = "") {
+  const files = [];
+  const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const relativePath = join(relativeDirectory, entry.name);
+    const absolutePath = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listSourceFiles(absolutePath, relativePath));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      files.push(relativePath);
+    }
+  }
+  return files.sort();
+}
+
+const sourceFiles = listSourceFiles(sourceRoot);
 
 function isIdentifierStart(character) {
   return character !== undefined && /[A-Za-z_$]/.test(character);
@@ -95,13 +108,15 @@ function collectImports(source) {
       continue;
     }
 
-    if (source.startsWith("import", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6])) {
+    const isImport = source.startsWith("import", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6]);
+    const isExport = source.startsWith("export", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6]);
+    if (isImport || isExport) {
       let next = skipTrivia(source, cursor + 6);
-      if (source[next] === ".") {
+      if (isImport && source[next] === ".") {
         cursor += 6;
         continue;
       }
-      if (source[next] === "(") {
+      if (isImport && source[next] === "(") {
         next = skipTrivia(source, next + 1);
         const imported = readQuoted(source, next);
         if (imported) imports.push({ specifier: imported.value, clause: "", index: cursor });
@@ -110,7 +125,7 @@ function collectImports(source) {
       }
 
       const declarationStart = next;
-      const sideEffect = readQuoted(source, next);
+      const sideEffect = isImport ? readQuoted(source, next) : undefined;
       if (sideEffect) {
         imports.push({ specifier: sideEffect.value, clause: "", index: cursor });
         cursor = sideEffect.end;
@@ -207,6 +222,54 @@ function hasCall(source, name) {
   return false;
 }
 
+function hasMemberCall(source, name, excludedObject) {
+  let cursor = 0;
+  let quote;
+  while (cursor < source.length) {
+    const character = source[cursor];
+    if (quote) {
+      if (character === "\\") cursor += 2;
+      else if (character === quote) {
+        quote = undefined;
+        cursor += 1;
+      } else cursor += 1;
+      continue;
+    }
+    if (character === "\"" || character === "'" || character === "`") {
+      quote = character;
+      cursor += 1;
+      continue;
+    }
+    if (source.startsWith("//", cursor)) {
+      const newline = source.indexOf("\n", cursor + 2);
+      cursor = newline === -1 ? source.length : newline + 1;
+      continue;
+    }
+    if (source.startsWith("/*", cursor)) {
+      const end = source.indexOf("*/", cursor + 2);
+      cursor = end === -1 ? source.length : end + 2;
+      continue;
+    }
+
+    const optional = source.startsWith("?.", cursor);
+    if (character === "." || optional) {
+      const memberStart = cursor + (optional ? 2 : 1);
+      if (source.startsWith(name, memberStart) && !isIdentifierPart(source[memberStart - 1]) && !isIdentifierPart(source[memberStart + name.length])) {
+        const next = skipTrivia(source, memberStart + name.length);
+        if (source[next] === "(") {
+          let objectEnd = cursor;
+          while (objectEnd > 0 && /\s/.test(source[objectEnd - 1])) objectEnd -= 1;
+          let objectStart = objectEnd;
+          while (objectStart > 0 && isIdentifierPart(source[objectStart - 1])) objectStart -= 1;
+          if (source.slice(objectStart, objectEnd) !== excludedObject) return true;
+        }
+      }
+    }
+    cursor += 1;
+  }
+  return false;
+}
+
 function moduleBase(specifier) {
   const withoutQuery = specifier.split(/[?#]/, 1)[0].replaceAll("\\", "/");
   const finalPart = withoutQuery.slice(withoutQuery.lastIndexOf("/") + 1);
@@ -281,6 +344,13 @@ for (const file of sourceFiles) {
 
   if (layer !== "sandbox" && hasCall(source, "spawn")) {
     addViolation(violations, file, "spawn", "spawn may only be used by sandbox.ts");
+  }
+
+  if (layer !== "sandbox" && hasCall(source, "process.kill")) {
+    addViolation(violations, file, "process.kill", "process-control calls may only be used by sandbox.ts");
+  }
+  if (layer !== "sandbox" && hasMemberCall(source, "kill", "process")) {
+    addViolation(violations, file, "ChildProcess.kill", "process-control calls may only be used by sandbox.ts");
   }
 }
 

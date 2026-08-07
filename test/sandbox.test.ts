@@ -1,8 +1,8 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildBwrapArgs, runSandbox } from "../src/sandbox.js";
+import { buildBwrapArgs, buildPiWorkerBwrapArgs, runSandbox } from "../src/sandbox.js";
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-test-"));
@@ -41,6 +41,19 @@ it("binds requested workspace resources read-only and rejects outside paths", as
     await mkdir(outside);
     await expect(buildBwrapArgs({ ...f, readOnlyPaths: [outside] }, { executable: "/bin/cat", args: [] }))
       .rejects.toThrow("under the workspace");
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+it("rejects a symlinked appRoot node_modules tree", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const dependencyTarget = path.join(f.root, "dependencies");
+  try {
+    await mkdir(appRoot);
+    await mkdir(dependencyTarget);
+    await symlink(dependencyTarget, path.join(appRoot, "node_modules"), "dir");
+    await expect(buildPiWorkerBwrapArgs({ workspace: f.workspace, appRoot }))
+      .rejects.toThrow("node_modules must be a real directory");
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 

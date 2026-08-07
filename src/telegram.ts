@@ -130,6 +130,9 @@ export function splitTelegramText(text: string, limit = 4000): string[] {
 async function replyChunks(ctx: Context, text: string): Promise<void> {
   for (const chunk of splitTelegramText(text)) await ctx.reply(chunk);
 }
+async function sendChunks(bot: Bot, chatId: number, text: string): Promise<void> {
+  for (const chunk of splitTelegramText(text)) await bot.api.sendMessage(chatId, chunk);
+}
 
 function safeFilename(name: string | undefined, fallback: string): string {
   const base = path.basename(name?.trim() || fallback)
@@ -272,6 +275,7 @@ export async function flushTelegramIngress(bot: Bot): Promise<void> {
 
 export function createTelegramBot(config: Config, agents: AgentManager): Bot {
   const bot = new Bot(config.token);
+  agents.setAssistantProgress((chatId, text) => sendChunks(bot, chatId, text));
   const ingress = new TelegramIngressBuffer(async (chatId, messages) =>
     agents.prompt(chatId, formatBufferedPrompt(messages)));
   ingressByBot.set(bot, ingress);

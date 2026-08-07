@@ -28,6 +28,14 @@ npm run build
 npm start
 ```
 
+### systemd deployment backstop
+
+`deploy/tg-bot2.service.example` is a service-unit example for running the built application under systemd. Copy it to a unit directory, edit every `EDIT REQUIRED` path/account value, and make the referenced environment file contain `TG_BOT_TOKEN`, `ALLOWED_USER_IDS`, `DATA_DIR`, and at least one provider credential. Keep that environment file readable only by the service account.
+
+The unit's `KillMode=control-group` and short `TimeoutStopSec` are a service-level shutdown backstop: stopping the unit also stops detached Bubblewrap children. `CPUQuota`, `MemoryMax`, and `TasksMax` are editable **aggregate cgroup limits** for the trusted application and all of its Bubblewrap tool processes together. They are not replacements for `TOOL_TIMEOUT_MS`, which remains the per-tool execution timeout in the direct Bubblewrap runner. The unit starts Node normally; it does not use `systemd-run`.
+
+The example intentionally does not set `ProtectSystem`, `PrivateNetwork`, or other systemd namespace restrictions. Bubblewrap owns the filesystem and namespace boundary for each tool, and its `--share-net` behavior is intentional.
+
 Development: `npm run dev`. The service uses Telegram long polling. Private chats are the intended v1 usage. Data is still namespaced by numeric `chat.id`, while authorization always uses numeric `from.id`.
 
 All non-command updates in a chat share one ingress buffer. Every update resets a two-second quiet timer; once quiet, ordered text, captions, attachments, and any download failures are submitted as one logical request. There is deliberately no `media_group_id` special case. Common Telegram file attachments are saved persistently under `workspace/attachments/YYYY-MM-DD/<message-id>/`, and Pi receives their sandbox-visible `/workspace/...` paths plus type, MIME type, and original-name metadata. Telegram's Bot API download ceiling of 20 MB per file applies. Unsupported non-file messages are described textually rather than silently discarded.

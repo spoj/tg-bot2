@@ -1,0 +1,36 @@
+# Copy to /etc/systemd/system/tg-bot2.service after editing every value marked EDIT REQUIRED.
+# Keep the EnvironmentFile out of the repository: it contains TG_BOT_TOKEN and provider keys.
+[Unit]
+Description=tg-bot2 Telegram agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# EDIT REQUIRED: create this unprivileged account, or replace both account values.
+User=tg-bot2
+Group=tg-bot2
+# EDIT REQUIRED: absolute path to the checked-out/build deployment.
+WorkingDirectory=/opt/tg-bot2
+# EDIT REQUIRED: absolute path to a mode-0600 file containing TG_BOT_TOKEN,
+# ALLOWED_USER_IDS, DATA_DIR, and at least one Pi provider credential.
+EnvironmentFile=/etc/tg-bot2/tg-bot2.env
+# EDIT REQUIRED: use the node binary and built entrypoint installed on this host.
+ExecStart=/usr/bin/node /opt/tg-bot2/dist/index.js
+Restart=on-failure
+RestartSec=5s
+
+# Service-level shutdown backstop: stop every process in this cgroup,
+# including detached Bubblewrap tool children, within this short grace period.
+KillMode=control-group
+TimeoutStopSec=10s
+
+# EDIT VALUES: aggregate limits for the application and all child Bubblewrap
+# processes together. These are not per-tool limits; TOOL_TIMEOUT_MS remains
+# the per-tool timeout configured in the environment file.
+CPUQuota=200%
+MemoryMax=1G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

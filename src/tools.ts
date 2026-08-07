@@ -11,10 +11,19 @@ import {
 import { runSandbox, type SandboxPaths, type SandboxRequest, type SandboxResult } from "./sandbox.js";
 
 export type SandboxRunner = (paths: SandboxPaths, request: SandboxRequest) => Promise<SandboxResult>;
+export type ScheduleRecurrence = "hourly" | "daily" | "weekly";
+export type ToolHandlers = {
+  sendFile?: (chatId: number, sandboxPath: string, caption?: string) => Promise<string>;
+  schedule?: (chatId: number, request: { when: string; prompt: string; recurring?: ScheduleRecurrence }) => Promise<string>;
+  listSchedules?: (chatId: number) => Promise<string>;
+  cancelSchedule?: (chatId: number, id: string) => Promise<string>;
+};
 export type ToolOptions = {
   timeoutMs: number;
   maxOutputBytes: number;
   runner?: SandboxRunner;
+  handlers?: ToolHandlers;
+  chatId?: number;
 };
 
 function render(result: SandboxResult, options: { noMatches?: boolean } = {}): string {

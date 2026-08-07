@@ -75,12 +75,19 @@ type ChatState = {
   activeRun: Promise<string> | undefined;
   lastSettledAt: number | undefined;
   queue: SerialQueue;
+  unsubscribe: (() => void) | undefined;
 };
+
+export type PromptMode = "interactive" | "follow-up";
+
+export type AssistantProgressCallback = (chatId: number, text: string) => void | Promise<void>;
 
 export type AgentManagerOptions = {
   now?: () => number;
   newestSessionModifiedAt?: (sessionsDir: string) => Promise<number | undefined>;
+  assistantProgress?: AssistantProgressCallback;
 };
+
 
 export class AgentManager {
   private readonly states = new Map<number, ChatState>();
@@ -89,6 +96,7 @@ export class AgentManager {
 
   private readonly now: () => number;
   private readonly findNewestSessionModifiedAt: (sessionsDir: string) => Promise<number | undefined>;
+  private assistantProgress: AssistantProgressCallback | undefined;
 
   constructor(private readonly config: Config, factory?: AgentFactory, options: AgentManagerOptions = {}) {
     const isolatedAgentDir = path.join(config.dataDir, ".pi-runtime");
@@ -99,8 +107,12 @@ export class AgentManager {
     this.factory = factory ?? ((options) => this.createPiSession(options));
     this.now = options.now ?? Date.now;
     this.findNewestSessionModifiedAt = options.newestSessionModifiedAt ?? newestSessionModifiedAt;
+    this.assistantProgress = options.assistantProgress;
   }
 
+  setAssistantProgress(callback: AssistantProgressCallback | undefined): void {
+    this.assistantProgress = callback;
+  }
   private state(chatId: number): ChatState {
     let state = this.states.get(chatId);
     if (!state) {
@@ -110,6 +122,7 @@ export class AgentManager {
         activeRun: undefined,
         lastSettledAt: undefined,
         queue: new SerialQueue(),
+        unsubscribe: undefined,
       };
       this.states.set(chatId, state);
     }
@@ -173,6 +186,22 @@ export class AgentManager {
     if (result.modelFallbackMessage) console.warn(result.modelFallbackMessage);
     return result.session;
   }
+  private subscribeAssistantProgress(chatId: number, state: ChatState, session: AgentSession): void {
+    if (typeof session.subscribe !== "function") return;
+    state.unsubscribe?.();
+    state.unsubscribe = session.subscribe((event) => {
+      if (event.type !== "message_end") return;
+      const message = event.message as { role?: unknown; content?: unknown } | undefined;
+      if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
+      const hasToolCall = message.content.some((block) =>
+        !!block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall");
+      if (!hasToolCall) return;
+      const text = extractFinalAssistantText([message]);
+      const callback = this.assistantProgress;
+      if (!text || !callback) return;
+      void Promise.resolve().then(() => callback(chatId, text)).catch(() => {});
+    });
+  }
 
   private async ensureSession(chatId: number, state: ChatState): Promise<AgentSession> {
     if (state.session) return state.session;
@@ -183,6 +212,7 @@ export class AgentManager {
         const fresh = isSessionIdleExpired(lastModifiedAt, this.now(), this.config.sessionIdleTimeoutMs);
         const session = await this.factory({ ...paths, fresh });
         state.session = session;
+        this.subscribeAssistantProgress(chatId, state, session);
         state.lastSettledAt = fresh ? undefined : lastModifiedAt;
         return session;
       })().finally(() => { state.sessionPromise = undefined; });
@@ -192,32 +222,35 @@ export class AgentManager {
 
   private async replaceWithFreshSession(chatId: number, state: ChatState): Promise<AgentSession> {
     const pendingSession = state.sessionPromise ? await state.sessionPromise : undefined;
+    state.unsubscribe?.();
+    state.unsubscribe = undefined;
     (state.session ?? pendingSession)?.dispose();
     state.session = undefined;
     state.lastSettledAt = undefined;
     const paths = chatPaths(this.config.dataDir, chatId);
     const session = await this.factory({ ...paths, fresh: true });
     state.session = session;
+    this.subscribeAssistantProgress(chatId, state, session);
     return session;
   }
 
-  async prompt(chatId: number, text: string): Promise<string | undefined> {
+  async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<string | undefined> {
     const state = this.state(chatId);
     const action = await state.queue.run(async () => {
       let session = await this.ensureSession(chatId, state);
-      if (state.activeRun) {
+      if (mode === "interactive" && state.activeRun) {
         return { kind: "steer" as const, completion: session.prompt(text, { streamingBehavior: "steer" }) };
       }
+      if (mode === "follow-up") await state.activeRun?.catch(() => {});
       if (isSessionIdleExpired(state.lastSettledAt, this.now(), this.config.sessionIdleTimeoutMs)) {
         session = await this.replaceWithFreshSession(chatId, state);
       }
 
-      const messageCount = session.messages.length;
       let run!: Promise<string>;
       run = (async () => {
         try {
           await session.prompt(text);
-          return extractFinalAssistantText(session.messages.slice(messageCount)) ?? "I completed the turn but produced no text response.";
+          return extractFinalAssistantText(session.messages) ?? "I completed the turn but produced no text response.";
         } finally {
           if (state.activeRun === run) {
             state.activeRun = undefined;
@@ -248,7 +281,11 @@ export class AgentManager {
       await Promise.allSettled([...this.states.values()].map(async (state) => state.session?.abort()));
     }
     await Promise.allSettled([...this.states.values()].map((state) => state.queue.idle()));
-    for (const state of this.states.values()) state.session?.dispose();
+    for (const state of this.states.values()) {
+      state.unsubscribe?.();
+      state.unsubscribe = undefined;
+      state.session?.dispose();
+    }
     this.states.clear();
   }
 }

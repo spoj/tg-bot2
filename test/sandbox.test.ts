@@ -19,6 +19,12 @@ it("constructs the restrictive common profile and direct executable argv", async
     expect(built.args).toContain("--unshare-user");
     expect(built.args).toContain("--share-net");
     expect(built.args).toContain("--cap-drop");
+    expect(built.args).toEqual(expect.arrayContaining([
+      "--setenv", "HOME", "/workspace",
+      "--setenv", "TMPDIR", "/tmp",
+      "--setenv", "PATH", "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    ]));
+    expect(built.args).not.toContain("--unshare-net");
     expect(built.args).not.toContain("/");
     expect(built.args.slice(-3)).toEqual(["--", "/bin/cat", "x;bad"]);
     expect(built.args).toContain("/workspace/sessions_ro");

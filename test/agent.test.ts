@@ -111,6 +111,67 @@ it("steers a logical request arriving during an active Pi run", async () => {
   expect(factory).toHaveBeenCalledTimes(1);
 });
 
+it("waits for an active run before starting a distinct follow-up prompt", async () => {
+  let finishFirst!: () => void;
+  const firstDone = new Promise<void>((resolve) => { finishFirst = resolve; });
+  const messages: unknown[] = [];
+  const prompt = vi.fn(async (text: string) => {
+    if (text === "first") {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "first response" }] });
+    } else {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "follow-up response" }] });
+    }
+  });
+  const session = { messages, prompt, dispose: vi.fn(), abort: vi.fn() } as unknown as AgentSession;
+  const manager = new AgentManager(config, vi.fn(async () => session), { newestSessionModifiedAt: async () => undefined });
+
+  const first = manager.prompt(1, "first");
+  await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+  const followUp = manager.prompt(1, "follow-up", "follow-up");
+  await Promise.resolve();
+  expect(prompt).toHaveBeenCalledTimes(1);
+  finishFirst();
+  await expect(first).resolves.toBe("first response");
+  await expect(followUp).resolves.toBe("follow-up response");
+  expect(prompt).toHaveBeenNthCalledWith(2, "follow-up");
+});
+
+it("forwards only assistant tool-call progress and unsubscribes replaced sessions", async () => {
+  let listener!: (event: unknown) => void;
+  const unsubscribe = vi.fn();
+  const session = {
+    messages: [],
+    prompt: vi.fn(async () => { (session.messages as unknown[]).push({ role: "assistant", content: "done" }); }),
+    subscribe: vi.fn((callback: (event: unknown) => void) => { listener = callback; return unsubscribe; }),
+    dispose: vi.fn(),
+    abort: vi.fn(),
+  } as unknown as AgentSession;
+  const progress = vi.fn();
+  const manager = new AgentManager(config, vi.fn(async () => session), {
+    assistantProgress: progress,
+    newestSessionModifiedAt: async () => undefined,
+  });
+  await manager.prompt(1, "request");
+  listener({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working" }] } });
+  listener({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working " }, { type: "toolCall", name: "bash" }] } });
+  listener({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "ignored" }, { type: "toolCall" }] } });
+  await Promise.resolve();
+  expect(progress).toHaveBeenCalledOnce();
+  expect(progress).toHaveBeenCalledWith(1, "working");
+  await manager.newSession(1);
+  expect(unsubscribe).toHaveBeenCalledOnce();
+});
+
+it("extracts the latest assistant result after compaction", async () => {
+  const session = fakeSession("new result");
+  (session.messages as unknown[]).push({ role: "assistant", content: "old result" });
+  vi.mocked(session.prompt).mockImplementationOnce(async () => {
+    (session.messages as unknown[]).splice(0, session.messages.length, { role: "assistant", content: "new result" });
+  });
+  const manager = new AgentManager(config, vi.fn(async () => session), { newestSessionModifiedAt: async () => undefined });
+  await expect(manager.prompt(1, "compact")).resolves.toBe("new result");
+});
+
 it("continues a recent session but starts fresh for a stale session after restart", async () => {
   const recentFactory = vi.fn(async () => fakeSession());
   const recent = new AgentManager(config, recentFactory, {

@@ -1,4 +1,5 @@
-import { chmod, lstat, mkdir, writeFile } from "node:fs/promises";
+import { watch, type FSWatcher } from "node:fs";
+import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -129,6 +130,43 @@ async function ensureWebSearchConfig(workspace: string): Promise<void> {
   }
 }
 
+const EXTENSION_RELOAD_DEBOUNCE_MS = 500;
+const EXTENSION_RELOAD_RETRY_MS = 100;
+
+function extensionWatchKind(filename: string | Buffer | null): "settings" | "resource" | undefined {
+  if (filename === null) return undefined;
+  const relative = filename.toString().replaceAll(path.sep, "/");
+  if (relative === "settings.json" || relative === "agent/settings.json") return "settings";
+  if (
+    relative === "extensions" || relative.startsWith("extensions/") ||
+    relative === "npm" || relative.startsWith("npm/") ||
+    relative === "agent/extensions" || relative.startsWith("agent/extensions/") ||
+    relative === "agent/npm" || relative.startsWith("agent/npm/")
+  ) return "resource";
+  return undefined;
+}
+
+async function extensionSettingsFingerprint(workspace: string): Promise<string | undefined> {
+  const settingsPaths = [
+    path.join(workspace, ".pi", "settings.json"),
+    path.join(workspace, ".pi", "agent", "settings.json"),
+  ];
+  const snapshots: unknown[] = [];
+  for (const settingsPath of settingsPaths) {
+    try {
+      const parsed = asRecord(JSON.parse(await readFile(settingsPath, "utf8")));
+      snapshots.push({ packages: parsed?.packages ?? null, extensions: parsed?.extensions ?? null });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        snapshots.push({ packages: null, extensions: null });
+        continue;
+      }
+      return undefined;
+    }
+  }
+  return JSON.stringify(snapshots);
+}
+
 async function prepareWorkspace(workspace: string): Promise<void> {
   await ensurePrivateDirectory(workspace);
   for (const relative of [
@@ -178,6 +216,13 @@ export class PiRpcWorker {
   private terminalError: Error | undefined;
   private stderr = "";
   private stopping = false;
+  private lifecycleEpoch = 0;
+  private extensionWatcher: FSWatcher | undefined;
+  private extensionReloadTimer: ReturnType<typeof setTimeout> | undefined;
+  private extensionReloadPromise: Promise<void> | undefined;
+  private extensionSettingsFingerprint = "";
+  private extensionResourceDirty = false;
+  private extensionSettingsDirty = false;
 
   constructor(options: PiRpcWorkerOptions) {
     this.workspace = options.workspace;
@@ -191,11 +236,126 @@ export class PiRpcWorker {
       throw new Error("stopGraceMs must be a non-negative integer");
     }
   }
+  private startExtensionWatcher(): void {
+    const root = path.join(this.workspace, ".pi");
+    const watcher = watch(root, { recursive: true }, (_event, filename) => {
+      const kind = extensionWatchKind(filename);
+      if (!kind) return;
+      if (kind === "settings") this.extensionSettingsDirty = true;
+      else this.extensionResourceDirty = true;
+      this.scheduleExtensionReload();
+    });
+    watcher.on("error", () => {
+      if (this.stopping) return;
+      this.extensionResourceDirty = true;
+      this.scheduleExtensionReload();
+    });
+    this.extensionWatcher = watcher;
+  }
+
+  private closeExtensionWatcher(): void {
+    if (this.extensionReloadTimer) clearTimeout(this.extensionReloadTimer);
+    this.extensionReloadTimer = undefined;
+    const watcher = this.extensionWatcher;
+    this.extensionWatcher = undefined;
+    watcher?.close();
+  }
+
+  private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
+    if (this.stopping || !this.process) return;
+    if (this.extensionReloadTimer) clearTimeout(this.extensionReloadTimer);
+    this.extensionReloadTimer = setTimeout(() => {
+      this.extensionReloadTimer = undefined;
+      void this.processExtensionReload();
+    }, delayMs);
+    this.extensionReloadTimer.unref?.();
+  }
+
+  private async processExtensionReload(): Promise<void> {
+    if (this.extensionReloadPromise || this.stopping || !this.process) return;
+    if (!this.extensionResourceDirty && !this.extensionSettingsDirty) return;
+    if (this.unsettledWork.size > 0 || this.pending.size > 0) {
+      this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
+      return;
+    }
+    try {
+      const fingerprint = await extensionSettingsFingerprint(this.workspace);
+      if (fingerprint === undefined) {
+        this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
+        return;
+      }
+      const changed = this.extensionResourceDirty ||
+        (this.extensionSettingsDirty && fingerprint !== this.extensionSettingsFingerprint);
+      this.extensionResourceDirty = false;
+      this.extensionSettingsDirty = false;
+      if (!changed) return;
+      const reload = this.reloadForExtensionChanges();
+      this.extensionReloadPromise = reload;
+      try {
+        await reload;
+      } finally {
+        if (this.extensionReloadPromise === reload) this.extensionReloadPromise = undefined;
+      }
+    } catch (error) {
+      this.terminalError ??= asError(error);
+    }
+  }
+
+  private async reloadForExtensionChanges(): Promise<void> {
+    const epoch = this.lifecycleEpoch;
+    await this.stopProcess();
+    if (epoch !== this.lifecycleEpoch || this.terminalError) return;
+    await this.start();
+  }
+
+
+  private async stopProcess(): Promise<void> {
+    this.closeExtensionWatcher();
+    const child = this.process;
+    const done = this.processDone;
+    if (!child || !done) {
+      this.clearPromptSettlementTimers();
+      this.unsettledWork.clear();
+      this.acceptedWork.clear();
+      this.startedWork.clear();
+      return;
+    }
+    this.stopping = true;
+    terminateProcessGroup(child, "SIGTERM");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      done,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, this.stopGraceMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (this.process === child) {
+      const forcedStopError = new Error("Pi worker did not exit after SIGKILL");
+      terminateProcessGroup(child, "SIGKILL");
+      await Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, this.stopGraceMs))]);
+      if (this.process === child) {
+        this.rejectPending(forcedStopError);
+        this.rejectSettledWaiters(forcedStopError);
+        this.finishProcess();
+      }
+    }
+    this.clearPromptSettlementTimers();
+    this.unsettledWork.clear();
+    this.acceptedWork.clear();
+    this.startedWork.clear();
+    this.process = undefined;
+    this.processDone = undefined;
+    this.resolveProcessDone = undefined;
+  }
 
   async start(): Promise<void> {
     if (this.process) throw new Error("Pi worker is already started");
     if (this.terminalError) throw this.terminalError;
     await prepareWorkspace(this.workspace);
+    this.extensionSettingsFingerprint = await extensionSettingsFingerprint(this.workspace) ?? "";
+    this.extensionResourceDirty = false;
+    this.extensionSettingsDirty = false;
     const built = await buildPiWorkerBwrapArgs({
       workspace: this.workspace,
       appRoot: this.appRoot,
@@ -261,51 +421,26 @@ export class PiRpcWorker {
       this.handleExit(child.exitCode, child.signalCode);
       throw this.terminalError ?? new Error("Pi worker exited during startup");
     }
+    try {
+      this.startExtensionWatcher();
+    } catch (error) {
+      const failure = asError(error);
+      this.failProcess(failure);
+      throw failure;
+    }
   }
 
   async stop(): Promise<void> {
-    const child = this.process;
-    const done = this.processDone;
-    if (!child || !done) {
-      this.clearPromptSettlementTimers();
-      this.unsettledWork.clear();
-      this.acceptedWork.clear();
-      this.startedWork.clear();
-      return;
-    }
-    this.stopping = true;
-    terminateProcessGroup(child, "SIGTERM");
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      done,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, this.stopGraceMs);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (this.process === child) {
-      const forcedStopError = new Error("Pi worker did not exit after SIGKILL");
-      terminateProcessGroup(child, "SIGKILL");
-      await Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, this.stopGraceMs))]);
-      if (this.process === child) {
-        this.rejectPending(forcedStopError);
-        this.rejectSettledWaiters(forcedStopError);
-        this.finishProcess();
-      }
-    }
-    this.clearPromptSettlementTimers();
-    this.unsettledWork.clear();
-    this.acceptedWork.clear();
-    this.startedWork.clear();
-    this.process = undefined;
-    this.processDone = undefined;
-    this.resolveProcessDone = undefined;
+    this.lifecycleEpoch += 1;
+    await this.stopProcess();
   }
   async abort(): Promise<void> {
     await this.request({ type: "abort" });
   }
 
   async newSession(): Promise<void> {
+    const reload = this.extensionReloadPromise;
+    if (reload) await reload;
     const response = await this.request({ type: "new_session" });
     const record = asRecord(response);
     const data = asRecord(record?.data);
@@ -315,10 +450,14 @@ export class PiRpcWorker {
   }
 
   async prompt(message: string): Promise<void> {
+    const reload = this.extensionReloadPromise;
+    if (reload) await reload;
     await this.queueWork({ type: "prompt", message });
   }
 
   async steer(message: string): Promise<void> {
+    const reload = this.extensionReloadPromise;
+    if (reload) await reload;
     await this.queueWork({ type: "steer", message });
   }
 
@@ -332,6 +471,8 @@ export class PiRpcWorker {
   }
 
   async getLastAssistantText(): Promise<string | undefined> {
+    const reload = this.extensionReloadPromise;
+    if (reload) await reload;
     if (this.assistantTextKnown) return this.lastAssistantText;
     const response = await this.request({ type: "get_last_assistant_text" });
     const record = asRecord(response);

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PiRpcWorker, StrictJsonlParser, type PiWorkerSpawn } from "../src/pi-worker.js";
 
 type Signal = NodeJS.Signals | null;
@@ -108,6 +108,73 @@ describe("PiRpcWorker", () => {
       await expect(worker.getLastAssistantText()).resolves.toBe("answer");
     } finally {
       delete process.env.TG_BOT_TOKEN;
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("debounces extension resource changes and restarts the idle worker", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      expect(children).toHaveLength(1);
+      await writeFile(path.join(f.workspace, ".pi", "settings.json"), '{"theme":"dark"}\n');
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      expect(children).toHaveLength(1);
+      const extensionDirectory = path.join(f.workspace, ".pi", "extensions");
+      await mkdir(extensionDirectory, { recursive: true });
+      const extensionPath = path.join(extensionDirectory, "example.ts");
+      await writeFile(extensionPath, "export default () => {};\n");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await writeFile(extensionPath, "export default () => { return undefined; };\n");
+      await vi.waitFor(() => expect(children).toHaveLength(2), { timeout: 3_000, interval: 50 });
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      expect(children).toHaveLength(2);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("waits for an active turn before reloading extensions", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("active");
+      const command = JSON.parse(children[0]?.commands[0] ?? "{}") as { id?: string };
+      record(children[0]!, { type: "response", id: command.id, command: "prompt", success: true });
+      await prompt;
+      const extensionDirectory = path.join(f.workspace, ".pi", "extensions");
+      await mkdir(extensionDirectory, { recursive: true });
+      await writeFile(path.join(extensionDirectory, "active.ts"), "export default () => {};\n");
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      expect(children).toHaveLength(1);
+      const settled = worker.waitForSettled();
+      record(children[0]!, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+      record(children[0]!, { type: "agent_settled" });
+      await settled;
+      await vi.waitFor(() => expect(children).toHaveLength(2), { timeout: 3_000, interval: 50 });
+    } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });
     }

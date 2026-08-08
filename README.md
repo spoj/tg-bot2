@@ -58,7 +58,7 @@ Pi provider credentials and model selection are workspace-owned. Before a chat's
 
 The workspace `.pi/` directory is the chat's project layer. Project `settings.json` and resources override user-layer resources where Pi allows it. Use `pi install <source> -l` for optional extensions so their package files and package settings stay in this project layer; the base Pi CLI remains the only Pi package bundled by the application. The worker discovers resources from both `.pi/agent/` and `.pi/`. These are Pi precedence and lifecycle scopes, not an access-control boundary: the worker can read both.
 
-Pi runs headless with `--mode rpc --continue --approve` and exchanges newline-delimited JSON requests/events with the host. Optional extension behavior, including media analysis, is available only after its package is installed and may require provider consent.
+Pi runs headless with `--mode rpc --continue --approve` and exchanges newline-delimited JSON requests/events with the host. Optional extension behavior, including media analysis, is available only after its package is installed and may require provider consent. The host watches project and user extension resources, debounces changes, and restarts an idle worker so newly installed or edited extensions load without a bot-wide restart.
 
 ## Persistent layout
 

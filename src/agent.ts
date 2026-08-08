@@ -9,7 +9,7 @@ Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
-Use the pi command with install <source> -l for optional project-local extensions and list to inspect them; restart the worker after changing extensions.
+Use the pi command with install <source> -l for optional project-local extensions and list to inspect them; extension changes are debounced and automatically reloaded after the current turn settles.
 To send a file through Telegram, write a send_file request under the root
 /workspace/.tg-bot/outbox/. The request object is
 {version:1,id,type:"send_file",path,caption?}; id must be unique and path must

@@ -56,6 +56,26 @@ it("rejects a symlinked appRoot node_modules tree", async () => {
       .rejects.toThrow("node_modules must be a real directory");
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
+it("loads only explicit regular-file extensions from node_modules", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cliPath = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const extensionPath = path.join(appRoot, "node_modules", "trusted-extension", "index.ts");
+  try {
+    await mkdir(path.dirname(cliPath), { recursive: true });
+    await mkdir(path.dirname(extensionPath), { recursive: true });
+    await writeFile(cliPath, "#!/usr/bin/env node\n", { mode: 0o700 });
+    await writeFile(extensionPath, "export default () => {};\n", { mode: 0o600 });
+    await writeFile(path.join(f.root, "outside.ts"), "export default () => {};\n", { mode: 0o600 });
+    const built = await buildPiWorkerBwrapArgs({ workspace: f.workspace, appRoot, extensions: [extensionPath] });
+    expect(built.args).toEqual(expect.arrayContaining(["--extension", "/app/node_modules/trusted-extension/index.ts"]));
+    await expect(buildPiWorkerBwrapArgs({
+      workspace: f.workspace,
+      appRoot,
+      extensions: [path.join(f.root, "outside.ts")],
+    })).rejects.toThrow("under");
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
 
 const integration = process.env.RUN_BWRAP_TESTS === "1" ? describe : describe.skip;
 integration("Bubblewrap integration", () => {

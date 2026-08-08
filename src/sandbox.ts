@@ -130,7 +130,13 @@ export async function buildBwrapArgs(
   return { args, resolved: { workspace, sessions } };
 }
 
-export type PiWorkerSandboxPaths = { workspace: string; appRoot: string; cliPath?: string; appendSystemPrompt?: string };
+export type PiWorkerSandboxPaths = {
+  workspace: string;
+  appRoot: string;
+  cliPath?: string;
+  extensions?: readonly string[];
+  appendSystemPrompt?: string;
+};
 export type PiWorkerBwrapResult = { args: string[]; resolved: { workspace: string; appRoot: string; cliPath: string } };
 
 function relativeMountPath(root: string, candidate: string, mountPoint: string, label: string): string {
@@ -180,6 +186,18 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
   const cliStat = await lstat(cliPath);
   if (!cliStat.isFile() || cliStat.isSymbolicLink()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
+  const extensionMountPaths: string[] = [];
+  for (const requestedExtension of paths.extensions ?? []) {
+    const hostExtensionPath = requestedExtension.startsWith("/app/node_modules/")
+      ? path.join(nodeModules, requestedExtension.slice("/app/node_modules/".length))
+      : path.isAbsolute(requestedExtension) ? requestedExtension : path.resolve(appRoot, requestedExtension);
+    const extensionPath = await realpath(hostExtensionPath);
+    const extensionStat = await lstat(extensionPath);
+    if (!extensionStat.isFile() || extensionStat.isSymbolicLink()) {
+      throw new Error("Pi worker extensions must be regular files");
+    }
+    extensionMountPaths.push(relativeMountPath(nodeModules, extensionPath, "/app/node_modules", "Pi worker extension"));
+  }
 
   const args = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
@@ -212,6 +230,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--chdir", "/workspace", "--", "/usr/bin/node", cliMountPath,
     "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
+    ...extensionMountPaths.flatMap((extensionPath) => ["--extension", extensionPath]),
   );
   return { args, resolved: { workspace, appRoot, cliPath } };
 }

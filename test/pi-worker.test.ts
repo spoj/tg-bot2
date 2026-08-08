@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -77,6 +77,8 @@ describe("PiRpcWorker", () => {
     try {
       process.env.TG_BOT_TOKEN = "must-not-leak";
       await worker.start();
+      expect(await readFile(path.join(f.workspace, ".pi", "agent", "web-search.json"), "utf8"))
+        .toBe('{"workflow":"none","autoOpenBrowser":false}\n');
       expect(calls).toHaveLength(1);
       expect(calls[0]?.executable).toBe("/test/bwrap");
       expect(calls[0]?.args).toEqual(expect.arrayContaining([

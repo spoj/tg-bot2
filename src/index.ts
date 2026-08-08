@@ -3,34 +3,39 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { createTelegramBot, closeTelegramIngress, sendTelegramText, sendWorkspaceFile } from "./telegram.js";
+import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
 
 async function main(): Promise<void> {
   const config = parseConfig();
   await checkSandboxEnvironment(config.dataDir);
 
   const agents = new AgentManager(config, { appRoot: process.cwd() });
+  const delivery = new TelegramDeliveryQueue();
   let bot: ReturnType<typeof createTelegramBot>;
   const scheduler = new WorkspaceScheduler({
     dataDir: config.dataDir,
     run: (chatId, prompt) => agents.prompt(chatId, prompt, "follow-up"),
     send: async (chatId, text) => {
-      if (text.trim().length > 0) await sendTelegramText(bot, chatId, text);
+      if (text.trim().length > 0) {
+        await delivery.enqueue(chatId, () => sendTelegramText(bot, chatId, text));
+      }
     },
   });
   const outbox = new WorkspaceOutbox({
     dataDir: config.dataDir,
     sendFile: async (chatId, sandboxPath, caption) => {
-      await sendWorkspaceFile(bot, {
-        chatId,
-        workspace: chatPaths(config.dataDir, chatId).workspace,
-        sandboxPath,
-        ...(caption === undefined ? {} : { caption }),
+      await delivery.enqueue(chatId, async () => {
+        await sendWorkspaceFile(bot, {
+          chatId,
+          workspace: chatPaths(config.dataDir, chatId).workspace,
+          sandboxPath,
+          ...(caption === undefined ? {} : { caption }),
+        });
       });
     },
   });
 
-  bot = createTelegramBot(config, agents);
+  bot = createTelegramBot(config, agents, delivery);
 
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -45,6 +50,11 @@ async function main(): Promise<void> {
         console.error("Telegram stop failed", error);
       }
       closeTelegramIngress(bot);
+      try {
+        await flushTelegramIngress(bot);
+      } catch (error) {
+        console.error("Telegram ingress drain failed", error);
+      }
       try {
         await agents.beginShutdown();
       } catch (error) {
@@ -69,6 +79,11 @@ async function main(): Promise<void> {
         terminateActiveSandboxes();
       } catch (error) {
         console.error("Sandbox shutdown failed", error);
+      }
+      try {
+        await delivery.drain();
+      } catch (error) {
+        console.error("Telegram delivery drain failed", error);
       }
     })();
     return shutdownPromise;

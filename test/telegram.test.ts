@@ -12,7 +12,9 @@ import {
   sendTelegramText,
   sendWorkspaceFile,
   splitTelegramText,
+  TelegramDeliveryQueue,
   TelegramIngressBuffer,
+  type TelegramBatchResult,
   type BufferedTelegramMessage,
 } from "../src/telegram.js";
 
@@ -87,53 +89,239 @@ Telegram message 12:
 Attachment download failed (type=voice, MIME=audio/ogg): download failed`);
 });
 
-it("buffers all updates until two seconds of quiet and replies only once", async () => {
-  vi.useFakeTimers();
-  try {
-    const batches: BufferedTelegramMessage[][] = [];
-    const replies: string[] = [];
-    const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
-      batches.push(messages);
+describe("TelegramIngressBuffer", () => {
+  const message = (messageId: number): BufferedTelegramMessage => ({
+    messageId,
+    text: `m${messageId}`,
+    attachments: [],
+  });
 
-      return "combined response";
-    }, 2_000);
-    const makeEntry = (messageId: number) => ({
-      value: Promise.resolve({ messageId, text: `m${messageId}`, attachments: [] }),
-      respond: async (text: string) => { replies.push(text); },
-      typing: async () => {},
-    });
-
-    buffer.add(7, makeEntry(1));
-    await vi.advanceTimersByTimeAsync(1_500);
-    buffer.add(7, makeEntry(2));
-    await vi.advanceTimersByTimeAsync(1_999);
-    expect(batches).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
-
-    expect(batches).toEqual([[
-      { messageId: 1, text: "m1", attachments: [] },
-      { messageId: 2, text: "m2", attachments: [] },
-    ]]);
-    expect(replies).toEqual(["combined response"]);
-  } finally {
-    vi.useRealTimers();
-  }
-});
-it("drops pending ingress after shutdown close", async () => {
-  const batches: BufferedTelegramMessage[][] = [];
-  const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
-    batches.push(messages);
-    return "should not run";
-  }, 2_000);
-  buffer.add(7, {
-    value: Promise.resolve({ messageId: 1, text: "pending", attachments: [] }),
-    respond: async () => {},
+  const entry = (messageId: number, respond: (text: string) => void | Promise<void> = async () => {}) => ({
+    value: Promise.resolve(message(messageId)),
+    respond,
     typing: async () => {},
   });
-  buffer.close();
-  await buffer.flushAll();
-  expect(batches).toEqual([]);
+
+  it("batches a quiet window and gives the latest entry ownership", async () => {
+    vi.useFakeTimers();
+    try {
+      const batches: BufferedTelegramMessage[][] = [];
+      const replies: string[] = [];
+      const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
+        batches.push(messages);
+        return { kind: "reply", text: "combined response" };
+      }, 2_000);
+
+      expect(buffer.add(7, entry(1, (text) => { replies.push(`one:${text}`); })).kind).toBe("accepted");
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(buffer.add(7, entry(2, (text) => { replies.push(`two:${text}`); })).kind).toBe("accepted");
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(batches).toEqual([[message(1), message(2)]]);
+      expect(replies).toEqual(["two:combined response"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("serializes overlapping batches in FIFO order even when later work completes first", async () => {
+    const completions: Array<() => void> = [];
+    const callbacks: number[] = [];
+    const replies: string[] = [];
+    let resolveFirstStarted!: () => void;
+    let resolveSecondStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
+    const secondStarted = new Promise<void>((resolve) => { resolveSecondStarted = resolve; });
+    const buffer = new TelegramIngressBuffer((_chatId, messages) => new Promise<TelegramBatchResult>((resolve) => {
+      const messageId = messages[0]!.messageId;
+      callbacks.push(messageId);
+      if (messageId === 1) resolveFirstStarted();
+      else resolveSecondStarted();
+      completions.push(() => resolve({ kind: "reply", text: `reply-${messageId}` }));
+    }), 60_000);
+
+    buffer.add(7, entry(1, (text) => { replies.push(text); }));
+    const first = buffer.flush(7);
+    await firstStarted;
+    buffer.add(7, entry(2, (text) => { replies.push(text); }));
+    const second = buffer.flush(7);
+    expect(callbacks).toEqual([1]);
+    completions[0]!();
+    await secondStarted;
+    expect(callbacks).toEqual([1, 2]);
+    expect(replies).toEqual(["reply-1"]);
+    completions[1]!();
+    await Promise.all([first, second]);
+    expect(replies).toEqual(["reply-1", "reply-2"]);
+  });
+
+  it("keeps accepted pending work deliverable after close", async () => {
+    const replies: string[] = [];
+    const buffer = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "pending" }), 60_000);
+    buffer.add(7, entry(1, (text) => { replies.push(text); }));
+    buffer.close();
+    await buffer.flushAll();
+    expect(replies).toEqual(["pending"]);
+  });
+
+  it("does not suppress an in-flight delivery when closing", async () => {
+    let responseStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => { responseStarted = resolve; });
+    let releaseResponse!: () => void;
+    const responseFinished = new Promise<void>((resolve) => { releaseResponse = resolve; });
+    let attempts = 0;
+    const buffer = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "in flight" }), 60_000);
+    buffer.add(7, entry(1, () => {
+      attempts += 1;
+      responseStarted();
+      return responseFinished;
+    }));
+    const draining = buffer.flush(7);
+    await callbackStarted;
+    expect(attempts).toBe(1);
+    buffer.close();
+    releaseResponse();
+    await draining;
+    await buffer.flushAll();
+    expect(attempts).toBe(1);
+  });
+
+  it("reports quiesced admission after close", () => {
+    const buffer = new TelegramIngressBuffer(async () => ({ kind: "no-reply", reason: "steered" }));
+    buffer.close();
+    expect(buffer.add(7, entry(1))).toEqual({ kind: "quiesced", reason: "closed" });
+  });
+
+  it("does not deliver a reply for a steered batch", async () => {
+    let attempts = 0;
+    const buffer = new TelegramIngressBuffer(async () => ({ kind: "no-reply", reason: "steered" }));
+    buffer.add(7, entry(1, () => { attempts += 1; }));
+    await buffer.flushAll();
+    expect(attempts).toBe(0);
+  });
+
+  it("flushAll drains work admitted while an earlier batch is running", async () => {
+    const replies: string[] = [];
+    let calls = 0;
+    const buffer = new TelegramIngressBuffer(async () => {
+      calls += 1;
+      if (calls === 1) {
+        buffer.add(7, entry(2, (text) => { replies.push(text); }));
+        return { kind: "reply", text: "first" };
+      }
+      return { kind: "reply", text: "second" };
+    }, 60_000);
+    buffer.add(7, entry(1, (text) => { replies.push(text); }));
+    await buffer.flushAll();
+    expect(replies).toEqual(["first", "second"]);
+  });
+
+  it("uses one fallback for model failures and never retries response delivery", async () => {
+    const fallbackReplies: string[] = [];
+    const failingModel = new TelegramIngressBuffer(async () => {
+      throw new Error("model failed");
+    });
+    failingModel.add(7, entry(1, (text) => { fallbackReplies.push(text); }));
+    await failingModel.flushAll();
+    expect(fallbackReplies).toEqual(["I could not complete that request. Please try again."]);
+
+    const sendAttempts: string[] = [];
+    const failingSend = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "reply" }));
+    failingSend.add(7, entry(1, () => {
+      sendAttempts.push("attempt");
+      throw new Error("send failed");
+    }));
+    await failingSend.flushAll();
+    expect(sendAttempts).toEqual(["attempt"]);
+  });
+
+  it("catches synchronous callback throws without leaking a rejection", async () => {
+    const replies: string[] = [];
+    const buffer = new TelegramIngressBuffer(() => {
+      throw new Error("synchronous handler failure");
+    });
+    buffer.add(7, entry(1, (text) => { replies.push(text); }));
+    await expect(buffer.flushAll()).resolves.toBeUndefined();
+    expect(replies).toHaveLength(1);
+  });
 });
+describe("TelegramDeliveryQueue", () => {
+  it("delivers operations FIFO within one chat", async () => {
+    const queue = new TelegramDeliveryQueue();
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    let resolveFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
+    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const first = queue.enqueue(7, async () => {
+      events.push("first:start");
+      resolveFirstStarted();
+      await firstFinished;
+      events.push("first:end");
+    });
+    await firstStarted;
+    const second = queue.enqueue(7, async () => {
+      events.push("second");
+    });
+    expect(events).toEqual(["first:start"]);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(events).toEqual(["first:start", "first:end", "second"]);
+  });
+
+  it("allows different chats to deliver concurrently", async () => {
+    const queue = new TelegramDeliveryQueue();
+    let releaseFirst!: () => void;
+    let resolveFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
+    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstDone = false;
+    const first = queue.enqueue(1, async () => {
+      resolveFirstStarted();
+      await firstFinished;
+      firstDone = true;
+    });
+    await firstStarted;
+    await queue.enqueue(2, () => "chat-two");
+    expect(firstDone).toBe(false);
+    releaseFirst();
+    await first;
+    expect(firstDone).toBe(true);
+  });
+
+  it("continues a chat after a rejected operation", async () => {
+    const queue = new TelegramDeliveryQueue();
+    const events: string[] = [];
+    const failure = queue.enqueue(3, () => {
+      events.push("failed");
+      throw new Error("send failed");
+    });
+    const later = queue.enqueue(3, () => {
+      events.push("later");
+      return "delivered";
+    });
+    await expect(failure).rejects.toThrow("send failed");
+    await expect(later).resolves.toBe("delivered");
+    await expect(queue.drain()).resolves.toBeUndefined();
+    expect(events).toEqual(["failed", "later"]);
+  });
+
+  it("drains operations accepted while a drain is already waiting", async () => {
+    const queue = new TelegramDeliveryQueue();
+    const events: string[] = [];
+    const first = queue.enqueue(4, () => {
+      events.push("first");
+    });
+    const draining = queue.drain();
+    await first;
+    queue.enqueue(4, () => {
+      events.push("second");
+    });
+    await draining;
+    expect(events).toEqual(["first", "second"]);
+    await queue.drain();
+  });
+});
+
 it("sends a valid workspace file with a bounded caption", async () => {
   await withWorkspace(async (workspace) => {
     await writeFile(path.join(workspace, "report.txt"), "report");

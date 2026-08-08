@@ -39,96 +39,241 @@ export type BufferedTelegramMessage = {
   attachments: SavedAttachment[];
 };
 
-type BufferEntry = {
-  value: Promise<BufferedTelegramMessage>;
-  respond: (text: string) => Promise<void>;
-  typing: () => Promise<void>;
+export type TelegramBatchResult =
+  | { readonly kind: "reply"; readonly text: string }
+  | { readonly kind: "no-reply"; readonly reason: "steered" };
+
+export type TelegramIngressAdmission =
+  | { readonly kind: "accepted" }
+  | { readonly kind: "quiesced"; readonly reason: "closed" };
+
+export type TelegramIngressEntry = {
+  value: PromiseLike<BufferedTelegramMessage>;
+  respond: (text: string) => void | PromiseLike<void>;
+  typing: () => void | PromiseLike<void>;
+};
+
+type BufferEntry = TelegramIngressEntry;
+
+type PendingBatch = {
+  readonly id: number;
+  readonly chatId: number;
+  readonly entries: readonly BufferEntry[];
+  readonly owner: BufferEntry;
 };
 
 type BufferState = {
-  entries: BufferEntry[];
+  pending: BufferEntry[];
   timer: NodeJS.Timeout | undefined;
-  inFlight: Set<Promise<void>>;
+  generation: number;
+  tail: Promise<void>;
+  running: Set<Promise<void>>;
 };
+
+const DELIVERY_FAILURE_MESSAGE = "I could not complete that request. Please try again.";
+
+function invokeCallback<T>(callback: () => T | PromiseLike<T>): Promise<T> {
+  return Promise.resolve().then(callback);
+}
+
+function isTelegramBatchResult(value: unknown): value is TelegramBatchResult {
+  if (typeof value !== "object" || value === null || !("kind" in value)) return false;
+  const result = value as { kind?: unknown; text?: unknown; reason?: unknown };
+  if (result.kind === "reply") return typeof result.text === "string";
+  return result.kind === "no-reply" && result.reason === "steered";
+}
 
 export class TelegramIngressBuffer {
   private closed = false;
+  private nextBatchId = 1;
   private readonly states = new Map<number, BufferState>();
 
   constructor(
-    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => Promise<string | undefined>,
+    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => TelegramBatchResult | PromiseLike<TelegramBatchResult>,
     private readonly cooldownMs = INGRESS_COOLDOWN_MS,
   ) {}
 
-  add(chatId: number, entry: BufferEntry): void {
-    if (this.closed) return;
+  add(chatId: number, entry: BufferEntry): TelegramIngressAdmission {
+    if (this.closed) return { kind: "quiesced", reason: "closed" };
     let state = this.states.get(chatId);
     if (!state) {
-      state = { entries: [], timer: undefined, inFlight: new Set() };
+      state = { pending: [], timer: undefined, generation: 0, tail: Promise.resolve(), running: new Set() };
       this.states.set(chatId, state);
     }
-    state.entries.push(entry);
+    state.pending.push(entry);
+    this.schedule(chatId, state);
+    return { kind: "accepted" };
+  }
+
+  private schedule(chatId: number, state: BufferState): void {
     if (state.timer) clearTimeout(state.timer);
-    state.timer = setTimeout(() => void this.flush(chatId), this.cooldownMs);
-    state.timer.unref();
+    const generation = ++state.generation;
+    state.timer = setTimeout(() => {
+      if (this.states.get(chatId) !== state || state.generation !== generation) return;
+      state.timer = undefined;
+      void this.flush(chatId).catch((error) => {
+        console.error("Buffered Telegram timer flush failed", error);
+      });
+    }, this.cooldownMs);
+    state.timer.unref?.();
+  }
+
+  private cancelTimer(state: BufferState): void {
+    ++state.generation;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = undefined;
+  }
+
+  private claim(chatId: number, state: BufferState): Promise<void> | undefined {
+    if (state.pending.length === 0) return undefined;
+    this.cancelTimer(state);
+    const entries = state.pending.splice(0);
+    const owner = entries.at(-1);
+    if (!owner) return undefined;
+    const batch: PendingBatch = Object.freeze({
+      id: this.nextBatchId++,
+      chatId,
+      entries: Object.freeze(entries),
+      owner,
+    });
+    const job = state.tail.then(
+      () => this.executeBatch(batch),
+      () => this.executeBatch(batch),
+    );
+    state.tail = job;
+    state.running.add(job);
+    void job.then(
+      () => {
+        state.running.delete(job);
+        this.maybeDelete(chatId, state);
+      },
+      (error) => {
+        state.running.delete(job);
+        console.error("Buffered Telegram batch failed", error);
+        this.maybeDelete(chatId, state);
+      },
+    );
+    return job;
+  }
+
+  private maybeDelete(chatId: number, state: BufferState): void {
+    if (state.pending.length === 0 && state.running.size === 0 && !state.timer && this.states.get(chatId) === state) {
+      this.states.delete(chatId);
+    }
+  }
+
+  private async executeBatch(batch: PendingBatch): Promise<void> {
+    let typing: NodeJS.Timeout | undefined;
+    try {
+      await invokeCallback(batch.owner.typing).catch(() => {});
+      typing = setInterval(() => {
+        void invokeCallback(batch.owner.typing).catch((error) => {
+          console.error("Buffered Telegram typing notification failed", error);
+        });
+      }, 4_000);
+      typing.unref?.();
+
+      const messages = await Promise.all(batch.entries.map((entry) => Promise.resolve(entry.value)));
+      const result = await invokeCallback(() => this.flushBatch(batch.chatId, messages));
+      if (!isTelegramBatchResult(result)) throw new Error("Buffered Telegram handler returned an invalid batch result");
+      if (result.kind === "reply") {
+        try {
+          await invokeCallback(() => batch.owner.respond(result.text));
+        } catch (error) {
+          console.error("Buffered Telegram response delivery failed", error);
+        }
+      }
+    } catch (error) {
+      console.error("Buffered Telegram request failed", error);
+      try {
+        await invokeCallback(() => batch.owner.respond(DELIVERY_FAILURE_MESSAGE));
+      } catch (deliveryError) {
+        console.error("Buffered Telegram failure response delivery failed", deliveryError);
+      }
+    } finally {
+      if (typing) clearInterval(typing);
+    }
   }
 
   async flush(chatId: number): Promise<void> {
-    if (this.closed) return;
     const state = this.states.get(chatId);
     if (!state) return;
-    if (state.entries.length === 0) {
-      await Promise.allSettled([...state.inFlight]);
-      return;
+    while (true) {
+      this.claim(chatId, state);
+      const tail = state.tail;
+      await tail;
+      if (state.pending.length === 0 && state.running.size === 0) break;
     }
-    if (state.timer) clearTimeout(state.timer);
-    state.timer = undefined;
-    const entries = state.entries.splice(0);
-    const current = (async () => {
-      const latest = entries.at(-1)!;
-      await latest.typing().catch(() => {});
-      const typing = setInterval(() => void latest.typing().catch(() => {}), 4_000);
-      typing.unref();
-      try {
-        const messages = await Promise.all(entries.map((entry) => entry.value));
-        if (this.closed) return;
-        const response = await this.flushBatch(chatId, messages);
-        if (this.closed) return;
-        if (response) await latest.respond(response);
-      } catch (error) {
-        console.error("Buffered Telegram request failed", error);
-        if (!this.closed) await latest.respond("I could not complete that request. Please try again.").catch(() => {});
-      } finally {
-        clearInterval(typing);
-      }
-    })();
-    state.inFlight.add(current);
-    try {
-      await current;
-    } finally {
-      state.inFlight.delete(current);
-      if (state.entries.length === 0 && state.inFlight.size === 0) this.states.delete(chatId);
-    }
+    this.maybeDelete(chatId, state);
   }
 
   close(): void {
     this.closed = true;
-    for (const [chatId, state] of this.states) {
-      if (state.timer) clearTimeout(state.timer);
-      state.timer = undefined;
-      state.entries.splice(0);
-      if (state.inFlight.size === 0) this.states.delete(chatId);
-    }
+    for (const state of this.states.values()) this.cancelTimer(state);
+    for (const [chatId, state] of this.states) this.maybeDelete(chatId, state);
   }
 
   async flushAll(): Promise<void> {
-    await Promise.allSettled([...this.states.keys()].map(async (chatId) => {
-      await this.flush(chatId);
-      const state = this.states.get(chatId);
-      if (state) await Promise.allSettled([...state.inFlight]);
-    }));
+    while (true) {
+      const states = [...this.states.entries()];
+      if (states.length === 0) return;
+      await Promise.all(states.map(([chatId, state]) => {
+        if (this.states.get(chatId) !== state) return Promise.resolve();
+        return this.flush(chatId);
+      }));
+      const outstanding = [...this.states.values()].some((state) => state.pending.length > 0 || state.running.size > 0);
+      if (!outstanding) return;
+    }
   }
 }
+type TelegramDeliveryOperation<T> = () => T | PromiseLike<T>;
+
+type DeliveryState = {
+  tail: Promise<void>;
+};
+
+export class TelegramDeliveryQueue {
+  private readonly states = new Map<number, DeliveryState>();
+  private readonly pending = new Set<Promise<unknown>>();
+
+  enqueue<T>(chatId: number, operation: TelegramDeliveryOperation<T>): Promise<T> {
+    let state = this.states.get(chatId);
+    if (!state) {
+      state = { tail: Promise.resolve() };
+      this.states.set(chatId, state);
+    }
+
+    const result = state.tail.then(() => invokeCallback(operation));
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    state.tail = tail;
+    this.pending.add(result);
+    void result.then(
+      () => this.complete(chatId, state!, tail, result),
+      () => this.complete(chatId, state!, tail, result),
+    );
+    return result;
+  }
+
+  private complete(chatId: number, state: DeliveryState, tail: Promise<void>, result: Promise<unknown>): void {
+    this.pending.delete(result);
+    if (state.tail === tail && this.states.get(chatId) === state) this.states.delete(chatId);
+  }
+
+  async drain(): Promise<void> {
+    while (this.pending.size > 0) {
+      const accepted = [...this.pending];
+      await Promise.all(accepted.map((operation) => operation.then(
+        () => undefined,
+        () => undefined,
+      )));
+      await Promise.resolve();
+    }
+  }
+}
+
 
 export function splitTelegramText(text: string, limit = 4000): string[] {
   if (limit < 1) throw new Error("limit must be positive");
@@ -414,35 +559,48 @@ export function closeTelegramIngress(bot: Bot): void {
   ingressByBot.get(bot)?.close();
 }
 
-export function createTelegramBot(config: Config, agents: AgentManager): Bot {
+export function createTelegramBot(
+  config: Config,
+  agents: AgentManager,
+  deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
+): Bot {
   const bot = new Bot(config.token);
+  agents.setAssistantProgress((chatId, text) => deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text)));
+  const queuedReply = (ctx: Context, text: string): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return Promise.resolve();
+    return deliveryQueue.enqueue(chatId, () => ctx.reply(text)).then(() => undefined);
+  };
 
-  agents.setAssistantProgress((chatId, text) => sendTelegramText(bot, chatId, text));
-  const ingress = new TelegramIngressBuffer(async (chatId, messages) =>
-    agents.prompt(chatId, formatBufferedPrompt(messages)));
+  const ingress = new TelegramIngressBuffer(async (chatId, messages) => {
+    const response = await agents.prompt(chatId, formatBufferedPrompt(messages));
+    return response === undefined
+      ? { kind: "no-reply", reason: "steered" }
+      : { kind: "reply", text: response };
+  });
   ingressByBot.set(bot, ingress);
 
   bot.use(async (ctx, next) => {
     const userId = ctx.from?.id;
     if (userId === undefined || !config.allowedUserIds.has(userId)) {
-      if (ctx.chat) await ctx.reply("Unauthorized.");
+      if (ctx.chat) await queuedReply(ctx, "Unauthorized.");
       return;
     }
     await next();
   });
 
   bot.command("start", async (ctx) => {
-    await ctx.reply("Personal agent. Send text or attachments to continue your persistent session, or /new to start a fresh one.");
+    await queuedReply(ctx, "Personal agent. Send text or attachments to continue your persistent session, or /new to start a fresh one.");
   });
 
   bot.command("new", async (ctx) => {
     try {
       await ingress.flush(ctx.chat.id);
       await agents.newSession(ctx.chat.id);
-      await ctx.reply("Started a new session. Earlier session files remain searchable.");
+      await queuedReply(ctx, "Started a new session. Earlier session files remain searchable.");
     } catch (error) {
       console.error("Failed to start new session", error);
-      await ctx.reply("I could not start a new session. Please try again.");
+      await queuedReply(ctx, "I could not start a new session. Please try again.");
     }
   });
 
@@ -450,7 +608,7 @@ export function createTelegramBot(config: Config, agents: AgentManager): Bot {
     const prepared = prepareMessage(bot, config, ctx);
     ingress.add(ctx.chat.id, {
       value: prepared,
-      respond: (text) => replyChunks(ctx, text),
+      respond: (text) => deliveryQueue.enqueue(ctx.chat.id, () => replyChunks(ctx, text)),
       typing: async () => { await ctx.replyWithChatAction("typing"); },
     });
   });

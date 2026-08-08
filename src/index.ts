@@ -4,18 +4,12 @@ import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
-const PI_EXTENSION_PATHS = [
-  "node_modules/pi-web-access/index.ts",
-  "node_modules/pi-docparser/extensions/docparser/index.ts",
-  "node_modules/pi-multimodal-proxy/extensions/vision-proxy.ts",
-  "node_modules/pi-subagents/index.ts",
-] as const;
 
 async function main(): Promise<void> {
   const config = parseConfig();
   await checkSandboxEnvironment(config.dataDir);
 
-  const agents = new AgentManager(config, { appRoot: process.cwd(), extensions: PI_EXTENSION_PATHS });
+  const agents = new AgentManager(config, { appRoot: process.cwd() });
   const delivery = new TelegramDeliveryQueue();
   let bot: ReturnType<typeof createTelegramBot>;
   const scheduler = new WorkspaceScheduler({

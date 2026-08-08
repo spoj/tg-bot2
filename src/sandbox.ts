@@ -134,7 +134,6 @@ export type PiWorkerSandboxPaths = {
   workspace: string;
   appRoot: string;
   cliPath?: string;
-  extensions?: readonly string[];
   appendSystemPrompt?: string;
 };
 export type PiWorkerBwrapResult = { args: string[]; resolved: { workspace: string; appRoot: string; cliPath: string } };
@@ -147,7 +146,7 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
   return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
 }
 
-/** Build the Pi worker profile; appRoot, source, and .env stay out, while dependencies and extensions are read-only. */
+/** Build the Pi worker profile; appRoot, source, and .env stay out while dependencies remain read-only. */
 export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promise<PiWorkerBwrapResult> {
   const workspace = await realpath(paths.workspace);
   const appRoot = await realpath(paths.appRoot);
@@ -182,18 +181,6 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
   const cliStat = await lstat(cliPath);
   if (!cliStat.isFile() || cliStat.isSymbolicLink()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
-  const extensionMountPaths: string[] = [];
-  for (const requestedExtension of paths.extensions ?? []) {
-    const hostExtensionPath = requestedExtension.startsWith("/app/node_modules/")
-      ? path.join(nodeModules, requestedExtension.slice("/app/node_modules/".length))
-      : path.isAbsolute(requestedExtension) ? requestedExtension : path.resolve(appRoot, requestedExtension);
-    const extensionPath = await realpath(hostExtensionPath);
-    const extensionStat = await lstat(extensionPath);
-    if (!extensionStat.isFile() || extensionStat.isSymbolicLink()) {
-      throw new Error("Pi worker extensions must be regular files");
-    }
-    extensionMountPaths.push(relativeMountPath(nodeModules, extensionPath, "/app/node_modules", "Pi worker extension"));
-  }
 
   const args = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
@@ -215,7 +202,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--ro-bind", nodeModules, "/app/node_modules", "--bind", workspace, "/workspace",
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
-    "--setenv", "PATH", "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
     "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
     "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
     "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
@@ -226,7 +213,6 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--chdir", "/workspace", "--", "/usr/bin/node", cliMountPath,
     "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
-    ...extensionMountPaths.flatMap((extensionPath) => ["--extension", extensionPath]),
   );
   return { args, resolved: { workspace, appRoot, cliPath } };
 }

@@ -66,7 +66,8 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("/workspace/.pi");
   expect(SYSTEM_PROMPT).toContain("Runtime, authentication, and session files are writable");
   expect(SYSTEM_PROMPT).toContain("Attachments are ordinary data paths");
-  expect(SYSTEM_PROMPT).toContain("Native tools and selected extensions");
+  expect(SYSTEM_PROMPT).toContain("Native tools and Pi-managed extensions");
+  expect(SYSTEM_PROMPT).toContain("install <source> -l");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/outbox/");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?}");
   expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
@@ -113,20 +114,6 @@ it("creates one worker lazily per numeric chat and returns its final text", asyn
   });
   expect(worker.start).toHaveBeenCalledOnce();
   expect(worker.prompt).toHaveBeenCalledTimes(2);
-});
-it("forwards selected extensions to each new worker", async () => {
-  const worker = fakeWorker("answer");
-  const factory = vi.fn(() => worker);
-  const extensions = ["node_modules/example-extension/index.ts"] as const;
-  const manager = new AgentManager(config, { ...managerOptions, extensions, workerFactory: factory });
-
-  await expect(manager.prompt(7, "hello")).resolves.toBe("answer");
-  expect(factory).toHaveBeenCalledWith({
-    workspace: path.join(config.dataDir, "chats", "7", "workspace"),
-    appRoot: path.resolve(managerOptions.appRoot),
-    extensions,
-    appendSystemPrompt: SYSTEM_PROMPT,
-  });
 });
 
 it("steers an interactive request while the active worker run owns the response", async () => {

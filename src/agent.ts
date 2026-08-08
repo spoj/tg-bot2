@@ -8,7 +8,8 @@ export const SYSTEM_PROMPT = `You are a persistent personal agent reached throug
 Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
-Native tools and selected extensions for documents, media, web research, and delegation may be available.
+Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
+Use the pi command with install <source> -l for optional project-local extensions and list to inspect them; restart the worker after changing extensions.
 To send a file through Telegram, write a send_file request under the root
 /workspace/.tg-bot/outbox/. The request object is
 {version:1,id,type:"send_file",path,caption?}; id must be unique and path must
@@ -66,7 +67,6 @@ export type AgentWorkerOptions = {
   workspace: string;
   appRoot: string;
   bwrapPath?: string;
-  extensions?: readonly string[];
   appendSystemPrompt?: string;
 };
 
@@ -75,7 +75,6 @@ export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | 
 export type AgentManagerOptions = {
   appRoot: string;
   bwrapPath?: string;
-  extensions?: readonly string[];
   workerFactory?: AgentWorkerFactory;
 };
 
@@ -108,14 +107,12 @@ export class AgentManager {
   private readonly workerFactory: AgentWorkerFactory;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
-  private readonly extensions: readonly string[];
   private assistantProgress: AssistantProgressCallback | undefined;
   private shutdownAbort: Promise<void> | undefined;
   private shuttingDown = false;
   constructor(private readonly config: Pick<Config, "dataDir">, options: AgentManagerOptions) {
     this.appRoot = path.resolve(options.appRoot);
     this.bwrapPath = options.bwrapPath;
-    this.extensions = options.extensions ?? [];
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRpcWorker(workerOptions));
   }
 
@@ -235,7 +232,6 @@ export class AgentManager {
             workspace: paths.workspace,
             appRoot: this.appRoot,
             ...(this.bwrapPath === undefined ? {} : { bwrapPath: this.bwrapPath }),
-            ...(this.extensions.length === 0 ? {} : { extensions: this.extensions }),
             appendSystemPrompt: SYSTEM_PROMPT,
           });
           await worker.start();

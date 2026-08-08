@@ -1,6 +1,6 @@
 # tg-bot2
 
-A small personal Telegram agent. The trusted TypeScript process owns the Telegram token and orchestration. Each chat has one long-lived Pi RPC worker inside Bubblewrap; the headless Pi process, native tools, selected extensions, and inner `bash` run there. The worker owns that chat's provider configuration and JSONL sessions.
+A small personal Telegram agent. The trusted TypeScript process owns the Telegram token and orchestration. Each chat has one long-lived Pi RPC worker inside Bubblewrap; the headless Pi process, native tools, Pi-managed extensions, and inner `bash` run there. The worker owns that chat's provider configuration and JSONL sessions.
 
 ## Requirements
 
@@ -9,7 +9,7 @@ A small personal Telegram agent. The trusted TypeScript process owns the Telegra
 - Host executables needed by workspace tools under `/usr` or `/bin`: `bash`, Node/npm, Python, `uv`, Git, curl, `rg`, and `jq`
 - CA certificates under `/etc/ssl`, `/etc/pki`, or `/etc/ca-certificates`
 - A Telegram bot token and workspace-owned Pi provider configuration
-- Optional media tooling for full multimodal support: `ffmpeg`/`ffprobe` for long audio and `yt-dlp` for YouTube URLs.
+- Optional media tooling for installed multimodal extensions: `ffmpeg`/`ffprobe` for long audio and `yt-dlp` for YouTube URLs.
 
 Example Debian/Ubuntu packages (names vary by distribution):
 
@@ -54,18 +54,21 @@ Required:
 - `ALLOWED_USER_IDS`: comma-separated positive numeric Telegram user IDs. Missing, empty, zero, or malformed values fail startup; there is no allow-all mode.
 - `DATA_DIR`: persistent host data root.
 
-Pi provider credentials and model selection are workspace-owned. Before a chat's first prompt, place the selected provider's Pi files under `DATA_DIR/chats/<numeric-chat-id>/workspace/.pi/agent/` (typically `auth.json`, `models.json`, and `settings.json`). The worker passes an empty host environment to Bubblewrap, so provider secrets are not inherited from the service. The old shared `.pi-runtime` layout is not migrated.
+Pi provider credentials and model selection are workspace-owned. Before a chat's first prompt, place the selected provider's Pi files under `DATA_DIR/chats/<numeric-chat-id>/workspace/.pi/agent/` (typically `auth.json`, `models.json`, and `settings.json`). This is the chat's Pi user layer. The worker passes an empty host environment to Bubblewrap, so provider secrets are not inherited from the service. The old shared `.pi-runtime` layout is not migrated.
 
-`settings.json` supports `defaultProvider`, a provider-local `defaultModel`, and `defaultThinkingLevel` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`). The worker uses the exact chat workspace as its persistent Pi resource/config root and discovers skills from `.pi/skills/` and `.agents/skills/`.
+The workspace `.pi/` directory is the chat's project layer. Project `settings.json` and resources override user-layer resources where Pi allows it. Use `pi install <source> -l` for optional extensions so their package files and package settings stay in this project layer; the base Pi CLI remains the only Pi package bundled by the application. The worker discovers resources from both `.pi/agent/` and `.pi/`. These are Pi precedence and lifecycle scopes, not an access-control boundary: the worker can read both.
 
-The worker loads these selected extensions inside the same boundary: web access (`pi-web-access`), document parsing (`pi-docparser`), multimodal media proxy (`pi-multimodal-proxy`), and subagent delegation (`pi-subagents`). Pi runs headless with `--mode rpc --continue --approve` and exchanges newline-delimited JSON requests/events with the host; media analysis requires per-provider consent through `/multimodal-proxy consent ...`.
+Pi runs headless with `--mode rpc --continue --approve` and exchanges newline-delimited JSON requests/events with the host. Optional extension behavior, including media analysis, is available only after its package is installed and may require provider consent.
 
 ## Persistent layout
 
 ```text
 DATA_DIR/chats/<numeric-chat-id>/
   workspace/                         # persistent writable worker bind
-    .pi/agent/                       # Pi auth, models, and settings
+    .pi/agent/                       # Pi user config, auth, models, and user packages
+    .pi/settings.json                # project settings and package sources
+    .pi/npm/                         # project-scoped Pi packages
+    .pi/extensions/                  # project-local extension files
     .pi/sessions/*.jsonl             # canonical Pi conversation files
     .tg-bot/schedules.json           # workspace-owned reminders
     .tg-bot/outbox/{*.json,processed,failed}/
@@ -74,7 +77,7 @@ DATA_DIR/chats/<numeric-chat-id>/
     .cache/npm/ .cache/uv/ .local/ .python/
 ```
 
-Normal files, workspace-local npm installs, uv environments/tools, scripts, caches, attachments, schedules, outbox requests, and Pi sessions persist. Pi JSONL files are the session transcript; other workspace files are ordinary data. To send a file, write a unique `send_file` request (`{version:1,id,type:"send_file",path,caption?}`) to `.tg-bot/outbox/` via a temporary non-`.json` file and atomic rename. The requested path must remain in the workspace; processed and failed requests are archived in their corresponding directories.
+Normal files, workspace-local npm installs, Pi package installs, uv environments/tools, scripts, caches, attachments, schedules, outbox requests, and Pi sessions persist. Pi JSONL files are the session transcript; other workspace files are ordinary data. To send a file, write a unique `send_file` request (`{version:1,id,type:"send_file",path,caption?}`) to `.tg-bot/outbox/` via a temporary non-`.json` file and atomic rename. The requested path must remain in the workspace; processed and failed requests are archived in their corresponding directories.
 
 Schedules are stored in `.tg-bot/schedules.json` with root `{version:1,schedules:[...]}`. Each record has `id`, `prompt`, `dueAt`, `recurrence`, `enabled`, `lastRunAt`, and `runCount`; timestamps are UTC and recurrence is hourly, daily, weekly, or `null`.
 
@@ -90,7 +93,7 @@ Node starts one detached `bwrap` process per chat worker; model commands are sen
 
 Workers unshare user, PID, IPC, and UTS namespaces, drop all capabilities, use a new session, and intentionally share the network. The security boundary is filesystem containment enforced by Bubblewrap/kernel, not protection from kernel exploits or hostile local-network services. The agent can exfiltrate anything it can read, destroy its workspace, and run arbitrary downloaded package code inside this boundary.
 
-The worker sets `HOME=/workspace`, `TMPDIR=/tmp`, `PI_CODING_AGENT_DIR=/workspace/.pi/agent`, `PATH=/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin`, and workspace-local npm/uv cache and install paths. Startup fails rather than falling back to unsandboxed execution if the data root is unwritable, Bubblewrap is unavailable, or the required runtime probe fails.
+The worker sets `HOME=/workspace`, `TMPDIR=/tmp`, `PI_CODING_AGENT_DIR=/workspace/.pi/agent`, `PATH=/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin`, and workspace-local npm/uv cache and install paths. The `pi` CLI is available from the read-only application runtime, while installed packages persist in the writable project layer. Startup fails rather than falling back to unsandboxed execution if the data root is unwritable, Bubblewrap is unavailable, or the required runtime probe fails.
 
 ## Tests
 

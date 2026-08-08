@@ -157,7 +157,6 @@ export class PiRpcWorker {
   private readonly appRoot: string;
   private readonly bwrapPath: string;
   private readonly cliPath: string | undefined;
-  private readonly extensions: readonly string[] | undefined;
   private readonly appendSystemPrompt: string | undefined;
   private readonly spawnProcess: PiWorkerSpawn;
   private readonly stopGraceMs: number;
@@ -185,7 +184,6 @@ export class PiRpcWorker {
     this.appRoot = options.appRoot;
     this.bwrapPath = options.bwrapPath ?? "bwrap";
     this.cliPath = options.cliPath;
-    this.extensions = options.extensions;
     this.appendSystemPrompt = options.appendSystemPrompt;
     this.spawnProcess = options.spawn ?? spawnPiWorker;
     this.stopGraceMs = options.stopGraceMs ?? 1_000;
@@ -202,7 +200,6 @@ export class PiRpcWorker {
       workspace: this.workspace,
       appRoot: this.appRoot,
       ...(this.cliPath === undefined ? {} : { cliPath: this.cliPath }),
-      ...(this.extensions === undefined ? {} : { extensions: this.extensions }),
       ...(this.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: this.appendSystemPrompt }),
     });
     let child: PiWorkerChildProcess;

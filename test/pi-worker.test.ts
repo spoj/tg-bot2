@@ -87,6 +87,7 @@ describe("PiRpcWorker", () => {
         "--share-net", "--cap-drop", "ALL",
         "--setenv", "HOME", "/workspace",
         "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
+        "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
         "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
         "--append-system-prompt", "runtime prompt",
       ]));

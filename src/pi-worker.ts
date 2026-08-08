@@ -16,7 +16,7 @@ export type { PiWorkerSpawn } from "./sandbox.js";
 export type PiRpcEvent = Record<string, unknown>;
 export type PiRpcEventListener = (event: PiRpcEvent) => void;
 
-/** A strict LF-only JSONL decoder. U+2028/U+2029 never delimit records. */
+/** Parse strict LF-delimited JSONL; U+2028/U+2029 are data. */
 export class StrictJsonlParser {
   private readonly decoder = new StringDecoder("utf8");
   private buffer = "";
@@ -62,7 +62,7 @@ export class StrictJsonlParser {
 
 export type PiRpcWorkerOptions = PiWorkerSandboxPaths & {
   bwrapPath?: string;
-  /** Injectable for tests; production code delegates spawning to sandbox.ts. */
+  /** Test seam; production spawning stays in sandbox.ts. */
   spawn?: PiWorkerSpawn;
   stopGraceMs?: number;
 };
@@ -404,7 +404,7 @@ export class PiRpcWorker {
         const record = asRecord(response);
         const data = asRecord(record?.data);
         if (data?.isStreaming === false && data.pendingMessageCount === 0) this.settleWork(epoch);
-      }).catch(() => { /* the process failure path rejects waiters */ });
+      }).catch(() => { /* process failure rejects waiters */ });
     }, IMMEDIATE_PROMPT_SETTLEMENT_MS);
     timer.unref?.();
     this.promptSettlementTimers.set(epoch, timer);
@@ -475,7 +475,7 @@ export class PiRpcWorker {
       this.markAgentProgress();
     }
     for (const listener of this.listeners) {
-      try { listener(record); } catch { /* listeners must not break the RPC pump */ }
+      try { listener(record); } catch { /* listeners cannot break the RPC pump */ }
     }
     if (record.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(String(record.method))) {
       const id = record.id;
@@ -486,7 +486,7 @@ export class PiRpcWorker {
   private writeFireAndForget(value: JsonRecord): void {
     const stdin = this.process?.stdin;
     if (!stdin) return;
-    try { stdin.write(`${JSON.stringify(value)}\n`); } catch { /* process exit is handled separately */ }
+    try { stdin.write(`${JSON.stringify(value)}\n`); } catch { /* process exit handles write failure */ }
   }
 
   private failProcess(error: Error): void {

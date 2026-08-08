@@ -168,10 +168,7 @@ async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<v
   }
 }
 
-/**
- * Polls workspace-owned schedules. Schedule files are deliberately the only
- * scheduling interface: agents write UTC ISO timestamps directly.
- */
+/** Poll workspace-owned schedules from agent-written UTC ISO timestamps. */
 export class WorkspaceScheduler {
   private readonly dataDir: string;
   private readonly run: WorkspaceSchedulerOptions["run"];
@@ -234,7 +231,7 @@ export class WorkspaceScheduler {
     if (pendingPoll) await pendingPoll.catch(() => {});
   }
 
-  /** Poll all numeric chat workspaces. Concurrent polls share one operation. */
+  /** Poll numeric chat workspaces; concurrent calls share one operation. */
   async poll(now = this.now()): Promise<void> {
     if (this.pollInFlight) return this.pollInFlight;
     const operation = this.runPoll(now);

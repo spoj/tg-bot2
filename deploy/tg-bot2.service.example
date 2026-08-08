@@ -1,5 +1,4 @@
-# Copy to /etc/systemd/system/tg-bot2.service after editing every value marked EDIT REQUIRED.
-# Keep the EnvironmentFile out of the repository: it contains the Telegram token.
+# Copy to /etc/systemd/system/tg-bot2.service after editing every EDIT REQUIRED value.
 [Unit]
 Description=tg-bot2 Telegram agent
 Wants=network-online.target
@@ -13,20 +12,20 @@ Group=tg-bot2
 # EDIT REQUIRED: absolute path to the checked-out/build deployment.
 WorkingDirectory=/opt/tg-bot2
 # EDIT REQUIRED: absolute path to a mode-0600 file containing TG_BOT_TOKEN,
-# ALLOWED_USER_IDS, and DATA_DIR. Configure Pi credentials per chat workspace.
+# ALLOWED_USER_IDS, and DATA_DIR.
 EnvironmentFile=/etc/tg-bot2/tg-bot2.env
-# EDIT REQUIRED: use the node binary and built entrypoint installed on this host.
-ExecStart=/usr/bin/node /opt/tg-bot2/dist/index.js
+# EDIT REQUIRED: node binary and built entrypoint installed on this host.
+ExecStart=/usr/bin/node /opt/tg-bot2/dist/src/index.js
 Restart=on-failure
 RestartSec=5s
 
-# Service-level shutdown backstop: stop every process in this cgroup,
-# including detached Bubblewrap tool children, within this short grace period.
+# Stop all processes in this cgroup, including detached Bubblewrap children,
+# within this short grace period.
 KillMode=control-group
 TimeoutStopSec=10s
 
-# EDIT VALUES: aggregate limits for the application and all child Bubblewrap
-# Service-level resource limits; tool execution limits are fixed by the application.
+# Aggregate limits for the application and all child Bubblewrap processes.
+# EDIT REQUIRED: tune these values for the deployment.
 CPUQuota=200%
 MemoryMax=1G
 TasksMax=256

@@ -9,7 +9,7 @@ import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
-const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit.
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;

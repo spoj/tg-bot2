@@ -123,11 +123,7 @@ export class AgentManager {
     this.assistantProgress = callback;
   }
 
-  /**
-   * Stop accepting work and request cancellation of workers already known to
-   * the manager. The gate is established synchronously before the returned
-   * promise waits for abort RPCs, so callers can close ingress first.
-   */
+  /** Synchronous gate closes ingress before abort RPCs complete. */
   beginShutdown(): Promise<void> {
     if (this.shuttingDown) return this.shutdownAbort ?? Promise.resolve();
     this.shuttingDown = true;
@@ -162,7 +158,7 @@ export class AgentManager {
     try {
       await worker.abort();
     } catch {
-      // Shutdown must continue even when a worker rejects its abort request.
+      // Shutdown continues if abort rejects.
     }
   }
 

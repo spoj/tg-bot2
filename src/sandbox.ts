@@ -7,18 +7,18 @@ export type PiWorkerChildProcess = ChildProcess;
 export type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
 export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
 
-/** Spawn a Pi worker; child-process access stays inside the sandbox layer. */
+/** Spawn a Pi worker within the sandbox boundary. */
 export function spawnPiWorker(executable: string, args: string[], options: PiWorkerSpawnOptions): ChildProcess {
   return spawn(executable, args, options);
 }
-/** Terminate a child process group, falling back to the child itself when needed. */
+/** Terminate the process group, then the child if needed. */
 export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid !== undefined && child.pid !== null && child.pid > 0) {
     try {
       process.kill(-child.pid, signal);
       return;
     } catch {
-      // A process can exit between pid lookup and group signalling.
+      // The group may exit before signalling.
     }
   }
   try { child.kill(signal); } catch { /* already exited */ }
@@ -52,7 +52,7 @@ async function existing(paths: string[]): Promise<string[]> {
     try {
       await access(candidate, fsConstants.R_OK);
       found.push(candidate);
-    } catch { /* optional mount absent */ }
+    } catch { /* unavailable optional path */ }
   }
   return found;
 }
@@ -147,11 +147,7 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
   return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
 }
 
-/**
- * Build the isolated Pi worker profile. Only the installed dependency tree is
- * exposed read-only; the host project root (including .env and source) stays
- * outside the worker namespace.
- */
+/** Build the Pi worker profile; appRoot, source, and .env stay out, while dependencies and extensions are read-only. */
 export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promise<PiWorkerBwrapResult> {
   const workspace = await realpath(paths.workspace);
   const appRoot = await realpath(paths.appRoot);
@@ -236,7 +232,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
 }
 
 
-/** Explicit environment passed to the worker's host-side spawn. */
+/** Host spawn gets an empty env; bwrap sets worker variables. */
 export function buildPiWorkerEnvironment(): Record<string, string> {
   return {};
 }
@@ -335,7 +331,7 @@ async function requireExecutable(executable: string): Promise<string> {
     try {
       await access(candidate, fsConstants.X_OK);
       return candidate;
-    } catch { /* keep searching */ }
+    } catch {}
   }
   throw new Error(`Executable not found or not executable: ${executable}`);
 }

@@ -31,8 +31,7 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const CHAT_DIRECTORY = /^-?\d+$/;
 const JSON_REQUEST = /\.json$/;
-// Claims older than five minutes are conservatively assumed abandoned. A long
-// grace period avoids racing an active sender while still recovering crashes.
+// Recover claims older than five minutes after crashes without racing active senders.
 const STALE_CLAIM_AGE_MS = 5 * 60_000;
 const CLAIM_NAME = /^\.in-progress-(\d+)-[^/]+$/u;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
@@ -242,7 +241,7 @@ export class WorkspaceOutbox {
     }
   }
 
-  /** Poll all numeric chat workspaces. Concurrent calls share one poll operation. */
+  /** Poll numeric chat workspaces; concurrent calls share one operation. */
   async poll(): Promise<void> {
     if (this.pollInFlight) return this.pollInFlight;
     const operation = this.runPoll();
@@ -254,7 +253,7 @@ export class WorkspaceOutbox {
     }
   }
 
-  /** Process one numeric chat at its canonical workspace path. */
+  /** Process one numeric chat workspace; same-chat calls are serialized. */
   async processChat(chatId: number): Promise<void> {
     if (!Number.isSafeInteger(chatId)) throw new Error("Outbox chat ID must be a safe integer");
     const workspace = path.join(this.dataDir, "chats", String(chatId), "workspace");

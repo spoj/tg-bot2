@@ -62,12 +62,24 @@ type PendingBatch = {
   readonly owner: BufferEntry;
 };
 
+type IngressBarrierState = {
+  pending: number;
+  owners: number;
+  released: Promise<void>;
+  resolveReleased: () => void;
+};
+
 type BufferState = {
   pending: BufferEntry[];
   timer: NodeJS.Timeout | undefined;
   generation: number;
   tail: Promise<void>;
   running: Set<Promise<void>>;
+  barrier: IngressBarrierState | undefined;
+};
+
+export type TelegramIngressBarrier = {
+  release: () => void;
 };
 
 const DELIVERY_FAILURE_MESSAGE = "I could not complete that request. Please try again.";
@@ -97,12 +109,65 @@ export class TelegramIngressBuffer {
     if (this.closed) return { kind: "quiesced", reason: "closed" };
     let state = this.states.get(chatId);
     if (!state) {
-      state = { pending: [], timer: undefined, generation: 0, tail: Promise.resolve(), running: new Set() };
+      state = {
+        pending: [],
+        timer: undefined,
+        generation: 0,
+        tail: Promise.resolve(),
+        running: new Set(),
+        barrier: undefined,
+      };
       this.states.set(chatId, state);
     }
     state.pending.push(entry);
-    this.schedule(chatId, state);
+    if (!state.barrier) this.schedule(chatId, state);
     return { kind: "accepted" };
+  }
+
+  acquireBarrier(chatId: number): TelegramIngressBarrier {
+    let state = this.states.get(chatId);
+    if (!state) {
+      state = {
+        pending: [],
+        timer: undefined,
+        generation: 0,
+        tail: Promise.resolve(),
+        running: new Set(),
+        barrier: undefined,
+      };
+      this.states.set(chatId, state);
+    }
+    if (!state.barrier) {
+      this.cancelTimer(state);
+      let resolveReleased!: () => void;
+      const released = new Promise<void>((resolve) => { resolveReleased = resolve; });
+      state.barrier = {
+        pending: state.pending.length,
+        owners: 0,
+        released,
+        resolveReleased,
+      };
+    }
+    const barrier = state.barrier!;
+    barrier.owners += 1;
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        this.releaseBarrier(chatId, state!, barrier);
+      },
+    };
+  }
+
+  private releaseBarrier(chatId: number, state: BufferState, barrier: IngressBarrierState): void {
+    if (state.barrier !== barrier) return;
+    barrier.owners -= 1;
+    if (barrier.owners > 0) return;
+    state.barrier = undefined;
+    barrier.resolveReleased();
+    if (state.pending.length > 0 && !this.closed) this.schedule(chatId, state);
+    this.maybeDelete(chatId, state);
   }
 
   private schedule(chatId: number, state: BufferState): void {
@@ -124,12 +189,14 @@ export class TelegramIngressBuffer {
     state.timer = undefined;
   }
 
-  private claim(chatId: number, state: BufferState): Promise<void> | undefined {
+  private claim(chatId: number, state: BufferState, maxEntries = Number.POSITIVE_INFINITY): Promise<void> | undefined {
     if (state.pending.length === 0) return undefined;
-    this.cancelTimer(state);
-    const entries = state.pending.splice(0);
+    const count = Math.min(maxEntries, state.pending.length);
+    const entries = state.pending.splice(0, count);
     const owner = entries.at(-1);
     if (!owner) return undefined;
+    if (state.barrier) state.barrier.pending -= entries.length;
+    this.cancelTimer(state);
     const batch: PendingBatch = Object.freeze({
       id: this.nextBatchId++,
       chatId,
@@ -157,7 +224,7 @@ export class TelegramIngressBuffer {
   }
 
   private maybeDelete(chatId: number, state: BufferState): void {
-    if (state.pending.length === 0 && state.running.size === 0 && !state.timer && this.states.get(chatId) === state) {
+    if (state.pending.length === 0 && state.running.size === 0 && !state.timer && !state.barrier && this.states.get(chatId) === state) {
       this.states.delete(chatId);
     }
   }
@@ -199,10 +266,17 @@ export class TelegramIngressBuffer {
     const state = this.states.get(chatId);
     if (!state) return;
     while (true) {
+      const barrier = state.barrier;
+      if (barrier) {
+        this.claim(chatId, state, barrier.pending);
+        await state.tail;
+        this.maybeDelete(chatId, state);
+        return;
+      }
       this.claim(chatId, state);
       const tail = state.tail;
       await tail;
-      if (state.pending.length === 0 && state.running.size === 0) break;
+      if (state.pending.length === 0 && state.running.size === 0 && !state.barrier) break;
     }
     this.maybeDelete(chatId, state);
   }
@@ -217,10 +291,17 @@ export class TelegramIngressBuffer {
     while (true) {
       const states = [...this.states.entries()];
       if (states.length === 0) return;
+      const barriers = states
+        .map(([, state]) => state.barrier?.released)
+        .filter((released): released is Promise<void> => released !== undefined);
       await Promise.all(states.map(([chatId, state]) => {
         if (this.states.get(chatId) !== state) return Promise.resolve();
         return this.flush(chatId);
       }));
+      if (barriers.length > 0) {
+        await Promise.all(barriers);
+        continue;
+      }
       const outstanding = [...this.states.values()].some((state) => state.pending.length > 0 || state.running.size > 0);
       if (!outstanding) return;
     }
@@ -594,9 +675,22 @@ export function createTelegramBot(
   });
 
   bot.command("new", async (ctx) => {
+    const barrier = ingress.acquireBarrier(ctx.chat.id);
+    let started = false;
     try {
       await ingress.flush(ctx.chat.id);
       await agents.newSession(ctx.chat.id);
+      started = true;
+    } catch (error) {
+      console.error("Failed to start new session", error);
+    } finally {
+      barrier.release();
+    }
+    if (!started) {
+      await queuedReply(ctx, "I could not start a new session. Please try again.");
+      return;
+    }
+    try {
       await queuedReply(ctx, "Started a new session. Earlier session files remain searchable.");
     } catch (error) {
       console.error("Failed to start new session", error);

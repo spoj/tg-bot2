@@ -76,7 +76,10 @@ export type AgentManagerOptions = {
   appRoot: string;
   bwrapPath?: string;
   workerFactory?: AgentWorkerFactory;
+  /** Bounds worker abort and active-run draining during shutdown. */
+  shutdownTimeoutMs?: number;
 };
+
 
 type ChatState = {
   worker: AgentWorker | undefined;
@@ -86,8 +89,12 @@ type ChatState = {
   unsubscribe: (() => void) | undefined;
   progressTail: Promise<void>;
   invalidation: { worker: AgentWorker; completion: Promise<void> } | undefined;
+  stoppedWorker: AgentWorker | undefined;
   closing: boolean;
   abortPromise: Promise<void> | undefined;
+  shutdownSignal: Promise<void>;
+  resolveShutdown: () => void;
+  shutdownError: Error | undefined;
 };
 
 type PromptAction =
@@ -95,6 +102,24 @@ type PromptAction =
   | { kind: "prompt"; completion: Promise<string> };
 
 const NO_TEXT_RESPONSE = "I completed the turn but produced no text response.";
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
+
+function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -107,6 +132,7 @@ export class AgentManager {
   private readonly workerFactory: AgentWorkerFactory;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
+  private readonly shutdownTimeoutMs: number;
   private assistantProgress: AssistantProgressCallback | undefined;
   private shutdownAbort: Promise<void> | undefined;
   private shuttingDown = false;
@@ -114,6 +140,10 @@ export class AgentManager {
     this.appRoot = path.resolve(options.appRoot);
     this.bwrapPath = options.bwrapPath;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRpcWorker(workerOptions));
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 0) {
+      throw new Error("shutdownTimeoutMs must be a non-negative integer");
+    }
   }
 
   setAssistantProgress(callback: AssistantProgressCallback | undefined): void {
@@ -132,49 +162,83 @@ export class AgentManager {
     return this.shutdownAbort;
   }
 
+  private cancelState(state: ChatState, message: string): void {
+    if (state.shutdownError) return;
+    state.shutdownError = new Error(message);
+    state.resolveShutdown();
+    if (state.worker) void this.invalidateWorker(state, state.worker).catch(() => {});
+  }
+
+  private raceShutdown<T>(state: ChatState, promise: Promise<T>): Promise<T> {
+    if (state.shutdownError) return Promise.reject(state.shutdownError);
+    return Promise.race([
+      promise,
+      state.shutdownSignal.then(() => {
+        throw state.shutdownError ?? new Error("Agent manager is shutting down");
+      }),
+    ]);
+  }
+
   private requestAbort(state: ChatState): Promise<void> {
     if (state.abortPromise) return state.abortPromise;
     const worker = state.worker;
     if (worker) {
-      state.abortPromise = this.abortWorker(worker);
+      state.abortPromise = this.abortWorker(state, worker);
       return state.abortPromise;
     }
     const workerPromise = state.workerPromise;
     if (workerPromise) {
-      state.abortPromise = workerPromise.then(
-        (startedWorker) => this.abortWorker(startedWorker),
-        () => {},
-      );
+      let handled = false;
+      const handle = async (startedWorker: AgentWorker): Promise<void> => {
+        if (handled) return;
+        handled = true;
+        await this.abortWorker(state, startedWorker);
+      };
+      void workerPromise.then((startedWorker) => handle(startedWorker), () => {});
+      state.abortPromise = bounded(workerPromise, this.shutdownTimeoutMs, "Agent worker startup timed out")
+        .then((startedWorker) => handle(startedWorker), () => {});
       return state.abortPromise;
     }
     state.abortPromise = Promise.resolve();
     return state.abortPromise;
   }
 
-  private async abortWorker(worker: AgentWorker): Promise<void> {
+  private async abortWorker(state: ChatState, worker: AgentWorker): Promise<void> {
     try {
-      await worker.abort();
+      await bounded(worker.abort(), this.shutdownTimeoutMs, "Agent worker abort timed out");
     } catch {
-      // Shutdown continues if abort rejects.
+      await bounded(
+        this.invalidateWorker(state, worker),
+        this.shutdownTimeoutMs,
+        "Agent worker stop timed out",
+      ).catch(() => {});
     }
   }
 
   private state(chatId: number): ChatState {
-    let state = this.states.get(chatId);
-    if (!state) {
-      state = {
-        worker: undefined,
-        workerPromise: undefined,
-        activeRun: undefined,
-        queue: new SerialQueue(),
-        unsubscribe: undefined,
-        progressTail: Promise.resolve(),
-        invalidation: undefined,
-        closing: false,
-        abortPromise: undefined,
-      };
-      this.states.set(chatId, state);
-    }
+    const existing = this.states.get(chatId);
+    if (existing) return existing;
+
+    let resolveShutdown!: () => void;
+    const shutdownSignal = new Promise<void>((resolve) => {
+      resolveShutdown = resolve;
+    });
+    const state: ChatState = {
+      worker: undefined,
+      workerPromise: undefined,
+      activeRun: undefined,
+      queue: new SerialQueue(),
+      unsubscribe: undefined,
+      progressTail: Promise.resolve(),
+      invalidation: undefined,
+      stoppedWorker: undefined,
+      closing: false,
+      abortPromise: undefined,
+      shutdownSignal,
+      resolveShutdown,
+      shutdownError: undefined,
+    };
+    this.states.set(chatId, state);
     return state;
   }
 
@@ -202,6 +266,8 @@ export class AgentManager {
   private invalidateWorker(state: ChatState, worker: AgentWorker): Promise<void> {
     const existing = state.invalidation;
     if (existing?.worker === worker) return existing.completion;
+    if (state.stoppedWorker === worker) return Promise.resolve();
+    state.stoppedWorker = worker;
 
     let completion!: Promise<void>;
     completion = (async () => {
@@ -224,9 +290,12 @@ export class AgentManager {
     if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
     if (state.worker) return state.worker;
     if (!state.workerPromise) {
+      const priorInvalidation = state.invalidation;
+      if (priorInvalidation) await priorInvalidation.completion.catch(() => {});
       const paths = chatPaths(this.config.dataDir, chatId);
       const pending = (async () => {
         let worker: AgentWorker | undefined;
+        let invalidated = false;
         try {
           worker = await this.workerFactory({
             workspace: paths.workspace,
@@ -234,12 +303,20 @@ export class AgentManager {
             ...(this.bwrapPath === undefined ? {} : { bwrapPath: this.bwrapPath }),
             appendSystemPrompt: SYSTEM_PROMPT,
           });
+          state.stoppedWorker = undefined;
           await worker.start();
+          if (this.shuttingDown || state.closing) {
+            invalidated = true;
+            await this.invalidateWorker(state, worker);
+            throw new Error("Agent manager is shutting down");
+          }
           state.worker = worker;
           this.subscribeAssistantProgress(chatId, state, worker);
           return worker;
         } catch (error) {
-          if (worker) await this.invalidateWorker(state, worker);
+          if (worker && !invalidated && state.worker !== worker && state.invalidation?.worker !== worker) {
+            await this.invalidateWorker(state, worker);
+          }
           throw error;
         }
       })();
@@ -248,7 +325,7 @@ export class AgentManager {
     const pending = state.workerPromise;
     if (!pending) throw new Error("Pi worker startup was not scheduled");
     try {
-      return await pending;
+      return await this.raceShutdown(state, pending);
     } finally {
       if (state.workerPromise === pending) state.workerPromise = undefined;
     }
@@ -264,18 +341,30 @@ export class AgentManager {
 
   private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string> {
     let run!: Promise<string>;
+    const operation = (async () => {
+      await command();
+      await worker.waitForSettled();
+      const result = (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
+      await this.drainProgress(state);
+      return result;
+    })();
     run = (async () => {
       try {
-        await command();
-        await worker.waitForSettled();
-        const result = (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
-        await this.drainProgress(state);
-        return result;
+        return await this.raceShutdown(state, operation);
       } catch (error) {
-        await this.invalidateWorker(state, worker);
+        if (state.shutdownError) {
+          void this.invalidateWorker(state, worker).catch(() => {});
+        } else {
+          await this.invalidateWorker(state, worker);
+        }
         throw error;
       } finally {
-        await this.drainProgress(state);
+        const progress = this.drainProgress(state);
+        if (state.shutdownError) {
+          await bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {});
+        } else {
+          await progress;
+        }
         if (state.activeRun === run) state.activeRun = undefined;
       }
     })();
@@ -284,8 +373,16 @@ export class AgentManager {
   }
 
   private steer(state: ChatState, worker: AgentWorker, text: string): Promise<void> {
-    return worker.steer(text).catch(async (error) => {
-      await this.invalidateWorker(state, worker);
+    const operation = worker.steer(text).catch(async (error) => {
+      if (state.shutdownError) {
+        void this.invalidateWorker(state, worker).catch(() => {});
+      } else {
+        await this.invalidateWorker(state, worker);
+      }
+      throw error;
+    });
+    return this.raceShutdown(state, operation).catch(async (error) => {
+      if (state.shutdownError) void this.invalidateWorker(state, worker).catch(() => {});
       throw error;
     });
   }
@@ -300,9 +397,11 @@ export class AgentManager {
         if (activeWorker) {
           return { kind: "steer", completion: this.steer(state, activeWorker, text) };
         }
-        await state.activeRun.catch(() => {});
+        await this.raceShutdown(state, state.activeRun).catch(() => {});
       }
-      if (mode === "follow-up" && state.activeRun) await state.activeRun.catch(() => {});
+      if (mode === "follow-up" && state.activeRun) {
+        await this.raceShutdown(state, state.activeRun).catch(() => {});
+      }
 
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
@@ -317,7 +416,12 @@ export class AgentManager {
       try {
         await action.completion;
       } finally {
-        await this.drainProgress(state);
+        const progress = this.drainProgress(state);
+        if (state.shutdownError) {
+          await bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {});
+        } else {
+          await progress;
+        }
       }
       return undefined;
     }
@@ -329,14 +433,19 @@ export class AgentManager {
     const state = this.state(chatId);
     return state.queue.run(async () => {
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      await state.activeRun?.catch(() => {});
-      await this.drainProgress(state);
+      const activeRun = state.activeRun;
+      if (activeRun) await this.raceShutdown(state, activeRun).catch(() => {});
+      await this.raceShutdown(state, this.drainProgress(state)).catch(() => {});
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
       try {
-        await worker.newSession();
+        await this.raceShutdown(state, worker.newSession());
       } catch (error) {
-        await this.invalidateWorker(state, worker);
+        if (state.shutdownError) {
+          void this.invalidateWorker(state, worker).catch(() => {});
+        } else {
+          await this.invalidateWorker(state, worker);
+        }
         throw error;
       }
     });
@@ -348,30 +457,76 @@ export class AgentManager {
 
     while (true) {
       const states = [...this.states.values()];
-      if (states.length === 0) return;
+      if (states.length === 0) break;
 
       if (abort) {
         await Promise.allSettled(states.map((state) => this.requestAbort(state)));
+        await Promise.all(states.map(async (state) => {
+          try {
+            await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out");
+          } catch {
+            this.cancelState(state, "Agent manager shutdown timed out");
+          }
+        }));
+        const activeRuns = states.flatMap((state) =>
+          state.activeRun ? [{ state, run: state.activeRun }] : [],
+        );
+        await Promise.all(activeRuns.map(async ({ state, run }) => {
+          const completed = run.then(() => false, () => false);
+          try {
+            await bounded(completed, this.shutdownTimeoutMs, "Agent worker run drain timed out");
+          } catch {
+            this.cancelState(state, "Agent worker run drain timed out");
+          }
+        }));
+        break;
       }
+
       await Promise.allSettled(states.map((state) => state.queue.idle()));
       const activeRuns = states.map((state) => state.activeRun).filter(
         (run): run is Promise<string> => run !== undefined,
       );
       await Promise.allSettled(activeRuns);
-
-      const remaining = [...this.states.values()];
-      if (!remaining.some((state) => state.activeRun || state.workerPromise || state.queue.size > 0)) break;
+      const current = [...this.states.values()];
+      if (
+        current.length === states.length &&
+        current.every((state) => state.queue.size === 0 && !state.activeRun && !state.workerPromise)
+      ) break;
     }
-
-    const states = [...this.states.values()];
-    await Promise.allSettled(states.map(async (state) => {
-      await state.queue.idle();
-      const worker = state.worker ?? await state.workerPromise?.catch(() => undefined);
-      state.unsubscribe?.();
-      state.unsubscribe = undefined;
-      await worker?.stop();
-    }));
-    this.states.clear();
+    while (true) {
+      const states = [...this.states.values()];
+      if (states.length === 0) break;
+      for (const state of states) state.closing = true;
+      await Promise.allSettled(states.map(async (state) => {
+        if (abort) {
+          await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out").catch(() => {});
+        } else {
+          await state.queue.idle().catch(() => {});
+        }
+        state.unsubscribe?.();
+        state.unsubscribe = undefined;
+        const invalidation = state.invalidation;
+        if (invalidation) {
+          if (abort) {
+            await bounded(invalidation.completion, this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
+          } else {
+            await invalidation.completion.catch(() => {});
+          }
+          return;
+        }
+        const worker = state.worker;
+        if (!worker) return;
+        if (abort) {
+          await bounded(this.invalidateWorker(state, worker), this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
+        } else {
+          await this.invalidateWorker(state, worker).catch(() => {});
+        }
+      }));
+      const disposing = new Set(states);
+      for (const [chatId, state] of this.states) {
+        if (disposing.has(state)) this.states.delete(chatId);
+      }
+    }
     if (!permanentlyClosed) this.shuttingDown = false;
   }
 }

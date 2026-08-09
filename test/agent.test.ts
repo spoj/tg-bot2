@@ -333,8 +333,10 @@ it("gates new work and aborts each known worker only once", async () => {
   const active = manager.prompt(9, "scheduled work", "follow-up");
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
 
-  manager.beginShutdown();
-  manager.beginShutdown();
+  const firstShutdown = manager.beginShutdown();
+  const secondShutdown = manager.beginShutdown();
+  await expect(firstShutdown).resolves.toBeUndefined();
+  await expect(secondShutdown).resolves.toBeUndefined();
   await expect(active).resolves.toBe("done");
   expect(worker.abort).toHaveBeenCalledOnce();
   await expect(manager.prompt(9, "replacement", "follow-up")).rejects.toThrow("shutting down");
@@ -342,4 +344,85 @@ it("gates new work and aborts each known worker only once", async () => {
 
   await manager.disposeAll(true);
   expect(worker.stop).toHaveBeenCalledOnce();
+});
+it("disposes an idle worker normally and clears its state", async () => {
+  const worker = fakeWorker("done");
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+  await expect(manager.prompt(10, "first")).resolves.toBe("done");
+  await expect(manager.disposeAll()).resolves.toBeUndefined();
+  expect(worker.stop).toHaveBeenCalledOnce();
+
+  await expect(manager.prompt(10, "after dispose")).resolves.toBe("done");
+  await manager.disposeAll();
+  expect(worker.stop).toHaveBeenCalledTimes(2);
+});
+it("also disposes workers created while another worker is stopping", async () => {
+  const first = fakeWorker("first");
+  const second = fakeWorker("second");
+  const stopDone = deferred<void>();
+  vi.mocked(first.stop).mockImplementationOnce(async () => {
+    await stopDone.promise;
+  });
+  const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second);
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
+
+  await expect(manager.prompt(12, "first request")).resolves.toBe("first");
+  const disposal = manager.disposeAll();
+  await vi.waitFor(() => expect(first.stop).toHaveBeenCalledOnce());
+
+  await expect(manager.prompt(13, "during disposal")).resolves.toBe("second");
+  stopDone.resolve();
+  await expect(disposal).resolves.toBeUndefined();
+  expect(second.stop).toHaveBeenCalledOnce();
+});
+
+
+it("bounds abort disposal and rejects active and queued work", async () => {
+  const worker = fakeWorker("done");
+  const activeDone = deferred<void>();
+  const abortDone = deferred<void>();
+  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
+    await activeDone.promise;
+  });
+  vi.mocked(worker.abort).mockImplementationOnce(async () => {
+    await abortDone.promise;
+  });
+  const manager = new AgentManager(config, {
+    ...managerOptions,
+    shutdownTimeoutMs: 10,
+    workerFactory: () => worker,
+  });
+
+  const active = manager.prompt(11, "active");
+  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
+  const queued = manager.newSession(11);
+  await Promise.resolve();
+  const disposal = manager.disposeAll(true);
+
+  await expect(disposal).resolves.toBeUndefined();
+  await expect(active).rejects.toThrow("timed out");
+  await expect(queued).rejects.toThrow("shutting down");
+  expect(worker.stop).toHaveBeenCalledOnce();
+  activeDone.resolve();
+  abortDone.resolve();
+  await manager.disposeAll(true);
+  expect(worker.stop).toHaveBeenCalledOnce();
+});
+
+it("cleans up a worker that appears after an aborted hanging startup", async () => {
+  const startup = deferred<FakeWorker>();
+  const manager = new AgentManager(config, {
+    ...managerOptions,
+    shutdownTimeoutMs: 10,
+    workerFactory: () => startup.promise,
+  });
+
+  const pendingPrompt = manager.prompt(12, "during startup");
+  await Promise.resolve();
+  await expect(manager.disposeAll(true)).resolves.toBeUndefined();
+  await expect(pendingPrompt).rejects.toThrow();
+  const lateWorker = fakeWorker();
+  startup.resolve(lateWorker);
+  await vi.waitFor(() => expect(lateWorker.stop).toHaveBeenCalledOnce());
 });

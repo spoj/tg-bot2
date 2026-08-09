@@ -164,6 +164,16 @@ describe("PiRpcWorker", () => {
       const command = JSON.parse(children[0]?.commands[0] ?? "{}") as { id?: string };
       record(children[0]!, { type: "response", id: command.id, command: "prompt", success: true });
       await prompt;
+      record(children[0]!, { type: "agent_start" });
+      await vi.waitFor(() => expect(children[0]?.commands).toHaveLength(2), { timeout: 1_000, interval: 10 });
+      const stateCommand = JSON.parse(children[0]?.commands[1] ?? "{}") as { id?: string };
+      record(children[0]!, {
+        type: "response",
+        id: stateCommand.id,
+        command: "get_state",
+        success: true,
+        data: { isStreaming: true, pendingMessageCount: 0 },
+      });
       const extensionDirectory = path.join(f.workspace, ".pi", "extensions");
       await mkdir(extensionDirectory, { recursive: true });
       await writeFile(path.join(extensionDirectory, "active.ts"), "export default () => {};\n");
@@ -230,6 +240,174 @@ describe("PiRpcWorker", () => {
       await expect(prompt).rejects.toThrow("Pi worker exited");
       await expect(settled).rejects.toThrow("Pi worker exited");
       expect(command.id).toMatch(/^pi-rpc-/);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("settles active work when abort is acknowledged without agent_settled", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      rpcTimeoutMs: 20,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("active");
+      const promptCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
+      await prompt;
+      const settled = worker.waitForSettled();
+      const abort = worker.abort();
+      const abortCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: abortCommand.id, command: "abort", success: true });
+      await abort;
+      await expect(settled).resolves.toBeUndefined();
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retain a prompt epoch after abort acknowledges first", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("aborted before acknowledgement");
+      const promptCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      const settled = worker.waitForSettled();
+      const abort = worker.abort();
+      const abortCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: abortCommand.id, command: "abort", success: true });
+      await abort;
+      await expect(settled).resolves.toBeUndefined();
+      record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
+      await expect(prompt).resolves.toBeUndefined();
+      const state = worker as unknown as {
+        acceptedWork: Set<number>;
+        unsettledWork: Set<number>;
+        startedWork: Set<number>;
+        settledBeforeAcceptance: Set<number>;
+      };
+      expect(state.acceptedWork.size).toBe(0);
+      expect(state.unsettledWork.size).toBe(0);
+      expect(state.startedWork.size).toBe(0);
+      expect(state.settledBeforeAcceptance.size).toBe(0);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("settles a steer whose response arrives after agent_settled", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("first");
+      const promptCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
+      await prompt;
+      const steer = worker.steer("late");
+      const settled = worker.waitForSettled();
+      const steerCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
+      record(child, { type: "agent_settled" });
+      record(child, { type: "response", id: steerCommand.id, command: "steer", success: true });
+      await expect(steer).resolves.toBeUndefined();
+      await expect(settled).resolves.toBeUndefined();
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects settlement waiters when the state probe times out", async () => {
+    vi.useFakeTimers();
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("silent state");
+      const promptCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
+      await prompt;
+      const settled = worker.waitForSettled();
+      const settledRejection = expect(settled).rejects.toThrow("timed out");
+      await vi.advanceTimersByTimeAsync(100);
+      await settledRejection;
+    } finally {
+      await worker.stop();
+      vi.useRealTimers();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("does not claim startup success when stop overlaps startup", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      const initialStart = worker.start();
+      const initialFailure = expect(initialStart).rejects.toThrow("superseded by stop");
+      const stopping = worker.stop();
+      const restart = worker.start();
+      await initialFailure;
+      await stopping;
+      await expect(restart).resolves.toBeUndefined();
+      expect(children).toHaveLength(1);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("serializes a restart that overlaps stop", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      await Promise.all([worker.stop(), worker.start()]);
+      expect(children).toHaveLength(2);
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

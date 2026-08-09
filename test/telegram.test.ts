@@ -123,6 +123,97 @@ describe("TelegramIngressBuffer", () => {
       vi.useRealTimers();
     }
   });
+
+  it("drains pre-barrier messages before admitting post-barrier work", async () => {
+    const batches: number[][] = [];
+    const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
+      batches.push(messages.map(({ messageId }) => messageId));
+      return { kind: "no-reply", reason: "steered" };
+    }, 60_000);
+
+    buffer.add(7, entry(1));
+    const barrier = buffer.acquireBarrier(7);
+    buffer.add(7, entry(2));
+    await buffer.flush(7);
+    expect(batches).toEqual([[1]]);
+
+    barrier.release();
+    await buffer.flush(7);
+    expect(batches).toEqual([[1], [2]]);
+  });
+
+  it("defers post-barrier admission while an earlier batch is active", async () => {
+    const batches: number[][] = [];
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let resolveFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
+    const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
+      batches.push(messages.map(({ messageId }) => messageId));
+      if (batches.length === 1) {
+        resolveFirstStarted();
+        await firstFinished;
+      }
+      return { kind: "no-reply", reason: "steered" };
+    }, 60_000);
+
+    buffer.add(7, entry(1));
+    const first = buffer.flush(7);
+    await firstStarted;
+    const barrier = buffer.acquireBarrier(7);
+    buffer.add(7, entry(2));
+    const beforeRelease = buffer.flush(7);
+    expect(batches).toEqual([[1]]);
+
+    releaseFirst();
+    await Promise.all([first, beforeRelease]);
+    expect(batches).toEqual([[1]]);
+    barrier.release();
+    await buffer.flush(7);
+    expect(batches).toEqual([[1], [2]]);
+  });
+
+  it("releases the barrier when starting a new session fails", async () => {
+    const batches: number[][] = [];
+    const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
+      batches.push(messages.map(({ messageId }) => messageId));
+      return { kind: "no-reply", reason: "steered" };
+    }, 60_000);
+    const newSession = vi.fn(async () => {
+      throw new Error("session failed");
+    });
+
+    buffer.add(7, entry(1));
+    const barrier = buffer.acquireBarrier(7);
+    buffer.add(7, entry(2));
+    try {
+      await buffer.flush(7);
+      await newSession();
+    } catch {
+      // The command reports the failure after its barrier is resumed.
+    } finally {
+      barrier.release();
+    }
+
+    await buffer.flush(7);
+    expect(newSession).toHaveBeenCalledOnce();
+    expect(batches).toEqual([[1], [2]]);
+  });
+
+  it("drains accepted barrier work after close and release", async () => {
+    const batches: number[][] = [];
+    const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
+      batches.push(messages.map(({ messageId }) => messageId));
+      return { kind: "no-reply", reason: "steered" };
+    }, 60_000);
+    const barrier = buffer.acquireBarrier(7);
+    buffer.add(7, entry(1));
+
+    buffer.close();
+    barrier.release();
+    await buffer.flushAll();
+    expect(batches).toEqual([[1]]);
+  });
   it("serializes overlapping batches in FIFO order even when later work completes first", async () => {
     const completions: Array<() => void> = [];
     const callbacks: number[] = [];

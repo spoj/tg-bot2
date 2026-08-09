@@ -66,6 +66,8 @@ export type PiRpcWorkerOptions = PiWorkerSandboxPaths & {
   /** Test seam; production spawning stays in sandbox.ts. */
   spawn?: PiWorkerSpawn;
   stopGraceMs?: number;
+  /** Bound RPCs so a silent worker cannot strand lifecycle operations. */
+  rpcTimeoutMs?: number;
 };
 
 type PendingRequest = {
@@ -189,6 +191,8 @@ async function prepareWorkspace(workspace: string): Promise<void> {
 }
 
 const IMMEDIATE_PROMPT_SETTLEMENT_MS = 50;
+const DEFAULT_RPC_TIMEOUT_MS = 1_000;
+
 
 export class PiRpcWorker {
   private readonly workspace: string;
@@ -198,6 +202,7 @@ export class PiRpcWorker {
   private readonly appendSystemPrompt: string | undefined;
   private readonly spawnProcess: PiWorkerSpawn;
   private readonly stopGraceMs: number;
+  private readonly rpcTimeoutMs: number;
   private process: PiWorkerChildProcess | undefined;
   private processDone: Promise<void> | undefined;
   private resolveProcessDone: (() => void) | undefined;
@@ -209,6 +214,7 @@ export class PiRpcWorker {
   private readonly unsettledWork = new Set<number>();
   private readonly acceptedWork = new Set<number>();
   private readonly startedWork = new Set<number>();
+  private readonly settledBeforeAcceptance = new Set<number>();
   private readonly promptSettlementTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private parser: StrictJsonlParser | undefined;
   private lastAssistantText: string | undefined;
@@ -220,6 +226,9 @@ export class PiRpcWorker {
   private extensionWatcher: FSWatcher | undefined;
   private extensionReloadTimer: ReturnType<typeof setTimeout> | undefined;
   private extensionReloadPromise: Promise<void> | undefined;
+  private stopPromise: Promise<void> | undefined;
+  private stopBarrierPromise: Promise<void> | undefined;
+  private startPromise: Promise<void> | undefined;
   private extensionSettingsFingerprint = "";
   private extensionResourceDirty = false;
   private extensionSettingsDirty = false;
@@ -232,8 +241,12 @@ export class PiRpcWorker {
     this.appendSystemPrompt = options.appendSystemPrompt;
     this.spawnProcess = options.spawn ?? spawnPiWorker;
     this.stopGraceMs = options.stopGraceMs ?? 1_000;
+    this.rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.stopGraceMs) || this.stopGraceMs < 0) {
       throw new Error("stopGraceMs must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(this.rpcTimeoutMs) || this.rpcTimeoutMs < 0) {
+      throw new Error("rpcTimeoutMs must be a non-negative integer");
     }
   }
   private startExtensionWatcher(): void {
@@ -274,6 +287,7 @@ export class PiRpcWorker {
   private async processExtensionReload(): Promise<void> {
     if (this.extensionReloadPromise || this.stopping || !this.process) return;
     if (!this.extensionResourceDirty && !this.extensionSettingsDirty) return;
+    const epoch = this.lifecycleEpoch;
     if (this.unsettledWork.size > 0 || this.pending.size > 0) {
       this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
       return;
@@ -284,12 +298,13 @@ export class PiRpcWorker {
         this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
         return;
       }
+      if (epoch !== this.lifecycleEpoch || this.stopping || !this.process || this.terminalError) return;
       const changed = this.extensionResourceDirty ||
         (this.extensionSettingsDirty && fingerprint !== this.extensionSettingsFingerprint);
       this.extensionResourceDirty = false;
       this.extensionSettingsDirty = false;
       if (!changed) return;
-      const reload = this.reloadForExtensionChanges();
+      const reload = this.reloadForExtensionChanges(epoch);
       this.extensionReloadPromise = reload;
       try {
         await reload;
@@ -301,23 +316,36 @@ export class PiRpcWorker {
     }
   }
 
-  private async reloadForExtensionChanges(): Promise<void> {
-    const epoch = this.lifecycleEpoch;
+  private async reloadForExtensionChanges(epoch: number): Promise<void> {
     await this.stopProcess();
     if (epoch !== this.lifecycleEpoch || this.terminalError) return;
     await this.start();
   }
 
+  private stopProcess(): Promise<void> {
+    const existing = this.stopPromise;
+    if (existing) return existing;
+    let completion!: Promise<void>;
+    completion = this.stopProcessInternal().finally(() => {
+      if (this.stopPromise === completion) this.stopPromise = undefined;
+    });
+    this.stopPromise = completion;
+    return completion;
+  }
 
-  private async stopProcess(): Promise<void> {
+  private async stopProcessInternal(): Promise<void> {
     this.closeExtensionWatcher();
     const child = this.process;
     const done = this.processDone;
     if (!child || !done) {
+      const stopped = this.terminalError ?? new Error("Pi worker stopped");
       this.clearPromptSettlementTimers();
+      this.rejectPending(stopped);
+      this.rejectSettledWaiters(stopped);
       this.unsettledWork.clear();
       this.acceptedWork.clear();
       this.startedWork.clear();
+      this.settledBeforeAcceptance.clear();
       return;
     }
     this.stopping = true;
@@ -344,14 +372,32 @@ export class PiRpcWorker {
     this.unsettledWork.clear();
     this.acceptedWork.clear();
     this.startedWork.clear();
+    this.settledBeforeAcceptance.clear();
     this.process = undefined;
     this.processDone = undefined;
     this.resolveProcessDone = undefined;
   }
 
   async start(): Promise<void> {
+    const stopping = this.stopBarrierPromise;
+    if (stopping) await stopping;
+    const stoppingProcess = this.stopPromise;
+    if (stoppingProcess) await stoppingProcess;
+    const existing = this.startPromise;
+    if (existing) return existing;
+    let completion!: Promise<void>;
+    completion = this.startInternal().finally(() => {
+      if (this.startPromise === completion) this.startPromise = undefined;
+    });
+    this.startPromise = completion;
+    return completion;
+  }
+
+  private async startInternal(): Promise<void> {
     if (this.process) throw new Error("Pi worker is already started");
     if (this.terminalError) throw this.terminalError;
+    this.lifecycleEpoch += 1;
+    const epoch = this.lifecycleEpoch;
     await prepareWorkspace(this.workspace);
     this.extensionSettingsFingerprint = await extensionSettingsFingerprint(this.workspace) ?? "";
     this.extensionResourceDirty = false;
@@ -362,6 +408,7 @@ export class PiRpcWorker {
       ...(this.cliPath === undefined ? {} : { cliPath: this.cliPath }),
       ...(this.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: this.appendSystemPrompt }),
     });
+    if (epoch !== this.lifecycleEpoch) throw new Error("Pi worker start was superseded by stop");
     let child: PiWorkerChildProcess;
     try {
       child = this.spawnProcess(this.bwrapPath, built.args, {
@@ -381,6 +428,7 @@ export class PiRpcWorker {
     this.unsettledWork.clear();
     this.acceptedWork.clear();
     this.startedWork.clear();
+    this.settledBeforeAcceptance.clear();
     this.clearPromptSettlementTimers();
     this.process = child;
     this.stopping = false;
@@ -429,13 +477,33 @@ export class PiRpcWorker {
       throw failure;
     }
   }
-
   async stop(): Promise<void> {
     this.lifecycleEpoch += 1;
-    await this.stopProcess();
+    const existing = this.stopBarrierPromise;
+    if (existing) {
+      await existing;
+      return;
+    }
+    const starting = this.startPromise;
+    let completion!: Promise<void>;
+    completion = (async () => {
+      if (starting) await starting.catch(() => {});
+      await this.stopProcess();
+    })().finally(() => {
+      if (this.stopBarrierPromise === completion) this.stopBarrierPromise = undefined;
+    });
+    this.stopBarrierPromise = completion;
+    await completion;
   }
   async abort(): Promise<void> {
-    await this.request({ type: "abort" });
+    try {
+      await this.request({ type: "abort" }, undefined, this.rpcTimeoutMs);
+      this.settleAllWork();
+    } catch (error) {
+      const failure = asError(error);
+      this.failProcess(failure);
+      throw failure;
+    }
   }
 
   async newSession(): Promise<void> {
@@ -509,6 +577,7 @@ export class PiRpcWorker {
     }
     const id = `pi-rpc-${++this.requestId}`;
     const line = `${JSON.stringify({ id, ...command })}\n`;
+    const effectiveTimeout = timeoutMs ?? this.rpcTimeoutMs;
     return new Promise<unknown>((resolve, reject) => {
       const pending: PendingRequest = {
         resolve,
@@ -516,14 +585,14 @@ export class PiRpcWorker {
         ...(workEpoch === undefined ? {} : { workEpoch }),
       };
       this.pending.set(id, pending);
-      if (timeoutMs !== undefined) {
-        pending.timeout = setTimeout(() => {
-          if (this.pending.get(id) !== pending) return;
-          this.pending.delete(id);
-          reject(new Error(`Pi RPC ${String(command.type)} request timed out`));
-        }, timeoutMs);
-        pending.timeout.unref?.();
-      }
+      pending.timeout = setTimeout(() => {
+        if (this.pending.get(id) !== pending) return;
+        this.pending.delete(id);
+        const failure = new Error(`Pi RPC ${String(command.type)} request timed out`);
+        pending.reject(failure);
+        if (pending.workEpoch !== undefined) this.failProcess(failure);
+      }, effectiveTimeout);
+      pending.timeout.unref?.();
       try {
         stdin.write(line);
       } catch (error) {
@@ -542,10 +611,19 @@ export class PiRpcWorker {
         const record = asRecord(response);
         const data = asRecord(record?.data);
         if (data?.isStreaming === false && data.pendingMessageCount === 0) this.settleWork(epoch);
-      }).catch(() => { /* process failure rejects waiters */ });
+      }).catch((error) => {
+        if (this.unsettledWork.has(epoch)) this.failProcess(asError(error));
+      });
     }, IMMEDIATE_PROMPT_SETTLEMENT_MS);
     timer.unref?.();
     this.promptSettlementTimers.set(epoch, timer);
+  }
+
+  private settleAllWork(): void {
+    for (const epoch of [...this.unsettledWork]) this.settleWork(epoch);
+    this.acceptedWork.clear();
+    this.startedWork.clear();
+    this.settledBeforeAcceptance.clear();
   }
 
   private settleWork(epoch: number): void {
@@ -553,6 +631,7 @@ export class PiRpcWorker {
     this.unsettledWork.delete(epoch);
     this.acceptedWork.delete(epoch);
     this.startedWork.delete(epoch);
+    this.settledBeforeAcceptance.delete(epoch);
     if (this.unsettledWork.size === 0) {
       this.resolveSettledWaiters();
     }
@@ -592,7 +671,10 @@ export class PiRpcWorker {
       this.pending.delete(id);
       if (pending.timeout) clearTimeout(pending.timeout);
       if (record.success === true) {
-        if (pending.workEpoch !== undefined) this.acceptedWork.add(pending.workEpoch);
+        if (pending.workEpoch !== undefined && this.unsettledWork.has(pending.workEpoch)) {
+          this.acceptedWork.add(pending.workEpoch);
+          if (this.settledBeforeAcceptance.has(pending.workEpoch)) this.settleWork(pending.workEpoch);
+        }
         pending.resolve(record);
       } else {
         pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC command failed"));
@@ -608,7 +690,10 @@ export class PiRpcWorker {
       }
     }
     if (record.type === "agent_settled") {
-      for (const epoch of [...this.acceptedWork]) this.settleWork(epoch);
+      for (const epoch of [...this.unsettledWork]) {
+        if (this.acceptedWork.has(epoch)) this.settleWork(epoch);
+        else this.settledBeforeAcceptance.add(epoch);
+      }
     } else if (this.isAgentProgressEvent(record.type)) {
       this.markAgentProgress();
     }
@@ -632,6 +717,7 @@ export class PiRpcWorker {
     this.clearPromptSettlementTimers();
     this.rejectPending(error);
     this.rejectSettledWaiters(error);
+    this.settleAllWork();
     const child = this.process;
     if (child && !this.stopping) terminateProcessGroup(child, "SIGKILL");
   }
@@ -643,6 +729,7 @@ export class PiRpcWorker {
     this.clearPromptSettlementTimers();
     this.rejectPending(error);
     this.rejectSettledWaiters(error);
+    this.settleAllWork();
     if (!this.stopping && !this.terminalError) this.terminalError = error;
     this.process = undefined;
     this.finishProcess();

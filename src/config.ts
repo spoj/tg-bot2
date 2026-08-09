@@ -40,6 +40,5 @@ export function canonicalChatId(chatId: number): string {
 }
 
 export function chatPaths(dataDir: string, chatId: number): { workspace: string } {
-  const root = path.join(dataDir, "chats", canonicalChatId(chatId));
-  return { workspace: path.join(root, "workspace") };
+  return { workspace: path.join(dataDir, "chats", canonicalChatId(chatId), "workspace") };
 }

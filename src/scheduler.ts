@@ -85,13 +85,9 @@ async function openPinnedDirectory(directory: string, expectedRealPath?: string)
     if (openedPath !== canonical) throw new Error(`Scheduler directory is not stable: ${directory}`);
     return { handle, path: `/proc/self/fd/${handle.fd}`, realPath: canonical };
   } catch (error) {
-    await handle.close().catch(() => {});
+    await closeQuietly(handle);
     throw error;
   }
-}
-
-async function closeDirectory(directory: PinnedDirectory): Promise<void> {
-  await directory.handle.close().catch(() => {});
 }
 
 function isDirectory(stat: Awaited<ReturnType<typeof lstat>>): boolean {
@@ -148,9 +144,7 @@ function validateScheduleFile(value: unknown): ScheduleFile {
 }
 
 function recurrencePeriod(recurrence: Recurrence): number {
-  if (recurrence === "hourly") return HOUR_MS;
-  if (recurrence === "daily") return DAY_MS;
-  return WEEK_MS;
+  return recurrence === "hourly" ? HOUR_MS : recurrence === "daily" ? DAY_MS : WEEK_MS;
 }
 
 function compareStrings(a: string, b: string): number {
@@ -219,8 +213,7 @@ export class WorkspaceScheduler {
     this.timer = this.schedule(() => {
       void this.poll().catch((error) => this.report(error));
     }, this.pollIntervalMs);
-    const unref = (this.timer as unknown as { unref?: () => void }).unref;
-    unref?.call(this.timer);
+    this.timer.unref?.();
   }
 
   async stop(): Promise<void> {
@@ -278,9 +271,9 @@ export class WorkspaceScheduler {
           }
         } catch (error) {
           if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
-          if (metadata && !openDirectories.includes(metadata)) await closeDirectory(metadata);
-          if (workspace && !openDirectories.includes(workspace)) await closeDirectory(workspace);
-          if (chatDirectory && !openDirectories.includes(chatDirectory)) await closeDirectory(chatDirectory);
+          if (metadata && !openDirectories.includes(metadata)) await closeQuietly(metadata.handle);
+          if (workspace && !openDirectories.includes(workspace)) await closeQuietly(workspace.handle);
+          if (chatDirectory && !openDirectories.includes(chatDirectory)) await closeQuietly(chatDirectory.handle);
         }
       }
 
@@ -289,7 +282,7 @@ export class WorkspaceScheduler {
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
-      for (const directory of openDirectories.reverse()) await closeDirectory(directory);
+      for (const directory of openDirectories.reverse()) await closeQuietly(directory.handle);
     }
   }
 

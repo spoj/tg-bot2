@@ -126,7 +126,7 @@ function validateRecord(value: unknown, index: number): StoredScheduleRecord {
   }
   if (typeof record.enabled !== "boolean") invalid(`record ${index} has an invalid enabled flag`);
   if (record.lastRunAt !== null && !isUtcIso(record.lastRunAt)) invalid(`record ${index} has an invalid lastRunAt`);
-  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0) {
+  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0 || record.runCount >= Number.MAX_SAFE_INTEGER) {
     invalid(`record ${index} has an invalid runCount`);
   }
   return { ...record } as StoredScheduleRecord;
@@ -362,15 +362,6 @@ export class WorkspaceScheduler {
 
   private async writeSchedule(metadata: PinnedDirectory, file: ScheduleFile, expectedRaw: string): Promise<void> {
     const filePath = path.join(metadata.path, "schedules.json");
-    let target: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      target = await open(filePath, READ_FILE);
-      const targetStat = await target.stat();
-      if (!targetStat.isFile() || targetStat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
-    } finally {
-      if (target) await closeQuietly(target);
-    }
-
     const temporaryPath = path.join(metadata.path, `schedules.json.${randomUUID()}.tmp`);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {

@@ -92,6 +92,19 @@ describe("WorkspaceScheduler discovery and validation", () => {
     expect(runs).toEqual([[-2, "chat negative"], [12, "chat twelve"]]);
     expect(errors.length).toBeGreaterThanOrEqual(3);
   }));
+  it("rejects the maximum safe run count before execution", async () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, 6, [record({ runCount: Number.MAX_SAFE_INTEGER })]);
+    const runs: string[] = [];
+    const scheduler = new WorkspaceScheduler({
+      dataDir,
+      run: async (_chatId, prompt) => { runs.push(prompt); return ""; },
+      send: async () => {},
+    });
+
+    await scheduler.poll(NOW);
+    expect(runs).toEqual([]);
+    expect((await readSchedules(filePath)).schedules[0]!.runCount).toBe(Number.MAX_SAFE_INTEGER);
+  }));
 
   it("rejects symlinked workspace metadata directories", async () => withDirectory(async (dataDir) => {
     const target = path.join(dataDir, "target-metadata");

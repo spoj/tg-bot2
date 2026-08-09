@@ -7,13 +7,14 @@ import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTele
 
 async function main(): Promise<void> {
   const config = parseConfig();
-  await checkSandboxEnvironment(config.dataDir);
+  const dataDir = await checkSandboxEnvironment(config.dataDir);
+  const runtimeConfig = { ...config, dataDir };
 
-  const agents = new AgentManager(config, { appRoot: process.cwd() });
+  const agents = new AgentManager(runtimeConfig, { appRoot: process.cwd() });
   const delivery = new TelegramDeliveryQueue();
   let bot: ReturnType<typeof createTelegramBot>;
   const scheduler = new WorkspaceScheduler({
-    dataDir: config.dataDir,
+    dataDir,
     run: (chatId, prompt) => agents.prompt(chatId, prompt, "follow-up"),
     send: async (chatId, text) => {
       if (text.trim().length > 0) {
@@ -22,12 +23,12 @@ async function main(): Promise<void> {
     },
   });
   const outbox = new WorkspaceOutbox({
-    dataDir: config.dataDir,
+    dataDir,
     sendFile: async (chatId, sandboxPath, caption) => {
       await delivery.enqueue(chatId, async () => {
         await sendWorkspaceFile(bot, {
           chatId,
-          workspace: chatPaths(config.dataDir, chatId).workspace,
+          workspace: chatPaths(dataDir, chatId).workspace,
           sandboxPath,
           ...(caption === undefined ? {} : { caption }),
         });
@@ -35,7 +36,7 @@ async function main(): Promise<void> {
     },
   });
 
-  bot = createTelegramBot(config, agents, delivery);
+  bot = createTelegramBot(runtimeConfig, agents, delivery);
 
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;

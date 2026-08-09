@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open as openFile, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WorkspaceScheduler, type ScheduleRecord } from "../src/scheduler.js";
 
 const NOW = Date.parse("2026-01-10T12:30:00.000Z");
@@ -160,6 +160,31 @@ describe("WorkspaceScheduler processing", () => {
     expect(Date.parse(persisted.schedules.find((item) => item.id === "hourly")!.dueAt)).toBeGreaterThan(NOW);
     expect(persisted.schedules.find((item) => item.id === "future")!.runCount).toBe(0);
   }));
+  it("rechecks each due record after earlier callbacks edit schedules", async () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, 43, [
+      record({ id: "first", prompt: "first", dueAt: new Date(NOW - 2_000).toISOString() }),
+      record({ id: "later", prompt: "later", dueAt: new Date(NOW - 1_000).toISOString() }),
+    ]);
+    const runs: string[] = [];
+    const scheduler = new WorkspaceScheduler({
+      dataDir,
+      run: async (_chatId, prompt) => {
+        runs.push(prompt);
+        if (prompt === "first") {
+          const current = await readSchedules(filePath);
+          current.schedules = current.schedules.map((item) => item.id === "later" ? { ...item, enabled: false } : item);
+          await writeFile(filePath, JSON.stringify(current), "utf8");
+        }
+        return "";
+      },
+      send: async () => {},
+    });
+
+    await scheduler.poll(NOW);
+    expect(runs).toEqual(["first"]);
+    expect((await readSchedules(filePath)).schedules).toMatchObject([{ id: "first" }, { id: "later", enabled: false, runCount: 0 }]);
+  }));
+
 
   it("leaves a failed run due for at-least-once retry", async () => withDirectory(async (dataDir) => {
     const filePath = await writeSchedules(dataDir, 7, [record()]);
@@ -207,6 +232,48 @@ describe("WorkspaceScheduler processing", () => {
       lastRunAt: new Date(NOW).toISOString(),
     });
   }));
+  it("preserves an atomic agent edit detected before replacement", async () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, 14, [record({ prompt: "original" })]);
+    const probe = await openFile(filePath, "r");
+    const prototype = Object.getPrototypeOf(probe) as {
+      sync: (this: unknown, ...args: any[]) => Promise<any>;
+    };
+    const originalSync = prototype.sync;
+    let syncs = 0;
+    const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(async function (this: unknown, ...args: any[]) {
+      syncs += 1;
+      if (syncs === 1) {
+        const replacement = `${filePath}.agent`;
+        await writeFile(replacement, JSON.stringify({
+          version: 1,
+          schedules: [record({ prompt: "agent edit", runCount: 0 })],
+        }) + "\n", "utf8");
+        await rename(replacement, filePath);
+      }
+      return originalSync.apply(this, args);
+    });
+    const errors: unknown[] = [];
+    try {
+      const scheduler = new WorkspaceScheduler({
+        dataDir,
+        run: async () => "done",
+        send: async () => {},
+        logger: (error) => errors.push(error),
+      });
+      await scheduler.poll(NOW);
+    } finally {
+      syncSpy.mockRestore();
+      await probe.close();
+    }
+
+
+    const persisted = await readSchedules(filePath);
+    expect(persisted.schedules[0]).toMatchObject({ prompt: "agent edit", enabled: true, runCount: 0 });
+    expect(Date.parse(persisted.schedules[0]!.dueAt)).toBeLessThanOrEqual(NOW);
+    expect(errors).toHaveLength(1);
+    expect(String((errors[0] as Error).cause)).toContain("leaving schedule due for a later poll");
+  }));
+
 
   it("uses an atomic replacement without leaving temporary files", async () => withDirectory(async (dataDir) => {
     const filePath = await writeSchedules(dataDir, 10, [record()]);

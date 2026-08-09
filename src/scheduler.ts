@@ -14,13 +14,17 @@ export type ScheduleRecord = {
   lastRunAt: string | null;
   runCount: number;
 };
-
 type StoredScheduleRecord = ScheduleRecord & Record<string, unknown>;
 
 type ScheduleFile = {
   version: 1;
   schedules: StoredScheduleRecord[];
 } & Record<string, unknown>;
+
+type ScheduleSnapshot = {
+  file: ScheduleFile;
+  raw: string;
+};
 
 type MaybePromise<T> = T | PromiseLike<T>;
 export type WorkspaceSchedulerOptions = {
@@ -267,9 +271,9 @@ export class WorkspaceScheduler {
           workspace = await openPinnedDirectory(path.join(chatDirectory.path, "workspace"), path.join(chatDirectory.realPath, "workspace"));
           metadata = await openPinnedDirectory(path.join(workspace.path, ".tg-bot"), path.join(workspace.realPath, ".tg-bot"));
           openDirectories.push(chatDirectory, workspace, metadata);
-          const scheduleFile = await this.readSchedule(metadata, chatId);
-          if (!scheduleFile) continue;
-          for (const record of scheduleFile.schedules) {
+          const scheduleSnapshot = await this.readSchedule(metadata, chatId);
+          if (!scheduleSnapshot) continue;
+          for (const record of scheduleSnapshot.file.schedules) {
             if (record.enabled && Date.parse(record.dueAt) <= now) due.push({ chatId, metadata, record });
           }
         } catch (error) {
@@ -290,23 +294,27 @@ export class WorkspaceScheduler {
   }
 
   private async processRecord(item: { chatId: number; metadata: PinnedDirectory; record: StoredScheduleRecord }, now: number): Promise<void> {
+    const currentSnapshot = await this.readSchedule(item.metadata, item.chatId);
+    const current = currentSnapshot?.file.schedules.find((record) => record.id === item.record.id);
+    if (!current || !current.enabled || Date.parse(current.dueAt) > now) return;
+
     let output: string | undefined;
     try {
-      output = await this.run(item.chatId, item.record.prompt);
+      output = await this.run(item.chatId, current.prompt);
       if (typeof output === "string" && output.trim().length > 0) await this.send(item.chatId, output);
     } catch (error) {
-      this.report(new Error(`Schedule ${item.record.id} for chat ${item.chatId} was not completed`, { cause: error }));
+      this.report(new Error(`Schedule ${current.id} for chat ${item.chatId} was not completed`, { cause: error }));
       return;
     }
 
     try {
-      await this.markRun(item.metadata, item.chatId, item.record.id, now);
+      await this.markRun(item.metadata, item.chatId, current.id, now);
     } catch (error) {
-      this.report(new Error(`Could not update schedule ${item.record.id} for chat ${item.chatId}`, { cause: error }));
+      this.report(new Error(`Could not update schedule ${current.id} for chat ${item.chatId}`, { cause: error }));
     }
   }
 
-  private async readSchedule(metadata: PinnedDirectory, chatId: number): Promise<ScheduleFile | undefined> {
+  private async readSchedule(metadata: PinnedDirectory, chatId: number): Promise<ScheduleSnapshot | undefined> {
     const filePath = path.join(metadata.path, "schedules.json");
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     let raw: string;
@@ -323,7 +331,7 @@ export class WorkspaceScheduler {
     }
 
     try {
-      return validateScheduleFile(JSON.parse(raw) as unknown);
+      return { file: validateScheduleFile(JSON.parse(raw) as unknown), raw };
     } catch (error) {
       this.report(new Error(`Malformed schedules for chat ${chatId}`, { cause: error }));
       return undefined;
@@ -331,8 +339,9 @@ export class WorkspaceScheduler {
   }
 
   private async markRun(metadata: PinnedDirectory, chatId: number, id: string, now: number): Promise<void> {
-    const file = await this.readSchedule(metadata, chatId);
-    if (!file) return;
+    const snapshot = await this.readSchedule(metadata, chatId);
+    if (!snapshot) return;
+    const { file } = snapshot;
     const index = file.schedules.findIndex((record) => record.id === id);
     if (index < 0) return;
     const current = file.schedules[index];
@@ -348,10 +357,10 @@ export class WorkspaceScheduler {
       updated.dueAt = advanceRecurring(current.dueAt, current.recurrence, now);
     }
     file.schedules[index] = updated;
-    await this.writeSchedule(metadata, file);
+    await this.writeSchedule(metadata, file, snapshot.raw);
   }
 
-  private async writeSchedule(metadata: PinnedDirectory, file: ScheduleFile): Promise<void> {
+  private async writeSchedule(metadata: PinnedDirectory, file: ScheduleFile, expectedRaw: string): Promise<void> {
     const filePath = path.join(metadata.path, "schedules.json");
     let target: Awaited<ReturnType<typeof open>> | undefined;
     try {
@@ -370,7 +379,18 @@ export class WorkspaceScheduler {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await rename(temporaryPath, filePath);
+
+      let latest: Awaited<ReturnType<typeof open>> | undefined;
+      try {
+        latest = await open(filePath, READ_FILE);
+        const latestStat = await latest.stat();
+        if (!latestStat.isFile() || latestStat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
+        const latestRaw = await latest.readFile("utf8");
+        if (latestRaw !== expectedRaw) throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
+        await rename(temporaryPath, filePath);
+      } finally {
+        if (latest) await closeQuietly(latest);
+      }
     } finally {
       if (handle) await closeQuietly(handle);
       await rm(temporaryPath, { force: true }).catch(() => {});

@@ -67,7 +67,14 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("Runtime, authentication, and session files are writable");
   expect(SYSTEM_PROMPT).toContain("Attachments are ordinary data paths");
   expect(SYSTEM_PROMPT).toContain("Native tools and Pi-managed extensions");
-  expect(SYSTEM_PROMPT).toContain("install <source> -l");
+  expect(SYSTEM_PROMPT).toContain("pi install npm:<package> -l --approve");
+  expect(SYSTEM_PROMPT).toContain("pi install https://... -l --approve");
+  expect(SYSTEM_PROMPT).toContain("pi install git:... -l --approve");
+  expect(SYSTEM_PROMPT).toContain("pi install ./... -l --approve");
+  expect(SYSTEM_PROMPT).toContain("pi list --approve");
+  expect(SYSTEM_PROMPT).toContain("Project settings are stored at /workspace/.pi/settings.json");
+  expect(SYSTEM_PROMPT).toContain("reloaded after the current turn");
+  expect(SYSTEM_PROMPT).not.toContain("install <source> -l");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/outbox/");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?}");
   expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
@@ -229,11 +236,48 @@ it("stops a worker whose startup fails before assignment", async () => {
   const factory = vi.fn().mockReturnValueOnce(failed).mockReturnValueOnce(replacement);
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
 
+
   await expect(manager.prompt(6, "not replayed")).rejects.toThrow("startup failed");
   expect(failed.stop).toHaveBeenCalledOnce();
   await expect(manager.prompt(6, "new request")).resolves.toBe("fresh");
   expect(failed.prompt).not.toHaveBeenCalled();
   expect(replacement.prompt).toHaveBeenCalledWith("new request");
+});
+it("retries stopping a worker after a rejected cleanup", async () => {
+  const worker = fakeWorker();
+  vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+  const state = (manager as unknown as { state(chatId: number): unknown }).state(14);
+  const invalidate = (manager as unknown as {
+    invalidateWorker(state: unknown, worker: AgentWorker): Promise<void>;
+  }).invalidateWorker.bind(manager);
+
+  await expect(invalidate(state, worker)).rejects.toThrow("stop failed");
+  await expect(invalidate(state, worker)).resolves.toBeUndefined();
+  expect(worker.stop).toHaveBeenCalledTimes(2);
+});
+
+it("replaces an idle worker after a worker_error event", async () => {
+  const worker = fakeWorker("old");
+  const replacement = fakeWorker("fresh");
+  const stopDone = deferred<void>();
+  vi.mocked(worker.stop).mockImplementationOnce(async () => {
+    await stopDone.promise;
+  });
+  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
+
+  await expect(manager.prompt(15, "first")).resolves.toBe("old");
+  worker.emit({ type: "worker_error", error: "extension reload failed" });
+  const next = manager.prompt(15, "next request");
+  await Promise.resolve();
+  expect(factory).toHaveBeenCalledOnce();
+
+  stopDone.resolve();
+  await expect(next).resolves.toBe("fresh");
+  expect(worker.stop).toHaveBeenCalledOnce();
+  expect(replacement.start).toHaveBeenCalledOnce();
+  expect(replacement.prompt).toHaveBeenCalledWith("next request");
 });
 
 it("stops a failed worker before dispatching queued work without replaying it", async () => {

@@ -1,7 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { lstat, mkdir, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
@@ -9,6 +9,7 @@ import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
+const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
@@ -468,8 +469,20 @@ type AttachmentDirectory = {
 };
 
 async function ensureAttachmentDirectory(workspace: string, date: string, messageId: number): Promise<AttachmentDirectory> {
-  await mkdir(workspace, { recursive: true, mode: 0o700 });
-  const root = await realpath(workspace);
+  const expectedWorkspace = path.resolve(workspace);
+  try {
+    const entry = await lstat(expectedWorkspace);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Attachment workspace is not safe.");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await mkdir(expectedWorkspace, { recursive: true, mode: 0o700 });
+  }
+  const workspaceEntry = await lstat(expectedWorkspace).catch(() => undefined);
+  if (!workspaceEntry || workspaceEntry.isSymbolicLink() || !workspaceEntry.isDirectory()) {
+    throw new Error("Attachment workspace is not safe.");
+  }
+  const root = await realpath(expectedWorkspace);
+  if (root !== expectedWorkspace) throw new Error("Attachment workspace is not safe.");
   let directory = root;
   for (const segment of ["attachments", date, String(messageId)]) {
     directory = path.join(directory, segment);
@@ -546,6 +559,45 @@ function fallbackName(source: AttachmentSource, remotePath?: string): string {
   return `${source.type}${extension[source.type] ?? ".bin"}`;
 }
 
+class AttachmentDownloadFailure extends Error {}
+
+async function readAttachmentBody(response: Response, destination: Awaited<ReturnType<typeof open>>, signal: AbortSignal): Promise<void> {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      if (!value || value.byteLength === 0) continue;
+      if (value.byteLength > MAX_ATTACHMENT_BYTES - total) {
+        throw new AttachmentDownloadFailure("Attachment exceeds Telegram's 20 MB bot download limit.");
+      }
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const result = await destination.write(value, offset, value.byteLength - offset);
+        if (result.bytesWritten <= 0) throw new AttachmentDownloadFailure("Telegram attachment download failed.");
+        offset += result.bytesWritten;
+      }
+      total += value.byteLength;
+      if (signal.aborted) throw new AttachmentDownloadFailure("Telegram attachment download timed out.");
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function attachmentTimeout<T>(operation: Promise<T>, controller: AbortController): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new AttachmentDownloadFailure("Telegram attachment download timed out."));
+    }, ATTACHMENT_FETCH_TIMEOUT_MS);
+    timer.unref?.();
+    operation.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
 async function downloadAttachment(
   bot: Bot,
   config: Config,
@@ -560,38 +612,41 @@ async function downloadAttachment(
   try {
     const file = await bot.api.getFile(source.fileId);
     if (!file.file_path) return { ...common, failure: "Telegram did not provide a downloadable file path." };
-    const response = await fetch(`https://api.telegram.org/file/bot${config.token}/${file.file_path}`);
+    const controller = new AbortController();
+    const response = await attachmentTimeout(
+      fetch(`https://api.telegram.org/file/bot${config.token}/${file.file_path}`, { signal: controller.signal }),
+      controller,
+    );
     if (!response.ok) return { ...common, failure: `Telegram download failed with HTTP ${response.status}.` };
     const declaredLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(declaredLength) && declaredLength > MAX_ATTACHMENT_BYTES) {
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.length > MAX_ATTACHMENT_BYTES) {
-      return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
-    }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
     const workspace = chatPaths(config.dataDir, chatId).workspace;
     const attachmentDirectory = await ensureAttachmentDirectory(workspace, date, message.message_id);
+    let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
+    let temporary: string | undefined;
     try {
       const filename = safeFilename(source.originalName, fallbackName(source, file.file_path));
       const directory = attachmentDirectory.path;
-      const destination = path.join(directory, filename);
-      const temporary = path.join(directory, `.${filename}.${randomUUID()}.part`);
-      try {
-        await writeFile(temporary, bytes, { mode: 0o600 });
-        await rename(temporary, destination);
-      } finally {
-        await rm(temporary, { force: true });
-      }
+      temporary = path.join(directory, `.${filename}.${randomUUID()}.part`);
+      temporaryHandle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+      await attachmentTimeout(readAttachmentBody(response, temporaryHandle, controller.signal), controller);
+      await temporaryHandle.close();
+      temporaryHandle = undefined;
+      await rename(temporary, path.join(directory, filename));
       return {
         ...common,
         path: `/workspace/attachments/${date}/${message.message_id}/${filename}`,
       };
     } finally {
+      await temporaryHandle?.close().catch(() => {});
+      if (temporary) await rm(temporary, { force: true });
       await attachmentDirectory.handle.close();
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof AttachmentDownloadFailure) return { ...common, failure: error.message };
     return { ...common, failure: "Telegram attachment download failed." };
   }
 }

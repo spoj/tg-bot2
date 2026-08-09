@@ -29,14 +29,24 @@ export type WorkspaceOutboxOptions = {
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
+const MAX_REQUEST_BYTES = 64 * 1024;
+const MAX_REQUEST_ID_LENGTH = 256;
+const MAX_REQUEST_PATH_LENGTH = 4_096;
+const MAX_REQUEST_CAPTION_LENGTH = 16 * 1024;
 const CHAT_DIRECTORY = /^-?\d+$/;
 const JSON_REQUEST = /\.json$/;
 // Recover claims older than five minutes after crashes without racing active senders.
 const STALE_CLAIM_AGE_MS = 5 * 60_000;
+const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
 const CLAIM_NAME = /^\.in-progress-(\d+)-[^/]+$/u;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
 const DIRECTORY = fsConstants.O_DIRECTORY ?? 0;
+
+type ClaimLease = {
+  stop: () => Promise<void>;
+};
+
 
 type OutboxEntry = {
   name: string;
@@ -92,9 +102,14 @@ function validateRequest(value: unknown): WorkspaceOutboxRequest {
   if (request.version !== 1) throw new Error("Outbox request version must be 1");
   if (request.type !== "send_file") throw new Error("Outbox request type must be send_file");
   if (typeof request.id !== "string" || request.id.length === 0) throw new Error("Outbox request id must be a non-empty string");
+  if (request.id.length > MAX_REQUEST_ID_LENGTH) throw new Error(`Outbox request id must be at most ${MAX_REQUEST_ID_LENGTH} characters`);
   if (typeof request.path !== "string" || request.path.length === 0) throw new Error("Outbox request path must be a non-empty string");
+  if (request.path.length > MAX_REQUEST_PATH_LENGTH) throw new Error(`Outbox request path must be at most ${MAX_REQUEST_PATH_LENGTH} characters`);
   if (request.caption !== undefined && typeof request.caption !== "string") {
     throw new Error("Outbox request caption must be a string");
+  }
+  if (typeof request.caption === "string" && request.caption.length > MAX_REQUEST_CAPTION_LENGTH) {
+    throw new Error(`Outbox request caption must be at most ${MAX_REQUEST_CAPTION_LENGTH} characters`);
   }
   return {
     version: 1,
@@ -104,6 +119,7 @@ function validateRequest(value: unknown): WorkspaceOutboxRequest {
     ...(request.caption === undefined ? {} : { caption: request.caption }),
   };
 }
+
 
 function validateWorkspacePath(workspace: string, requestPath: string): void {
   if (requestPath.includes("\0")) throw new Error("Outbox request path contains a NUL byte");
@@ -131,7 +147,18 @@ async function readRequest(filePath: string): Promise<WorkspaceOutboxRequest> {
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("Outbox request is not a regular file");
-    const raw = await handle.readFile("utf8");
+    if (stat.size > MAX_REQUEST_BYTES) throw new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`);
+
+    const buffer = Buffer.allocUnsafe(MAX_REQUEST_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, null);
+      bytesRead += result.bytesRead;
+      if (result.bytesRead === 0) break;
+    }
+    if (bytesRead > MAX_REQUEST_BYTES) throw new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`);
+
+    const raw = buffer.subarray(0, bytesRead).toString("utf8");
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -328,12 +355,20 @@ export class WorkspaceOutbox {
           : await this.claimEntry(openedOutbox, entry, chatId);
         if (!claim) continue;
         const archiveName = claim.originalName ?? entry.name;
+        let lease: ClaimLease | undefined;
         try {
+          lease = this.startClaimLease(claim, chatId);
           const request = await readRequest(claim.path);
           validateWorkspacePath(workspace, request.path);
           await this.sendFile(chatId, request.path, request.caption);
+          await lease.stop();
+          lease = undefined;
           await this.archiveClaimed(claim.path, processed, archiveName);
         } catch (error) {
+          if (lease) {
+            await lease.stop();
+            lease = undefined;
+          }
           try {
             await this.archiveClaimed(claim.path, failed, archiveName);
           } catch (moveError) {
@@ -341,9 +376,11 @@ export class WorkspaceOutbox {
           }
           this.reportRequestError(chatId, archiveName, error);
         } finally {
+          if (lease) await lease.stop();
           this.claimOriginalNames.delete(claim.path);
         }
       }
+
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
@@ -355,6 +392,51 @@ export class WorkspaceOutbox {
       if (chatDirectory) await this.closeDirectory(chatDirectory);
       if (chatsRoot) await this.closeDirectory(chatsRoot);
     }
+  }
+
+  private startClaimLease(claim: OutboxEntry, chatId: number): ClaimLease {
+    let stopped = false;
+    let heartbeatInFlight: Promise<void> | undefined;
+    const heartbeat = (): void => {
+      if (stopped || heartbeatInFlight) return;
+      const operation = this.refreshClaim(claim);
+      heartbeatInFlight = operation;
+      void operation
+        .catch((error) => this.reportRequestError(chatId, claim.originalName ?? claim.name, error))
+        .finally(() => {
+          if (heartbeatInFlight === operation) heartbeatInFlight = undefined;
+        });
+    };
+    const timer = this.schedule(heartbeat, CLAIM_HEARTBEAT_INTERVAL_MS);
+    const unref = (timer as unknown as { unref?: () => void }).unref;
+    unref?.call(timer);
+    return {
+      stop: async () => {
+        stopped = true;
+        this.cancelSchedule(timer);
+        if (heartbeatInFlight) await heartbeatInFlight.catch(() => {});
+      },
+    };
+  }
+
+  private async refreshClaim(claim: OutboxEntry): Promise<void> {
+    const previousPath = claim.path;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const claimName = `.in-progress-${this.now()}-${randomUUID()}`;
+      const claimPath = path.join(path.dirname(previousPath), claimName);
+      try {
+        await rename(previousPath, claimPath);
+        this.claimOriginalNames.delete(previousPath);
+        this.claimOriginalNames.set(claimPath, claim.originalName ?? claim.name);
+        claim.name = claimName;
+        claim.path = claimPath;
+        return;
+      } catch (error) {
+        if (isExisting(error)) continue;
+        throw error;
+      }
+    }
+    throw new Error("Unable to refresh outbox request lease");
   }
 
   private isStaleClaim(name: string): boolean {

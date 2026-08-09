@@ -93,6 +93,18 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(outbox, "failed"))).toEqual(["invalid.json", "malformed.json"]);
   });
 
+  it("quarantines oversized requests without delivering them", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    await writeFile(path.join(outbox, "oversized.json"), `${JSON.stringify(valid())}${"x".repeat(64 * 1024)}`, "utf8");
+    const sendFile = vi.fn(async () => {});
+
+    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
+    expect(sendFile).not.toHaveBeenCalled();
+    expect(await names(path.join(outbox, "failed"))).toEqual(["oversized.json"]);
+  });
+
+
   it("rejects traversal before invoking the host callback", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "escape.json", valid("escape", "/workspace/../outside.txt"));
@@ -158,6 +170,42 @@ describe("WorkspaceOutbox", () => {
     expect(maximum).toBe(1);
     expect(sendFile).toHaveBeenCalledTimes(2);
   });
+  it("renews a live claim before stale recovery can reclaim a long send", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "long.json", valid("long"));
+    const callbacks: (() => void)[] = [];
+    const setIntervalMock = vi.fn(((callback: Parameters<NonNullable<WorkspaceOutboxOptions["setInterval"]>>[0]) => {
+      callbacks.push(callback);
+      return callbacks.length as unknown as ReturnType<NonNullable<WorkspaceOutboxOptions["setInterval"]>>;
+    }) as NonNullable<WorkspaceOutboxOptions["setInterval"]>);
+    const setInterval = setIntervalMock as unknown as NonNullable<WorkspaceOutboxOptions["setInterval"]>;
+    const clearInterval = vi.fn(((timer: unknown) => {}) as typeof globalThis.clearInterval);
+    let now = 0;
+    let finishSend!: () => void;
+    let markSendStarted!: () => void;
+    const sendFinished = new Promise<void>((resolve) => { finishSend = resolve; });
+    const sendStarted = new Promise<void>((resolve) => { markSendStarted = resolve; });
+    const sendFile = vi.fn(async () => {
+      markSendStarted();
+      await sendFinished;
+    });
+    const first = new WorkspaceOutbox({ dataDir, sendFile, now: () => now, setInterval, clearInterval });
+    const firstPoll = first.poll();
+
+    await sendStarted;
+    now = 5 * 60_000;
+    callbacks[0]?.();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const duplicateSend = vi.fn(async () => {});
+    await new WorkspaceOutbox({ dataDir, sendFile: duplicateSend, now: () => now }).poll();
+    expect(duplicateSend).not.toHaveBeenCalled();
+
+    finishSend();
+    await firstPoll;
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["long.json"]);
+  });
+
 
   it("stops and clears its polling timer", async () => {
     const { dataDir } = await fixture();

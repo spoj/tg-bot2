@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -142,10 +142,67 @@ function extensionWatchKind(filename: string | Buffer | null): "settings" | "res
   if (
     relative === "extensions" || relative.startsWith("extensions/") ||
     relative === "npm" || relative.startsWith("npm/") ||
+    relative === "git" || relative.startsWith("git/") ||
     relative === "agent/extensions" || relative.startsWith("agent/extensions/") ||
-    relative === "agent/npm" || relative.startsWith("agent/npm/")
+    relative === "agent/npm" || relative.startsWith("agent/npm/") ||
+    relative === "agent/git" || relative.startsWith("agent/git/")
   ) return "resource";
   return undefined;
+}
+
+const RESOURCE_DISCOVERY_SETTINGS = ["packages", "extensions", "skills", "prompts", "themes"] as const;
+
+function localExtensionSource(source: string): boolean {
+  const trimmed = source.trim();
+  return trimmed.length > 0 && !/^(?:npm:|git:|git\+|github:|https?:|ssh:)/i.test(trimmed);
+}
+
+function settingSources(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const sources: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string") sources.push(entry);
+    else {
+      const source = asRecord(entry)?.source;
+      if (typeof source === "string") sources.push(source);
+    }
+  }
+  return sources;
+}
+
+async function localExtensionWatchPaths(workspace: string): Promise<string[]> {
+  const configRoots = [
+    { directory: path.join(workspace, ".pi"), file: path.join(workspace, ".pi", "settings.json") },
+    { directory: path.join(workspace, ".pi", "agent"), file: path.join(workspace, ".pi", "agent", "settings.json") },
+  ];
+  const piRoot = path.join(workspace, ".pi");
+  const watchPaths = new Set<string>();
+  for (const config of configRoots) {
+    let settings: JsonRecord;
+    try {
+      settings = asRecord(JSON.parse(await readFile(config.file, "utf8"))) ?? {};
+    } catch {
+      continue;
+    }
+    const sources = [
+      ...settingSources(settings.packages),
+      ...settingSources(settings.extensions),
+    ];
+    for (const source of sources) {
+      if (!localExtensionSource(source)) continue;
+      const resolved = path.resolve(config.directory, source.trim());
+      const relativeToPi = path.relative(piRoot, resolved);
+      if (relativeToPi === "" || (!relativeToPi.startsWith(`..${path.sep}`) && relativeToPi !== "..")) continue;
+      if (resolved === workspace) continue;
+      try {
+        const real = await realpath(resolved);
+        watchPaths.add(real);
+      } catch {
+        // A local source may be installed or created after the worker starts.
+      }
+    }
+  }
+  return [...watchPaths];
 }
 
 async function extensionSettingsFingerprint(workspace: string): Promise<string | undefined> {
@@ -157,10 +214,14 @@ async function extensionSettingsFingerprint(workspace: string): Promise<string |
   for (const settingsPath of settingsPaths) {
     try {
       const parsed = asRecord(JSON.parse(await readFile(settingsPath, "utf8")));
-      snapshots.push({ packages: parsed?.packages ?? null, extensions: parsed?.extensions ?? null });
+      const snapshot: JsonRecord = {};
+      for (const key of RESOURCE_DISCOVERY_SETTINGS) snapshot[key] = parsed?.[key] ?? null;
+      snapshots.push(snapshot);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        snapshots.push({ packages: null, extensions: null });
+        const snapshot: JsonRecord = {};
+        for (const key of RESOURCE_DISCOVERY_SETTINGS) snapshot[key] = null;
+        snapshots.push(snapshot);
         continue;
       }
       return undefined;
@@ -188,6 +249,15 @@ async function prepareWorkspace(workspace: string): Promise<void> {
     await ensurePrivateDirectory(path.join(workspace, relative));
   }
   await ensureWebSearchConfig(workspace);
+}
+
+const MAX_WORKER_ERROR_LENGTH = 2_048;
+
+function boundedErrorMessage(error: unknown): string {
+  const message = asError(error).message;
+  return message.length <= MAX_WORKER_ERROR_LENGTH
+    ? message
+    : `${message.slice(0, MAX_WORKER_ERROR_LENGTH - 1)}…`;
 }
 
 const IMMEDIATE_PROMPT_SETTLEMENT_MS = 50;
@@ -219,11 +289,14 @@ export class PiRpcWorker {
   private parser: StrictJsonlParser | undefined;
   private lastAssistantText: string | undefined;
   private assistantTextKnown = false;
+  private currentPromptText: string | undefined;
   private terminalError: Error | undefined;
+  private reportedWorkerError: Error | undefined;
   private stderr = "";
   private stopping = false;
   private lifecycleEpoch = 0;
   private extensionWatcher: FSWatcher | undefined;
+  private readonly localExtensionWatchers = new Map<string, FSWatcher>();
   private extensionReloadTimer: ReturnType<typeof setTimeout> | undefined;
   private extensionReloadPromise: Promise<void> | undefined;
   private stopPromise: Promise<void> | undefined;
@@ -232,6 +305,7 @@ export class PiRpcWorker {
   private extensionSettingsFingerprint = "";
   private extensionResourceDirty = false;
   private extensionSettingsDirty = false;
+  private extensionChangeVersion = 0;
 
   constructor(options: PiRpcWorkerOptions) {
     this.workspace = options.workspace;
@@ -249,21 +323,53 @@ export class PiRpcWorker {
       throw new Error("rpcTimeoutMs must be a non-negative integer");
     }
   }
-  private startExtensionWatcher(): void {
-    const root = path.join(this.workspace, ".pi");
-    const watcher = watch(root, { recursive: true }, (_event, filename) => {
-      const kind = extensionWatchKind(filename);
-      if (!kind) return;
-      if (kind === "settings") this.extensionSettingsDirty = true;
-      else this.extensionResourceDirty = true;
-      this.scheduleExtensionReload();
-    });
+  private markExtensionChange(kind: "settings" | "resource"): void {
+    if (kind === "settings") this.extensionSettingsDirty = true;
+    else this.extensionResourceDirty = true;
+    this.extensionChangeVersion += 1;
+    this.scheduleExtensionReload();
+  }
+
+  private attachExtensionWatcher(watcher: FSWatcher, kind: "settings" | "resource"): void {
     watcher.on("error", () => {
       if (this.stopping) return;
-      this.extensionResourceDirty = true;
-      this.scheduleExtensionReload();
+      this.markExtensionChange(kind);
     });
-    this.extensionWatcher = watcher;
+  }
+
+  private async refreshLocalExtensionWatchers(): Promise<void> {
+    const desired = new Set(await localExtensionWatchPaths(this.workspace));
+    for (const [source, watcher] of this.localExtensionWatchers) {
+      if (desired.has(source)) continue;
+      watcher.close();
+      this.localExtensionWatchers.delete(source);
+    }
+    for (const source of desired) {
+      if (this.localExtensionWatchers.has(source)) continue;
+      try {
+        const entry = await lstat(source);
+        const watcher = watch(source, { recursive: entry.isDirectory() }, () => {
+          this.markExtensionChange("resource");
+        });
+        this.attachExtensionWatcher(watcher, "resource");
+        this.localExtensionWatchers.set(source, watcher);
+      } catch {
+        // Missing or inaccessible local sources must not prevent worker startup.
+      }
+    }
+  }
+
+  private async startExtensionWatcher(): Promise<void> {
+    if (!this.extensionWatcher) {
+      const root = path.join(this.workspace, ".pi");
+      const watcher = watch(root, { recursive: true }, (_event, filename) => {
+        const kind = extensionWatchKind(filename);
+        if (kind) this.markExtensionChange(kind);
+      });
+      this.attachExtensionWatcher(watcher, "resource");
+      this.extensionWatcher = watcher;
+    }
+    await this.refreshLocalExtensionWatchers();
   }
 
   private closeExtensionWatcher(): void {
@@ -272,6 +378,14 @@ export class PiRpcWorker {
     const watcher = this.extensionWatcher;
     this.extensionWatcher = undefined;
     watcher?.close();
+    for (const localWatcher of this.localExtensionWatchers.values()) localWatcher.close();
+    this.localExtensionWatchers.clear();
+  }
+
+  private clearExtensionChangeState(): void {
+    this.extensionResourceDirty = false;
+    this.extensionSettingsDirty = false;
+    this.extensionChangeVersion = 0;
   }
 
   private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
@@ -301,6 +415,7 @@ export class PiRpcWorker {
       if (epoch !== this.lifecycleEpoch || this.stopping || !this.process || this.terminalError) return;
       const changed = this.extensionResourceDirty ||
         (this.extensionSettingsDirty && fingerprint !== this.extensionSettingsFingerprint);
+      const changeVersion = this.extensionChangeVersion;
       this.extensionResourceDirty = false;
       this.extensionSettingsDirty = false;
       if (!changed) return;
@@ -308,33 +423,43 @@ export class PiRpcWorker {
       this.extensionReloadPromise = reload;
       try {
         await reload;
+        if (this.extensionChangeVersion === changeVersion) {
+          this.extensionSettingsFingerprint = await extensionSettingsFingerprint(this.workspace) ?? this.extensionSettingsFingerprint;
+        } else {
+          this.scheduleExtensionReload();
+        }
       } finally {
         if (this.extensionReloadPromise === reload) this.extensionReloadPromise = undefined;
       }
     } catch (error) {
-      this.terminalError ??= asError(error);
+      const failure = asError(error);
+      this.terminalError ??= failure;
+      this.emitWorkerError(failure);
     }
   }
 
   private async reloadForExtensionChanges(epoch: number): Promise<void> {
-    await this.stopProcess();
+    await this.stopProcess(true);
     if (epoch !== this.lifecycleEpoch || this.terminalError) return;
     await this.start();
   }
 
-  private stopProcess(): Promise<void> {
+  private stopProcess(keepExtensionWatcher = false): Promise<void> {
     const existing = this.stopPromise;
-    if (existing) return existing;
+    if (existing) {
+      if (!keepExtensionWatcher) this.closeExtensionWatcher();
+      return existing;
+    }
     let completion!: Promise<void>;
-    completion = this.stopProcessInternal().finally(() => {
+    completion = this.stopProcessInternal(keepExtensionWatcher).finally(() => {
       if (this.stopPromise === completion) this.stopPromise = undefined;
     });
     this.stopPromise = completion;
     return completion;
   }
 
-  private async stopProcessInternal(): Promise<void> {
-    this.closeExtensionWatcher();
+  private async stopProcessInternal(keepExtensionWatcher: boolean): Promise<void> {
+    if (!keepExtensionWatcher) this.closeExtensionWatcher();
     const child = this.process;
     const done = this.processDone;
     if (!child || !done) {
@@ -346,6 +471,7 @@ export class PiRpcWorker {
       this.acceptedWork.clear();
       this.startedWork.clear();
       this.settledBeforeAcceptance.clear();
+      if (!keepExtensionWatcher) this.clearExtensionChangeState();
       return;
     }
     this.stopping = true;
@@ -376,6 +502,7 @@ export class PiRpcWorker {
     this.process = undefined;
     this.processDone = undefined;
     this.resolveProcessDone = undefined;
+    if (!keepExtensionWatcher) this.clearExtensionChangeState();
   }
 
   async start(): Promise<void> {
@@ -386,22 +513,28 @@ export class PiRpcWorker {
     const existing = this.startPromise;
     if (existing) return existing;
     let completion!: Promise<void>;
-    completion = this.startInternal().finally(() => {
+    completion = this.startInternal().catch((error) => {
+      this.emitWorkerError(error);
+      throw error;
+    }).finally(() => {
       if (this.startPromise === completion) this.startPromise = undefined;
     });
     this.startPromise = completion;
     return completion;
   }
-
   private async startInternal(): Promise<void> {
     if (this.process) throw new Error("Pi worker is already started");
     if (this.terminalError) throw this.terminalError;
+    const reloading = this.extensionReloadPromise !== undefined;
     this.lifecycleEpoch += 1;
     const epoch = this.lifecycleEpoch;
     await prepareWorkspace(this.workspace);
-    this.extensionSettingsFingerprint = await extensionSettingsFingerprint(this.workspace) ?? "";
-    this.extensionResourceDirty = false;
-    this.extensionSettingsDirty = false;
+    const fingerprint = await extensionSettingsFingerprint(this.workspace);
+    if (!reloading) {
+      this.extensionSettingsFingerprint = fingerprint ?? "";
+      this.clearExtensionChangeState();
+      this.currentPromptText = undefined;
+    }
     const built = await buildPiWorkerBwrapArgs({
       workspace: this.workspace,
       appRoot: this.appRoot,
@@ -470,7 +603,7 @@ export class PiRpcWorker {
       throw this.terminalError ?? new Error("Pi worker exited during startup");
     }
     try {
-      this.startExtensionWatcher();
+      await this.startExtensionWatcher();
     } catch (error) {
       const failure = asError(error);
       this.failProcess(failure);
@@ -515,11 +648,15 @@ export class PiRpcWorker {
     if (data?.cancelled === true) throw new Error("Pi worker new session was cancelled");
     this.lastAssistantText = undefined;
     this.assistantTextKnown = false;
+    this.currentPromptText = undefined;
   }
 
   async prompt(message: string): Promise<void> {
     const reload = this.extensionReloadPromise;
     if (reload) await reload;
+    this.currentPromptText = message;
+    this.lastAssistantText = undefined;
+    this.assistantTextKnown = false;
     await this.queueWork({ type: "prompt", message });
   }
 
@@ -542,6 +679,7 @@ export class PiRpcWorker {
     const reload = this.extensionReloadPromise;
     if (reload) await reload;
     if (this.assistantTextKnown) return this.lastAssistantText;
+    if (this.currentPromptText !== undefined) return undefined;
     const response = await this.request({ type: "get_last_assistant_text" });
     const record = asRecord(response);
     const data = asRecord(record?.data);
@@ -659,6 +797,18 @@ export class PiRpcWorker {
     ].includes(String(type));
   }
 
+  private emitEvent(event: PiRpcEvent): void {
+    for (const listener of this.listeners) {
+      try { listener(event); } catch { /* listeners cannot break the RPC pump */ }
+    }
+  }
+
+  private emitWorkerError(error: unknown): void {
+    const failure = asError(error);
+    if (this.reportedWorkerError === failure) return;
+    this.reportedWorkerError = failure;
+    this.emitEvent({ type: "worker_error", error: boundedErrorMessage(failure) });
+  }
 
   private handleRecord(value: unknown): void {
     const record = asRecord(value);
@@ -697,9 +847,7 @@ export class PiRpcWorker {
     } else if (this.isAgentProgressEvent(record.type)) {
       this.markAgentProgress();
     }
-    for (const listener of this.listeners) {
-      try { listener(record); } catch { /* listeners cannot break the RPC pump */ }
-    }
+    this.emitEvent(record);
     if (record.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(String(record.method))) {
       const id = record.id;
       if (typeof id === "string") this.writeFireAndForget({ type: "extension_ui_response", id, cancelled: true });

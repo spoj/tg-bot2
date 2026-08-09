@@ -68,6 +68,10 @@ export async function buildBwrapArgs(
   paths: SandboxPaths,
   request: SandboxRequest,
 ): Promise<{ args: string[]; resolved: SandboxPaths }> {
+  const sessionsStat = await lstat(paths.sessions);
+  if (!sessionsStat.isDirectory() || sessionsStat.isSymbolicLink()) {
+    throw new Error("Sandbox sessions must be a real directory");
+  }
   const workspace = await realpath(paths.workspace);
   const sessions = await realpath(paths.sessions);
   if (workspace !== path.resolve(paths.workspace) || sessions !== path.resolve(paths.sessions)) {
@@ -255,11 +259,14 @@ export async function runSandbox(
   request: SandboxRequest,
   options: SandboxOptions = {},
 ): Promise<SandboxResult> {
+  const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+    throw new Error("timeoutMs must be a positive safe integer no larger than 2147483647");
+  }
   const { args } = await buildBwrapArgs(paths, request);
   const limit = request.maxOutputBytes ?? options.maxOutputBytes ?? DEFAULT_LIMIT;
   if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("maxOutputBytes must be a positive integer");
   const capture = outputCapture(limit);
-  const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT;
 
   return await new Promise<SandboxResult>((resolve, reject) => {
     const child = spawn(options.bwrapPath ?? "bwrap", args, {
@@ -270,20 +277,29 @@ export async function runSandbox(
     activeProcesses.add(child);
     let timedOut = false;
     let settled = false;
+    let terminated = false;
+    const terminate = () => {
+      if (terminated) return;
+      terminated = true;
+      terminateProcessGroup(child, "SIGKILL");
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      terminateProcessGroup(child, "SIGKILL");
+      terminate();
     }, timeoutMs);
     timer.unref();
-    child.stdout.on("data", (chunk: Buffer) => capture.stdout.add(chunk));
-    child.stderr.on("data", (chunk: Buffer) => capture.stderr.add(chunk));
-    child.once("error", (error) => {
+    const rejectOnce = (error: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       activeProcesses.delete(child);
+      terminate();
       reject(error);
-    });
+    };
+    child.stdout.on("data", (chunk: Buffer) => capture.stdout.add(chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture.stderr.add(chunk));
+    child.once("error", rejectOnce);
+    child.stdin.on("error", rejectOnce);
     child.once("close", (exitCode) => {
       if (settled) return;
       settled = true;
@@ -322,7 +338,7 @@ async function requireExecutable(executable: string): Promise<string> {
   throw new Error(`Executable not found or not executable: ${executable}`);
 }
 
-export async function checkSandboxEnvironment(dataDir: string, options: SandboxOptions = {}): Promise<void> {
+export async function checkSandboxEnvironment(dataDir: string, options: SandboxOptions = {}): Promise<string> {
   const bwrapPath = await requireExecutable(options.bwrapPath ?? "bwrap");
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const writeProbe = path.join(dataDir, `.write-probe-${process.pid}`);
@@ -345,4 +361,5 @@ export async function checkSandboxEnvironment(dataDir: string, options: SandboxO
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+  return await realpath(dataDir);
 }

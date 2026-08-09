@@ -9,7 +9,7 @@ Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
-Use the pi command with install <source> -l for optional project-local extensions and list to inspect them; extension changes are debounced and automatically reloaded after the current turn settles.
+Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Extension changes are debounced and automatically reloaded after the current turn.
 To send a file through Telegram, write a send_file request under the root
 /workspace/.tg-bot/outbox/. The request object is
 {version:1,id,type:"send_file",path,caption?}; id must be unique and path must
@@ -23,7 +23,6 @@ lastRunAt is nullable and, when present, must be a UTC timestamp ending in Z; an
 runCount must be a nonnegative integer.
 Keep Telegram-facing answers concise unless the user asks for detail.
 `;
-
 
 export function extractFinalAssistantText(messages: readonly unknown[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -249,6 +248,10 @@ export class AgentManager {
   private subscribeAssistantProgress(chatId: number, state: ChatState, worker: AgentWorker): void {
     state.unsubscribe?.();
     state.unsubscribe = worker.onEvent((event) => {
+      if (event.type === "worker_error") {
+        void this.invalidateWorker(state, worker).catch(() => {});
+        return;
+      }
       if (event.type !== "message_end") return;
       const message = record(event.message);
       if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
@@ -267,7 +270,6 @@ export class AgentManager {
     const existing = state.invalidation;
     if (existing?.worker === worker) return existing.completion;
     if (state.stoppedWorker === worker) return Promise.resolve();
-    state.stoppedWorker = worker;
 
     let completion!: Promise<void>;
     completion = (async () => {
@@ -276,10 +278,16 @@ export class AgentManager {
         state.unsubscribe?.();
         state.unsubscribe = undefined;
       }
+      let stopped = false;
       try {
         await worker.stop();
+        stopped = true;
       } finally {
-        if (state.invalidation?.completion === completion) state.invalidation = undefined;
+        if (state.invalidation?.completion === completion) {
+          state.invalidation = undefined;
+          if (stopped) state.stoppedWorker = worker;
+          else if (state.stoppedWorker === worker) state.stoppedWorker = undefined;
+        }
       }
     })();
     state.invalidation = { worker, completion };
@@ -288,10 +296,11 @@ export class AgentManager {
 
   private async ensureWorker(chatId: number, state: ChatState): Promise<AgentWorker> {
     if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
+    const priorInvalidation = state.invalidation;
+    if (priorInvalidation) await priorInvalidation.completion.catch(() => {});
+    if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
     if (state.worker) return state.worker;
     if (!state.workerPromise) {
-      const priorInvalidation = state.invalidation;
-      if (priorInvalidation) await priorInvalidation.completion.catch(() => {});
       const paths = chatPaths(this.config.dataDir, chatId);
       const pending = (async () => {
         let worker: AgentWorker | undefined;

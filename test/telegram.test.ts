@@ -2,12 +2,14 @@ import { execFile as execFileCallback } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
-import { appendFile, mkdtemp, mkdir, open as openFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, open as openFile, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 
 import type { Bot } from "grammy";
 import {
+  createTelegramBot,
+  flushTelegramIngress,
   formatBufferedPrompt,
   sendTelegramText,
   sendWorkspaceFile,
@@ -35,6 +37,43 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+}
+
+async function runAttachmentFixture(dataDir: string, fetchImplementation: typeof fetch): Promise<ReturnType<typeof vi.fn>> {
+  const prompt = vi.fn(async () => undefined);
+  const bot = createTelegramBot({
+    token: "test-token",
+    allowedUserIds: new Set([42]),
+    dataDir,
+  }, {
+    prompt,
+    setAssistantProgress: vi.fn(),
+  } as never);
+  (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
+  bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/remote.bin" })) as unknown as typeof bot.api.getFile;
+  (bot.api as unknown as { sendChatAction: ReturnType<typeof vi.fn> }).sendChatAction = vi.fn(async () => ({}));
+  vi.stubGlobal("fetch", fetchImplementation);
+  await bot.handleUpdate({
+    update_id: 1,
+    message: {
+      message_id: 7,
+      date: 1_700_000_000,
+      chat: { id: 42, type: "private" },
+      from: { id: 42, is_bot: false, first_name: "Test" },
+      document: { file_id: "file-id", file_name: "report.txt", mime_type: "text/plain" },
+    },
+  } as never);
+  await flushTelegramIngress(bot);
+  return prompt;
+}
+
+function chunkedResponse(chunks: readonly Uint8Array[], headers?: HeadersInit): Response {
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  }), { status: 200, ...(headers === undefined ? {} : { headers }) });
 }
 async function createFifo(fifoPath: string): Promise<boolean> {
   try {
@@ -544,6 +583,85 @@ it("rejects a regular file that grows beyond the upload cap after stat", async (
     } finally {
       readSpy.mockRestore();
       await probe.close();
+    }
+  });
+});
+
+
+describe("Telegram attachment downloads", () => {
+  it("bounds a stalled Telegram fetch with AbortController", async () => {
+    vi.useFakeTimers();
+    try {
+      await withWorkspace(async (dataDir) => {
+        let signal: AbortSignal | null | undefined;
+        const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+          signal = init?.signal;
+          return new Promise<Response>(() => {});
+        });
+        const fixture = runAttachmentFixture(dataDir, fetchMock as unknown as typeof fetch);
+        await Promise.resolve();
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(30_000);
+        const prompt = await fixture;
+        expect(signal?.aborted).toBe(true);
+        expect(prompt.mock.calls[0]?.[1]).toMatch(/download timed out/);
+      });
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a chunked response as soon as it exceeds 20 MiB", async () => {
+    try {
+      await withWorkspace(async (dataDir) => {
+        const response = chunkedResponse([
+          new Uint8Array(20 * 1024 * 1024),
+          new Uint8Array([1]),
+        ]);
+        const prompt = await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
+        expect(prompt.mock.calls[0]?.[1]).toMatch(/20 MB/);
+        expect(await readFile(path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("streams a bounded response while preserving attachment metadata", async () => {
+    try {
+      await withWorkspace(async (dataDir) => {
+        const response = chunkedResponse([
+          new TextEncoder().encode("hello "),
+          new TextEncoder().encode("telegram"),
+        ]);
+        const prompt = await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
+        const destination = path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7", "report.txt");
+        expect(await readFile(destination, "utf8")).toBe("hello telegram");
+        expect(prompt.mock.calls[0]?.[1]).toMatch(/text\/plain/);
+        expect(prompt.mock.calls[0]?.[1]).toMatch(/report\.txt/);
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a pre-existing symlinked chat workspace", async () => {
+    try {
+      await withWorkspace(async (dataDir) => {
+        const chatRoot = path.join(dataDir, "chats", "42");
+        const outside = path.join(dataDir, "outside");
+        const workspace = path.join(chatRoot, "workspace");
+        await mkdir(chatRoot, { recursive: true });
+        await mkdir(outside);
+        await symlink(outside, workspace);
+        const response = chunkedResponse([new TextEncoder().encode("secret")]);
+        const prompt = await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
+        expect(prompt.mock.calls[0]?.[1]).toMatch(/download failed/);
+        expect(await readFile(path.join(outside, "attachments", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+      });
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });

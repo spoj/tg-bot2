@@ -2,7 +2,7 @@ import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildBwrapArgs, buildPiWorkerBwrapArgs, runSandbox } from "../src/sandbox.js";
+import { buildBwrapArgs, buildPiWorkerBwrapArgs, checkSandboxEnvironment, runSandbox } from "../src/sandbox.js";
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-test-"));
@@ -43,6 +43,21 @@ it("binds requested workspace resources read-only and rejects outside paths", as
       .rejects.toThrow("under the workspace");
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
+it("rejects non-directory and symlinked sessions sources", async () => {
+  const f = await fixture();
+  const file = path.join(f.root, "sessions-file");
+  const target = path.join(f.root, "sessions-target");
+  const linked = path.join(f.root, "sessions-link");
+  try {
+    await writeFile(file, "not a directory");
+    await mkdir(target);
+    await symlink(target, linked, "dir");
+    await expect(buildBwrapArgs({ ...f, sessions: file }, { executable: "/bin/cat", args: [] }))
+      .rejects.toThrow("sessions must be a real directory");
+    await expect(buildBwrapArgs({ ...f, sessions: linked }, { executable: "/bin/cat", args: [] }))
+      .rejects.toThrow("sessions must be a real directory");
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
 
 it("rejects a symlinked appRoot node_modules tree", async () => {
   const f = await fixture();
@@ -56,6 +71,29 @@ it("rejects a symlinked appRoot node_modules tree", async () => {
       .rejects.toThrow("node_modules must be a real directory");
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
+it("rejects timeout values outside Node's timer-safe range before spawning", async () => {
+  const invalidTimeouts = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER, 2_147_483_648];
+  for (const timeoutMs of invalidTimeouts) {
+    await expect(runSandbox(
+      { workspace: "/missing-workspace", sessions: "/missing-sessions" },
+      { executable: "/bin/true", args: [], timeoutMs },
+    )).rejects.toThrow("timeoutMs must be a positive safe integer");
+  }
+});
+
+it("returns the canonical data root after probing a symlinked data directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-data-test-"));
+  const target = path.join(root, "data");
+  const linked = path.join(root, "data-link");
+  const bwrap = path.join(root, "bwrap-probe");
+  try {
+    await mkdir(target);
+    await symlink(target, linked, "dir");
+    await writeFile(bwrap, "#!/bin/sh\ncat >/dev/null\n", { mode: 0o755 });
+    await expect(checkSandboxEnvironment(linked, { bwrapPath: bwrap })).resolves.toBe(target);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 
 const integration = process.env.RUN_BWRAP_TESTS === "1" ? describe : describe.skip;
 integration("Bubblewrap integration", () => {

@@ -145,6 +145,162 @@ describe("PiRpcWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+
+  it("reloads resources under project and user git install directories", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      await mkdir(path.join(f.workspace, ".pi", "git"), { recursive: true });
+      await mkdir(path.join(f.workspace, ".pi", "agent", "git"), { recursive: true });
+      await writeFile(path.join(f.workspace, ".pi", "git", "project.ts"), "export default () => {};\n");
+      await writeFile(path.join(f.workspace, ".pi", "agent", "git", "user.ts"), "export default () => {};\n");
+      await vi.waitFor(() => expect(children).toHaveLength(2), { timeout: 3_000, interval: 25 });
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("reloads when any resource discovery setting changes", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const settingsPath = path.join(f.workspace, ".pi", "settings.json");
+      const updates = [
+        { packages: ["./local-package"] },
+        { extensions: ["./local-extension.ts"] },
+        { skills: ["./local-skills"] },
+        { prompts: ["./local-prompts"] },
+        { themes: ["./local-themes"] },
+      ];
+      for (const [index, update] of updates.entries()) {
+        await writeFile(settingsPath, `${JSON.stringify(update)}\n`);
+        await vi.waitFor(() => expect(children).toHaveLength(index + 2), { timeout: 3_000, interval: 25 });
+      }
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("watches configured local project and user sources outside .pi", async () => {
+    const f = await fixture();
+    const outsideExtension = path.join(f.root, "outside-extension.ts");
+    const outsidePackage = path.join(f.root, "outside-package");
+    await mkdir(outsidePackage, { recursive: true });
+    await writeFile(outsideExtension, "export default () => {};\n");
+    await writeFile(path.join(outsidePackage, "extension.ts"), "export default () => {};\n");
+    await mkdir(path.join(f.workspace, ".pi", "agent"), { recursive: true });
+    await writeFile(path.join(f.workspace, ".pi", "settings.json"), JSON.stringify({
+      extensions: [path.relative(path.join(f.workspace, ".pi"), outsideExtension)],
+    }));
+    await writeFile(path.join(f.workspace, ".pi", "agent", "settings.json"), JSON.stringify({
+      packages: [path.relative(path.join(f.workspace, ".pi", "agent"), outsidePackage)],
+    }));
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      await writeFile(outsideExtension, "export default () => undefined;\n");
+      await writeFile(path.join(outsidePackage, "extension.ts"), "export default () => undefined;\n");
+      await vi.waitFor(() => expect(children).toHaveLength(2), { timeout: 3_000, interval: 25 });
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a second extension change made during reload", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const secondPath = path.join(f.workspace, ".pi", "extensions", "second.ts");
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        if (children.length === 2) void writeFile(secondPath, "export default () => {};\n");
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      await mkdir(path.dirname(secondPath), { recursive: true });
+      await writeFile(path.join(f.workspace, ".pi", "extensions", "first.ts"), "export default () => {};\n");
+      await vi.waitFor(() => expect(children).toHaveLength(3), { timeout: 4_000, interval: 25 });
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("emits a bounded worker_error when extension reload startup fails", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const events: Record<string, unknown>[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        if (children.length > 0) throw new Error("reload failure ".repeat(1_000));
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    const unsubscribe = worker.onEvent((event) => events.push(event));
+    try {
+      await worker.start();
+      const extensionDirectory = path.join(f.workspace, ".pi", "extensions");
+      await mkdir(extensionDirectory, { recursive: true });
+      await writeFile(path.join(extensionDirectory, "failure.ts"), "export default () => {};\n");
+      await vi.waitFor(() => expect(events.some((event) => event.type === "worker_error")).toBe(true), {
+        timeout: 3_000,
+        interval: 25,
+      });
+      const errorEvent = events.find((event) => event.type === "worker_error");
+      expect(typeof errorEvent?.error).toBe("string");
+      expect(String(errorEvent?.error).length).toBeLessThanOrEqual(2_048);
+    } finally {
+      unsubscribe();
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
   it("waits for an active turn before reloading extensions", async () => {
     const f = await fixture();
     const children: FakeChild[] = [];
@@ -216,6 +372,47 @@ describe("PiRpcWorker", () => {
         data: { isStreaming: false, pendingMessageCount: 0 },
       });
       await settled;
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not return a prior assistant answer for a handled prompt", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const first = worker.prompt("first");
+      const firstCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: firstCommand.id, command: "prompt", success: true });
+      await first;
+      record(child, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "old answer" }] } });
+      record(child, { type: "agent_settled" });
+      await worker.waitForSettled();
+
+      const handled = worker.prompt("/handled");
+      const handledCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: handledCommand.id, command: "prompt", success: true });
+      await handled;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const stateRequest = JSON.parse(child.commands[2] ?? "{}") as { id?: string };
+      const settled = worker.waitForSettled();
+      record(child, {
+        type: "response",
+        id: stateRequest.id,
+        command: "get_state",
+        success: true,
+        data: { isStreaming: false, pendingMessageCount: 0 },
+      });
+      await settled;
+      await expect(worker.getLastAssistantText()).resolves.toBeUndefined();
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

@@ -9,14 +9,12 @@ export class SerialQueue {
   run<T>(task: () => Promise<T>): Promise<T> {
     this.pending += 1;
     const result = this.tail.then(task, task);
-    this.tail = result.then(
-      () => { this.pending -= 1; },
-      () => { this.pending -= 1; },
-    );
+    const decrement = () => { this.pending -= 1; };
+    this.tail = result.then(decrement, decrement);
     return result;
   }
 
-  async idle(): Promise<void> {
-    await this.tail;
+  idle(): Promise<void> {
+    return this.tail;
   }
 }

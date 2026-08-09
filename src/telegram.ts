@@ -321,10 +321,8 @@ export class TelegramDeliveryQueue {
 
     const result = state.run(() => invokeCallback(operation));
     this.pending.add(result);
-    void result.then(
-      () => this.complete(chatId, state!, result),
-      () => this.complete(chatId, state!, result),
-    );
+    const complete = () => { this.complete(chatId, state!, result); };
+    void result.then(complete, complete);
     return result;
   }
 
@@ -336,10 +334,7 @@ export class TelegramDeliveryQueue {
   async drain(): Promise<void> {
     while (this.pending.size > 0) {
       const accepted = [...this.pending];
-      await Promise.all(accepted.map((operation) => operation.then(
-        () => undefined,
-        () => undefined,
-      )));
+      await Promise.all(accepted.map((operation) => operation.catch(() => undefined)));
       await Promise.resolve();
     }
   }

@@ -177,13 +177,11 @@ async function openPinnedDirectory(directory: string): Promise<PinnedDirectory> 
   const initial = await lstat(directory);
   if (!isDirectoryEntry(initial)) throw new Error(`Outbox path is not a real directory: ${directory}`);
   const canonical = await realpath(directory);
-  const canonicalStat = await lstat(canonical);
-  if (!isDirectoryEntry(canonicalStat)) throw new Error(`Outbox path is not a real directory: ${directory}`);
 
   const handle = await open(canonical, fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW);
   try {
     const openedStat = await handle.stat();
-    if (!isDirectoryEntry(openedStat) || openedStat.dev !== canonicalStat.dev || openedStat.ino !== canonicalStat.ino) {
+    if (!isDirectoryEntry(openedStat) || openedStat.dev !== initial.dev || openedStat.ino !== initial.ino) {
       throw new Error(`Outbox directory changed while opening: ${directory}`);
     }
     const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);

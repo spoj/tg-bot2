@@ -2,15 +2,12 @@ import { constants as fsConstants } from "node:fs";
 import { access, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
+export { spawnProcess };
 export type PiWorkerChildProcess = ChildProcess;
 export type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
 export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
 
-/** Spawn a Pi worker within the sandbox boundary. */
-export function spawnPiWorker(executable: string, args: string[], options: PiWorkerSpawnOptions): ChildProcess {
-  return spawn(executable, args, options);
-}
 /** Terminate the process group, then the child if needed. */
 export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid !== undefined && child.pid !== null && child.pid > 0) {
@@ -100,6 +97,8 @@ export async function buildBwrapArgs(
   for (const candidate of paths.readOnlyPaths ?? []) {
     let resolved: string;
     try {
+      const entry = await lstat(candidate);
+      if (entry.isSymbolicLink()) throw new Error("Sandbox read-only paths must not be symlinks");
       resolved = await realpath(candidate);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -109,8 +108,6 @@ export async function buildBwrapArgs(
     if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error("Sandbox read-only paths must remain under the workspace");
     }
-    const entry = await lstat(resolved);
-    if (entry.isSymbolicLink()) throw new Error("Sandbox read-only paths must not be symlinks");
     protectedMounts.push([resolved, path.posix.join("/workspace", relative.split(path.sep).join("/"))]);
   }
   args.push(
@@ -181,8 +178,8 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
   const hostCliPath = requestedCli.startsWith("/app/node_modules/")
     ? path.join(nodeModules, requestedCli.slice("/app/node_modules/".length))
     : path.isAbsolute(requestedCli) ? requestedCli : path.resolve(appRoot, requestedCli);
+  const cliStat = await lstat(hostCliPath);
   const cliPath = await realpath(hostCliPath);
-  const cliStat = await lstat(cliPath);
   if (!cliStat.isFile() || cliStat.isSymbolicLink()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
 
@@ -262,8 +259,8 @@ export async function runSandbox(
   if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("maxOutputBytes must be a positive integer");
   const capture = outputCapture(limit);
 
-  return await new Promise<SandboxResult>((resolve, reject) => {
-    const child = spawn(options.bwrapPath ?? "bwrap", args, {
+  return new Promise<SandboxResult>((resolve, reject) => {
+    const child = spawnProcess(options.bwrapPath ?? "bwrap", args, {
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
       env: {},

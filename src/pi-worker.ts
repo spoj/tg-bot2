@@ -4,7 +4,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   buildPiWorkerBwrapArgs,
-  spawnPiWorker,
+  spawnProcess as sandboxSpawnProcess,
   terminateProcessGroup,
   type PiWorkerChildProcess,
   type PiWorkerSandboxPaths,
@@ -322,7 +322,7 @@ export class PiRpcWorker {
     this.bwrapPath = options.bwrapPath ?? "bwrap";
     this.cliPath = options.cliPath;
     this.appendSystemPrompt = options.appendSystemPrompt;
-    this.spawnProcess = options.spawn ?? spawnPiWorker;
+    this.spawnProcess = options.spawn ?? sandboxSpawnProcess;
     this.stopGraceMs = options.stopGraceMs ?? 1_000;
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.stopGraceMs) || this.stopGraceMs < 0) {
@@ -397,6 +397,13 @@ export class PiRpcWorker {
     this.extensionChangeVersion = 0;
   }
 
+  private clearWorkSets(): void {
+    this.unsettledWork.clear();
+    this.acceptedWork.clear();
+    this.startedWork.clear();
+    this.settledBeforeAcceptance.clear();
+  }
+
   private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
     if (this.stopping || !this.process) return;
     if (this.extensionReloadTimer) clearTimeout(this.extensionReloadTimer);
@@ -433,7 +440,12 @@ export class PiRpcWorker {
       try {
         await reload;
         if (this.extensionChangeVersion === changeVersion) {
-          this.extensionSettingsFingerprint = await extensionSettingsFingerprint(this.workspace) ?? this.extensionSettingsFingerprint;
+          const refreshedFingerprint = await extensionSettingsFingerprint(this.workspace);
+          if (this.extensionChangeVersion === changeVersion) {
+            this.extensionSettingsFingerprint = refreshedFingerprint ?? this.extensionSettingsFingerprint;
+          } else {
+            this.scheduleExtensionReload();
+          }
         } else {
           this.scheduleExtensionReload();
         }
@@ -476,10 +488,7 @@ export class PiRpcWorker {
       this.clearPromptSettlementTimers();
       this.rejectPending(stopped);
       this.rejectSettledWaiters(stopped);
-      this.unsettledWork.clear();
-      this.acceptedWork.clear();
-      this.startedWork.clear();
-      this.settledBeforeAcceptance.clear();
+      this.clearWorkSets();
       if (!keepExtensionWatcher) this.clearExtensionChangeState();
       return;
     }
@@ -504,10 +513,7 @@ export class PiRpcWorker {
       }
     }
     this.clearPromptSettlementTimers();
-    this.unsettledWork.clear();
-    this.acceptedWork.clear();
-    this.startedWork.clear();
-    this.settledBeforeAcceptance.clear();
+    this.clearWorkSets();
     this.process = undefined;
     this.processDone = undefined;
     this.resolveProcessDone = undefined;
@@ -567,10 +573,7 @@ export class PiRpcWorker {
     this.lastAssistantText = undefined;
     this.assistantTextKnown = false;
     this.workEpoch = 0;
-    this.unsettledWork.clear();
-    this.acceptedWork.clear();
-    this.startedWork.clear();
-    this.settledBeforeAcceptance.clear();
+    this.clearWorkSets();
     this.clearPromptSettlementTimers();
     this.process = child;
     this.stopping = false;
@@ -754,9 +757,7 @@ export class PiRpcWorker {
       try {
         stdin.write(line);
       } catch (error) {
-        this.pending.delete(id);
-        if (pending.timeout) clearTimeout(pending.timeout);
-        reject(asError(error));
+        this.failProcess(asError(error));
       }
     });
   }

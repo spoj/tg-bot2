@@ -1,10 +1,11 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { PiRpcWorker, StrictJsonlParser, type PiWorkerSpawn } from "../src/pi-worker.js";
+import { buildBwrapArgs, buildPiWorkerBwrapArgs } from "../src/sandbox.js";
 
 type Signal = NodeJS.Signals | null;
 
@@ -64,6 +65,27 @@ describe("StrictJsonlParser", () => {
     expect(() => parser.push("not-json\n")).toThrow("Invalid Pi RPC JSON");
   });
 });
+
+it("rejects symlinked read-only and CLI sources", async () => {
+  const f = await fixture();
+  const sessions = path.join(f.root, "sessions");
+  const readOnlyTarget = path.join(f.workspace, "target");
+  const readOnlyLink = path.join(f.workspace, "linked-target");
+  const cliLink = path.join(f.root, "linked-cli.js");
+  try {
+    await mkdir(sessions);
+    await mkdir(readOnlyTarget);
+    await symlink(readOnlyTarget, readOnlyLink, "dir");
+    await expect(buildBwrapArgs({ workspace: f.workspace, sessions, readOnlyPaths: [readOnlyLink] }, { executable: "/bin/cat", args: [] }))
+      .rejects.toThrow("read-only paths must not be symlinks");
+    await symlink(f.cliPath, cliLink, "file");
+    await expect(buildPiWorkerBwrapArgs({ workspace: f.workspace, appRoot: f.appRoot, cliPath: cliLink }))
+      .rejects.toThrow("CLI must be a regular file");
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
 
 describe("PiRpcWorker", () => {
   it("constructs a read-only app worker profile and correlates responses", async () => {
@@ -467,6 +489,29 @@ describe("PiRpcWorker", () => {
       await expect(settled).rejects.toThrow("Pi worker exited");
       child.emit("close", 1, null);
       expect(command.id).toMatch(/^pi-rpc-/);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("terminates after a synchronous stdin write failure", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      child.stdin.write = (() => {
+        throw new Error("stdin write failed");
+      }) as typeof child.stdin.write;
+      await expect(worker.prompt("fails synchronously")).rejects.toThrow("stdin write failed");
+      await expect(worker.prompt("is terminal")).rejects.toThrow("stdin write failed");
+      expect(child.signals).toContain("SIGKILL");
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

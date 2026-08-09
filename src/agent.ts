@@ -347,6 +347,13 @@ export class AgentManager {
       if (tail === state.progressTail) return;
     }
   }
+  private finishProgressDrain(state: ChatState): Promise<void> {
+    const progress = this.drainProgress(state);
+    return state.shutdownError
+      ? bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {})
+      : progress;
+  }
+
 
   private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string> {
     let run!: Promise<string>;
@@ -364,12 +371,7 @@ export class AgentManager {
         await this.invalidateWorker(state, worker).catch(() => {});
         throw error;
       } finally {
-        const progress = this.drainProgress(state);
-        if (state.shutdownError) {
-          await bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {});
-        } else {
-          await progress;
-        }
+        await this.finishProgressDrain(state);
         if (state.activeRun === run) state.activeRun = undefined;
       }
     })();
@@ -389,22 +391,16 @@ export class AgentManager {
     const state = this.state(chatId);
     const action = await state.queue.run(async (): Promise<PromptAction> => {
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      if (mode === "interactive" && state.activeRun) {
+      if (state.activeRun) {
         const activeWorker = state.worker;
-        if (activeWorker) {
+        if (mode === "interactive" && activeWorker) {
           return { kind: "steer", completion: this.steer(state, activeWorker, text) };
         }
-        await this.raceShutdown(state, state.activeRun).catch(() => {});
-      }
-      if (mode === "follow-up" && state.activeRun) {
         await this.raceShutdown(state, state.activeRun).catch(() => {});
       }
 
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      if (mode === "interactive" && state.activeRun) {
-        return { kind: "steer", completion: this.steer(state, worker, text) };
-      }
       const completion = this.beginRun(state, worker, () => worker.prompt(text));
       return { kind: "prompt", completion };
     });
@@ -413,12 +409,7 @@ export class AgentManager {
       try {
         await action.completion;
       } finally {
-        const progress = this.drainProgress(state);
-        if (state.shutdownError) {
-          await bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {});
-        } else {
-          await progress;
-        }
+        await this.finishProgressDrain(state);
       }
       return undefined;
     }

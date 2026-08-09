@@ -141,6 +141,36 @@ it("steers an interactive request while the active worker run owns the response"
   expect(worker.prompt).toHaveBeenCalledTimes(1);
 });
 
+it("waits for active work when the current worker is invalidated", async () => {
+  const worker = fakeWorker("first response");
+  const replacement = fakeWorker("replacement response");
+  const firstDone = deferred<void>();
+  const stopDone = deferred<void>();
+  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
+    await firstDone.promise;
+  });
+  vi.mocked(worker.stop).mockImplementationOnce(async () => {
+    await stopDone.promise;
+  });
+  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
+
+  const first = manager.prompt(13, "first");
+  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
+  worker.emit({ type: "worker_error", error: "reload failed" });
+  await vi.waitFor(() => expect(worker.stop).toHaveBeenCalledOnce());
+  const second = manager.prompt(13, "second");
+  await Promise.resolve();
+  expect(worker.steer).not.toHaveBeenCalled();
+  expect(replacement.prompt).not.toHaveBeenCalled();
+
+  firstDone.resolve();
+  stopDone.resolve();
+  await expect(first).resolves.toBe("first response");
+  await expect(second).resolves.toBe("replacement response");
+  expect(replacement.prompt).toHaveBeenCalledWith("second");
+});
+
 it("waits for active work before issuing an independent follow-up prompt", async () => {
   const worker = fakeWorker("follow-up response");
   const firstDone = deferred<void>();

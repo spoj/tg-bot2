@@ -392,9 +392,8 @@ export class AgentManager {
     const action = await state.queue.run(async (): Promise<PromptAction> => {
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
       if (state.activeRun) {
-        const activeWorker = state.worker;
-        if (mode === "interactive" && activeWorker) {
-          return { kind: "steer", completion: this.steer(state, activeWorker, text) };
+        if (mode === "interactive" && state.worker) {
+          return { kind: "steer", completion: this.steer(state, state.worker, text) };
         }
         await this.raceShutdown(state, state.activeRun).catch(() => {});
       }

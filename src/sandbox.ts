@@ -3,10 +3,10 @@ import { access, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 
 import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
-export { spawnProcess };
 export type PiWorkerChildProcess = ChildProcess;
 export type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
 export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
+export { spawnProcess };
 
 /** Terminate the process group, then the child if needed. */
 export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {

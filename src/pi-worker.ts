@@ -779,10 +779,7 @@ export class PiRpcWorker {
   }
 
   private settleAllWork(): void {
-    for (const epoch of [...this.unsettledWork]) this.settleWork(epoch);
-    this.acceptedWork.clear();
-    this.startedWork.clear();
-    this.settledBeforeAcceptance.clear();
+    for (const epoch of this.unsettledWork) this.settleWork(epoch);
   }
 
   private settleWork(epoch: number): void {

@@ -126,7 +126,7 @@ function validateRecord(value: unknown, index: number): StoredScheduleRecord {
   }
   if (typeof record.enabled !== "boolean") invalid(`record ${index} has an invalid enabled flag`);
   if (record.lastRunAt !== null && !isUtcIso(record.lastRunAt)) invalid(`record ${index} has an invalid lastRunAt`);
-  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0 || record.runCount >= Number.MAX_SAFE_INTEGER) {
+  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0 || record.runCount > Number.MAX_SAFE_INTEGER) {
     invalid(`record ${index} has an invalid runCount`);
   }
   return { ...record } as StoredScheduleRecord;
@@ -349,7 +349,7 @@ export class WorkspaceScheduler {
     const updated: StoredScheduleRecord = {
       ...current,
       lastRunAt: new Date(now).toISOString(),
-      runCount: current.runCount + 1,
+      runCount: Math.min(current.runCount + 1, Number.MAX_SAFE_INTEGER),
     };
     if (current.recurrence === null) {
       updated.enabled = false;

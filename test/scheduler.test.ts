@@ -92,8 +92,11 @@ describe("WorkspaceScheduler discovery and validation", () => {
     expect(runs).toEqual([[-2, "chat negative"], [12, "chat twelve"]]);
     expect(errors.length).toBeGreaterThanOrEqual(3);
   }));
-  it("rejects the maximum safe run count before execution", async () => withDirectory(async (dataDir) => {
-    const filePath = await writeSchedules(dataDir, 6, [record({ runCount: Number.MAX_SAFE_INTEGER })]);
+  it("saturates the maximum safe run count without invalidating unrelated schedules", async () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, 6, [
+      record({ id: "boundary", prompt: "boundary", runCount: Number.MAX_SAFE_INTEGER }),
+      record({ id: "unrelated", prompt: "unrelated" }),
+    ]);
     const runs: string[] = [];
     const scheduler = new WorkspaceScheduler({
       dataDir,
@@ -102,8 +105,11 @@ describe("WorkspaceScheduler discovery and validation", () => {
     });
 
     await scheduler.poll(NOW);
-    expect(runs).toEqual([]);
-    expect((await readSchedules(filePath)).schedules[0]!.runCount).toBe(Number.MAX_SAFE_INTEGER);
+    expect(runs).toEqual(["boundary", "unrelated"]);
+    expect((await readSchedules(filePath)).schedules).toMatchObject([
+      { id: "boundary", enabled: false, runCount: Number.MAX_SAFE_INTEGER },
+      { id: "unrelated", enabled: false, runCount: 1 },
+    ]);
   }));
 
   it("rejects symlinked workspace metadata directories", async () => withDirectory(async (dataDir) => {

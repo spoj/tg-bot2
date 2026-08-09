@@ -28,6 +28,7 @@ export type WorkspaceOutboxOptions = {
 };
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_REQUEST_ID_LENGTH = 256;
@@ -218,8 +219,8 @@ export class WorkspaceOutbox {
   private running = false;
 
   constructor(options: WorkspaceOutboxOptions) {
-    if (!Number.isSafeInteger(options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS) || (options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS) <= 0) {
-      throw new Error("Outbox poll interval must be a positive integer");
+    if (!Number.isSafeInteger(options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS) || (options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS) <= 0 || (options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS) > MAX_TIMER_MS) {
+      throw new Error("Outbox poll interval must be a positive timer-safe integer");
     }
     this.dataDir = path.resolve(options.dataDir);
     this.sendFile = options.sendFile;

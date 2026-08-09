@@ -36,6 +36,14 @@ const valid = (id = "one", filePath = "/workspace/report.txt") => ({
 });
 
 describe("WorkspaceOutbox", () => {
+  it("rejects poll intervals above the timer-safe limit", async () => {
+    const { dataDir } = await fixture();
+    expect(() => new WorkspaceOutbox({
+      dataDir,
+      sendFile: async () => {},
+      pollIntervalMs: 2_147_483_648,
+    })).toThrow("positive timer-safe integer");
+  });
   it("delivers valid requests and moves them to processed", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "one.json", valid());

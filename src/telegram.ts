@@ -57,7 +57,6 @@ export type TelegramIngressEntry = {
 type BufferEntry = TelegramIngressEntry;
 
 type PendingBatch = {
-  readonly id: number;
   readonly chatId: number;
   readonly entries: readonly BufferEntry[];
   readonly owner: BufferEntry;
@@ -98,7 +97,6 @@ function isTelegramBatchResult(value: unknown): value is TelegramBatchResult {
 
 export class TelegramIngressBuffer {
   private closed = false;
-  private nextBatchId = 1;
   private readonly states = new Map<number, BufferState>();
 
   constructor(
@@ -199,7 +197,6 @@ export class TelegramIngressBuffer {
     if (state.barrier) state.barrier.pending -= entries.length;
     this.cancelTimer(state);
     const batch: PendingBatch = Object.freeze({
-      id: this.nextBatchId++,
       chatId,
       entries: Object.freeze(entries),
       owner,

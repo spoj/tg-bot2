@@ -7,6 +7,7 @@ import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
+import { SerialQueue } from "./queue.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
@@ -307,38 +308,29 @@ export class TelegramIngressBuffer {
 }
 type TelegramDeliveryOperation<T> = () => T | PromiseLike<T>;
 
-type DeliveryState = {
-  tail: Promise<void>;
-};
-
 export class TelegramDeliveryQueue {
-  private readonly states = new Map<number, DeliveryState>();
+  private readonly states = new Map<number, SerialQueue>();
   private readonly pending = new Set<Promise<unknown>>();
 
   enqueue<T>(chatId: number, operation: TelegramDeliveryOperation<T>): Promise<T> {
     let state = this.states.get(chatId);
     if (!state) {
-      state = { tail: Promise.resolve() };
+      state = new SerialQueue();
       this.states.set(chatId, state);
     }
 
-    const result = state.tail.then(() => invokeCallback(operation));
-    const tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    state.tail = tail;
+    const result = state.run(() => invokeCallback(operation));
     this.pending.add(result);
     void result.then(
-      () => this.complete(chatId, state!, tail, result),
-      () => this.complete(chatId, state!, tail, result),
+      () => this.complete(chatId, state!, result),
+      () => this.complete(chatId, state!, result),
     );
     return result;
   }
 
-  private complete(chatId: number, state: DeliveryState, tail: Promise<void>, result: Promise<unknown>): void {
+  private complete(chatId: number, state: SerialQueue, result: Promise<unknown>): void {
     this.pending.delete(result);
-    if (state.tail === tail && this.states.get(chatId) === state) this.states.delete(chatId);
+    if (state.size === 0 && this.states.get(chatId) === state) this.states.delete(chatId);
   }
 
   async drain(): Promise<void> {

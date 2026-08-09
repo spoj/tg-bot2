@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, link, unlink } from "node:fs/promises";
+import { lstat, link, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
+import { SerialQueue } from "./queue.js";
 
 export type WorkspaceOutboxRequest = {
   version: 1;
@@ -212,7 +213,7 @@ export class WorkspaceOutbox {
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
-  private readonly chatOperations = new Map<number, Promise<void>>();
+  private readonly chatOperations = new Map<number, SerialQueue>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -262,7 +263,7 @@ export class WorkspaceOutbox {
       const pending: Promise<void>[] = [];
       if (this.startInFlight) pending.push(this.startInFlight);
       if (this.pollInFlight) pending.push(this.pollInFlight);
-      pending.push(...this.chatOperations.values());
+      pending.push(...[...this.chatOperations.values()].map((queue) => queue.idle()));
       if (pending.length === 0) return;
       await Promise.all(pending.map((operation) => operation.catch(() => {})));
     }
@@ -285,16 +286,16 @@ export class WorkspaceOutbox {
     if (!Number.isSafeInteger(chatId)) throw new Error("Outbox chat ID must be a safe integer");
     const workspace = path.join(this.dataDir, "chats", String(chatId), "workspace");
 
-    const previous = this.chatOperations.get(chatId) ?? Promise.resolve();
-    const operation = previous.then(
-      () => this.processChatNow(chatId, workspace),
-      () => this.processChatNow(chatId, workspace),
-    );
-    this.chatOperations.set(chatId, operation);
+    let queue = this.chatOperations.get(chatId);
+    if (!queue) {
+      queue = new SerialQueue();
+      this.chatOperations.set(chatId, queue);
+    }
+    const operation = queue.run(() => this.processChatNow(chatId, workspace));
     try {
       await operation;
     } finally {
-      if (this.chatOperations.get(chatId) === operation) this.chatOperations.delete(chatId);
+      if (queue.size === 0 && this.chatOperations.get(chatId) === queue) this.chatOperations.delete(chatId);
     }
   }
 
@@ -350,9 +351,7 @@ export class WorkspaceOutbox {
         .sort((a, b) => a.name.localeCompare(b.name));
 
       for (const entry of entries) {
-        const claim = CLAIM_NAME.test(entry.name)
-          ? await this.claimStaleEntry(openedOutbox, entry, chatId)
-          : await this.claimEntry(openedOutbox, entry, chatId);
+        const claim = await this.claimEntry(openedOutbox, entry, chatId, CLAIM_NAME.test(entry.name));
         if (!claim) continue;
         const archiveName = claim.originalName ?? entry.name;
         let lease: ClaimLease | undefined;
@@ -445,8 +444,13 @@ export class WorkspaceOutbox {
     return Number.isFinite(current) && current >= createdAt && current - createdAt >= STALE_CLAIM_AGE_MS;
   }
 
-  private async claimStaleEntry(outbox: PinnedDirectory, entry: OutboxEntry, chatId: number): Promise<OutboxEntry | undefined> {
-    if (!this.isStaleClaim(entry.name)) return undefined;
+  private async claimEntry(
+    outbox: PinnedDirectory,
+    entry: OutboxEntry,
+    chatId: number,
+    stale = false,
+  ): Promise<OutboxEntry | undefined> {
+    if (stale && !this.isStaleClaim(entry.name)) return undefined;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       let claimName: string;
       try {
@@ -466,31 +470,7 @@ export class WorkspaceOutbox {
         return undefined;
       }
     }
-    this.reportRequestError(chatId, entry.name, new Error("Unable to claim stale outbox request"));
-    return undefined;
-  }
-
-  private async claimEntry(outbox: PinnedDirectory, entry: OutboxEntry, chatId: number): Promise<OutboxEntry | undefined> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      let claimName: string;
-      try {
-        claimName = `.in-progress-${this.now()}-${randomUUID()}`;
-      } catch (error) {
-        this.reportRequestError(chatId, entry.name, error);
-        return undefined;
-      }
-      const claimPath = path.join(outbox.path, claimName);
-      try {
-        await rename(entry.path, claimPath);
-        return { name: claimName, path: claimPath, originalName: entry.name };
-      } catch (error) {
-        if (isMissing(error)) return undefined;
-        if (isExisting(error)) continue;
-        this.reportRequestError(chatId, entry.name, error);
-        return undefined;
-      }
-    }
-    this.reportRequestError(chatId, entry.name, new Error("Unable to claim outbox request"));
+    this.reportRequestError(chatId, entry.name, new Error(`Unable to claim${stale ? " stale" : ""} outbox request`));
     return undefined;
   }
 

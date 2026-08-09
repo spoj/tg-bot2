@@ -2,7 +2,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
-import { appendFile, mkdtemp, mkdir, open as openFile, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, open as openFile, readFile, readdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 
@@ -39,7 +39,7 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
   }
 }
 
-async function runAttachmentFixture(dataDir: string, fetchImplementation: typeof fetch): Promise<ReturnType<typeof vi.fn>> {
+async function runAttachmentFixture(dataDir: string, fetchImplementation: typeof fetch, fileName = "report.txt"): Promise<ReturnType<typeof vi.fn>> {
   const prompt = vi.fn(async () => undefined);
   const bot = createTelegramBot({
     token: "test-token",
@@ -60,7 +60,7 @@ async function runAttachmentFixture(dataDir: string, fetchImplementation: typeof
       date: 1_700_000_000,
       chat: { id: 42, type: "private" },
       from: { id: 42, is_bot: false, first_name: "Test" },
-      document: { file_id: "file-id", file_name: "report.txt", mime_type: "text/plain" },
+      document: { file_id: "file-id", file_name: fileName, mime_type: "text/plain" },
     },
   } as never);
   await flushTelegramIngress(bot);
@@ -97,6 +97,12 @@ describe("splitTelegramText", () => {
   it("handles exact limits and empty input", () => {
     expect(splitTelegramText("abcd", 4)).toEqual(["abcd"]);
     expect(splitTelegramText("")).toEqual([]);
+  });
+  it("caps a delimiter that starts at the message limit", () => {
+    const text = `${"a".repeat(4_000)}\n\nb`;
+    const chunks = splitTelegramText(text);
+    expect(chunks).toEqual(["a".repeat(4_000), "\n\nb"]);
+    expect(chunks.every((chunk) => chunk.length <= 4_000)).toBe(true);
   });
 });
 
@@ -628,7 +634,30 @@ describe("Telegram attachment downloads", () => {
     }
   });
 
+  it("cancels an attachment reader after an oversized response", async () => {
+    try {
+      await withWorkspace(async (dataDir) => {
+        let cancelled = false;
+        const response = new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(20 * 1024 * 1024));
+            controller.enqueue(new Uint8Array([1]));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }), { status: 200 });
+        const prompt = await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
+        expect(prompt.mock.calls[0]?.[1]).toMatch(/20 MB/);
+        expect(cancelled).toBe(true);
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("streams a bounded response while preserving attachment metadata", async () => {
+
     try {
       await withWorkspace(async (dataDir) => {
         const response = chunkedResponse([
@@ -640,6 +669,22 @@ describe("Telegram attachment downloads", () => {
         expect(await readFile(destination, "utf8")).toBe("hello telegram");
         expect(prompt.mock.calls[0]?.[1]).toMatch(/text\/plain/);
         expect(prompt.mock.calls[0]?.[1]).toMatch(/report\.txt/);
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps Unicode attachment filenames within Linux filename limits", async () => {
+    try {
+      await withWorkspace(async (dataDir) => {
+        const fileName = `${"界".repeat(100)}.txt`;
+        const prompt = await runAttachmentFixture(dataDir, vi.fn(async () => chunkedResponse([new TextEncoder().encode("hello")])) as unknown as typeof fetch, fileName);
+        expect(prompt.mock.calls[0]?.[1]).not.toMatch(/download failed/);
+        const directory = path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7");
+        const [savedName] = await readdir(directory);
+        expect(savedName).toBeDefined();
+        expect(Buffer.byteLength(savedName!)).toBeLessThanOrEqual(255);
       });
     } finally {
       vi.unstubAllGlobals();

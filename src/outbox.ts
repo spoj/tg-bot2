@@ -139,7 +139,7 @@ function validateWorkspacePath(workspace: string, requestPath: string): void {
     throw new Error("Outbox request path escapes the workspace");
   }
   const candidate = path.resolve(workspace, relative);
-  if (outside(workspace, candidate)) throw new Error("Outbox request path escapes the workspace");
+  if (candidate === path.resolve(workspace) || outside(workspace, candidate)) throw new Error("Outbox request path escapes the workspace");
 }
 
 async function readRequest(filePath: string): Promise<WorkspaceOutboxRequest> {
@@ -208,7 +208,6 @@ export class WorkspaceOutbox {
   private readonly sendFile: WorkspaceOutboxSender;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
-  private readonly claimOriginalNames = new Map<string, string>();
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
@@ -377,7 +376,6 @@ export class WorkspaceOutbox {
           this.reportRequestError(chatId, archiveName, error);
         } finally {
           if (lease) await lease.stop();
-          this.claimOriginalNames.delete(claim.path);
         }
       }
 
@@ -426,8 +424,6 @@ export class WorkspaceOutbox {
       const claimPath = path.join(path.dirname(previousPath), claimName);
       try {
         await rename(previousPath, claimPath);
-        this.claimOriginalNames.delete(previousPath);
-        this.claimOriginalNames.set(claimPath, claim.originalName ?? claim.name);
         claim.name = claimName;
         claim.path = claimPath;
         return;
@@ -461,9 +457,7 @@ export class WorkspaceOutbox {
       const claimPath = path.join(outbox.path, claimName);
       try {
         await rename(entry.path, claimPath);
-        const originalName = this.claimOriginalNames.get(entry.path) ?? entry.name;
-        this.claimOriginalNames.set(claimPath, originalName);
-        return { name: claimName, path: claimPath, originalName };
+        return { name: claimName, path: claimPath, originalName: entry.name };
       } catch (error) {
         if (isMissing(error)) return undefined;
         if (isExisting(error)) continue;
@@ -487,7 +481,6 @@ export class WorkspaceOutbox {
       const claimPath = path.join(outbox.path, claimName);
       try {
         await rename(entry.path, claimPath);
-        this.claimOriginalNames.set(claimPath, entry.name);
         return { name: claimName, path: claimPath, originalName: entry.name };
       } catch (error) {
         if (isMissing(error)) return undefined;

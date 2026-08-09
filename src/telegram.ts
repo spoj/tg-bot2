@@ -367,8 +367,7 @@ export function splitTelegramText(text: string, limit = 4000): string[] {
     if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf("\n", limit);
     if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf(" ", limit);
     if (cut < 1) cut = limit;
-    else if (rest[cut] === "\n") cut += rest[cut + 1] === "\n" ? 2 : 1;
-    else cut += 1;
+    else cut = Math.min(limit, cut + (rest[cut] === "\n" && rest[cut + 1] === "\n" ? 2 : 1));
     chunks.push(rest.slice(0, cut));
     rest = rest.slice(cut);
   }
@@ -511,7 +510,7 @@ function safeFilename(name: string | undefined, fallback: string): string {
     .normalize("NFKC")
     .replace(/[^\p{L}\p{N}._ -]/gu, "_")
     .replace(/^\.+/, "")
-    .slice(0, 160);
+    .slice(0, 48);
   return base || fallback;
 }
 
@@ -583,6 +582,7 @@ async function readAttachmentBody(response: Response, destination: Awaited<Retur
       if (signal.aborted) throw new AttachmentDownloadFailure("Telegram attachment download timed out.");
     }
   } finally {
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

@@ -114,6 +114,20 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["escape.json"]);
   });
 
+  it("rejects workspace directory aliases before invoking the host callback", async () => {
+    const { dataDir, workspace } = await fixture();
+    const aliases = ["/workspace/", "/workspace/.", "/workspace/./"];
+    for (const [index, requestPath] of aliases.entries()) {
+      await request(workspace, `alias-${index}.json`, valid(`alias-${index}`, requestPath));
+    }
+    const sendFile = vi.fn(async () => {});
+    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
+    expect(sendFile).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual([
+      "alias-0.json", "alias-1.json", "alias-2.json",
+    ]);
+  });
+
   it("rejects symlinked request files without following them", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");

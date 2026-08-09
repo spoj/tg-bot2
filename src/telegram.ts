@@ -231,7 +231,9 @@ export class TelegramIngressBuffer {
   private async executeBatch(batch: PendingBatch): Promise<void> {
     let typing: NodeJS.Timeout | undefined;
     try {
-      await invokeCallback(batch.owner.typing).catch(() => {});
+      void invokeCallback(batch.owner.typing).catch((error) => {
+        console.error("Buffered Telegram initial typing notification failed", error);
+      });
       typing = setInterval(() => {
         void invokeCallback(batch.owner.typing).catch((error) => {
           console.error("Buffered Telegram typing notification failed", error);
@@ -448,6 +450,7 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
 }
 type AttachmentDirectory = {
   path: string;
+  expectedPath: string;
   handle: Awaited<ReturnType<typeof open>>;
 };
 
@@ -482,10 +485,23 @@ async function ensureAttachmentDirectory(workspace: string, date: string, messag
     handle = await open(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
     const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
     if (!isWithinWorkspace(root, openedPath)) throw new Error("Attachment directory is not safe.");
-    return { path: `/proc/self/fd/${handle.fd}`, handle };
+    return { path: `/proc/self/fd/${handle.fd}`, expectedPath: directory, handle };
   } catch (error) {
     await handle?.close().catch(() => {});
     throw error;
+  }
+}
+
+function cancelAttachmentResponse(response: Response, controller: AbortController): void {
+  controller.abort();
+  if (response.body) void response.body.cancel().catch(() => {});
+}
+
+async function verifyAttachmentDirectory(directory: AttachmentDirectory): Promise<void> {
+  const live = await lstat(directory.expectedPath);
+  const pinned = await directory.handle.stat();
+  if (!live.isDirectory() || live.dev !== pinned.dev || live.ino !== pinned.ino) {
+    throw new AttachmentDownloadFailure("Telegram attachment download failed.");
   }
 }
 
@@ -594,16 +610,23 @@ async function downloadAttachment(
     return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
   }
   try {
-    const file = await bot.api.getFile(source.fileId);
-    if (!file.file_path) return { ...common, failure: "Telegram did not provide a downloadable file path." };
     const controller = new AbortController();
+    const file = await attachmentTimeout(
+      Promise.resolve().then(() => bot.api.getFile(source.fileId)),
+      controller,
+    );
+    if (!file.file_path) return { ...common, failure: "Telegram did not provide a downloadable file path." };
     const response = await attachmentTimeout(
       fetch(`https://api.telegram.org/file/bot${config.token}/${file.file_path}`, { signal: controller.signal }),
       controller,
     );
-    if (!response.ok) return { ...common, failure: `Telegram download failed with HTTP ${response.status}.` };
+    if (!response.ok) {
+      cancelAttachmentResponse(response, controller);
+      return { ...common, failure: `Telegram download failed with HTTP ${response.status}.` };
+    }
     const declaredLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(declaredLength) && declaredLength > MAX_ATTACHMENT_BYTES) {
+      cancelAttachmentResponse(response, controller);
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
@@ -620,6 +643,7 @@ async function downloadAttachment(
       await temporaryHandle.close();
       temporaryHandle = undefined;
       await rename(temporary, path.join(directory, filename));
+      await verifyAttachmentDirectory(attachmentDirectory);
       return {
         ...common,
         path: `/workspace/attachments/${date}/${message.message_id}/${filename}`,
@@ -738,12 +762,16 @@ export function createTelegramBot(
   });
 
   bot.on("message", async (ctx) => {
-    const prepared = prepareMessage(bot, config, ctx);
-    ingress.add(ctx.chat.id, {
+    let startPreparation!: () => void;
+    const prepared = new Promise<BufferedTelegramMessage>((resolve, reject) => {
+      startPreparation = () => { void prepareMessage(bot, config, ctx).then(resolve, reject); };
+    });
+    const admission = ingress.add(ctx.chat.id, {
       value: prepared,
       respond: (text) => deliveryQueue.enqueue(ctx.chat.id, () => replyChunks(ctx, text)),
       typing: async () => { await ctx.replyWithChatAction("typing"); },
     });
+    if (admission.kind === "accepted") startPreparation();
   });
 
   bot.catch((error) => {

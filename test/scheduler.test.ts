@@ -92,6 +92,34 @@ describe("WorkspaceScheduler discovery and validation", () => {
     expect(runs).toEqual([[-2, "chat negative"], [12, "chat twelve"]]);
     expect(errors.length).toBeGreaterThanOrEqual(3);
   }));
+  it("rejects schedule files larger than the bounded read limit", async () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, 13, []);
+    await writeFile(filePath, "x".repeat(64 * 1024 + 1), "utf8");
+    const runs: string[] = [];
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; }, send: async () => {} });
+    await scheduler.poll(NOW);
+    expect(runs).toEqual([]);
+  }));
+
+  it("rejects schedule files with too many records", async () => withDirectory(async (dataDir) => {
+    const schedules = Array.from({ length: 257 }, (_value, index) => record({ id: `schedule-${index}` }));
+    await writeSchedules(dataDir, 13, schedules);
+    const runs: string[] = [];
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; }, send: async () => {} });
+    await scheduler.poll(NOW);
+    expect(runs).toEqual([]);
+  }));
+
+  it.each([
+    ["id", { id: "i".repeat(257) }],
+    ["prompt", { prompt: "p".repeat(16 * 1024 + 1) }],
+  ])("rejects a schedule record with an oversized %s", async (_field, overrides) => withDirectory(async (dataDir) => {
+    await writeSchedules(dataDir, 13, [record(overrides)]);
+    const runs: string[] = [];
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; }, send: async () => {} });
+    await scheduler.poll(NOW);
+    expect(runs).toEqual([]);
+  }));
   it("saturates the maximum safe run count without invalidating unrelated schedules", async () => withDirectory(async (dataDir) => {
     const filePath = await writeSchedules(dataDir, 6, [
       record({ id: "boundary", prompt: "boundary", runCount: Number.MAX_SAFE_INTEGER }),
@@ -151,6 +179,62 @@ describe("WorkspaceScheduler discovery and validation", () => {
     await scheduler.poll(NOW);
     expect((await readSchedules(replacementFile)).schedules[0]!.enabled).toBe(true);
   }));
+  it("does not execute a due record from detached metadata", async () => withDirectory(async (dataDir) => {
+    const original = await writeSchedules(dataDir, 15, [
+      record({ id: "first", prompt: "first" }),
+      record({ id: "later", prompt: "later" }),
+    ]);
+    const metadata = path.dirname(original);
+    const detached = `${metadata}.detached`;
+    const replacement = [
+      record({ id: "first", prompt: "replacement first" }),
+      record({ id: "later", prompt: "replacement later", enabled: false }),
+    ];
+    const runs: string[] = [];
+    const scheduler = new WorkspaceScheduler({
+      dataDir,
+      run: async (_chatId, prompt) => {
+        runs.push(prompt);
+        if (prompt === "first") {
+          await rename(metadata, detached);
+          await mkdir(metadata, { recursive: true });
+          await writeFile(path.join(metadata, "schedules.json"), JSON.stringify({ version: 1, schedules: replacement }), "utf8");
+        }
+        return "";
+      },
+      send: async () => {},
+    });
+
+    await scheduler.poll(NOW);
+    expect(runs).toEqual(["first"]);
+    expect((await readSchedules(path.join(metadata, "schedules.json"))).schedules.find((item) => item.id === "later")).toMatchObject({ enabled: false });
+  }));
+
+  it("releases per-chat directory handles before processing due work", async () => withDirectory(async (dataDir) => {
+    await writeSchedules(dataDir, 20, [record({ id: "due" })]);
+    await writeSchedules(dataDir, 21, [record({ id: "future", dueAt: new Date(NOW + 60_000).toISOString() })]);
+    const closedDirectories: string[] = [];
+    let closedAtRun: string[] = [];
+    const scheduler = new WorkspaceScheduler({
+      dataDir,
+      onDirectoryHandleClosed: (realPath) => { closedDirectories.push(realPath); },
+      run: async () => {
+        closedAtRun = [...closedDirectories];
+        return "";
+      },
+      send: async () => {},
+    });
+
+    await scheduler.poll(NOW);
+
+    const perChatDirectories = ["20", "21"].flatMap((chatId) => {
+      const chatDirectory = path.join(dataDir, "chats", chatId);
+      const workspaceDirectory = path.join(chatDirectory, "workspace");
+      return [chatDirectory, workspaceDirectory, path.join(workspaceDirectory, ".tg-bot")];
+    });
+    expect(closedAtRun).toEqual(expect.arrayContaining(perChatDirectories));
+  }));
+
 });
 
 describe("WorkspaceScheduler processing", () => {
@@ -292,6 +376,49 @@ describe("WorkspaceScheduler processing", () => {
     expect(errors).toHaveLength(1);
     expect(String((errors[0] as Error).cause)).toContain("leaving schedule due for a later poll");
   }));
+  it("preserves an agent atomic rename after the final content read", async () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, 16, [record({ prompt: "original" })]);
+    const probe = await openFile(filePath, "r");
+    const prototype = Object.getPrototypeOf(probe) as {
+      read: (this: unknown, ...args: any[]) => Promise<{ bytesRead: number }>;
+    };
+    const originalRead = prototype.read;
+    let successfulReads = 0;
+    const readSpy = vi.spyOn(prototype, "read").mockImplementation(async function (this: unknown, ...args: any[]) {
+      const result = await originalRead.apply(this, args);
+      if (result.bytesRead > 0) {
+        successfulReads += 1;
+        if (successfulReads === 4) {
+          const replacement = `${filePath}.agent`;
+          await writeFile(replacement, JSON.stringify({
+            version: 1,
+            schedules: [record({ prompt: "agent edit", runCount: 0 })],
+          }) + "\n", "utf8");
+          await rename(replacement, filePath);
+        }
+      }
+      return result;
+    });
+    const errors: unknown[] = [];
+    try {
+      const scheduler = new WorkspaceScheduler({
+        dataDir,
+        run: async () => "done",
+        send: async () => {},
+        logger: (error) => errors.push(error),
+      });
+      await scheduler.poll(NOW);
+    } finally {
+      readSpy.mockRestore();
+      await probe.close();
+    }
+
+    const persisted = await readSchedules(filePath);
+    expect(persisted.schedules[0]).toMatchObject({ prompt: "agent edit", enabled: true, runCount: 0 });
+    expect(errors).toHaveLength(1);
+    expect(String((errors[0] as Error).cause)).toContain("leaving schedule due for a later poll");
+  }));
+
 
 
   it("uses an atomic replacement without leaving temporary files", async () => withDirectory(async (dataDir) => {

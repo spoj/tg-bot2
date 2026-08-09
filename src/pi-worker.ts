@@ -65,8 +65,12 @@ export type PiRpcWorkerOptions = PiWorkerSandboxPaths & {
   /** Test seam; production spawning stays in sandbox.ts. */
   spawn?: PiWorkerSpawn;
   stopGraceMs?: number;
-  /** Bound RPCs so a silent worker cannot strand lifecycle operations. */
+  /** Bound fast RPC control requests so a silent worker cannot strand operations. */
   rpcTimeoutMs?: number;
+  /** Prompt acceptance can include extension/resource expansion work. */
+  promptTimeoutMs?: number;
+  /** Session lifecycle commands may perform asynchronous cleanup. */
+  lifecycleTimeoutMs?: number;
 };
 
 type PendingRequest = {
@@ -260,7 +264,26 @@ async function prepareWorkspace(workspace: string): Promise<void> {
   await ensureWebSearchConfig(workspace);
 }
 
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+const MAX_WORKER_STDERR_LENGTH = 64 * 1024;
 const MAX_WORKER_ERROR_LENGTH = 2_048;
+
+function validateTimer(name: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  if (value > MAX_NODE_TIMEOUT_MS) {
+    throw new Error(`${name} must not exceed ${MAX_NODE_TIMEOUT_MS}`);
+  }
+}
+
+function boundedStderr(previous: string, chunk: string | Buffer): string {
+  const incoming = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  const availablePrevious = MAX_WORKER_STDERR_LENGTH - 1 - incoming.length;
+  if (availablePrevious <= 0) return `…${incoming.slice(-(MAX_WORKER_STDERR_LENGTH - 1))}`;
+  if (previous.length > availablePrevious) return `…${previous.slice(-availablePrevious)}${incoming}`;
+  return previous + incoming;
+}
 
 function boundedErrorMessage(error: unknown): string {
   const message = asError(error).message;
@@ -269,9 +292,10 @@ function boundedErrorMessage(error: unknown): string {
     : `${message.slice(0, MAX_WORKER_ERROR_LENGTH - 1)}…`;
 }
 
-const IMMEDIATE_PROMPT_SETTLEMENT_MS = 50;
+const PROMPT_SETTLEMENT_PROBE_DELAY_MS = 50;
 const DEFAULT_RPC_TIMEOUT_MS = 1_000;
-
+const DEFAULT_PROMPT_TIMEOUT_MS = 30_000;
+const DEFAULT_LIFECYCLE_TIMEOUT_MS = 30_000;
 
 export class PiRpcWorker {
   private readonly workspace: string;
@@ -282,6 +306,15 @@ export class PiRpcWorker {
   private readonly spawnProcess: PiWorkerSpawn;
   private readonly stopGraceMs: number;
   private readonly rpcTimeoutMs: number;
+  private readonly promptTimeoutMs: number;
+  private readonly lifecycleTimeoutMs: number;
+  private readonly workErrors = new Map<number, Error>();
+  private readonly promptSettlementTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  private parser: StrictJsonlParser | undefined;
+  private lastAssistantText: string | undefined;
+  private assistantTextKnown = false;
+  private currentPromptText: string | undefined;
+  private settledError: Error | undefined;
   private process: PiWorkerChildProcess | undefined;
   private processDone: Promise<void> | undefined;
   private resolveProcessDone: (() => void) | undefined;
@@ -294,11 +327,6 @@ export class PiRpcWorker {
   private readonly acceptedWork = new Set<number>();
   private readonly startedWork = new Set<number>();
   private readonly settledBeforeAcceptance = new Set<number>();
-  private readonly promptSettlementTimers = new Map<number, ReturnType<typeof setTimeout>>();
-  private parser: StrictJsonlParser | undefined;
-  private lastAssistantText: string | undefined;
-  private assistantTextKnown = false;
-  private currentPromptText: string | undefined;
   private terminalError: Error | undefined;
   private reportedWorkerError: Error | undefined;
   private stderr = "";
@@ -325,12 +353,12 @@ export class PiRpcWorker {
     this.spawnProcess = options.spawn ?? sandboxSpawnProcess;
     this.stopGraceMs = options.stopGraceMs ?? 1_000;
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
-    if (!Number.isSafeInteger(this.stopGraceMs) || this.stopGraceMs < 0) {
-      throw new Error("stopGraceMs must be a non-negative integer");
-    }
-    if (!Number.isSafeInteger(this.rpcTimeoutMs) || this.rpcTimeoutMs < 0) {
-      throw new Error("rpcTimeoutMs must be a non-negative integer");
-    }
+    this.promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
+    this.lifecycleTimeoutMs = options.lifecycleTimeoutMs ?? DEFAULT_LIFECYCLE_TIMEOUT_MS;
+    validateTimer("stopGraceMs", this.stopGraceMs);
+    validateTimer("rpcTimeoutMs", this.rpcTimeoutMs);
+    validateTimer("promptTimeoutMs", this.promptTimeoutMs);
+    validateTimer("lifecycleTimeoutMs", this.lifecycleTimeoutMs);
   }
   private markExtensionChange(kind: "settings" | "resource"): void {
     if (kind === "settings") this.extensionSettingsDirty = true;
@@ -402,6 +430,8 @@ export class PiRpcWorker {
     this.acceptedWork.clear();
     this.startedWork.clear();
     this.settledBeforeAcceptance.clear();
+    this.workErrors.clear();
+    this.settledError = undefined;
   }
 
   private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
@@ -603,7 +633,7 @@ export class PiRpcWorker {
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       if (this.process !== child) return;
-      this.stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      this.stderr = boundedStderr(this.stderr, chunk);
     });
     child.once("error", (error) => {
       if (this.process !== child) return;
@@ -627,8 +657,15 @@ export class PiRpcWorker {
     }
     try {
       await this.startExtensionWatcher();
+      if (epoch !== this.lifecycleEpoch) throw new Error("Pi worker start was superseded by stop");
+      if (this.process !== child || child.exitCode !== null || child.signalCode !== null) {
+        const failure = this.terminalError ?? new Error("Pi worker exited during startup");
+        this.failProcess(failure);
+        throw failure;
+      }
     } catch (error) {
       const failure = asError(error);
+      this.closeExtensionWatcher();
       this.failProcess(failure);
       throw failure;
     }
@@ -653,7 +690,7 @@ export class PiRpcWorker {
   }
   async abort(): Promise<void> {
     try {
-      await this.request({ type: "abort" }, undefined, this.rpcTimeoutMs);
+      await this.request({ type: "abort" }, undefined, this.lifecycleTimeoutMs);
       this.settleAllWork();
     } catch (error) {
       const failure = asError(error);
@@ -665,13 +702,14 @@ export class PiRpcWorker {
   async newSession(): Promise<void> {
     const reload = this.extensionReloadPromise;
     if (reload) await reload;
-    const response = await this.request({ type: "new_session" });
+    const response = await this.request({ type: "new_session" }, undefined, this.lifecycleTimeoutMs);
     const record = asRecord(response);
     const data = asRecord(record?.data);
     if (data?.cancelled === true) throw new Error("Pi worker new session was cancelled");
     this.lastAssistantText = undefined;
     this.assistantTextKnown = false;
     this.currentPromptText = undefined;
+    this.settledError = undefined;
   }
 
   async prompt(message: string): Promise<void> {
@@ -680,6 +718,7 @@ export class PiRpcWorker {
     this.currentPromptText = message;
     this.lastAssistantText = undefined;
     this.assistantTextKnown = false;
+    this.settledError = undefined;
     await this.queueWork({ type: "prompt", message });
   }
 
@@ -689,10 +728,12 @@ export class PiRpcWorker {
     await this.queueWork({ type: "steer", message });
   }
 
-
   async waitForSettled(): Promise<void> {
     if (this.terminalError) throw this.terminalError;
-    if (this.unsettledWork.size === 0) return;
+    if (this.unsettledWork.size === 0) {
+      if (this.settledError) throw this.settledError;
+      return;
+    }
     return await new Promise<void>((resolve, reject) => {
       this.settledWaiters.add({ resolve, reject });
     });
@@ -717,17 +758,22 @@ export class PiRpcWorker {
     return () => { this.listeners.delete(listener); };
   }
 
-
   private async queueWork(command: JsonRecord): Promise<void> {
     const epoch = ++this.workEpoch;
     this.unsettledWork.add(epoch);
     try {
-      await this.request(command, epoch);
+      await this.request(command, epoch, this.workTimeout(command.type));
       if (command.type === "prompt") this.schedulePromptSettlementProbe(epoch);
     } catch (error) {
       this.settleWork(epoch);
       throw error;
     }
+  }
+
+  private workTimeout(commandType: unknown): number {
+    return commandType === "prompt" || commandType === "steer"
+      ? this.promptTimeoutMs
+      : this.rpcTimeoutMs;
   }
 
   private request(command: JsonRecord, workEpoch?: number, timeoutMs?: number): Promise<unknown> {
@@ -765,7 +811,7 @@ export class PiRpcWorker {
     if (!this.unsettledWork.has(epoch)) return;
     const timer = setTimeout(() => {
       this.promptSettlementTimers.delete(epoch);
-      void this.request({ type: "get_state" }, undefined, IMMEDIATE_PROMPT_SETTLEMENT_MS).then((response) => {
+      void this.request({ type: "get_state" }).then((response) => {
         if (!this.unsettledWork.has(epoch) || this.startedWork.has(epoch)) return;
         const record = asRecord(response);
         const data = asRecord(record?.data);
@@ -773,7 +819,7 @@ export class PiRpcWorker {
       }).catch((error) => {
         if (this.unsettledWork.has(epoch)) this.failProcess(asError(error));
       });
-    }, IMMEDIATE_PROMPT_SETTLEMENT_MS);
+    }, PROMPT_SETTLEMENT_PROBE_DELAY_MS);
     timer.unref?.();
     this.promptSettlementTimers.set(epoch, timer);
   }
@@ -788,9 +834,14 @@ export class PiRpcWorker {
     this.acceptedWork.delete(epoch);
     this.startedWork.delete(epoch);
     this.settledBeforeAcceptance.delete(epoch);
-    if (this.unsettledWork.size === 0) {
-      this.resolveSettledWaiters();
-    }
+    this.workErrors.delete(epoch);
+    if (this.unsettledWork.size === 0) this.finishSettledWaiters();
+  }
+
+  private finishSettledWaiters(): void {
+    const error = this.settledError;
+    if (error) this.rejectSettledWaiters(error);
+    else this.resolveSettledWaiters();
   }
 
   private clearPromptSettlementTimer(epoch: number): void {
@@ -853,11 +904,35 @@ export class PiRpcWorker {
     if (record.type === "message_end") {
       const message = asRecord(record.message);
       if (message?.role === "assistant") {
-        this.lastAssistantText = text;
+        const stopReason = message.stopReason;
+        if (stopReason === "error") {
+          const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+            ? message.errorMessage
+            : "Pi assistant turn failed";
+          const failure = new Error(errorMessage);
+          this.settledError = failure;
+          let assigned = false;
+          for (const epoch of this.unsettledWork) {
+            if (!this.acceptedWork.has(epoch)) continue;
+            this.workErrors.set(epoch, failure);
+            assigned = true;
+          }
+          if (!assigned && this.unsettledWork.size === 1) {
+            const epoch = this.unsettledWork.values().next().value as number;
+            this.workErrors.set(epoch, failure);
+          }
+          this.lastAssistantText = undefined;
+        } else {
+          this.lastAssistantText = text;
+        }
         this.assistantTextKnown = true;
       }
     }
     if (record.type === "agent_settled") {
+      const turnError = [...this.unsettledWork]
+        .map((epoch) => this.workErrors.get(epoch))
+        .find((error): error is Error => error !== undefined);
+      if (turnError) this.settledError = turnError;
       for (const epoch of [...this.unsettledWork]) {
         if (this.acceptedWork.has(epoch)) this.settleWork(epoch);
         else this.settledBeforeAcceptance.add(epoch);
@@ -889,6 +964,7 @@ export class PiRpcWorker {
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
+    const unexpectedIdleExit = !this.stopping && !this.terminalError && this.unsettledWork.size === 0;
     const error = this.terminalError ?? new Error(
       `Pi worker exited (${signal ?? (code === null ? "unknown" : code)}).${this.stderr ? ` Stderr: ${this.stderr}` : ""}`,
     );
@@ -899,6 +975,7 @@ export class PiRpcWorker {
     if (!this.stopping && !this.terminalError) this.terminalError = error;
     this.process = undefined;
     this.finishProcess();
+    if (unexpectedIdleExit) this.emitWorkerError(error);
   }
 
   private finishProcess(): void {

@@ -5,12 +5,20 @@ import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js"
 import { WorkspaceScheduler } from "./scheduler.js";
 import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
 
+export function isIntentionalSignalAbort(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { name?: unknown; code?: unknown; message?: unknown };
+  if (candidate.name === "AbortError" || candidate.code === "ABORT_ERR") return true;
+  return candidate.message === "Aborted delay" || candidate.message === "This operation was aborted";
+}
+
 async function main(): Promise<void> {
   const config = parseConfig();
-  const dataDir = await checkSandboxEnvironment(config.dataDir);
+  const sandbox = await checkSandboxEnvironment(config.dataDir);
+  const { dataDir, bwrapPath } = sandbox;
   const runtimeConfig = { ...config, dataDir };
 
-  const agents = new AgentManager(runtimeConfig, { appRoot: process.cwd() });
+  const agents = new AgentManager(runtimeConfig, { appRoot: process.cwd(), bwrapPath });
   const delivery = new TelegramDeliveryQueue();
   let bot: ReturnType<typeof createTelegramBot>;
   const scheduler = new WorkspaceScheduler({
@@ -51,16 +59,15 @@ async function main(): Promise<void> {
         console.error("Telegram stop failed", error);
       }
       closeTelegramIngress(bot);
+      const agentShutdown = agents.beginShutdown().catch((error) => {
+        console.error("Agent abort failed", error);
+      });
       try {
         await flushTelegramIngress(bot);
       } catch (error) {
         console.error("Telegram ingress drain failed", error);
       }
-      try {
-        await agents.beginShutdown();
-      } catch (error) {
-        console.error("Agent abort failed", error);
-      }
+      await agentShutdown;
       try {
         await scheduler.stop();
       } catch (error) {
@@ -110,6 +117,7 @@ async function main(): Promise<void> {
     });
   } catch (error) {
     await shutdown("startup or polling failure");
+    if (shuttingDown && isIntentionalSignalAbort(error)) return;
     throw error;
   }
 }

@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -118,6 +118,7 @@ describe("PiRpcWorker", () => {
       expect(calls[0]?.args).not.toContain(path.join(f.appRoot, ".env"));
       expect(calls[0]?.args).toContain("/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
       expect(calls[0]?.options.env).toEqual({});
+      expect(calls[0]?.args).toContain(await realpath(process.execPath));
       const prompt = worker.prompt("hello");
       const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string; type?: string; message?: string };
       expect(command.type).toBe("prompt");
@@ -653,6 +654,7 @@ describe("PiRpcWorker", () => {
       workspace: f.workspace,
       appRoot: f.appRoot,
       cliPath: f.cliPath,
+      rpcTimeoutMs: 20,
       spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
     });
     try {
@@ -663,11 +665,13 @@ describe("PiRpcWorker", () => {
       await prompt;
       const settled = worker.waitForSettled();
       const settledRejection = expect(settled).rejects.toThrow("timed out");
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(child.commands).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(20);
       await settledRejection;
     } finally {
-      await worker.stop();
       vi.useRealTimers();
+      await worker.stop();
       await rm(f.root, { recursive: true, force: true });
     }
   });
@@ -715,6 +719,188 @@ describe("PiRpcWorker", () => {
       await worker.start();
       await Promise.all([worker.stop(), worker.start()]);
       expect(children).toHaveLength(2);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("surfaces assistant message_end errors after acceptance", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const events: Record<string, unknown>[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    const unsubscribe = worker.onEvent((event) => events.push(event));
+    try {
+      await worker.start();
+      const prompt = worker.prompt("erroring turn");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: command.id, command: "prompt", success: true });
+      await prompt;
+      const settled = worker.waitForSettled();
+      record(child, {
+        type: "message_end",
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "provider failed" },
+      });
+      record(child, { type: "agent_settled" });
+      await expect(settled).rejects.toThrow("provider failed");
+      await expect(worker.getLastAssistantText()).resolves.toBeUndefined();
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "message_end",
+        message: expect.objectContaining({ errorMessage: "provider failed" }),
+      }));
+    } finally {
+      unsubscribe();
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows slow prompt acceptance while keeping fast RPC deadlines", async () => {
+    vi.useFakeTimers();
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      rpcTimeoutMs: 20,
+      promptTimeoutMs: 200,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("slow acceptance");
+      await vi.advanceTimersByTimeAsync(199);
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: command.id, command: "prompt", success: true });
+      await expect(prompt).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the configured RPC timeout for delayed state settlement", async () => {
+    vi.useFakeTimers();
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      rpcTimeoutMs: 200,
+      promptTimeoutMs: 300,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("handled");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: command.id, command: "prompt", success: true });
+      await prompt;
+      await vi.advanceTimersByTimeAsync(50);
+      const stateCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
+      const settled = worker.waitForSettled();
+      await vi.advanceTimersByTimeAsync(70);
+      record(child, {
+        type: "response",
+        id: stateCommand.id,
+        command: "get_state",
+        success: true,
+        data: { isStreaming: false, pendingMessageCount: 0 },
+      });
+      await expect(settled).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects startup when the child exits during watcher setup", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        queueMicrotask(() => child.emit("exit", 1, null));
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await expect(worker.start()).rejects.toThrow("Pi worker exited");
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("emits one bounded worker_error for an unexpected idle exit", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const events: Record<string, unknown>[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    const unsubscribe = worker.onEvent((event) => events.push(event));
+    try {
+      await worker.start();
+      child.emit("exit", 1, null);
+      const errors = events.filter((event) => event.type === "worker_error");
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0]?.error).length).toBeLessThanOrEqual(2_048);
+      child.emit("close", 1, null);
+      expect(events.filter((event) => event.type === "worker_error")).toHaveLength(1);
+    } finally {
+      unsubscribe();
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects timer values above Node's maximum", async () => {
+    const f = await fixture();
+    try {
+      for (const option of ["stopGraceMs", "rpcTimeoutMs", "promptTimeoutMs", "lifecycleTimeoutMs"] as const) {
+        expect(() => new PiRpcWorker({
+          workspace: f.workspace,
+          appRoot: f.appRoot,
+          cliPath: f.cliPath,
+          [option]: 2_147_483_648,
+        } as ConstructorParameters<typeof PiRpcWorker>[0])).toThrow("2147483647");
+      }
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds retained stderr while preserving the newest diagnostics", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      child.stderr.write(`${"x".repeat(100_000)}tail`);
+      await Promise.resolve();
+      const state = worker as unknown as { stderr: string };
+      expect(state.stderr.length).toBeLessThanOrEqual(64 * 1024);
+      expect(state.stderr.endsWith("tail")).toBe(true);
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -81,16 +81,59 @@ it("rejects timeout values outside Node's timer-safe range before spawning", asy
   }
 });
 
-it("returns the canonical data root after probing a symlinked data directory", async () => {
+it("returns canonical data and validated Bubblewrap path after probing with alternate executables", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-data-test-"));
   const target = path.join(root, "data");
   const linked = path.join(root, "data-link");
-  const bwrap = path.join(root, "bwrap-probe");
+  const bin = path.join(root, "bin");
+  const node = path.join(bin, "node");
+  const bwrap = path.join(bin, "bwrap");
+  const log = path.join(root, "bwrap-args");
+  const previousPath = process.env.PATH;
   try {
     await mkdir(target);
     await symlink(target, linked, "dir");
+    await mkdir(bin);
+    await writeFile(node, "#!/bin/sh\nprintf node\n", { mode: 0o755 });
+    await writeFile(bwrap, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(log)}\ncat >/dev/null\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${path.delimiter}${previousPath ?? ""}`;
+    const appRoot = path.join(root, "app");
+    const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    const workerArgs = await buildPiWorkerBwrapArgs({ workspace: target, appRoot });
+    expect(workerArgs.args).toContain(await realpath(node));
+    expect(workerArgs.args).not.toContain("/usr/bin/node");
+    expect(workerArgs.args.slice(workerArgs.args.indexOf("--") + 1)).toEqual([
+      await realpath(node),
+      "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
+    ]);
+    const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });
+    expect(result).toEqual({ dataDir: target, bwrapPath: await realpath(bwrap) });
+    const args = await readFile(log, "utf8");
+    expect(args).toContain(await realpath(node));
+    expect(args).not.toContain("/usr/bin/node");
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("does not follow or clobber a write-probe symlink", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-probe-test-"));
+  const dataDir = path.join(root, "data");
+  const sentinel = path.join(root, "sentinel");
+  const probe = path.join(dataDir, `.write-probe-${process.pid}`);
+  const bwrap = path.join(root, "bwrap-probe");
+  try {
+    await mkdir(dataDir);
+    await writeFile(sentinel, "sentinel");
+    await symlink(sentinel, probe, "file");
     await writeFile(bwrap, "#!/bin/sh\ncat >/dev/null\n", { mode: 0o755 });
-    await expect(checkSandboxEnvironment(linked, { bwrapPath: bwrap })).resolves.toBe(target);
+    await expect(checkSandboxEnvironment(dataDir, { bwrapPath: bwrap })).rejects.toThrow();
+    expect(await readFile(sentinel, "utf8")).toBe("sentinel");
+    expect((await lstat(probe)).isSymbolicLink()).toBe(true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

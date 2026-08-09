@@ -84,6 +84,7 @@ type ChatState = {
   worker: AgentWorker | undefined;
   workerPromise: Promise<AgentWorker> | undefined;
   activeRun: Promise<string> | undefined;
+  workerTurnActive: boolean;
   queue: SerialQueue;
   unsubscribe: (() => void) | undefined;
   progressTail: Promise<void>;
@@ -226,6 +227,7 @@ export class AgentManager {
       worker: undefined,
       workerPromise: undefined,
       activeRun: undefined,
+      workerTurnActive: false,
       queue: new SerialQueue(),
       unsubscribe: undefined,
       progressTail: Promise.resolve(),
@@ -357,12 +359,20 @@ export class AgentManager {
 
   private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string> {
     let run!: Promise<string>;
+    state.workerTurnActive = true;
     const operation = (async () => {
-      await command();
-      await worker.waitForSettled();
-      const result = (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
-      await this.drainProgress(state);
-      return result;
+      try {
+        await command();
+        await worker.waitForSettled();
+        // activeRun remains set while progress callbacks drain, but the worker turn
+        // is no longer steerable once waitForSettled has completed.
+        state.workerTurnActive = false;
+        const result = (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
+        await this.drainProgress(state);
+        return result;
+      } finally {
+        state.workerTurnActive = false;
+      }
     })();
     run = (async () => {
       try {
@@ -392,7 +402,7 @@ export class AgentManager {
     const action = await state.queue.run(async (): Promise<PromptAction> => {
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
       if (state.activeRun) {
-        if (mode === "interactive" && state.worker) {
+        if (mode === "interactive" && state.workerTurnActive && state.worker) {
           return { kind: "steer", completion: this.steer(state, state.worker, text) };
         }
         await this.raceShutdown(state, state.activeRun).catch(() => {});

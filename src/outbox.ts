@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, link, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { lstat, link, mkdir, open, opendir, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { SerialQueue } from "./queue.js";
 
@@ -37,6 +37,10 @@ const MAX_REQUEST_PATH_LENGTH = 4_096;
 const MAX_REQUEST_CAPTION_LENGTH = 16 * 1024;
 const CHAT_DIRECTORY = /^-?\d+$/;
 const JSON_REQUEST = /\.json$/;
+// Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
+const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
+const MAX_OUTBOX_ENTRIES_PER_CHAT = 256;
+const MAX_PROCESSED_ENTRIES_TO_CHECK = 256;
 // Recover claims older than five minutes after crashes without racing active senders.
 const STALE_CLAIM_AGE_MS = 5 * 60_000;
 const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
@@ -202,6 +206,21 @@ async function openChildDirectory(parent: PinnedDirectory, name: string): Promis
   }
   return openPinnedDirectory(child);
 }
+async function readBoundedEntries(directory: string, limit: number) {
+  const directoryHandle = await opendir(directory);
+  const entries = [];
+  try {
+    for (;;) {
+      const entry = await directoryHandle.read();
+      if (entry === null) break;
+      entries.push(entry);
+      if (entries.length >= limit) break;
+    }
+  } finally {
+    await directoryHandle.close().catch(() => {});
+  }
+  return entries;
+}
 
 export class WorkspaceOutbox {
   private readonly dataDir: string;
@@ -301,7 +320,7 @@ export class WorkspaceOutbox {
     let chatsRoot: PinnedDirectory | undefined;
     try {
       chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readdir(chatsRoot.path, { withFileTypes: true });
+      const entries = await readBoundedEntries(chatsRoot.path, MAX_CHAT_DIRECTORIES_PER_POLL);
       const chats = entries
         .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
         .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
@@ -343,13 +362,17 @@ export class WorkspaceOutbox {
       processed = await openChildDirectory(openedOutbox, "processed");
       failed = await openChildDirectory(openedOutbox, "failed");
 
-      const entries = (await readdir(openedOutbox.path, { withFileTypes: true }))
+      const entries = (await readBoundedEntries(openedOutbox.path, MAX_OUTBOX_ENTRIES_PER_CHAT))
         .filter((entry) => JSON_REQUEST.test(entry.name) || CLAIM_NAME.test(entry.name))
         .map((entry) => ({ name: entry.name, path: path.join(openedOutbox.path, entry.name) }))
         .sort((a, b) => a.name.localeCompare(b.name));
 
       for (const entry of entries) {
-        const claim = await this.claimEntry(openedOutbox, entry, chatId, CLAIM_NAME.test(entry.name));
+        const isClaim = CLAIM_NAME.test(entry.name);
+        const stale = isClaim && this.isStaleClaim(entry.name);
+        if (isClaim && !stale) continue;
+        if (stale && await this.claimWasAlreadyArchived(entry, processed, chatId)) continue;
+        const claim = await this.claimEntry(openedOutbox, entry, chatId, stale);
         if (!claim) continue;
         const archiveName = claim.originalName ?? entry.name;
         let lease: ClaimLease | undefined;
@@ -358,9 +381,6 @@ export class WorkspaceOutbox {
           const request = await readRequest(claim.path);
           validateWorkspacePath(workspace, request.path);
           await this.sendFile(chatId, request.path, request.caption);
-          await lease.stop();
-          lease = undefined;
-          await this.archiveClaimed(claim.path, processed, archiveName);
         } catch (error) {
           if (lease) {
             await lease.stop();
@@ -372,8 +392,23 @@ export class WorkspaceOutbox {
             this.report(moveError);
           }
           this.reportRequestError(chatId, archiveName, error);
-        } finally {
-          if (lease) await lease.stop();
+          continue;
+        }
+
+        if (lease) {
+          await lease.stop();
+          lease = undefined;
+        }
+        try {
+          await this.archiveClaimed(claim.path, processed, archiveName);
+        } catch (error) {
+          // Sending succeeded. Never put this request in failed, where it would be resent.
+          this.reportRequestError(chatId, archiveName, error);
+          try {
+            await this.discardSentClaim(claim.path);
+          } catch (discardError) {
+            this.report(discardError);
+          }
         }
       }
 
@@ -440,6 +475,44 @@ export class WorkspaceOutbox {
     if (!Number.isSafeInteger(createdAt)) return false;
     const current = this.now();
     return Number.isFinite(current) && current >= createdAt && current - createdAt >= STALE_CLAIM_AGE_MS;
+  }
+  private async claimWasAlreadyArchived(entry: OutboxEntry, processed: PinnedDirectory, chatId: number): Promise<boolean> {
+    let claimStat: Awaited<ReturnType<typeof lstat>>;
+    try {
+      claimStat = await lstat(entry.path);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+
+    const processedEntries = await readBoundedEntries(processed.path, MAX_PROCESSED_ENTRIES_TO_CHECK);
+    for (const processedEntry of processedEntries) {
+      if (!processedEntry.isFile() || processedEntry.isSymbolicLink()) continue;
+      const processedPath = path.join(processed.path, processedEntry.name);
+      let processedStat: Awaited<ReturnType<typeof lstat>>;
+      try {
+        processedStat = await lstat(processedPath);
+      } catch (error) {
+        if (isMissing(error)) continue;
+        throw error;
+      }
+      if (processedStat.dev !== claimStat.dev || processedStat.ino !== claimStat.ino) continue;
+      try {
+        await unlink(entry.path);
+      } catch (error) {
+        if (!isMissing(error)) this.reportRequestError(chatId, entry.name, error);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private async discardSentClaim(claimedPath: string): Promise<void> {
+    try {
+      await unlink(claimedPath);
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
   }
 
   private async claimEntry(

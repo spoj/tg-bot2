@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
@@ -183,6 +183,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
   if (!cliStat.isFile() || cliStat.isSymbolicLink()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
 
+  const nodePath = await requireExecutable("node");
   const args = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
     "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
@@ -211,7 +212,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
     "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
-    "--chdir", "/workspace", "--", "/usr/bin/node", cliMountPath,
+    "--chdir", "/workspace", "--", nodePath, cliMountPath,
     "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
   );
@@ -322,19 +323,34 @@ async function requireExecutable(executable: string): Promise<string> {
     : (process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin").split(path.delimiter).map((dir) => path.join(dir, executable));
   for (const candidate of candidates) {
     try {
-      await access(candidate, fsConstants.X_OK);
-      return candidate;
+      const resolved = await realpath(candidate);
+      const stat = await lstat(resolved);
+      if (!stat.isFile()) continue;
+      await access(resolved, fsConstants.X_OK);
+      return resolved;
     } catch {}
   }
   throw new Error(`Executable not found or not executable: ${executable}`);
 }
 
-export async function checkSandboxEnvironment(dataDir: string, options: SandboxOptions = {}): Promise<string> {
+export type SandboxEnvironment = { dataDir: string; bwrapPath: string };
+
+export async function checkSandboxEnvironment(dataDir: string, options: SandboxOptions = {}): Promise<SandboxEnvironment> {
   const bwrapPath = await requireExecutable(options.bwrapPath ?? "bwrap");
+  const nodePath = await requireExecutable("node");
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const writeProbe = path.join(dataDir, `.write-probe-${process.pid}`);
-  await writeFile(writeProbe, "ok", { mode: 0o600 });
-  await rm(writeProbe);
+  const probe = await open(
+    writeProbe,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await probe.writeFile("ok");
+  } finally {
+    await probe.close();
+    await rm(writeProbe, { force: true });
+  }
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-probe-"));
   const workspace = path.join(root, "workspace");
   const sessions = path.join(root, "sessions");
@@ -343,7 +359,7 @@ export async function checkSandboxEnvironment(dataDir: string, options: SandboxO
     await mkdir(sessions, { recursive: true, mode: 0o700 });
     const result = await runSandbox(
       { workspace, sessions },
-      { executable: "/bin/bash", args: ["-lc", "node --version && uv --version && rg --version"], timeoutMs: 30_000 },
+      { executable: "/bin/bash", args: ["-lc", `${shellQuote(nodePath)} --version && uv --version && rg --version`], timeoutMs: 30_000 },
       { ...options, bwrapPath },
     );
     if (result.exitCode !== 0 || result.timedOut) {
@@ -352,5 +368,9 @@ export async function checkSandboxEnvironment(dataDir: string, options: SandboxO
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-  return await realpath(dataDir);
+  return { dataDir: await realpath(dataDir), bwrapPath };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }

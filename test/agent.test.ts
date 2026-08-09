@@ -141,6 +141,40 @@ it("steers an interactive request while the active worker run owns the response"
   expect(worker.prompt).toHaveBeenCalledTimes(1);
 });
 
+it("queues an independent prompt after the worker settles while progress drains", async () => {
+  const worker = fakeWorker("first response");
+  const progressStarted = deferred<void>();
+  const progressDone = deferred<void>();
+  const progress = vi.fn(async () => {
+    progressStarted.resolve();
+    await progressDone.promise;
+  });
+  vi.mocked(worker.prompt)
+    .mockImplementationOnce(async () => {
+      worker.emit({ type: "message_end", message: {
+        role: "assistant",
+        content: [{ type: "text", text: "working" }, { type: "toolCall", name: "bash" }],
+      } });
+    })
+    .mockImplementationOnce(async () => {
+      worker.lastText = "second response";
+    });
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+  manager.setAssistantProgress(progress);
+
+  const first = manager.prompt(16, "first");
+  await vi.waitFor(() => expect(progress).toHaveBeenCalledOnce());
+  const second = manager.prompt(16, "second");
+  await Promise.resolve();
+  expect(worker.steer).not.toHaveBeenCalled();
+  expect(worker.prompt).toHaveBeenCalledOnce();
+
+  progressDone.resolve();
+  await expect(first).resolves.toBe("first response");
+  await expect(second).resolves.toBe("second response");
+  expect(worker.prompt).toHaveBeenNthCalledWith(2, "second");
+});
+
 it("waits for active work when the current worker is invalidated", async () => {
   const worker = fakeWorker("first response");
   const replacement = fakeWorker("replacement response");

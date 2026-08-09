@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -64,6 +64,38 @@ describe("WorkspaceOutbox", () => {
     expect(sendFile).toHaveBeenCalledWith(42, "/workspace/report.txt", "Report");
     expect(await names(path.join(outbox, "processed"))).toEqual([claimName]);
   });
+  it("skips and cleans a stale claim whose inode is already processed", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    const claimName = ".in-progress-0-archived";
+    const claimPath = path.join(outbox, claimName);
+    await request(workspace, claimName, valid("archived"));
+    await mkdir(path.join(outbox, "processed"), { recursive: true });
+    await link(claimPath, path.join(outbox, "processed", "archived.json"));
+    const sendFile = vi.fn(async () => {});
+
+    await new WorkspaceOutbox({ dataDir, sendFile, now: () => 5 * 60_000 }).poll();
+    expect(sendFile).not.toHaveBeenCalled();
+    expect(await names(path.join(outbox, "processed"))).toEqual(["archived.json"]);
+    expect(await names(outbox)).not.toContain(claimName);
+  });
+
+  it("does not retry a sent request when archiving the claim fails", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    const sendFile = vi.fn(async () => {
+      const claim = (await readdir(outbox)).find((name) => name.startsWith(".in-progress-"));
+      if (claim) await rm(path.join(outbox, claim), { force: true });
+    });
+    await request(workspace, "sent.json", valid("sent"));
+    const instance = new WorkspaceOutbox({ dataDir, sendFile });
+
+    await instance.poll();
+    await instance.poll();
+    expect(sendFile).toHaveBeenCalledTimes(1);
+    expect(await names(path.join(outbox, "failed"))).toEqual([]);
+  });
+
 
   it("leaves recent claims untouched while another process may be sending", async () => {
     const { dataDir, workspace } = await fixture();
@@ -174,6 +206,28 @@ describe("WorkspaceOutbox", () => {
     expect(sendFile).toHaveBeenCalledTimes(1);
     expect(sendFile).toHaveBeenCalledWith(42, "/workspace/report.txt", "Report");
   });
+  it("bounds a flooded chat while still processing later chats", async () => {
+    const { dataDir, workspace } = await fixture();
+    const laterWorkspace = path.join(dataDir, "chats", "43", "workspace");
+    await mkdir(path.join(laterWorkspace, ".tg-bot", "outbox"), { recursive: true });
+    await request(laterWorkspace, "later.json", valid("later", "/workspace/later.txt"));
+    for (let index = 0; index < 300; index += 1) {
+      const id = String(index).padStart(4, "0");
+      await request(workspace, `${id}.json`, valid(id, `/workspace/${id}.txt`));
+    }
+
+    const chats: number[] = [];
+    const sendFile = vi.fn(async (chatId: number) => {
+      chats.push(chatId);
+    });
+    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
+
+    const floodedChatSends = chats.filter((chatId) => chatId === 42).length;
+    expect(floodedChatSends).toBeLessThanOrEqual(256);
+    expect(floodedChatSends).toBeLessThan(300);
+    expect(chats).toContain(43);
+  });
+
 
   it("serializes overlapping polls and requests within a chat", async () => {
     const { dataDir, workspace } = await fixture();

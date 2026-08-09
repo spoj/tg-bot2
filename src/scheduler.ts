@@ -1,5 +1,5 @@
 import { constants as fsConstants, type Dirent } from "node:fs";
-import { lstat, open, readdir, realpath, rename, rm } from "node:fs/promises";
+import { link, lstat, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -25,6 +25,12 @@ type ScheduleSnapshot = {
   file: ScheduleFile;
   raw: string;
 };
+type DueRecord = {
+  chatId: number;
+  chatName: string;
+  metadataRealPath: string;
+  record: StoredScheduleRecord;
+};
 
 type MaybePromise<T> = T | PromiseLike<T>;
 export type WorkspaceSchedulerOptions = {
@@ -36,6 +42,7 @@ export type WorkspaceSchedulerOptions = {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   logger?: (error: unknown) => void;
+  onDirectoryHandleClosed?: (realPath: string) => void;
 };
 
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1_000;
@@ -49,6 +56,10 @@ const DIRECTORY = fsConstants.O_DIRECTORY ?? 0;
 const READ_ONLY = fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW;
 const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
 const WRITE_NEW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW;
+const MAX_SCHEDULE_FILE_BYTES = 64 * 1024;
+const MAX_SCHEDULE_RECORDS = 256;
+const MAX_SCHEDULE_ID_LENGTH = 256;
+const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
 const UTC_ISO = /Z$/u;
 
 function isMissing(error: unknown): boolean {
@@ -114,8 +125,12 @@ function validateRecord(value: unknown, index: number): StoredScheduleRecord {
     invalid(`record ${index} must be an object`);
   }
   const record = value as Record<string, unknown>;
-  if (typeof record.id !== "string" || record.id.length === 0) invalid(`record ${index} has an invalid id`);
-  if (typeof record.prompt !== "string" || record.prompt.length === 0) invalid(`record ${index} has an invalid prompt`);
+  if (typeof record.id !== "string" || record.id.length === 0 || record.id.length > MAX_SCHEDULE_ID_LENGTH) {
+    invalid(`record ${index} has an invalid id`);
+  }
+  if (typeof record.prompt !== "string" || record.prompt.length === 0 || record.prompt.length > MAX_SCHEDULE_PROMPT_LENGTH) {
+    invalid(`record ${index} has an invalid prompt`);
+  }
   if (!isUtcIso(record.dueAt)) invalid(`record ${index} has an invalid dueAt`);
   if (record.recurrence !== null && record.recurrence !== "hourly" && record.recurrence !== "daily" && record.recurrence !== "weekly") {
     invalid(`record ${index} has an invalid recurrence`);
@@ -133,6 +148,7 @@ function validateScheduleFile(value: unknown): ScheduleFile {
   const file = value as Record<string, unknown>;
   if (file.version !== 1) invalid("version must be 1");
   if (!Array.isArray(file.schedules)) invalid("schedules must be an array");
+  if (file.schedules.length > MAX_SCHEDULE_RECORDS) invalid(`schedules exceed ${MAX_SCHEDULE_RECORDS} records`);
   const ids = new Set<string>();
   const schedules = file.schedules.map((record, index) => {
     const validated = validateRecord(record, index);
@@ -142,6 +158,7 @@ function validateScheduleFile(value: unknown): ScheduleFile {
   });
   return { ...file, version: 1, schedules } as ScheduleFile;
 }
+
 
 function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -154,12 +171,27 @@ function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): s
   return new Date(due + periods * period).toISOString();
 }
 
-async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<void> {
+async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<boolean> {
   try {
     await handle.close();
+    return true;
   } catch {
     // Preserve the original read/write error.
+    return false;
   }
+}
+async function readBoundedFile(handle: Awaited<ReturnType<typeof open>>): Promise<string> {
+  const buffer = Buffer.allocUnsafe(MAX_SCHEDULE_FILE_BYTES + 1);
+  let bytesRead = 0;
+  while (bytesRead < buffer.length) {
+    const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, null);
+    if (result.bytesRead === 0) break;
+    bytesRead += result.bytesRead;
+  }
+  if (bytesRead > MAX_SCHEDULE_FILE_BYTES) {
+    throw new Error(`schedules.json exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
+  }
+  return buffer.subarray(0, bytesRead).toString("utf8");
 }
 
 /** Poll workspace-owned schedules from agent-written UTC ISO timestamps. */
@@ -172,6 +204,7 @@ export class WorkspaceScheduler {
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
+  private readonly onDirectoryHandleClosed: WorkspaceSchedulerOptions["onDirectoryHandleClosed"];
   private timer: ReturnType<typeof setInterval> | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -190,6 +223,7 @@ export class WorkspaceScheduler {
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
     this.logger = options.logger ?? ((error) => console.error("Workspace scheduler error", error));
+    this.onDirectoryHandleClosed = options.onDirectoryHandleClosed;
   }
 
   async start(): Promise<void> {
@@ -238,10 +272,8 @@ export class WorkspaceScheduler {
 
   private async runPoll(now: number): Promise<void> {
     let chatsRoot: PinnedDirectory | undefined;
-    const openDirectories: PinnedDirectory[] = [];
     try {
       chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      openDirectories.push(chatsRoot);
       const entries = await readdir(chatsRoot.path, { withFileTypes: true });
       const chats = entries
         .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
@@ -249,7 +281,7 @@ export class WorkspaceScheduler {
         .filter((entry): entry is { name: string; chatId: number } => entry.chatId !== undefined)
         .sort((a, b) => a.chatId - b.chatId || a.name.localeCompare(b.name));
 
-      const due: Array<{ chatId: number; metadata: PinnedDirectory; record: StoredScheduleRecord }> = [];
+      const due: DueRecord[] = [];
       for (const { name, chatId } of chats) {
         let chatDirectory: PinnedDirectory | undefined;
         let workspace: PinnedDirectory | undefined;
@@ -259,17 +291,19 @@ export class WorkspaceScheduler {
           chatDirectory = await openPinnedDirectory(path.join(chatsRoot.path, name), expectedChat);
           workspace = await openPinnedDirectory(path.join(chatDirectory.path, "workspace"), path.join(chatDirectory.realPath, "workspace"));
           metadata = await openPinnedDirectory(path.join(workspace.path, ".tg-bot"), path.join(workspace.realPath, ".tg-bot"));
-          openDirectories.push(chatDirectory, workspace, metadata);
           const scheduleSnapshot = await this.readSchedule(metadata, chatId);
           if (!scheduleSnapshot) continue;
           for (const record of scheduleSnapshot.file.schedules) {
-            if (record.enabled && Date.parse(record.dueAt) <= now) due.push({ chatId, metadata, record });
+            if (record.enabled && Date.parse(record.dueAt) <= now) {
+              due.push({ chatId, chatName: name, metadataRealPath: metadata.realPath, record });
+            }
           }
         } catch (error) {
           if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
-          if (metadata && !openDirectories.includes(metadata)) await closeQuietly(metadata.handle);
-          if (workspace && !openDirectories.includes(workspace)) await closeQuietly(workspace.handle);
-          if (chatDirectory && !openDirectories.includes(chatDirectory)) await closeQuietly(chatDirectory.handle);
+        } finally {
+          if (metadata) await this.closeDirectory(metadata);
+          if (workspace) await this.closeDirectory(workspace);
+          if (chatDirectory) await this.closeDirectory(chatDirectory);
         }
       }
 
@@ -278,12 +312,39 @@ export class WorkspaceScheduler {
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
-      for (const directory of openDirectories.reverse()) await closeQuietly(directory.handle);
+      if (chatsRoot) await closeQuietly(chatsRoot.handle);
     }
   }
 
-  private async processRecord(item: { chatId: number; metadata: PinnedDirectory; record: StoredScheduleRecord }, now: number): Promise<void> {
-    const currentSnapshot = await this.readSchedule(item.metadata, item.chatId);
+  private async closeDirectory(directory: PinnedDirectory): Promise<void> {
+    const closed = await closeQuietly(directory.handle);
+    if (!closed || !this.onDirectoryHandleClosed) return;
+    try {
+      this.onDirectoryHandleClosed(directory.realPath);
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  private async openCurrentMetadata(item: DueRecord): Promise<PinnedDirectory | undefined> {
+    const metadataPath = path.join(this.dataDir, "chats", item.chatName, "workspace", ".tg-bot");
+    try {
+      return await openPinnedDirectory(metadataPath, item.metadataRealPath);
+    } catch (error) {
+      if (!isMissing(error)) this.report(new Error(`Could not reopen schedules for chat ${item.chatId}`, { cause: error }));
+      return undefined;
+    }
+  }
+
+  private async processRecord(item: DueRecord, now: number): Promise<void> {
+    const metadata = await this.openCurrentMetadata(item);
+    if (!metadata) return;
+    let currentSnapshot: ScheduleSnapshot | undefined;
+    try {
+      currentSnapshot = await this.readSchedule(metadata, item.chatId);
+    } finally {
+      await this.closeDirectory(metadata);
+    }
     const current = currentSnapshot?.file.schedules.find((record) => record.id === item.record.id);
     if (!current || !current.enabled || Date.parse(current.dueAt) > now) return;
 
@@ -297,7 +358,7 @@ export class WorkspaceScheduler {
     }
 
     try {
-      await this.markRun(item.metadata, item.chatId, current.id, now);
+      await this.markRun(item, current.id, now);
     } catch (error) {
       this.report(new Error(`Could not update schedule ${current.id} for chat ${item.chatId}`, { cause: error }));
     }
@@ -311,7 +372,8 @@ export class WorkspaceScheduler {
       handle = await open(filePath, READ_FILE);
       const stat = await handle.stat();
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
-      raw = await handle.readFile("utf8");
+      if (stat.size > MAX_SCHEDULE_FILE_BYTES) throw new Error(`schedules.json exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
+      raw = await readBoundedFile(handle);
     } catch (error) {
       if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
       return undefined;
@@ -327,8 +389,15 @@ export class WorkspaceScheduler {
     }
   }
 
-  private async markRun(metadata: PinnedDirectory, chatId: number, id: string, now: number): Promise<void> {
-    const snapshot = await this.readSchedule(metadata, chatId);
+  private async markRun(item: DueRecord, id: string, now: number): Promise<void> {
+    const metadata = await this.openCurrentMetadata(item);
+    if (!metadata) return;
+    let snapshot: ScheduleSnapshot | undefined;
+    try {
+      snapshot = await this.readSchedule(metadata, item.chatId);
+    } finally {
+      await this.closeDirectory(metadata);
+    }
     if (!snapshot) return;
     const { file } = snapshot;
     const index = file.schedules.findIndex((record) => record.id === id);
@@ -346,33 +415,79 @@ export class WorkspaceScheduler {
       updated.dueAt = advanceRecurring(current.dueAt, current.recurrence, now);
     }
     file.schedules[index] = updated;
-    await this.writeSchedule(metadata, file, snapshot.raw);
+    await this.writeSchedule(item, file, snapshot.raw);
   }
 
-  private async writeSchedule(metadata: PinnedDirectory, file: ScheduleFile, expectedRaw: string): Promise<void> {
+  private async writeSchedule(item: DueRecord, file: ScheduleFile, expectedRaw: string): Promise<void> {
+    const metadata = await this.openCurrentMetadata(item);
+    if (!metadata) throw new Error("Schedule metadata is no longer live");
     const filePath = path.join(metadata.path, "schedules.json");
     const temporaryPath = path.join(metadata.path, `schedules.json.${randomUUID()}.tmp`);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(temporaryPath, WRITE_NEW, 0o600);
-      await handle.writeFile(`${JSON.stringify(file)}\n`, "utf8");
+      const encoded = `${JSON.stringify(file)}\n`;
+      if (Buffer.byteLength(encoded, "utf8") > MAX_SCHEDULE_FILE_BYTES) {
+        throw new Error(`schedules.json exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
+      }
+      await handle.writeFile(encoded, "utf8");
       await handle.sync();
       await handle.close();
       handle = undefined;
 
       let latest: Awaited<ReturnType<typeof open>> | undefined;
+      let moved = false;
+      const previousPath = path.join(metadata.path, `schedules.json.${randomUUID()}.previous`);
       try {
         latest = await open(filePath, READ_FILE);
         const latestStat = await latest.stat();
         if (!latestStat.isFile() || latestStat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
-        const latestRaw = await latest.readFile("utf8");
+        const latestRaw = await readBoundedFile(latest);
         if (latestRaw !== expectedRaw) throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
-        await rename(temporaryPath, filePath);
+        const liveStat = await lstat(filePath);
+        if (!liveStat.isFile() || liveStat.dev !== latestStat.dev || liveStat.ino !== latestStat.ino) {
+          throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
+        }
+
+        // Node has no rename-noreplace/compare-and-swap primitive. Move the checked
+        // inode aside, then install the complete temp file with link(), which never
+        // overwrites a concurrent agent rename. If the inode changed, restore it
+        // only when the destination is still empty.
+        await rename(filePath, previousPath);
+        moved = true;
+        let previous: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          previous = await open(previousPath, READ_FILE);
+          const previousStat = await previous.stat();
+          const previousRaw = await readBoundedFile(previous);
+          if (!previousStat.isFile() || previousStat.dev !== latestStat.dev || previousStat.ino !== latestStat.ino || previousRaw !== expectedRaw) {
+            throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
+          }
+        } finally {
+          if (previous) await closeQuietly(previous);
+        }
+        try {
+          await link(temporaryPath, filePath);
+        } catch {
+          throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
+        }
+        await rm(temporaryPath, { force: true });
+        await rm(previousPath, { force: true });
+        moved = false;
       } finally {
         if (latest) await closeQuietly(latest);
+        if (moved) {
+          try {
+            await link(previousPath, filePath);
+          } catch {
+            // A concurrent agent won the empty-path race; preserve its edit.
+          }
+          await rm(previousPath, { force: true }).catch(() => {});
+        }
       }
     } finally {
       if (handle) await closeQuietly(handle);
+      await this.closeDirectory(metadata);
       await rm(temporaryPath, { force: true }).catch(() => {});
     }
   }

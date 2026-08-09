@@ -143,17 +143,13 @@ function validateScheduleFile(value: unknown): ScheduleFile {
   return { ...file, version: 1, schedules } as ScheduleFile;
 }
 
-function recurrencePeriod(recurrence: Recurrence): number {
-  return recurrence === "hourly" ? HOUR_MS : recurrence === "daily" ? DAY_MS : WEEK_MS;
-}
-
 function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): string {
   const due = Date.parse(dueAt);
   if (due > now) return dueAt;
-  const period = recurrencePeriod(recurrence);
+  const period = recurrence === "hourly" ? HOUR_MS : recurrence === "daily" ? DAY_MS : WEEK_MS;
   const periods = Math.floor((now - due) / period) + 1;
   return new Date(due + periods * period).toISOString();
 }

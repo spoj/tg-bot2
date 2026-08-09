@@ -21,6 +21,7 @@ class FakeChild extends EventEmitter {
     },
   });
   exitCode: number | null = null;
+  closeOnKill = true;
   signalCode: Signal = null;
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
@@ -28,7 +29,7 @@ class FakeChild extends EventEmitter {
     this.signalCode = signal;
     queueMicrotask(() => {
       this.emit("exit", null, signal);
-      this.emit("close", null, signal);
+      if (this.closeOnKill) this.emit("close", null, signal);
     });
     return true;
   }
@@ -240,6 +241,34 @@ describe("PiRpcWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+  it("watches the parent of a missing local source", async () => {
+    const f = await fixture();
+    const missingExtension = path.join(f.root, "future", "extension.ts");
+    await mkdir(path.join(f.workspace, ".pi"), { recursive: true });
+    await writeFile(path.join(f.workspace, ".pi", "settings.json"), JSON.stringify({
+      extensions: [path.relative(path.join(f.workspace, ".pi"), missingExtension)],
+    }));
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      await mkdir(path.dirname(missingExtension), { recursive: true });
+      await writeFile(missingExtension, "export default () => {};");
+      await vi.waitFor(() => expect(children).toHaveLength(2), { timeout: 3_000, interval: 25 });
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
 
   it("keeps a second extension change made during reload", async () => {
     const f = await fixture();
@@ -436,7 +465,43 @@ describe("PiRpcWorker", () => {
       child.emit("exit", 1, null);
       await expect(prompt).rejects.toThrow("Pi worker exited");
       await expect(settled).rejects.toThrow("Pi worker exited");
+      child.emit("close", 1, null);
       expect(command.id).toMatch(/^pi-rpc-/);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("ignores late events from a stale child after restart", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const oldChild = children[0]!;
+      oldChild.closeOnKill = false;
+      await worker.stop();
+      await worker.start();
+      const currentChild = children[1]!;
+      const prompt = worker.prompt("current child");
+      const command = JSON.parse(currentChild.commands[0] ?? "{}") as { id?: string };
+      oldChild.stdout.write('{"type":"message_end","message":{"role":"assistant","content":[]}}\n');
+      oldChild.stderr.write("late old stderr");
+      oldChild.emit("error", new Error("late old error"));
+      oldChild.emit("exit", 1, null);
+      oldChild.emit("close", 1, null);
+      oldChild.stdin.emit("error", new Error("late old stdin error"));
+      record(currentChild, { type: "response", id: command.id, command: "prompt", success: true });
+      await expect(prompt).resolves.toBeUndefined();
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

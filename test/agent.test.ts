@@ -243,6 +243,25 @@ it("stops a worker whose startup fails before assignment", async () => {
   expect(failed.prompt).not.toHaveBeenCalled();
   expect(replacement.prompt).toHaveBeenCalledWith("new request");
 });
+it("preserves startup failure when cleanup also fails", async () => {
+  const worker = fakeWorker();
+  vi.mocked(worker.start).mockRejectedValueOnce(new Error("startup failed"));
+  vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+  await expect(manager.prompt(10, "request")).rejects.toThrow("startup failed");
+  expect(worker.stop).toHaveBeenCalledOnce();
+});
+
+it("preserves prompt failure when cleanup also fails", async () => {
+  const worker = fakeWorker();
+  vi.mocked(worker.prompt).mockRejectedValueOnce(new Error("prompt failed"));
+  vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+  await expect(manager.prompt(11, "request")).rejects.toThrow("prompt failed");
+  expect(worker.stop).toHaveBeenCalledOnce();
+});
 it("retries stopping a worker after a rejected cleanup", async () => {
   const worker = fakeWorker();
   vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));

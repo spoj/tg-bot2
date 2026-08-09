@@ -4,7 +4,6 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   buildPiWorkerBwrapArgs,
-  buildPiWorkerEnvironment,
   spawnPiWorker,
   terminateProcessGroup,
   type PiWorkerChildProcess,
@@ -198,7 +197,17 @@ async function localExtensionWatchPaths(workspace: string): Promise<string[]> {
         const real = await realpath(resolved);
         watchPaths.add(real);
       } catch {
-        // A local source may be installed or created after the worker starts.
+        let parent = path.dirname(resolved);
+        while (true) {
+          try {
+            watchPaths.add(await realpath(parent));
+            break;
+          } catch {
+            const next = path.dirname(parent);
+            if (next === parent) break;
+            parent = next;
+          }
+        }
       }
     }
   }
@@ -546,7 +555,7 @@ export class PiRpcWorker {
     try {
       child = this.spawnProcess(this.bwrapPath, built.args, {
         detached: true,
-        env: buildPiWorkerEnvironment(),
+        env: {},
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
@@ -574,6 +583,7 @@ export class PiRpcWorker {
       throw failure;
     }
     child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (this.process !== child) return;
       try {
         for (const record of this.parser?.push(chunk) ?? []) this.handleRecord(record);
       } catch (error) {
@@ -581,6 +591,7 @@ export class PiRpcWorker {
       }
     });
     child.stdout?.on("end", () => {
+      if (this.process !== child) return;
       try {
         for (const record of this.parser?.end() ?? []) this.handleRecord(record);
       } catch (error) {
@@ -588,14 +599,23 @@ export class PiRpcWorker {
       }
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
+      if (this.process !== child) return;
       this.stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     });
     child.once("error", (error) => {
+      if (this.process !== child) return;
       this.failProcess(new Error(`Pi worker process error: ${error.message}. Stderr: ${this.stderr}`));
     });
-    child.once("exit", (code, signal) => this.handleExit(code, signal));
-    child.once("close", (code, signal) => this.handleExit(code, signal));
+    child.once("exit", (code, signal) => {
+      if (this.process !== child) return;
+      this.handleExit(code, signal);
+    });
+    child.once("close", (code, signal) => {
+      if (this.process !== child) return;
+      this.handleExit(code, signal);
+    });
     stdin.once("error", (error) => {
+      if (this.process !== child) return;
       this.failProcess(new Error(`Pi worker stdin error: ${error.message}. Stderr: ${this.stderr}`));
     });
     if (child.exitCode !== null) {

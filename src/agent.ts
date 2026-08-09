@@ -316,7 +316,7 @@ export class AgentManager {
           await worker.start();
           if (this.shuttingDown || state.closing) {
             invalidated = true;
-            await this.invalidateWorker(state, worker);
+            await this.invalidateWorker(state, worker).catch(() => {});
             throw new Error("Agent manager is shutting down");
           }
           state.worker = worker;
@@ -324,7 +324,7 @@ export class AgentManager {
           return worker;
         } catch (error) {
           if (worker && !invalidated && state.worker !== worker && state.invalidation?.worker !== worker) {
-            await this.invalidateWorker(state, worker);
+            await this.invalidateWorker(state, worker).catch(() => {});
           }
           throw error;
         }
@@ -361,11 +361,7 @@ export class AgentManager {
       try {
         return await this.raceShutdown(state, operation);
       } catch (error) {
-        if (state.shutdownError) {
-          void this.invalidateWorker(state, worker).catch(() => {});
-        } else {
-          await this.invalidateWorker(state, worker);
-        }
+        await this.invalidateWorker(state, worker).catch(() => {});
         throw error;
       } finally {
         const progress = this.drainProgress(state);
@@ -382,16 +378,8 @@ export class AgentManager {
   }
 
   private steer(state: ChatState, worker: AgentWorker, text: string): Promise<void> {
-    const operation = worker.steer(text).catch(async (error) => {
-      if (state.shutdownError) {
-        void this.invalidateWorker(state, worker).catch(() => {});
-      } else {
-        await this.invalidateWorker(state, worker);
-      }
-      throw error;
-    });
-    return this.raceShutdown(state, operation).catch(async (error) => {
-      if (state.shutdownError) void this.invalidateWorker(state, worker).catch(() => {});
+    return this.raceShutdown(state, worker.steer(text)).catch(async (error) => {
+      await this.invalidateWorker(state, worker).catch(() => {});
       throw error;
     });
   }
@@ -450,11 +438,7 @@ export class AgentManager {
       try {
         await this.raceShutdown(state, worker.newSession());
       } catch (error) {
-        if (state.shutdownError) {
-          void this.invalidateWorker(state, worker).catch(() => {});
-        } else {
-          await this.invalidateWorker(state, worker);
-        }
+        await this.invalidateWorker(state, worker).catch(() => {});
         throw error;
       }
     });

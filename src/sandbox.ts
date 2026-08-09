@@ -221,12 +221,6 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
   return { args, resolved: { workspace, appRoot, cliPath } };
 }
 
-
-/** Host spawn gets an empty env; bwrap sets worker variables. */
-export function buildPiWorkerEnvironment(): Record<string, string> {
-  return {};
-}
-
 function outputCapture(limit: number): {
   stdout: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
   stderr: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };

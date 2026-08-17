@@ -75,8 +75,8 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("reloaded after the current turn");
   expect(SYSTEM_PROMPT).not.toContain("install <source> -l");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/outbox/");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?,kind?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,reply_markup?,reply_to_message_id?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?,kind?,reply_to_message_id?,disable_notification?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/events.jsonl");
   expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'message',message,attachments}");
   expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'callback',callback_query}");
@@ -84,12 +84,12 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}");
   expect(SYSTEM_PROMPT).toContain("wakes you with a single \".\" prompt");
   expect(SYSTEM_PROMPT).toContain("ALL Telegram output through");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_poll\",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_poll\",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"stop_poll\",message_id,reply_markup?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_reaction\",message_id,emoji}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_reaction\",message_id,reaction}");
   expect(SYSTEM_PROMPT).toContain("sets a Telegram reaction on any message in the chat");
-  expect(SYSTEM_PROMPT).toContain("emoji is a single emoji string or an array of 1-3 emoji strings");
+  expect(SYSTEM_PROMPT).toContain("{type:\"custom_emoji\",custom_emoji_id}");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/poll-results.jsonl");
   expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
   expect(SYSTEM_PROMPT).toContain("final unique *.json request name");

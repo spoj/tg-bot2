@@ -428,7 +428,8 @@ describe("WorkspaceOutbox", () => {
       is_anonymous: false, allows_multiple_answers: true, poll_type: "regular",
     });
     await request(workspace, "react.json", {
-      version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍", "🔥"],
+      version: 1, id: "react", type: "send_reaction", message_id: 12,
+      reaction: [{ type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" }],
     });
     const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => {
       if (request.id === "loc") return { messageId: 301 };
@@ -447,7 +448,8 @@ describe("WorkspaceOutbox", () => {
       is_anonymous: false, allows_multiple_answers: true, poll_type: "regular",
     });
     expect(dispatch).toHaveBeenCalledWith(42, {
-      version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍", "🔥"],
+      version: 1, id: "react", type: "send_reaction", message_id: 12,
+      reaction: [{ type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" }],
     });
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
@@ -482,7 +484,7 @@ describe("WorkspaceOutbox", () => {
     await request(workspace, "few-options.json", { version: 1, id: "few-options", type: "send_poll", question: "q", options: ["only"] });
     await request(workspace, "quiz-no-answer.json", { version: 1, id: "quiz-no-answer", type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz" });
     await request(workspace, "bad-answer-index.json", { version: 1, id: "bad-answer-index", type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 });
-    await request(workspace, "bad-emoji.json", { version: 1, id: "bad-emoji", type: "send_reaction", message_id: 3, emoji: ["ok", ""] });
+    await request(workspace, "bad-emoji.json", { version: 1, id: "bad-emoji", type: "send_reaction", message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
     await request(workspace, "bad-stop.json", { version: 1, id: "bad-stop", type: "stop_poll", message_id: 0 });
     const dispatch = vi.fn(async () => undefined);
     await new WorkspaceOutbox({ dataDir, dispatch }).poll();
@@ -492,24 +494,33 @@ describe("WorkspaceOutbox", () => {
     ]);
   });
 
-  it("accepts a single-string reaction emoji and dispatches it as an array", async () => {
+  it("dispatches an empty reaction array to remove a reaction", async () => {
     const { dataDir, workspace } = await fixture();
-    await request(workspace, "react.json", { version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: "👍" });
+    await request(workspace, "react.json", { version: 1, id: "react", type: "send_reaction", message_id: 12, reaction: [] });
     const dispatch = vi.fn(async () => undefined);
     await new WorkspaceOutbox({ dataDir, dispatch }).poll();
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍"] });
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "react", type: "send_reaction", message_id: 12, reaction: [] });
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["react.json"]);
   });
 
-  it("rejects reaction requests with too many entries or an empty string", async () => {
+  it("rejects reaction requests with too many or invalid entries", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
-    await request(workspace, "too-many.json", { version: 1, id: "too-many", type: "send_reaction", message_id: 3, emoji: ["👍", "🔥", "😀", "😎"] });
-    await request(workspace, "empty-string.json", { version: 1, id: "empty-string", type: "send_reaction", message_id: 3, emoji: "" });
+    await request(workspace, "too-many.json", {
+      version: 1, id: "too-many", type: "send_reaction", message_id: 3,
+      reaction: [
+        { type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" },
+        { type: "emoji", emoji: "😀" }, { type: "emoji", emoji: "😎" },
+      ],
+    });
+    await request(workspace, "bad-entry.json", {
+      version: 1, id: "bad-entry", type: "send_reaction", message_id: 3,
+      reaction: [{ type: "emoji", emoji: "" }],
+    });
     const dispatch = vi.fn(async () => undefined);
     await new WorkspaceOutbox({ dataDir, dispatch }).poll();
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "failed"))).toEqual(["empty-string.json", "too-many.json"]);
+    expect(await names(path.join(outbox, "failed"))).toEqual(["bad-entry.json", "too-many.json"]);
   });
 
   it("records a failed send event when the dispatcher throws", async () => {
@@ -620,5 +631,127 @@ describe("WorkspaceOutbox", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+  it("dispatches edit_message and delete_message requests with their fields", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "edit.json", {
+      version: 1, id: "edit", type: "edit_message", message_id: 55,
+      text: "updated text", parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      link_preview_options: { is_disabled: true },
+    });
+    await request(workspace, "del.json", { version: 1, id: "del", type: "delete_message", message_id: 56 });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1, id: "edit", type: "edit_message", message_id: 55,
+      text: "updated text", parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      link_preview_options: { is_disabled: true },
+    });
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "del", type: "delete_message", message_id: 56 });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["del.json", "edit.json"]);
+  });
+
+  it("rejects edit_message with text over 4096 characters", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "long-edit.json", {
+      version: 1, id: "long-edit", type: "edit_message", message_id: 7, text: "x".repeat(4_097),
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["long-edit.json"]);
+  });
+
+  it("rejects send_message carrying both parse_mode and entities", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "both.json", {
+      version: 1, id: "both", type: "send_message", text: "hello",
+      parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 5 }],
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["both.json"]);
+  });
+
+  it("rejects entities with a non-object entry or a missing length", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    await request(workspace, "bad-entity.json", {
+      version: 1, id: "bad-entity", type: "send_message", text: "x", entities: ["bold"],
+    });
+    await request(workspace, "no-length.json", {
+      version: 1, id: "no-length", type: "send_message", text: "x",
+      entities: [{ type: "bold", offset: 0 }],
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(outbox, "failed"))).toEqual(["bad-entity.json", "no-length.json"]);
+  });
+
+  it("rejects oversized link_preview_options", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "big-preview.json", {
+      version: 1, id: "big-preview", type: "send_message", text: "x",
+      link_preview_options: { url: "x".repeat(8_193) },
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["big-preview.json"]);
+  });
+
+  it("accepts a reaction mixing emoji and custom_emoji entries", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "react.json", {
+      version: 1, id: "react", type: "send_reaction", message_id: 12,
+      reaction: [{ type: "emoji", emoji: "👍" }, { type: "custom_emoji", custom_emoji_id: "1234567890123456" }],
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1, id: "react", type: "send_reaction", message_id: 12,
+      reaction: [{ type: "emoji", emoji: "👍" }, { type: "custom_emoji", custom_emoji_id: "1234567890123456" }],
+    });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["react.json"]);
+  });
+
+  it("rejects edit_message with no text, reply_markup, or link_preview_options", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "empty-edit.json", { version: 1, id: "empty-edit", type: "edit_message", message_id: 9 });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["empty-edit.json"]);
+  });
+
+  it("rejects edit_message carrying both parse_mode and entities", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "both-edit.json", {
+      version: 1, id: "both-edit", type: "edit_message", message_id: 9,
+      text: "x", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 1 }],
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["both-edit.json"]);
+  });
+
+  it("dispatches edit_message without text using only reply_markup", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "reply-edit.json", {
+      version: 1, id: "reply-edit", type: "edit_message", message_id: 9,
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1, id: "reply-edit", type: "edit_message", message_id: 9,
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["reply-edit.json"]);
   });
 });

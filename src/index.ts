@@ -3,7 +3,7 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, recordPollOwner, sendTelegramLocation, sendTelegramPoll, sendTelegramReaction, sendTelegramRichMessage, sendWorkspaceFile, stopTelegramPoll, TelegramDeliveryQueue } from "./telegram.js";
+import { createTelegramBot, closeTelegramIngress, deleteTelegramMessage, flushTelegramIngress, recordPollOwner, sendTelegramEditMessage, sendTelegramLocation, sendTelegramPoll, sendTelegramReaction, sendTelegramRichMessage, sendWorkspaceFile, stopTelegramPoll, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -78,6 +78,8 @@ export async function main(): Promise<void> {
                 sandboxPath: request.path,
                 ...(request.caption === undefined ? {} : { caption: request.caption }),
                 ...(request.kind === undefined ? {} : { kind: request.kind }),
+                ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
+                ...(request.disable_notification === undefined ? {} : { disableNotification: request.disable_notification }),
               }),
             };
           case "send_message":
@@ -87,6 +89,9 @@ export async function main(): Promise<void> {
                 ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
                 ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
                 ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
+                ...(request.entities === undefined ? {} : { entities: request.entities }),
+                ...(request.link_preview_options === undefined ? {} : { linkPreviewOptions: request.link_preview_options }),
+                ...(request.disable_notification === undefined ? {} : { disableNotification: request.disable_notification }),
               }),
             };
           case "send_location":
@@ -98,6 +103,8 @@ export async function main(): Promise<void> {
                 ...(request.heading === undefined ? {} : { heading: request.heading }),
                 ...(request.live_period === undefined ? {} : { livePeriod: request.live_period }),
                 ...(request.venue === undefined ? {} : { venue: request.venue }),
+                ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
+                ...(request.disable_notification === undefined ? {} : { disableNotification: request.disable_notification }),
               }),
             };
           case "send_poll": {
@@ -108,6 +115,8 @@ export async function main(): Promise<void> {
               ...(request.allows_multiple_answers === undefined ? {} : { allowsMultipleAnswers: request.allows_multiple_answers }),
               ...(request.poll_type === undefined ? {} : { pollType: request.poll_type }),
               ...(request.correct_option_id === undefined ? {} : { correctOptionId: request.correct_option_id }),
+              ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
+              ...(request.disable_notification === undefined ? {} : { disableNotification: request.disable_notification }),
             });
             try {
               await recordPollOwner(dataDir, chatId, sent.pollId, sent.messageId);
@@ -121,7 +130,22 @@ export async function main(): Promise<void> {
               data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup),
             };
           case "send_reaction":
-            await sendTelegramReaction(bot, chatId, request.message_id, request.emoji);
+            await sendTelegramReaction(bot, chatId, request.message_id, request.reaction);
+            return {};
+          case "edit_message":
+            return {
+              messageId: await sendTelegramEditMessage(bot, {
+                chatId,
+                messageId: request.message_id,
+                ...(request.text === undefined ? {} : { text: request.text }),
+                ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
+                ...(request.entities === undefined ? {} : { entities: request.entities }),
+                ...(request.link_preview_options === undefined ? {} : { linkPreviewOptions: request.link_preview_options }),
+                ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
+              }),
+            };
+          case "delete_message":
+            await deleteTelegramMessage(bot, chatId, request.message_id);
             return {};
           default: {
             const unhandled: never = request;

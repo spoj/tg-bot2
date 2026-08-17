@@ -13,19 +13,23 @@ Attachments are ordinary data paths under /workspace/...; read them from those p
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
 Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Extension changes are debounced and automatically reloaded after the current turn.
 To send files or messages through Telegram, write one request per send under
-/workspace/.tg-bot/outbox/. Request types: {version:1,id,type:"send_file",path,caption?,kind?}
+/workspace/.tg-bot/outbox/. Request types:
+{version:1,id,type:"send_file",path,caption?,kind?,reply_to_message_id?,disable_notification?}
 sends the file at path (relative to /workspace or an absolute /workspace/... path)
 with an optional caption; kind is "auto" (default: images are sent as photos,
 audio as audio, video as video, other files as documents, and images over 10 MB
 as documents) or an explicit "photo", "audio", "video", "voice", or "document".
-{version:1,id,type:"send_message",text,parse_mode?,reply_markup?,reply_to_message_id?}
+{version:1,id,type:"send_message",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
 sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
-plain text; malformed markup is resent as plain text), reply_markup is Telegram
-reply-markup JSON such as an inline_keyboard button list, and
-reply_to_message_id targets an earlier message.
-{version:1,id,type:"send_location",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?}
+plain text; malformed markup is resent as plain text; parse_mode and entities
+are mutually exclusive), entities is a list of {type,offset,length} message
+entities, link_preview_options is a Telegram LinkPreviewOptions object,
+reply_markup is Telegram reply-markup JSON such as an inline_keyboard button
+list, reply_to_message_id targets an earlier message, and
+disable_notification sends silently.
+{version:1,id,type:"send_location",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
 sends a location pin (venue {title,address} sends a named venue instead).
-{version:1,id,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?}
+{version:1,id,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
 poll_answer event in events.jsonl; the matching send line in events.jsonl
@@ -33,7 +37,9 @@ records pollId.
 {version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
 appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
 (latest 256 lines kept); poll_id matches the poll_answer events' pollId.
-{version:1,id,type:"send_reaction",message_id,emoji} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): emoji is a single emoji string or an array of 1-3 emoji strings; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
+{version:1,id,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
+{version:1,id,type:"edit_message",message_id,text?,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (at least one of text/reply_markup/link_preview_options required; message_id is the numeric messageId of that message).
+{version:1,id,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
 Every chat event is appended by the host to /workspace/.tg-bot/events.jsonl (one JSON

@@ -330,17 +330,26 @@ export type TelegramLocationRequest = {
   heading?: number | undefined;
   livePeriod?: number | undefined;
   venue?: { title: string; address: string };
+  replyToMessageId?: number | undefined;
+  disableNotification?: boolean | undefined;
 };
 
 export async function sendTelegramLocation(bot: Bot, chatId: number, request: TelegramLocationRequest): Promise<number> {
+  const shared = {
+    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
+  };
   if (request.venue) {
-    const sent = await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address);
+    const sent = Object.keys(shared).length === 0
+      ? await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address)
+      : await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address, shared as never);
     return sent.message_id;
   }
   const sent = await bot.api.sendLocation(chatId, request.latitude, request.longitude, {
     ...(request.horizontalAccuracy === undefined ? {} : { horizontal_accuracy: request.horizontalAccuracy }),
     ...(request.heading === undefined ? {} : { heading: request.heading }),
     ...(request.livePeriod === undefined ? {} : { live_period: request.livePeriod }),
+    ...shared,
   });
   return sent.message_id;
 }
@@ -352,6 +361,8 @@ export type TelegramPollRequest = {
   allowsMultipleAnswers?: boolean | undefined;
   pollType?: "regular" | "quiz" | undefined;
   correctOptionId?: number | undefined;
+  replyToMessageId?: number | undefined;
+  disableNotification?: boolean | undefined;
 };
 
 export async function sendTelegramPoll(bot: Bot, chatId: number, request: TelegramPollRequest): Promise<{ messageId: number; pollId: string }> {
@@ -360,6 +371,8 @@ export async function sendTelegramPoll(bot: Bot, chatId: number, request: Telegr
     ...(request.allowsMultipleAnswers === undefined ? {} : { allows_multiple_answers: request.allowsMultipleAnswers }),
     ...(request.pollType === undefined ? {} : { type: request.pollType }),
     ...(request.correctOptionId === undefined ? {} : { correct_option_id: request.correctOptionId }),
+    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
   });
   return { messageId: sent.message_id, pollId: sent.poll.id };
 }
@@ -368,9 +381,10 @@ export async function stopTelegramPoll(bot: Bot, chatId: number, messageId: numb
   return bot.api.stopPoll(chatId, messageId, replyMarkup === undefined ? undefined : { reply_markup: replyMarkup as never });
 }
 
-export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: number, emoji: string[]): Promise<void> {
-  // The outbox validator bounds emoji strings; grammY's emoji literal union cannot express runtime values.
-  await bot.api.setMessageReaction(chatId, messageId, emoji.map((entry) => ({ type: "emoji" as const, emoji: entry })) as never);
+export type TelegramReaction = { type: "emoji"; emoji: string } | { type: "custom_emoji"; custom_emoji_id: string };
+
+export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: number, reaction: TelegramReaction[]): Promise<void> {
+  await bot.api.setMessageReaction(chatId, messageId, reaction as never);
 }
 
 export type TelegramRichMessageRequest = {
@@ -378,6 +392,9 @@ export type TelegramRichMessageRequest = {
   parseMode?: "HTML" | "MarkdownV2" | undefined;
   replyMarkup?: unknown;
   replyToMessageId?: number | undefined;
+  entities?: Array<{ type: string; offset: number; length: number; [key: string]: unknown }>;
+  linkPreviewOptions?: unknown;
+  disableNotification?: boolean | undefined;
 };
 function isTelegramParseFailure(error: unknown): boolean {
   return error instanceof GrammyError && /can['’]t parse|cannot parse/i.test(error.description);
@@ -389,6 +406,9 @@ export async function sendTelegramRichMessage(bot: Bot, chatId: number, request:
     ...(request.parseMode === undefined ? {} : { parse_mode: request.parseMode }),
     ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
     ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+    ...(request.entities === undefined ? {} : { entities: request.entities as never }),
+    ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
+    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
   };
   try {
     const sent = await bot.api.sendMessage(chatId, request.text, options);
@@ -398,9 +418,49 @@ export async function sendTelegramRichMessage(bot: Bot, chatId: number, request:
     const sent = await bot.api.sendMessage(chatId, request.text, {
       ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
       ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+      ...(request.entities === undefined ? {} : { entities: request.entities as never }),
+      ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
+      ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
     });
     return sent.message_id;
   }
+}
+export type TelegramEditMessageRequest = {
+  chatId: number;
+  messageId: number;
+  text?: string;
+  parseMode?: "HTML" | "MarkdownV2" | undefined;
+  entities?: Array<{ type: string; offset: number; length: number }>;
+  linkPreviewOptions?: unknown;
+  replyMarkup?: unknown;
+};
+
+/** Edits one message; malformed markup falls back to the same text as plain. */
+export async function sendTelegramEditMessage(bot: Bot, request: TelegramEditMessageRequest): Promise<number> {
+  const options = {
+    ...(request.parseMode === undefined ? {} : { parse_mode: request.parseMode }),
+    ...(request.entities === undefined ? {} : { entities: request.entities as never }),
+    ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
+    ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
+  };
+  try {
+    const sent = await bot.api.editMessageText(request.chatId, request.messageId, request.text as string, options);
+    if (sent === true) throw new Error("editMessageText returned true for a chat message");
+    return sent.message_id;
+  } catch (error) {
+    if (request.parseMode === undefined || !isTelegramParseFailure(error)) throw error;
+    const sent = await bot.api.editMessageText(request.chatId, request.messageId, request.text as string, {
+      ...(request.entities === undefined ? {} : { entities: request.entities as never }),
+      ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
+      ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
+    });
+    if (sent === true) throw new Error("editMessageText returned true for a chat message");
+    return sent.message_id;
+  }
+}
+
+export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId: number): Promise<void> {
+  await bot.api.deleteMessage(chatId, messageId);
 }
 
 
@@ -412,6 +472,8 @@ export type WorkspaceFileRequest = {
   sandboxPath: string;
   caption?: string | undefined;
   kind?: WorkspaceFileKind;
+  replyToMessageId?: number | undefined;
+  disableNotification?: boolean | undefined;
 };
 
 const MAX_PHOTO_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -498,7 +560,11 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
       : Array.from(request.caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
 
     const input = kind === "photo" ? new InputFile(bytes) : new InputFile(bytes, path.basename(resolved));
-    const options = caption === undefined ? undefined : { caption };
+    const options = {
+      ...(caption === undefined ? {} : { caption }),
+      ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+      ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
+    };
     let sent: { message_id: number };
     if (kind === "photo") sent = await bot.api.sendPhoto(request.chatId, input, options);
     else if (kind === "audio") sent = await bot.api.sendAudio(request.chatId, input, options);

@@ -10,12 +10,14 @@ import { GrammyError, type Bot } from "grammy";
 import {
   closeTelegramIngress,
   createTelegramBot,
+  deleteTelegramMessage,
   flushTelegramIngress,
   formatModelList,
   formatStatus,
   formatThinkingLevels,
   recordPollOwner,
   attachmentSource,
+  sendTelegramEditMessage,
   sendTelegramLocation,
   sendTelegramPoll,
   sendTelegramReaction,
@@ -33,6 +35,8 @@ const execFile = promisify(execFileCallback);
 function fakeBot() {
   return {
     api: {
+      deleteMessage: vi.fn(async () => true),
+      editMessageText: vi.fn(async () => ({ message_id: 123 })),
       sendAudio: vi.fn(async () => ({ message_id: 123 })),
       sendDocument: vi.fn(async () => ({ message_id: 123 })),
       sendLocation: vi.fn(async () => ({ message_id: 123 })),
@@ -539,6 +543,24 @@ it("sends a valid workspace file with a bounded caption", async () => {
     expect(sendDocument.mock.calls[0]?.[2]).toEqual({ caption: Array.from(caption).slice(0, 1_024).join("") });
   });
 });
+it("passes reply target and notification settings to the send method", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "report.txt"), "report");
+    const bot = fakeBot();
+
+    await expect(sendWorkspaceFile(bot, {
+      chatId: 42,
+      workspace,
+      sandboxPath: "/workspace/report.txt",
+      replyToMessageId: 9,
+      disableNotification: true,
+    })).resolves.toBe(123);
+
+    const sendDocument = bot.api.sendDocument as unknown as Mock;
+    expect(sendDocument.mock.calls[0]?.[0]).toBe(42);
+    expect(sendDocument.mock.calls[0]?.[2]).toEqual({ reply_to_message_id: 9, disable_notification: true });
+  });
+});
 it("sends detected media kinds with the matching API methods", async () => {
   await withWorkspace(async (workspace) => {
     const cases = [
@@ -1024,6 +1046,75 @@ describe("Telegram rich messages", () => {
     await expect(sendTelegramRichMessage(bot, 42, { text: "<b>hi</b>", parseMode: "HTML" })).rejects.toThrow("chat not found");
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
+
+  it("passes entities, link preview options, and notifications to sendMessage", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramRichMessage(bot, 42, {
+      text: "hi",
+      entities: [{ type: "bold", offset: 0, length: 2 }],
+      linkPreviewOptions: { is_disabled: true },
+      disableNotification: true,
+    })).resolves.toBe(123);
+    const sendMessage = bot.api.sendMessage as unknown as Mock;
+    expect(sendMessage).toHaveBeenCalledWith(42, "hi", {
+      entities: [{ type: "bold", offset: 0, length: 2 }],
+      link_preview_options: { is_disabled: true },
+      disable_notification: true,
+    });
+  });
+});
+
+describe("Telegram message editing and deletion", () => {
+  it("edits a message and returns the edited message id", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramEditMessage(bot, {
+      chatId: 42,
+      messageId: 7,
+      text: "<b>updated</b>",
+      parseMode: "HTML",
+      entities: [{ type: "bold", offset: 0, length: 3 }],
+      linkPreviewOptions: { is_disabled: true },
+      replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    })).resolves.toBe(123);
+    const editMessageText = bot.api.editMessageText as unknown as Mock;
+    expect(editMessageText).toHaveBeenCalledWith(42, 7, "<b>updated</b>", {
+      parse_mode: "HTML",
+      entities: [{ type: "bold", offset: 0, length: 3 }],
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    });
+  });
+
+  it("resends a malformed edit as plain text", async () => {
+    const bot = fakeBot();
+    const editMessageText = bot.api.editMessageText as unknown as Mock;
+    editMessageText.mockRejectedValueOnce(new GrammyError(
+      "Bad Request: can't parse entities",
+      { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
+      "editMessageText",
+      { chat_id: 42, message_id: 7, text: "<b>updated</b>", parse_mode: "HTML" },
+    ));
+    await expect(sendTelegramEditMessage(bot, {
+      chatId: 42,
+      messageId: 7,
+      text: "<b>updated</b>",
+      parseMode: "HTML",
+      linkPreviewOptions: { is_disabled: true },
+      replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    })).resolves.toBe(123);
+    expect(editMessageText).toHaveBeenCalledTimes(2);
+    expect(editMessageText.mock.calls[1]).toEqual([42, 7, "<b>updated</b>", {
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    }]);
+  });
+
+  it("deletes a message through the Bot API", async () => {
+    const bot = fakeBot();
+    await expect(deleteTelegramMessage(bot, 42, 7)).resolves.toBeUndefined();
+    const deleteMessage = bot.api.deleteMessage as unknown as Mock;
+    expect(deleteMessage).toHaveBeenCalledWith(42, 7);
+  });
 });
 
 describe("Telegram callback queries", () => {
@@ -1163,9 +1254,15 @@ describe("Telegram locations, polls, and reactions", () => {
 
   it("sets and clears reactions", async () => {
     const bot = fakeBot();
-    await sendTelegramReaction(bot, 42, 123, ["👍", "🔥"]);
-    const setReaction = bot.api.setMessageReaction as unknown as ReturnType<typeof vi.fn>;
-    expect(setReaction).toHaveBeenCalledWith(42, 123, [{ type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" }]);
+    await sendTelegramReaction(bot, 42, 123, [
+      { type: "emoji", emoji: "👍" },
+      { type: "custom_emoji", custom_emoji_id: "custom-1" },
+    ]);
+    const setReaction = bot.api.setMessageReaction as unknown as Mock;
+    expect(setReaction).toHaveBeenCalledWith(42, 123, [
+      { type: "emoji", emoji: "👍" },
+      { type: "custom_emoji", custom_emoji_id: "custom-1" },
+    ]);
     await sendTelegramReaction(bot, 42, 123, []);
     expect(setReaction.mock.calls[1]).toEqual([42, 123, []]);
   });

@@ -82,8 +82,8 @@ vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
   closeTelegramIngress: state.closeTelegramIngress,
   flushTelegramIngress: state.flushTelegramIngress,
+  sendTelegramRichMessage: vi.fn(),
   sendTelegramText: vi.fn(),
-  sendWorkspaceFile: vi.fn(),
   TelegramDeliveryQueue: state.delivery,
 }));
 

@@ -4,7 +4,7 @@ import { lstat, link, mkdir, open, opendir, realpath, rename, unlink } from "nod
 import path from "node:path";
 import { SerialQueue } from "./queue.js";
 
-export type WorkspaceOutboxRequest = {
+export type WorkspaceOutboxSendFileRequest = {
   version: 1;
   id: string;
   type: "send_file";
@@ -12,22 +12,32 @@ export type WorkspaceOutboxRequest = {
   caption?: string;
 };
 
-export type WorkspaceOutboxSender = (
+export type WorkspaceOutboxSendMessageRequest = {
+  version: 1;
+  id: string;
+  type: "send_message";
+  text: string;
+  parse_mode?: "HTML" | "MarkdownV2";
+  reply_markup?: unknown;
+  reply_to_message_id?: number;
+};
+
+export type WorkspaceOutboxRequest = WorkspaceOutboxSendFileRequest | WorkspaceOutboxSendMessageRequest;
+
+export type WorkspaceOutboxDispatcher = (
   chatId: number,
-  sandboxPath: string,
-  caption?: string,
-) => Promise<void>;
+  request: WorkspaceOutboxRequest,
+) => Promise<number | undefined>;
 
 export type WorkspaceOutboxOptions = {
   dataDir: string;
-  sendFile: WorkspaceOutboxSender;
+  dispatch: WorkspaceOutboxDispatcher;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   logger?: (error: unknown) => void;
 };
-
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
@@ -35,6 +45,12 @@ const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_REQUEST_ID_LENGTH = 256;
 const MAX_REQUEST_PATH_LENGTH = 4_096;
 const MAX_REQUEST_CAPTION_LENGTH = 16 * 1024;
+const MAX_REQUEST_TEXT_LENGTH = 4_096;
+const MAX_REQUEST_REPLY_MARKUP_BYTES = 8_192;
+const MAX_DELIVERY_ACK_LINES = 256;
+const MAX_DELIVERY_ACK_BYTES = 64 * 1024;
+const DELIVERY_ACK_NAME = "deliveries.jsonl";
+
 const CHAT_DIRECTORY = /^-?\d+$/;
 const JSON_REQUEST = /\.json$/;
 // Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
@@ -106,9 +122,14 @@ function validateRequest(value: unknown): WorkspaceOutboxRequest {
   }
   const request = value as Record<string, unknown>;
   if (request.version !== 1) throw new Error("Outbox request version must be 1");
-  if (request.type !== "send_file") throw new Error("Outbox request type must be send_file");
   if (typeof request.id !== "string" || request.id.length === 0) throw new Error("Outbox request id must be a non-empty string");
   if (request.id.length > MAX_REQUEST_ID_LENGTH) throw new Error(`Outbox request id must be at most ${MAX_REQUEST_ID_LENGTH} characters`);
+  if (request.type === "send_file") return validateSendFileRequest(request.id, request);
+  if (request.type === "send_message") return validateSendMessageRequest(request.id, request);
+  throw new Error("Outbox request type must be send_file or send_message");
+}
+
+function validateSendFileRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendFileRequest {
   if (typeof request.path !== "string" || request.path.length === 0) throw new Error("Outbox request path must be a non-empty string");
   if (request.path.length > MAX_REQUEST_PATH_LENGTH) throw new Error(`Outbox request path must be at most ${MAX_REQUEST_PATH_LENGTH} characters`);
   if (request.caption !== undefined && typeof request.caption !== "string") {
@@ -119,10 +140,46 @@ function validateRequest(value: unknown): WorkspaceOutboxRequest {
   }
   return {
     version: 1,
-    id: request.id,
+    id,
     type: "send_file",
     path: request.path,
     ...(request.caption === undefined ? {} : { caption: request.caption }),
+  };
+}
+
+function validateSendMessageRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendMessageRequest {
+  if (typeof request.text !== "string" || request.text.length === 0) throw new Error("Outbox request text must be a non-empty string");
+  if (request.text.length > MAX_REQUEST_TEXT_LENGTH) throw new Error(`Outbox request text must be at most ${MAX_REQUEST_TEXT_LENGTH} characters`);
+  if (request.parse_mode !== undefined && request.parse_mode !== "HTML" && request.parse_mode !== "MarkdownV2") {
+    throw new Error("Outbox request parse_mode must be HTML or MarkdownV2");
+  }
+  if (request.reply_markup !== undefined) {
+    if (request.reply_markup === null || typeof request.reply_markup !== "object" || Array.isArray(request.reply_markup)) {
+      throw new Error("Outbox request reply_markup must be an object");
+    }
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(request.reply_markup);
+    } catch {
+      throw new Error("Outbox request reply_markup must be JSON-serializable");
+    }
+    if (serialized.length > MAX_REQUEST_REPLY_MARKUP_BYTES) {
+      throw new Error(`Outbox request reply_markup must be at most ${MAX_REQUEST_REPLY_MARKUP_BYTES} bytes`);
+    }
+  }
+  if (request.reply_to_message_id !== undefined) {
+    if (typeof request.reply_to_message_id !== "number" || !Number.isSafeInteger(request.reply_to_message_id) || request.reply_to_message_id < 1) {
+      throw new Error("Outbox request reply_to_message_id must be a positive integer");
+    }
+  }
+  return {
+    version: 1,
+    id,
+    type: "send_message",
+    text: request.text,
+    ...(request.parse_mode === undefined ? {} : { parse_mode: request.parse_mode }),
+    ...(request.reply_markup === undefined ? {} : { reply_markup: request.reply_markup }),
+    ...(request.reply_to_message_id === undefined ? {} : { reply_to_message_id: request.reply_to_message_id }),
   };
 }
 
@@ -224,7 +281,7 @@ async function readBoundedEntries(directory: string, limit: number) {
 
 export class WorkspaceOutbox {
   private readonly dataDir: string;
-  private readonly sendFile: WorkspaceOutboxSender;
+  private readonly dispatch: WorkspaceOutboxDispatcher;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
@@ -241,7 +298,7 @@ export class WorkspaceOutbox {
       throw new Error("Outbox poll interval must be a positive timer-safe integer");
     }
     this.dataDir = path.resolve(options.dataDir);
-    this.sendFile = options.sendFile;
+    this.dispatch = options.dispatch;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
@@ -379,8 +436,16 @@ export class WorkspaceOutbox {
         try {
           lease = this.startClaimLease(claim, chatId);
           const request = await readRequest(claim.path);
-          validateWorkspacePath(workspace, request.path);
-          await this.sendFile(chatId, request.path, request.caption);
+          if (request.type === "send_file") validateWorkspacePath(workspace, request.path);
+          const messageId = await this.dispatch(chatId, request);
+          if (messageId !== undefined) {
+            try {
+              await this.appendDeliveryAck(metadata.path, request.id, messageId);
+            } catch (error) {
+              // Delivery succeeded; a lost ack must never resend the request.
+              this.reportRequestError(chatId, archiveName, error);
+            }
+          }
         } catch (error) {
           if (lease) {
             await lease.stop();
@@ -582,6 +647,77 @@ export class WorkspaceOutbox {
     }
     return { ok: true };
   }
+  /** Appends one ack line, rotating the file when it exceeds the line or byte caps. */
+  private async appendDeliveryAck(directoryPath: string, requestId: string, messageId: number): Promise<void> {
+    const filePath = path.join(directoryPath, DELIVERY_ACK_NAME);
+    const line = `${JSON.stringify({ id: requestId, messageId })}\n`;
+    const handle = await this.openDeliveryAck(filePath);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("Outbox delivery ack is not a regular file");
+      await handle.write(line, null, "utf8");
+      const total = stat.size + Buffer.byteLength(line, "utf8");
+      const lines = await this.latestDeliveryAckLines(handle, total);
+      if (lines.length > MAX_DELIVERY_ACK_LINES || total > MAX_DELIVERY_ACK_BYTES) {
+        await this.replaceDeliveryAck(filePath, `${lines.slice(-MAX_DELIVERY_ACK_LINES).join("\n")}\n`);
+      }
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+
+  /** Opens the ack file, replacing a symlink the workspace may have planted at its path. */
+  private async openDeliveryAck(filePath: string): Promise<Awaited<ReturnType<typeof open>>> {
+    try {
+      return await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
+    } catch (error) {
+      if (errorCode(error) !== "ELOOP") throw error;
+      try {
+        await unlink(filePath);
+      } catch (unlinkError) {
+        if (!isMissing(unlinkError)) throw unlinkError;
+      }
+      return open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
+    }
+  }
+
+  /** Reads the tail of the ack file (bounded), dropping a possible partial first line. */
+  private async latestDeliveryAckLines(handle: Awaited<ReturnType<typeof open>>, size: number): Promise<string[]> {
+    const readLength = Math.min(size, MAX_DELIVERY_ACK_BYTES);
+    const position = size - readLength;
+    const buffer = Buffer.allocUnsafe(readLength);
+    let bytesRead = 0;
+    while (bytesRead < readLength) {
+      const result = await handle.read(buffer, bytesRead, readLength - bytesRead, position + bytesRead);
+      if (result.bytesRead === 0) break;
+      bytesRead += result.bytesRead;
+    }
+    const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
+    const complete = position === 0 ? lines : lines.slice(1);
+    return complete.filter(Boolean);
+  }
+
+  /** Atomically rewrites the ack file via a unique temporary file in the same directory. */
+  private async replaceDeliveryAck(filePath: string, content: string): Promise<void> {
+    const directory = path.dirname(filePath);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const tempPath = path.join(directory, `.deliveries-${randomUUID()}.tmp`);
+      let handle: Awaited<ReturnType<typeof open>> | undefined;
+      try {
+        handle = await open(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
+        await handle.write(content, null, "utf8");
+      } catch (error) {
+        if (isExisting(error)) continue;
+        throw error;
+      } finally {
+        if (handle) await handle.close().catch(() => {});
+      }
+      await rename(tempPath, filePath);
+      return;
+    }
+    throw new Error("Unable to rewrite outbox delivery acks");
+  }
+
 
   private reportRequestError(chatId: number, name: string, error: unknown): void {
     let detail: string;

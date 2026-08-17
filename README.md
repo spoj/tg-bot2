@@ -42,7 +42,7 @@ The unit intentionally does not add `ProtectSystem`, `PrivateNetwork`, or other 
 
 Development: `pnpm run dev`. The service uses Telegram long polling. Private chats are intended. Data is namespaced by numeric `chat.id`; authorization uses numeric `from.id`.
 
-All non-command updates in a chat share an ingress buffer. Each update resets a two-second quiet timer; when it expires, ordered text, captions, attachments, and download failures are submitted as one logical request. Common Telegram attachments are saved under `workspace/attachments/YYYY-MM-DD/<message-id>/` and Pi receives sandbox-visible `/workspace/...` paths with type, MIME type, and original-name metadata. Telegram's Bot API download limit is 20 MB per file. Unsupported non-file messages are described textually.
+All non-command updates in a chat share an ingress buffer. Each update resets a two-second quiet timer; when it expires, ordered text, captions, attachments, and download failures are submitted as one logical request. Common Telegram attachments are saved under `workspace/attachments/YYYY-MM-DD/<message-id>/` and Pi receives sandbox-visible `/workspace/...` paths with type, MIME type, and original-name metadata. Telegram's Bot API download limit is 20 MB per file. Shared location pins and venues become `[Location pin: …]` prompt text (with optional accuracy, heading, live period, venue name, and address); other unsupported non-file messages are described textually.
 
 If a request arrives during an active run, it is sent through Pi's native steering mechanism; the active run sends the eventual response. `/new` establishes a per-chat ingress boundary: accepted earlier updates drain first, later updates wait until the new JSONL session starts, and older session files remain searchable. Replies, assistant progress, scheduled text, and outbox files use one per-chat FIFO delivery queue: same-chat sends retain production order, different chats can send concurrently, and one failed send does not block later sends. Shutdown stops polling and producers, drains accepted ingress and outbound sends, and terminates workers.
 
@@ -94,12 +94,13 @@ DATA_DIR/chats/<numeric-chat-id>/
     .pi/sessions/*.jsonl             # canonical Pi conversation files
     .tg-bot/schedules.json           # workspace-owned reminders
     .tg-bot/outbox/{*.json,processed,failed}/
+    .tg-bot/deliveries.jsonl        # bounded delivery acks (latest 256 lines)
     attachments/YYYY-MM-DD/<message-id>/
     memory/                           # optional user-curated notes
     .cache/npm/ .cache/uv/ .local/ .python/
 ```
 
-Normal files, workspace-local npm installs, Pi package installs, uv environments/tools, scripts, caches, attachments, schedules, outbox requests, and Pi sessions persist. Pi JSONL files are the session transcript; other workspace files are ordinary data. To send a file, write a unique `send_file` request (`{version:1,id,type:"send_file",path,caption?}`) to `.tg-bot/outbox/` via a temporary non-`.json` file and atomic rename. The requested path must remain in the workspace; processed and failed requests are archived in their corresponding directories.
+Normal files, workspace-local npm installs, Pi package installs, uv environments/tools, scripts, caches, attachments, schedules, outbox requests, and Pi sessions persist. Pi JSONL files are the session transcript; other workspace files are ordinary data. To send through Telegram, write one request (`{version:1,id,...}`) to `.tg-bot/outbox/` via a temporary non-`.json` file and atomic rename: `send_file` (`{version:1,id,type:"send_file",path,caption?}`) sends a workspace file; `send_message` (`{version:1,id,type:"send_message",text,parse_mode?,reply_markup?,reply_to_message_id?}`) sends a text message with optional HTML/MarkdownV2 markup (malformed markup is resent as plain text), inline-keyboard reply markup, and a reply target. Requested paths must remain in the workspace; processed and failed requests are archived in their corresponding directories. After each successful send the host appends `{id,messageId}` to `.tg-bot/deliveries.jsonl` (bounded to the latest 256 lines). Inline-button presses arrive as `[Telegram button press: data=…]` updates and flow through the same ingress buffering and steering as messages.
 
 Schedules are stored in `.tg-bot/schedules.json` with root `{version:1,schedules:[...]}`. Each record has `id`, `prompt`, `dueAt`, `recurrence`, `enabled`, `lastRunAt`, and `runCount`; timestamps are UTC and recurrence is hourly, daily, weekly, or `null`.
 

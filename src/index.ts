@@ -3,7 +3,7 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
+import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramRichMessage, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -89,13 +89,21 @@ export async function main(): Promise<void> {
   });
   const outboxInstance = new WorkspaceOutbox({
     dataDir,
-    sendFile: async (chatId, sandboxPath, caption) => {
-      await deliveryQueue.enqueue(chatId, async () => {
-        await sendWorkspaceFile(bot, {
-          chatId,
-          workspace: chatPaths(dataDir, chatId).workspace,
-          sandboxPath,
-          ...(caption === undefined ? {} : { caption }),
+    dispatch: async (chatId, request) => {
+      return deliveryQueue.enqueue(chatId, async () => {
+        if (request.type === "send_file") {
+          return sendWorkspaceFile(bot, {
+            chatId,
+            workspace: chatPaths(dataDir, chatId).workspace,
+            sandboxPath: request.path,
+            ...(request.caption === undefined ? {} : { caption: request.caption }),
+          });
+        }
+        return sendTelegramRichMessage(bot, chatId, {
+          text: request.text,
+          ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
+          ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
+          ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
         });
       });
     },

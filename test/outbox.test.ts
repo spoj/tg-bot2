@@ -40,16 +40,16 @@ describe("WorkspaceOutbox", () => {
     const { dataDir } = await fixture();
     expect(() => new WorkspaceOutbox({
       dataDir,
-      sendFile: async () => {},
+      dispatch: async () => undefined,
       pollIntervalMs: 2_147_483_648,
     })).toThrow("positive timer-safe integer");
   });
   it("delivers valid requests and moves them to processed", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "one.json", valid());
-    const sendFile = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).toHaveBeenCalledWith(42, "/workspace/report.txt", "Report");
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "one", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["one.json"]);
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual([]);
   });
@@ -58,10 +58,10 @@ describe("WorkspaceOutbox", () => {
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-crashed";
     await request(workspace, claimName, valid("crashed"));
-    const sendFile = vi.fn(async () => {});
+    const dispatch = vi.fn(async () => undefined);
 
-    await new WorkspaceOutbox({ dataDir, sendFile, now: () => 5 * 60_000 }).poll();
-    expect(sendFile).toHaveBeenCalledWith(42, "/workspace/report.txt", "Report");
+    await new WorkspaceOutbox({ dataDir, dispatch, now: () => 5 * 60_000 }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "crashed", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
     expect(await names(path.join(outbox, "processed"))).toEqual([claimName]);
   });
   it("skips and cleans a stale claim whose inode is already processed", async () => {
@@ -72,10 +72,10 @@ describe("WorkspaceOutbox", () => {
     await request(workspace, claimName, valid("archived"));
     await mkdir(path.join(outbox, "processed"), { recursive: true });
     await link(claimPath, path.join(outbox, "processed", "archived.json"));
-    const sendFile = vi.fn(async () => {});
+    const dispatch = vi.fn(async () => undefined);
 
-    await new WorkspaceOutbox({ dataDir, sendFile, now: () => 5 * 60_000 }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    await new WorkspaceOutbox({ dataDir, dispatch, now: () => 5 * 60_000 }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(outbox, "processed"))).toEqual(["archived.json"]);
     expect(await names(outbox)).not.toContain(claimName);
   });
@@ -83,16 +83,17 @@ describe("WorkspaceOutbox", () => {
   it("does not retry a sent request when archiving the claim fails", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
-    const sendFile = vi.fn(async () => {
+    const dispatch = vi.fn(async () => {
       const claim = (await readdir(outbox)).find((name) => name.startsWith(".in-progress-"));
       if (claim) await rm(path.join(outbox, claim), { force: true });
+      return undefined;
     });
     await request(workspace, "sent.json", valid("sent"));
-    const instance = new WorkspaceOutbox({ dataDir, sendFile });
+    const instance = new WorkspaceOutbox({ dataDir, dispatch });
 
     await instance.poll();
     await instance.poll();
-    expect(sendFile).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
     expect(await names(path.join(outbox, "failed"))).toEqual([]);
   });
 
@@ -102,10 +103,10 @@ describe("WorkspaceOutbox", () => {
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-299999-recent";
     await request(workspace, claimName, valid("recent"));
-    const sendFile = vi.fn(async () => {});
+    const dispatch = vi.fn(async () => undefined);
 
-    await new WorkspaceOutbox({ dataDir, sendFile, now: () => 300_000 }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    await new WorkspaceOutbox({ dataDir, dispatch, now: () => 300_000 }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(outbox, "processed"))).toEqual([]);
     expect(await names(outbox)).toContain(claimName);
   });
@@ -115,10 +116,10 @@ describe("WorkspaceOutbox", () => {
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-malformed";
     await writeFile(path.join(outbox, claimName), "{not json", "utf8");
-    const sendFile = vi.fn(async () => {});
+    const dispatch = vi.fn(async () => undefined);
 
-    await new WorkspaceOutbox({ dataDir, sendFile, now: () => 5 * 60_000 }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    await new WorkspaceOutbox({ dataDir, dispatch, now: () => 5 * 60_000 }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(outbox, "failed"))).toEqual([claimName]);
   });
 
@@ -127,9 +128,9 @@ describe("WorkspaceOutbox", () => {
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeFile(path.join(outbox, "malformed.json"), "{not json", "utf8");
     await request(workspace, "invalid.json", { version: 2, id: "bad", type: "send_file", path: "x" });
-    const sendFile = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(outbox, "failed"))).toEqual(["invalid.json", "malformed.json"]);
   });
 
@@ -137,10 +138,10 @@ describe("WorkspaceOutbox", () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeFile(path.join(outbox, "oversized.json"), `${JSON.stringify(valid())}${"x".repeat(64 * 1024)}`, "utf8");
-    const sendFile = vi.fn(async () => {});
+    const dispatch = vi.fn(async () => undefined);
 
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(outbox, "failed"))).toEqual(["oversized.json"]);
   });
 
@@ -148,9 +149,9 @@ describe("WorkspaceOutbox", () => {
   it("rejects traversal before invoking the host callback", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "escape.json", valid("escape", "/workspace/../outside.txt"));
-    const sendFile = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["escape.json"]);
   });
 
@@ -160,9 +161,9 @@ describe("WorkspaceOutbox", () => {
     for (const [index, requestPath] of aliases.entries()) {
       await request(workspace, `alias-${index}.json`, valid(`alias-${index}`, requestPath));
     }
-    const sendFile = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual([
       "alias-0.json", "alias-1.json", "alias-2.json",
     ]);
@@ -174,9 +175,9 @@ describe("WorkspaceOutbox", () => {
     const target = path.join(workspace, "outside.json");
     await writeFile(target, JSON.stringify(valid()), "utf8");
     await symlink(target, path.join(outbox, "link.json"));
-    const sendFile = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).not.toHaveBeenCalled();
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
     expect(await names(path.join(outbox, "failed"))).toEqual(["link.json"]);
     expect(JSON.parse(await readFile(target, "utf8"))).toEqual(valid());
   });
@@ -187,8 +188,8 @@ describe("WorkspaceOutbox", () => {
     await request(workspace, "failed.json", valid());
     await writeFile(path.join(outbox, "partial.json.tmp"), JSON.stringify(valid()), "utf8");
     await writeFile(path.join(outbox, "notes.txt"), JSON.stringify(valid()), "utf8");
-    const sendFile = vi.fn(async () => { throw new Error("upload failed"); });
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
+    const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
     expect(await names(path.join(outbox, "failed"))).toEqual(["failed.json"]);
     expect(await names(outbox)).toEqual(["failed", "notes.txt", "partial.json.tmp", "processed"]);
   });
@@ -201,10 +202,10 @@ describe("WorkspaceOutbox", () => {
     await request(aliasWorkspace, "alias.json", valid("alias"));
     await mkdir(path.join(dataDir, "chats", "not-a-chat", "workspace", ".tg-bot", "outbox"), { recursive: true });
     await request(path.join(dataDir, "chats", "not-a-chat", "workspace"), "ignored.json", valid());
-    const sendFile = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
-    expect(sendFile).toHaveBeenCalledTimes(1);
-    expect(sendFile).toHaveBeenCalledWith(42, "/workspace/report.txt", "Report");
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "one", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
   });
   it("bounds a flooded chat while still processing later chats", async () => {
     const { dataDir, workspace } = await fixture();
@@ -217,10 +218,11 @@ describe("WorkspaceOutbox", () => {
     }
 
     const chats: number[] = [];
-    const sendFile = vi.fn(async (chatId: number) => {
+    const dispatch = vi.fn(async (chatId: number) => {
       chats.push(chatId);
+      return undefined;
     });
-    await new WorkspaceOutbox({ dataDir, sendFile }).poll();
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
 
     const floodedChatSends = chats.filter((chatId) => chatId === 42).length;
     expect(floodedChatSends).toBeLessThanOrEqual(256);
@@ -235,16 +237,17 @@ describe("WorkspaceOutbox", () => {
     await request(workspace, "b.json", valid("b"));
     let active = 0;
     let maximum = 0;
-    const sendFile = vi.fn(async () => {
+    const dispatch = vi.fn(async () => {
       active += 1;
       maximum = Math.max(maximum, active);
       await new Promise((resolve) => setTimeout(resolve, 5));
       active -= 1;
+      return undefined;
     });
-    const outbox = new WorkspaceOutbox({ dataDir, sendFile });
+    const outbox = new WorkspaceOutbox({ dataDir, dispatch });
     await Promise.all([outbox.poll(), outbox.poll(), outbox.processChat(42)]);
     expect(maximum).toBe(1);
-    expect(sendFile).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledTimes(2);
   });
   it("renews a live claim before stale recovery can reclaim a long send", async () => {
     const { dataDir, workspace } = await fixture();
@@ -261,11 +264,12 @@ describe("WorkspaceOutbox", () => {
     let markSendStarted!: () => void;
     const sendFinished = new Promise<void>((resolve) => { finishSend = resolve; });
     const sendStarted = new Promise<void>((resolve) => { markSendStarted = resolve; });
-    const sendFile = vi.fn(async () => {
+    const dispatch = vi.fn(async () => {
       markSendStarted();
       await sendFinished;
+      return undefined;
     });
-    const first = new WorkspaceOutbox({ dataDir, sendFile, now: () => now, setInterval, clearInterval });
+    const first = new WorkspaceOutbox({ dataDir, dispatch, now: () => now, setInterval, clearInterval });
     const firstPoll = first.poll();
 
     await sendStarted;
@@ -273,8 +277,8 @@ describe("WorkspaceOutbox", () => {
     callbacks[0]?.();
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    const duplicateSend = vi.fn(async () => {});
-    await new WorkspaceOutbox({ dataDir, sendFile: duplicateSend, now: () => now }).poll();
+    const duplicateSend = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch: duplicateSend, now: () => now }).poll();
     expect(duplicateSend).not.toHaveBeenCalled();
 
     finishSend();
@@ -293,11 +297,80 @@ describe("WorkspaceOutbox", () => {
     }) as NonNullable<WorkspaceOutboxOptions["setInterval"]>);
     const setInterval = setIntervalMock as unknown as NonNullable<WorkspaceOutboxOptions["setInterval"]>;
     const clearInterval = vi.fn(((timer: unknown) => { cleared.push(timer); }) as typeof globalThis.clearInterval);
-    const outbox = new WorkspaceOutbox({ dataDir, sendFile: async () => {}, setInterval, clearInterval });
+    const outbox = new WorkspaceOutbox({ dataDir, dispatch: async () => undefined, setInterval, clearInterval });
     await outbox.start();
     expect(setIntervalMock).toHaveBeenCalledWith(expect.any(Function), 5_000);
     await outbox.stop();
     expect(clearInterval).toHaveBeenCalledWith(1);
     expect(callbacks).toHaveLength(1);
   });
+  it("dispatches send_message requests with their message fields", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "msg.json", {
+      version: 1,
+      id: "msg",
+      type: "send_message",
+      text: "hello <b>world</b>",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      reply_to_message_id: 42,
+    });
+    const dispatch = vi.fn(async () => 9_001);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1,
+      id: "msg",
+      type: "send_message",
+      text: "hello <b>world</b>",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      reply_to_message_id: 42,
+    });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["msg.json"]);
+  });
+
+  it("records a delivery ack for each sent message id", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "one.json", valid());
+    await request(workspace, "two.json", valid("two"));
+    const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => request.id === "one" ? 100 : 200);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    const acks = (await readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).trim().split("\n");
+    expect(acks).toEqual(['{"id":"one","messageId":100}', '{"id":"two","messageId":200}']);
+  });
+
+  it("skips delivery acks when the dispatcher reports no message id", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "one.json", valid());
+    await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => undefined) }).poll();
+    await expect(readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).rejects.toThrow();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["one.json"]);
+  });
+
+  it("bounds the delivery ack file to the latest lines", async () => {
+    const { dataDir, workspace } = await fixture();
+    const ackPath = path.join(workspace, ".tg-bot", "deliveries.jsonl");
+    const oldLines = Array.from({ length: 300 }, (_unused, index) => JSON.stringify({ id: `old-${index}`, messageId: index }));
+    await writeFile(ackPath, `${oldLines.join("\n")}\n`, "utf8");
+    await request(workspace, "one.json", valid());
+    await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => 777) }).poll();
+    const lines = (await readFile(ackPath, "utf8")).trim().split("\n");
+    expect(lines).toHaveLength(256);
+    expect(lines.at(-1)).toBe('{"id":"one","messageId":777}');
+    expect(lines.at(-2)).toBe('{"id":"old-299","messageId":299}');
+  });
+
+  it("quarantines invalid send_message requests without delivery", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    await request(workspace, "bad-mode.json", { version: 1, id: "bad-mode", type: "send_message", text: "x", parse_mode: "Markdown" });
+    await request(workspace, "bad-markup.json", { version: 1, id: "bad-markup", type: "send_message", text: "x", reply_markup: [1] });
+    await request(workspace, "bad-reply.json", { version: 1, id: "bad-reply", type: "send_message", text: "x", reply_to_message_id: -3 });
+    await request(workspace, "long-text.json", { version: 1, id: "long-text", type: "send_message", text: "x".repeat(4_097) });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(outbox, "failed"))).toEqual(["bad-markup.json", "bad-mode.json", "bad-reply.json", "long-text.json"]);
+  });
+
 });

@@ -12,11 +12,21 @@ Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
 Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Extension changes are debounced and automatically reloaded after the current turn.
-To send a file through Telegram, write a send_file request under the root
-/workspace/.tg-bot/outbox/. The request object is
-{version:1,id,type:"send_file",path,caption?}; id must be unique and path must
-identify the file to send. Write the request to a temporary filename that does not
+To send files or messages through Telegram, write one request per send under
+/workspace/.tg-bot/outbox/. Request types: {version:1,id,type:"send_file",path,caption?}
+sends the file at path (relative to /workspace or an absolute /workspace/... path)
+with an optional caption; {version:1,id,type:"send_message",text,parse_mode?,reply_markup?,reply_to_message_id?}
+sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
+plain text; malformed markup is resent as plain text), reply_markup is Telegram
+reply-markup JSON such as an inline_keyboard button list, and
+reply_to_message_id targets an earlier message. id must be unique. Write each
+request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
+After every send the host appends {id,messageId} to
+/workspace/.tg-bot/deliveries.jsonl (only the latest 256 lines are kept), so
+sent message ids are recoverable for later replies and edits. When the user
+presses one of your inline keyboard buttons, the press arrives as a normal
+Telegram message of the form "[Telegram button press: data=...]".
 Schedules are stored in /workspace/.tg-bot/schedules.json. Its root object is
 {version:1,schedules:[...]}. Each schedule record requires id, prompt, dueAt,
 recurrence, enabled, lastRunAt, and runCount. dueAt must be a UTC timestamp ending

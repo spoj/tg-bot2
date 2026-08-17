@@ -15,6 +15,7 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limi
 
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
+const MAX_CALLBACK_DATA_LENGTH = 64; // Telegram's callback_data limit.
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
@@ -368,6 +369,37 @@ async function replyChunks(ctx: Context, text: string): Promise<void> {
 export async function sendTelegramText(bot: Bot, chatId: number, text: string): Promise<void> {
   for (const chunk of splitTelegramText(text)) await bot.api.sendMessage(chatId, chunk);
 }
+export type TelegramRichMessageRequest = {
+  text: string;
+  parseMode?: "HTML" | "MarkdownV2" | undefined;
+  replyMarkup?: unknown;
+  replyToMessageId?: number | undefined;
+};
+
+function isTelegramParseFailure(error: unknown): boolean {
+  return error instanceof GrammyError && /can['’]t parse|cannot parse/i.test(error.description);
+}
+
+/** Sends one rich message; malformed markup falls back to the same text as plain. */
+export async function sendTelegramRichMessage(bot: Bot, chatId: number, request: TelegramRichMessageRequest): Promise<number> {
+  const options = {
+    ...(request.parseMode === undefined ? {} : { parse_mode: request.parseMode }),
+    ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
+    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+  };
+  try {
+    const sent = await bot.api.sendMessage(chatId, request.text, options);
+    return sent.message_id;
+  } catch (error) {
+    if (request.parseMode === undefined || !isTelegramParseFailure(error)) throw error;
+    const sent = await bot.api.sendMessage(chatId, request.text, {
+      ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
+      ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+    });
+    return sent.message_id;
+  }
+}
+
 
 export type WorkspaceFileRequest = {
   chatId: number;
@@ -392,7 +424,7 @@ function workspaceCandidate(workspace: string, sandboxPath: string): string {
   return path.resolve(workspace, sandboxPath);
 }
 
-export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest): Promise<string> {
+export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest): Promise<number> {
   let workspace: string;
   try {
     workspace = await realpath(request.workspace);
@@ -438,15 +470,15 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
     const caption = request.caption === undefined
       ? undefined
       : Array.from(request.caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
-    await bot.api.sendDocument(
+    const sent = await bot.api.sendDocument(
       request.chatId,
       new InputFile(bytes, path.basename(resolved)),
       caption === undefined ? undefined : { caption },
     );
+    return sent.message_id;
   } finally {
     await handle.close();
   }
-  return `Sent ${path.basename(resolved)}.`;
 }
 type AttachmentDirectory = {
   path: string;
@@ -557,6 +589,31 @@ function fallbackName(source: AttachmentSource, remotePath?: string): string {
   };
   return `${source.type}${extension[source.type] ?? ".bin"}`;
 }
+function locationText(message: Message): string | undefined {
+  const location = message.location;
+  if (location) {
+    const fields = [
+      `latitude=${location.latitude}`,
+      `longitude=${location.longitude}`,
+      location.horizontal_accuracy === undefined ? undefined : `horizontal accuracy=±${location.horizontal_accuracy} m`,
+      location.heading === undefined ? undefined : `heading=${location.heading}°`,
+      location.live_period === undefined ? undefined : `live period=${location.live_period} s`,
+    ].filter((field): field is string => field !== undefined);
+    return `[Location pin: ${fields.join(", ")}]`;
+  }
+  const venue = message.venue;
+  if (venue) {
+    const fields = [
+      `latitude=${venue.location.latitude}`,
+      `longitude=${venue.location.longitude}`,
+      `venue=${JSON.stringify(venue.title)}`,
+      `address=${JSON.stringify(venue.address)}`,
+    ];
+    return `[Location pin: ${fields.join(", ")}]`;
+  }
+  return undefined;
+}
+
 
 class AttachmentDownloadFailure extends Error {}
 
@@ -665,7 +722,7 @@ async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<B
   const attachments = source
     ? [await downloadAttachment(bot, config, ctx.chat!.id, message, source)]
     : [];
-  const text = message.text ?? message.caption;
+  const text = [message.text ?? message.caption, locationText(message)].filter(Boolean).join("\n") || undefined;
   if (!text && attachments.length === 0) {
     return {
       messageId: message.message_id,
@@ -783,7 +840,7 @@ export function createTelegramBot(
   });
 
   bot.command("start", async (ctx) => {
-    await queuedReply(ctx, "Personal agent. Send text or attachments to continue your persistent session, or /new to start a fresh one.");
+    await queuedReply(ctx, "Personal agent. Send text, attachments, or a location pin to continue your persistent session, or /new to start a fresh one.");
   });
 
   bot.command("new", async (ctx) => {
@@ -901,6 +958,25 @@ export function createTelegramBot(
     });
     if (admission.kind === "accepted") startPreparation();
   });
+  bot.on("callback_query", (ctx) => {
+    const query = ctx.callbackQuery;
+    const chatId = ctx.chat?.id;
+    const messageId = query.message?.message_id;
+    if (chatId === undefined || messageId === undefined) return;
+    // Answer promptly so Telegram does not retry the update; the batch replies later.
+    void ctx.answerCallbackQuery().catch(() => {});
+    const data = (query.data ?? "").slice(0, MAX_CALLBACK_DATA_LENGTH);
+    ingress.add(chatId, {
+      value: Promise.resolve({
+        messageId,
+        text: `[Telegram button press: data=${JSON.stringify(data)}]`,
+        attachments: [],
+      }),
+      respond: (text) => deliveryQueue.enqueue(chatId, () => replyChunks(ctx, text)),
+      typing: async () => {},
+    });
+  });
+
 
   bot.catch((error) => {
     const cause = error.error;

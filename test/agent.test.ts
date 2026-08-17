@@ -93,9 +93,11 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).not.toContain("install <source> -l");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/outbox/");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,reply_markup?,reply_to_message_id?}");
+  expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/deliveries.jsonl");
+  expect(SYSTEM_PROMPT).toContain("[Telegram button press: data=...]");
   expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
   expect(SYSTEM_PROMPT).toContain("final unique *.json request name");
-  expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/schedules.json");
   expect(SYSTEM_PROMPT).toContain("{version:1,schedules:[...]}");
   expect(SYSTEM_PROMPT).toContain("recurrence must be hourly, daily, weekly, or null");
   expect(SYSTEM_PROMPT).toContain("UTC timestamp ending\nin Z");

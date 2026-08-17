@@ -6,7 +6,7 @@ import { appendFile, mkdtemp, mkdir, open as openFile, readFile, readdir, rename
 import path from "node:path";
 import { tmpdir } from "node:os";
 
-import type { Bot } from "grammy";
+import { GrammyError, type Bot } from "grammy";
 import {
   closeTelegramIngress,
   createTelegramBot,
@@ -15,6 +15,7 @@ import {
   formatModelList,
   formatStatus,
   formatThinkingLevels,
+  sendTelegramRichMessage,
   sendTelegramText,
   sendWorkspaceFile,
   splitTelegramText,
@@ -28,8 +29,8 @@ const execFile = promisify(execFileCallback);
 function fakeBot() {
   return {
     api: {
-      sendDocument: vi.fn(async () => ({})),
-      sendMessage: vi.fn(async () => ({})),
+      sendDocument: vi.fn(async () => ({ message_id: 123 })),
+      sendMessage: vi.fn(async () => ({ message_id: 123 })),
     },
   } as unknown as Bot;
 }
@@ -500,7 +501,7 @@ it("sends a valid workspace file with a bounded caption", async () => {
       workspace,
       sandboxPath: "/workspace/report.txt",
       caption,
-    })).resolves.toBe("Sent report.txt.");
+    })).resolves.toBe(123);
 
     const sendDocument = bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>;
     expect(sendDocument).toHaveBeenCalledTimes(1);
@@ -846,6 +847,188 @@ describe("Telegram attachment downloads", () => {
     }
   });
 });
+describe("Telegram location pins", () => {
+  /** Feeds one update through the real bot and returns the prompt text handed to the agent. */
+  async function runLocationFixture(dataDir: string, message: Record<string, unknown>): Promise<string> {
+    let promptText = "";
+    const prompt = vi.fn(async (_chatId: number, text: string) => { promptText = text; return undefined; });
+    const bot = createTelegramBot({
+      token: "test-token",
+      allowedUserIds: new Set([42]),
+      dataDir,
+    }, {
+      prompt,
+      setAssistantProgress: vi.fn(),
+    } as never);
+    Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
+    Object.assign(bot.api, { sendChatAction: vi.fn(async () => ({})) });
+    await bot.handleUpdate({
+      update_id: 1,
+      message: {
+        message_id: 7,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Test" },
+        ...message,
+      },
+    } as never);
+    await flushTelegramIngress(bot);
+    return promptText;
+  }
+
+  it("passes a shared location to the agent as prompt text", async () => {
+    await withWorkspace(async (dataDir) => {
+      const promptText = await runLocationFixture(dataDir, { location: { latitude: 52.52, longitude: 13.405 } });
+      expect(promptText).toBe("Telegram message 7:\n[Location pin: latitude=52.52, longitude=13.405]");
+    });
+  });
+
+  it("includes accuracy, heading, and live period when present", async () => {
+    await withWorkspace(async (dataDir) => {
+      const promptText = await runLocationFixture(dataDir, {
+        location: { latitude: 52.52, longitude: 13.405, horizontal_accuracy: 50, heading: 180, live_period: 60 },
+      });
+      expect(promptText).toBe("Telegram message 7:\n[Location pin: latitude=52.52, longitude=13.405, horizontal accuracy=±50 m, heading=180°, live period=60 s]");
+    });
+  });
+
+  it("passes a venue with title and address to the agent", async () => {
+    await withWorkspace(async (dataDir) => {
+      const promptText = await runLocationFixture(dataDir, {
+        venue: {
+          location: { latitude: 52.5163, longitude: 13.3777 },
+          title: "Brandenburg Gate",
+          address: "Pariser Platz 1",
+        },
+      });
+      expect(promptText).toBe('Telegram message 7:\n[Location pin: latitude=52.5163, longitude=13.3777, venue="Brandenburg Gate", address="Pariser Platz 1"]');
+    });
+  });
+});
+describe("Telegram rich messages", () => {
+  it("sends a rich message with markup, keyboard, and reply target", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramRichMessage(bot, 42, {
+      text: "<b>hi</b>",
+      parseMode: "HTML",
+      replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      replyToMessageId: 7,
+    })).resolves.toBe(123);
+    const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    expect(sendMessage).toHaveBeenCalledWith(42, "<b>hi</b>", {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      reply_to_message_id: 7,
+    });
+  });
+
+  it("resends malformed markup as plain text and keeps the message fields", async () => {
+    const bot = fakeBot();
+    const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    sendMessage.mockRejectedValueOnce(new GrammyError(
+      "Bad Request: can't parse entities",
+      { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
+      "sendMessage",
+      { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
+    ));
+    await expect(sendTelegramRichMessage(bot, 42, {
+      text: "<b>hi</b>",
+      parseMode: "HTML",
+      replyToMessageId: 7,
+    })).resolves.toBe(123);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[1]).toEqual([42, "<b>hi</b>", { reply_to_message_id: 7 }]);
+  });
+
+  it("propagates non-parse failures without a plain retry", async () => {
+    const bot = fakeBot();
+    const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    sendMessage.mockRejectedValueOnce(new GrammyError(
+      "Bad Request: chat not found",
+      { ok: false, error_code: 400, description: "Bad Request: chat not found" },
+      "sendMessage",
+      { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
+    ));
+    await expect(sendTelegramRichMessage(bot, 42, { text: "<b>hi</b>", parseMode: "HTML" })).rejects.toThrow("chat not found");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Telegram callback queries", () => {
+  let sentRequests: Array<{ url: string; body: string }> = [];
+
+  async function makeCallbackBot(agents: {
+    prompt: ReturnType<typeof vi.fn>;
+    setAssistantProgress: ReturnType<typeof vi.fn>;
+  }): Promise<Bot> {
+    sentRequests = [];
+    const bot = createTelegramBot(
+      { token: "test-token", allowedUserIds: new Set([42]), dataDir: "/tmp/ignored" },
+      agents as never,
+    );
+    Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
+    const fakeFetch: typeof fetch = async (input, init) => {
+      sentRequests.push({
+        url: String(input),
+        body: typeof init?.body === "string" ? init.body : "",
+      });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    Object.assign(bot, { clientConfig: { fetch: fakeFetch } });
+    return bot;
+  }
+
+  function callbackUpdate(fromId: number, data: string) {
+    return {
+      update_id: 2,
+      callback_query: {
+        id: "cb-1",
+        from: { id: fromId, is_bot: false, first_name: "Test" },
+        message: {
+          message_id: 7,
+          date: 1_700_000_000,
+          chat: { id: 42, type: "private" },
+          from: { id: 999, is_bot: true, first_name: "Test" },
+        },
+        chat_instance: "ci",
+        data,
+      },
+    };
+  }
+
+  it("routes authorized button presses into the ingress buffer", async () => {
+    const prompt = vi.fn(async () => "acknowledged");
+    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
+    await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
+    await flushTelegramIngress(bot);
+    expect(prompt).toHaveBeenCalledWith(42, 'Telegram message 7:\n[Telegram button press: data="do_thing"]');
+    expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
+    expect(sentRequests.some((request) => request.url.endsWith("/sendMessage") && (JSON.parse(request.body) as { text: string }).text === "acknowledged")).toBe(true);
+  });
+
+  it("rejects unauthorized button presses", async () => {
+    const prompt = vi.fn(async () => undefined);
+    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
+    await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
+    await flushTelegramIngress(bot);
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("bounds the button data forwarded to the agent", async () => {
+    const prompt = vi.fn(async () => undefined);
+    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
+    await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
+    await flushTelegramIngress(bot);
+    expect(prompt).toHaveBeenCalledWith(42, `Telegram message 7:\n[Telegram button press: data="${"x".repeat(64)}"]`);
+  });
+});
+
+
+
+
 
 describe("Telegram command formatting", () => {
   it("numbers models, marks the current one, and handles empty lists", () => {
@@ -983,7 +1166,7 @@ describe("Telegram commands", () => {
     const bot = await makeBot(agents);
     await sendCommand(bot, "/start");
     expect(replies(bot)).toEqual([
-      "Personal agent. Send text or attachments to continue your persistent session, or /new to start a fresh one.",
+      "Personal agent. Send text, attachments, or a location pin to continue your persistent session, or /new to start a fresh one.",
     ]);
   });
 

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
-import type { Message } from "grammy/types";
+import type { Message, Poll } from "grammy/types";
 import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
@@ -369,13 +369,62 @@ async function replyChunks(ctx: Context, text: string): Promise<void> {
 export async function sendTelegramText(bot: Bot, chatId: number, text: string): Promise<void> {
   for (const chunk of splitTelegramText(text)) await bot.api.sendMessage(chatId, chunk);
 }
+export type TelegramLocationRequest = {
+  latitude: number;
+  longitude: number;
+  horizontalAccuracy?: number | undefined;
+  heading?: number | undefined;
+  livePeriod?: number | undefined;
+  venue?: { title: string; address: string };
+};
+
+export async function sendTelegramLocation(bot: Bot, chatId: number, request: TelegramLocationRequest): Promise<number> {
+  if (request.venue) {
+    const sent = await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address);
+    return sent.message_id;
+  }
+  const sent = await bot.api.sendLocation(chatId, request.latitude, request.longitude, {
+    ...(request.horizontalAccuracy === undefined ? {} : { horizontal_accuracy: request.horizontalAccuracy }),
+    ...(request.heading === undefined ? {} : { heading: request.heading }),
+    ...(request.livePeriod === undefined ? {} : { live_period: request.livePeriod }),
+  });
+  return sent.message_id;
+}
+
+export type TelegramPollRequest = {
+  question: string;
+  options: string[];
+  isAnonymous?: boolean | undefined;
+  allowsMultipleAnswers?: boolean | undefined;
+  pollType?: "regular" | "quiz" | undefined;
+  correctOptionId?: number | undefined;
+};
+
+export async function sendTelegramPoll(bot: Bot, chatId: number, request: TelegramPollRequest): Promise<{ messageId: number; pollId: string }> {
+  const sent = await bot.api.sendPoll(chatId, request.question, request.options, {
+    ...(request.isAnonymous === undefined ? {} : { is_anonymous: request.isAnonymous }),
+    ...(request.allowsMultipleAnswers === undefined ? {} : { allows_multiple_answers: request.allowsMultipleAnswers }),
+    ...(request.pollType === undefined ? {} : { type: request.pollType }),
+    ...(request.correctOptionId === undefined ? {} : { correct_option_id: request.correctOptionId }),
+  });
+  return { messageId: sent.message_id, pollId: sent.poll.id };
+}
+
+export async function stopTelegramPoll(bot: Bot, chatId: number, messageId: number, replyMarkup?: unknown): Promise<Poll> {
+  return bot.api.stopPoll(chatId, messageId, replyMarkup === undefined ? undefined : { reply_markup: replyMarkup as never });
+}
+
+export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: number, emoji: string[]): Promise<void> {
+  // The outbox validator bounds emoji strings; grammY's emoji literal union cannot express runtime values.
+  await bot.api.setMessageReaction(chatId, messageId, emoji.map((entry) => ({ type: "emoji" as const, emoji: entry })) as never);
+}
+
 export type TelegramRichMessageRequest = {
   text: string;
   parseMode?: "HTML" | "MarkdownV2" | undefined;
   replyMarkup?: unknown;
   replyToMessageId?: number | undefined;
 };
-
 function isTelegramParseFailure(error: unknown): boolean {
   return error instanceof GrammyError && /can['’]t parse|cannot parse/i.test(error.description);
 }
@@ -401,12 +450,34 @@ export async function sendTelegramRichMessage(bot: Bot, chatId: number, request:
 }
 
 
+export type WorkspaceFileKind = "auto" | "photo" | "audio" | "video" | "voice" | "document";
+
 export type WorkspaceFileRequest = {
   chatId: number;
   workspace: string;
   sandboxPath: string;
   caption?: string | undefined;
+  kind?: WorkspaceFileKind;
 };
+
+const MAX_PHOTO_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+const EXTENSION_KIND: Record<string, Exclude<WorkspaceFileKind, "auto" | "voice">> = {
+  jpg: "photo", jpeg: "photo", png: "photo", gif: "photo", webp: "photo", bmp: "photo",
+  mp3: "audio", m4a: "audio", aac: "audio", flac: "audio", wav: "audio", opus: "audio",
+  mp4: "video", webm: "video", mkv: "video", mov: "video", avi: "video",
+};
+
+function resolvedFileKind(name: string, size: number, override: WorkspaceFileKind | undefined): Exclude<WorkspaceFileKind, "auto"> {
+  const requested = override !== undefined && override !== "auto"
+    ? override
+    : EXTENSION_KIND[path.extname(name).slice(1).toLowerCase()];
+  if (requested === undefined) return "document";
+  // Telegram's photo upload cap is below the 20 MiB master cap; oversized images ship as documents.
+  if (requested === "photo" && size > MAX_PHOTO_UPLOAD_BYTES) return "document";
+  return requested;
+}
+
 
 function isWithinWorkspace(workspace: string, candidate: string): boolean {
   const relative = path.relative(workspace, candidate);
@@ -466,19 +537,105 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
     }
     if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
     const bytes = Buffer.concat(chunks, total);
+    const kind = resolvedFileKind(resolved, bytes.length, request.kind);
 
     const caption = request.caption === undefined
       ? undefined
       : Array.from(request.caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
-    const sent = await bot.api.sendDocument(
-      request.chatId,
-      new InputFile(bytes, path.basename(resolved)),
-      caption === undefined ? undefined : { caption },
-    );
+
+    const input = kind === "photo" ? new InputFile(bytes) : new InputFile(bytes, path.basename(resolved));
+    const options = caption === undefined ? undefined : { caption };
+    let sent: { message_id: number };
+    if (kind === "photo") sent = await bot.api.sendPhoto(request.chatId, input, options);
+    else if (kind === "audio") sent = await bot.api.sendAudio(request.chatId, input, options);
+    else if (kind === "video") sent = await bot.api.sendVideo(request.chatId, input, options);
+    else if (kind === "voice") sent = await bot.api.sendVoice(request.chatId, input, options);
+    else sent = await bot.api.sendDocument(request.chatId, input, options);
     return sent.message_id;
+
   } finally {
     await handle.close();
   }
+}
+const POLL_OWNER_STORE_NAME = "poll-owners.jsonl";
+const MAX_POLL_OWNER_LINES = 256;
+const MAX_POLL_OWNER_BYTES = 64 * 1024;
+
+/** Records poll ownership in a host-side store the sandbox cannot reach (only /workspace is mounted). */
+export async function recordPollOwner(dataDir: string, chatId: number, pollId: string, messageId: number): Promise<void> {
+  const filePath = path.join(dataDir, POLL_OWNER_STORE_NAME);
+  const line = `${JSON.stringify({ chatId, pollId, messageId })}\n`;
+  const handle = await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("Poll owner store is not a regular file");
+    await handle.write(line, null, "utf8");
+    const total = stat.size + Buffer.byteLength(line, "utf8");
+    const lines = await readPollOwnerLines(handle, total);
+    if (lines.length > MAX_POLL_OWNER_LINES || total > MAX_POLL_OWNER_BYTES) {
+      await replacePollOwnerStore(filePath, `${lines.slice(-MAX_POLL_OWNER_LINES).join("\n")}\n`);
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+/** Maps a poll id back to the chat that sent it via the host-side owner store. */
+async function findPollOwnerChat(dataDir: string, pollId: string): Promise<number | undefined> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path.join(dataDir, POLL_OWNER_STORE_NAME), fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+  } catch {
+    return undefined;
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > MAX_POLL_OWNER_BYTES) return undefined;
+    const lines = await readPollOwnerLines(handle, stat.size);
+    for (const line of lines.slice(-MAX_POLL_OWNER_LINES)) {
+      let record: unknown;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+      const candidate = record as Record<string, unknown>;
+      if (candidate.pollId !== pollId) continue;
+      if (typeof candidate.chatId !== "number" || !Number.isSafeInteger(candidate.chatId)) continue;
+      return candidate.chatId;
+    }
+    return undefined;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+async function readPollOwnerLines(handle: Awaited<ReturnType<typeof open>>, size: number): Promise<string[]> {
+  const readLength = Math.min(size, MAX_POLL_OWNER_BYTES);
+  const position = size - readLength;
+  const buffer = Buffer.allocUnsafe(readLength);
+  let bytesRead = 0;
+  while (bytesRead < readLength) {
+    const result = await handle.read(buffer, bytesRead, readLength - bytesRead, position + bytesRead);
+    if (result.bytesRead === 0) break;
+    bytesRead += result.bytesRead;
+  }
+  const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
+  const complete = position === 0 ? lines : lines.slice(1);
+  return complete.filter(Boolean);
+}
+
+async function replacePollOwnerStore(filePath: string, content: string): Promise<void> {
+  const directory = path.dirname(filePath);
+  const tempPath = path.join(directory, `.poll-owners-${randomUUID()}.tmp`);
+  const handle = await open(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
+  try {
+    await handle.write(content, null, "utf8");
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  await rename(tempPath, filePath);
 }
 type AttachmentDirectory = {
   path: string;
@@ -831,7 +988,8 @@ export function createTelegramBot(
   ingressByBot.set(bot, ingress);
 
   bot.use(async (ctx, next) => {
-    const userId = ctx.from?.id;
+    // grammY's ctx.from omits poll_answer updates; voters arrive in pollAnswer.user.
+    const userId = ctx.from?.id ?? ctx.pollAnswer?.user?.id;
     if (userId === undefined || !config.allowedUserIds.has(userId)) {
       if (ctx.chat) await queuedReply(ctx, "Unauthorized.");
       return;
@@ -976,6 +1134,21 @@ export function createTelegramBot(
       typing: async () => {},
     });
   });
+  bot.on("poll_answer", async (ctx) => {
+    const answer = ctx.pollAnswer;
+    const chatId = await findPollOwnerChat(config.dataDir, answer.poll_id);
+    if (chatId === undefined) return;
+    ingress.add(chatId, {
+      value: Promise.resolve({
+        messageId: 0,
+        text: `[Poll answer: poll_id=${answer.poll_id}, options=${JSON.stringify(answer.option_ids)}]`,
+        attachments: [],
+      }),
+      respond: (text) => deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text)),
+      typing: async () => {},
+    });
+  });
+
 
 
   bot.catch((error) => {

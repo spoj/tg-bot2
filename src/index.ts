@@ -3,7 +3,7 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramRichMessage, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
+import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, recordPollOwner, sendTelegramLocation, sendTelegramPoll, sendTelegramReaction, sendTelegramRichMessage, sendTelegramText, sendWorkspaceFile, stopTelegramPoll, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -92,19 +92,61 @@ export async function main(): Promise<void> {
     dispatch: async (chatId, request) => {
       return deliveryQueue.enqueue(chatId, async () => {
         if (request.type === "send_file") {
-          return sendWorkspaceFile(bot, {
-            chatId,
-            workspace: chatPaths(dataDir, chatId).workspace,
-            sandboxPath: request.path,
-            ...(request.caption === undefined ? {} : { caption: request.caption }),
-          });
+          return {
+            messageId: await sendWorkspaceFile(bot, {
+              chatId,
+              workspace: chatPaths(dataDir, chatId).workspace,
+              sandboxPath: request.path,
+              ...(request.caption === undefined ? {} : { caption: request.caption }),
+              ...(request.kind === undefined ? {} : { kind: request.kind }),
+            }),
+          };
         }
-        return sendTelegramRichMessage(bot, chatId, {
-          text: request.text,
-          ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
-          ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
-          ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
-        });
+        if (request.type === "send_message") {
+          return {
+            messageId: await sendTelegramRichMessage(bot, chatId, {
+              text: request.text,
+              ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
+              ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
+              ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
+            }),
+          };
+        }
+        if (request.type === "send_location") {
+          return {
+            messageId: await sendTelegramLocation(bot, chatId, {
+              latitude: request.latitude,
+              longitude: request.longitude,
+              ...(request.horizontal_accuracy === undefined ? {} : { horizontalAccuracy: request.horizontal_accuracy }),
+              ...(request.heading === undefined ? {} : { heading: request.heading }),
+              ...(request.live_period === undefined ? {} : { livePeriod: request.live_period }),
+              ...(request.venue === undefined ? {} : { venue: request.venue }),
+            }),
+          };
+        }
+        if (request.type === "send_poll") {
+          const sent = await sendTelegramPoll(bot, chatId, {
+            question: request.question,
+            options: request.options,
+            ...(request.is_anonymous === undefined ? {} : { isAnonymous: request.is_anonymous }),
+            ...(request.allows_multiple_answers === undefined ? {} : { allowsMultipleAnswers: request.allows_multiple_answers }),
+            ...(request.poll_type === undefined ? {} : { pollType: request.poll_type }),
+            ...(request.correct_option_id === undefined ? {} : { correctOptionId: request.correct_option_id }),
+          });
+          try {
+            await recordPollOwner(dataDir, chatId, sent.pollId, sent.messageId);
+          } catch (error) {
+            console.error("Failed to record poll ownership", error);
+          }
+          return sent;
+        }
+        if (request.type === "stop_poll") {
+          return {
+            data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup),
+          };
+        }
+        await sendTelegramReaction(bot, chatId, request.message_id, request.emoji);
+        return {};
       });
     },
   });
@@ -156,7 +198,7 @@ export async function main(): Promise<void> {
     }
     console.log("Starting Telegram long polling");
     await bot.start({
-      allowed_updates: ["message"],
+      allowed_updates: ["message", "callback_query", "poll_answer"],
       onStart: (info) => console.log(`Telegram bot @${info.username} started`),
     });
   } catch (error) {

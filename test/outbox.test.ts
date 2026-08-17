@@ -315,7 +315,7 @@ describe("WorkspaceOutbox", () => {
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
       reply_to_message_id: 42,
     });
-    const dispatch = vi.fn(async () => 9_001);
+    const dispatch = vi.fn(async () => ({ messageId: 9_001 }));
     await new WorkspaceOutbox({ dataDir, dispatch }).poll();
     expect(dispatch).toHaveBeenCalledWith(42, {
       version: 1,
@@ -333,7 +333,7 @@ describe("WorkspaceOutbox", () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "one.json", valid());
     await request(workspace, "two.json", valid("two"));
-    const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => request.id === "one" ? 100 : 200);
+    const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => ({ messageId: request.id === "one" ? 100 : 200 }));
     await new WorkspaceOutbox({ dataDir, dispatch }).poll();
     const acks = (await readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).trim().split("\n");
     expect(acks).toEqual(['{"id":"one","messageId":100}', '{"id":"two","messageId":200}']);
@@ -353,7 +353,7 @@ describe("WorkspaceOutbox", () => {
     const oldLines = Array.from({ length: 300 }, (_unused, index) => JSON.stringify({ id: `old-${index}`, messageId: index }));
     await writeFile(ackPath, `${oldLines.join("\n")}\n`, "utf8");
     await request(workspace, "one.json", valid());
-    await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => 777) }).poll();
+    await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => ({ messageId: 777 })) }).poll();
     const lines = (await readFile(ackPath, "utf8")).trim().split("\n");
     expect(lines).toHaveLength(256);
     expect(lines.at(-1)).toBe('{"id":"one","messageId":777}');
@@ -373,4 +373,74 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(outbox, "failed"))).toEqual(["bad-markup.json", "bad-mode.json", "bad-reply.json", "long-text.json"]);
   });
 
+  it("dispatches location, poll, and reaction requests and records poll ids", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "loc.json", {
+      version: 1, id: "loc", type: "send_location",
+      latitude: 52.52, longitude: 13.405, heading: 90,
+      venue: { title: "Gate", address: "Platz 1" },
+    });
+    await request(workspace, "poll.json", {
+      version: 1, id: "poll", type: "send_poll",
+      question: "Pick one", options: ["a", "b", "c"],
+      is_anonymous: false, allows_multiple_answers: true, poll_type: "regular",
+    });
+    await request(workspace, "react.json", {
+      version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍", "🔥"],
+    });
+    const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => {
+      if (request.id === "loc") return { messageId: 301 };
+      if (request.id === "poll") return { messageId: 302, pollId: "poll-abc" };
+      return undefined;
+    });
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1, id: "loc", type: "send_location",
+      latitude: 52.52, longitude: 13.405, heading: 90,
+      venue: { title: "Gate", address: "Platz 1" },
+    });
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1, id: "poll", type: "send_poll",
+      question: "Pick one", options: ["a", "b", "c"],
+      is_anonymous: false, allows_multiple_answers: true, poll_type: "regular",
+    });
+    expect(dispatch).toHaveBeenCalledWith(42, {
+      version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍", "🔥"],
+    });
+    const acks = (await readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).trim().split("\n");
+    expect(acks).toEqual(['{"id":"loc","messageId":301}', '{"id":"poll","messageId":302,"pollId":"poll-abc"}']);
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["loc.json", "poll.json", "react.json"]);
+  });
+
+  it("records stopped poll results in poll-results.jsonl", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "stop.json", { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
+    const poll = { id: "poll-xyz", question: "Q", options: [{ text: "a", voter_count: 2 }], total_voter_count: 2, is_closed: true };
+    const dispatch = vi.fn(async () => ({ data: poll }));
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
+    const results = (await readFile(path.join(workspace, ".tg-bot", "poll-results.jsonl"), "utf8")).trim();
+    expect(JSON.parse(results)).toEqual({ id: "stop", result: poll });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["stop.json"]);
+    await expect(readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).rejects.toThrow();
+  });
+
+  it("quarantines invalid location, poll, and reaction requests without delivery", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    await request(workspace, "bad-kind.json", { version: 1, id: "bad-kind", type: "send_file", path: "x", kind: "weird" });
+    await request(workspace, "bad-lat.json", { version: 1, id: "bad-lat", type: "send_location", latitude: 91, longitude: 0 });
+    await request(workspace, "bad-venue.json", { version: 1, id: "bad-venue", type: "send_location", latitude: 1, longitude: 2, venue: { title: "x" } });
+    await request(workspace, "few-options.json", { version: 1, id: "few-options", type: "send_poll", question: "q", options: ["only"] });
+    await request(workspace, "quiz-no-answer.json", { version: 1, id: "quiz-no-answer", type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz" });
+    await request(workspace, "bad-answer-index.json", { version: 1, id: "bad-answer-index", type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 });
+    await request(workspace, "bad-emoji.json", { version: 1, id: "bad-emoji", type: "send_reaction", message_id: 3, emoji: ["ok", ""] });
+    await request(workspace, "bad-stop.json", { version: 1, id: "bad-stop", type: "stop_poll", message_id: 0 });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(outbox, "failed"))).toEqual([
+      "bad-answer-index.json", "bad-emoji.json", "bad-kind.json", "bad-lat.json", "bad-stop.json", "bad-venue.json", "few-options.json", "quiz-no-answer.json",
+    ]);
+  });
 });

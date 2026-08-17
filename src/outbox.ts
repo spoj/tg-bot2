@@ -4,12 +4,15 @@ import { lstat, link, mkdir, open, opendir, realpath, rename, unlink } from "nod
 import path from "node:path";
 import { SerialQueue } from "./queue.js";
 
+export type WorkspaceOutboxFileKind = "auto" | "photo" | "audio" | "video" | "voice" | "document";
+
 export type WorkspaceOutboxSendFileRequest = {
   version: 1;
   id: string;
   type: "send_file";
   path: string;
   caption?: string;
+  kind?: WorkspaceOutboxFileKind;
 };
 
 export type WorkspaceOutboxSendMessageRequest = {
@@ -22,12 +25,64 @@ export type WorkspaceOutboxSendMessageRequest = {
   reply_to_message_id?: number;
 };
 
-export type WorkspaceOutboxRequest = WorkspaceOutboxSendFileRequest | WorkspaceOutboxSendMessageRequest;
+export type WorkspaceOutboxSendLocationRequest = {
+  version: 1;
+  id: string;
+  type: "send_location";
+  latitude: number;
+  longitude: number;
+  horizontal_accuracy?: number;
+  heading?: number;
+  live_period?: number;
+  venue?: { title: string; address: string };
+};
+
+export type WorkspaceOutboxSendPollRequest = {
+  version: 1;
+  id: string;
+  type: "send_poll";
+  question: string;
+  options: string[];
+  is_anonymous?: boolean;
+  allows_multiple_answers?: boolean;
+  poll_type?: "regular" | "quiz";
+  correct_option_id?: number;
+};
+
+export type WorkspaceOutboxStopPollRequest = {
+  version: 1;
+  id: string;
+  type: "stop_poll";
+  message_id: number;
+  reply_markup?: unknown;
+};
+
+export type WorkspaceOutboxSendReactionRequest = {
+  version: 1;
+  id: string;
+  type: "send_reaction";
+  message_id: number;
+  emoji: string[];
+};
+
+export type WorkspaceOutboxRequest =
+  | WorkspaceOutboxSendFileRequest
+  | WorkspaceOutboxSendMessageRequest
+  | WorkspaceOutboxSendLocationRequest
+  | WorkspaceOutboxSendPollRequest
+  | WorkspaceOutboxStopPollRequest
+  | WorkspaceOutboxSendReactionRequest;
+
+export type WorkspaceOutboxDispatchResult = {
+  messageId?: number;
+  pollId?: string;
+  data?: unknown;
+};
 
 export type WorkspaceOutboxDispatcher = (
   chatId: number,
   request: WorkspaceOutboxRequest,
-) => Promise<number | undefined>;
+) => Promise<WorkspaceOutboxDispatchResult | undefined>;
 
 export type WorkspaceOutboxOptions = {
   dataDir: string;
@@ -47,10 +102,20 @@ const MAX_REQUEST_PATH_LENGTH = 4_096;
 const MAX_REQUEST_CAPTION_LENGTH = 16 * 1024;
 const MAX_REQUEST_TEXT_LENGTH = 4_096;
 const MAX_REQUEST_REPLY_MARKUP_BYTES = 8_192;
-const MAX_DELIVERY_ACK_LINES = 256;
-const MAX_DELIVERY_ACK_BYTES = 64 * 1024;
+const MAX_JSONL_LINES = 256;
+const MAX_JSONL_BYTES = 64 * 1024;
 const DELIVERY_ACK_NAME = "deliveries.jsonl";
-
+const POLL_RESULTS_NAME = "poll-results.jsonl";
+const MAX_POLL_QUESTION_LENGTH = 300;
+const MAX_POLL_OPTION_LENGTH = 100;
+const MAX_POLL_OPTIONS = 10;
+const MIN_POLL_OPTIONS = 2;
+const MAX_VENUE_FIELD_LENGTH = 256;
+const MAX_REACTION_EMOJI_LENGTH = 64;
+const MAX_REACTIONS = 3;
+const MAX_LIVE_PERIOD_SECONDS = 86_400;
+const MIN_LIVE_PERIOD_SECONDS = 60;
+const MAX_HORIZONTAL_ACCURACY_METERS = 1_500;
 const CHAT_DIRECTORY = /^-?\d+$/;
 const JSON_REQUEST = /\.json$/;
 // Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
@@ -126,7 +191,35 @@ function validateRequest(value: unknown): WorkspaceOutboxRequest {
   if (request.id.length > MAX_REQUEST_ID_LENGTH) throw new Error(`Outbox request id must be at most ${MAX_REQUEST_ID_LENGTH} characters`);
   if (request.type === "send_file") return validateSendFileRequest(request.id, request);
   if (request.type === "send_message") return validateSendMessageRequest(request.id, request);
-  throw new Error("Outbox request type must be send_file or send_message");
+  if (request.type === "send_location") return validateSendLocationRequest(request.id, request);
+  if (request.type === "send_poll") return validateSendPollRequest(request.id, request);
+  if (request.type === "stop_poll") return validateStopPollRequest(request.id, request);
+  if (request.type === "send_reaction") return validateSendReactionRequest(request.id, request);
+  throw new Error("Outbox request type must be send_file, send_message, send_location, send_poll, stop_poll, or send_reaction");
+}
+
+function validateMessageId(request: Record<string, unknown>, name: string): number {
+  if (typeof request[name] !== "number" || !Number.isSafeInteger(request[name]) || (request[name] as number) < 1) {
+    throw new Error(`Outbox request ${name} must be a positive integer`);
+  }
+  return request[name] as number;
+}
+
+function validateReplyMarkup(request: Record<string, unknown>): unknown {
+  if (request.reply_markup === undefined) return undefined;
+  if (request.reply_markup === null || typeof request.reply_markup !== "object" || Array.isArray(request.reply_markup)) {
+    throw new Error("Outbox request reply_markup must be an object");
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(request.reply_markup);
+  } catch {
+    throw new Error("Outbox request reply_markup must be JSON-serializable");
+  }
+  if (serialized.length > MAX_REQUEST_REPLY_MARKUP_BYTES) {
+    throw new Error(`Outbox request reply_markup must be at most ${MAX_REQUEST_REPLY_MARKUP_BYTES} bytes`);
+  }
+  return request.reply_markup;
 }
 
 function validateSendFileRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendFileRequest {
@@ -138,12 +231,16 @@ function validateSendFileRequest(id: string, request: Record<string, unknown>): 
   if (typeof request.caption === "string" && request.caption.length > MAX_REQUEST_CAPTION_LENGTH) {
     throw new Error(`Outbox request caption must be at most ${MAX_REQUEST_CAPTION_LENGTH} characters`);
   }
+  if (request.kind !== undefined && request.kind !== "auto" && request.kind !== "photo" && request.kind !== "audio" && request.kind !== "video" && request.kind !== "voice" && request.kind !== "document") {
+    throw new Error("Outbox request kind must be auto, photo, audio, video, voice, or document");
+  }
   return {
     version: 1,
     id,
     type: "send_file",
     path: request.path,
     ...(request.caption === undefined ? {} : { caption: request.caption }),
+    ...(request.kind === undefined ? {} : { kind: request.kind as WorkspaceOutboxFileKind }),
   };
 }
 
@@ -153,34 +250,136 @@ function validateSendMessageRequest(id: string, request: Record<string, unknown>
   if (request.parse_mode !== undefined && request.parse_mode !== "HTML" && request.parse_mode !== "MarkdownV2") {
     throw new Error("Outbox request parse_mode must be HTML or MarkdownV2");
   }
-  if (request.reply_markup !== undefined) {
-    if (request.reply_markup === null || typeof request.reply_markup !== "object" || Array.isArray(request.reply_markup)) {
-      throw new Error("Outbox request reply_markup must be an object");
-    }
-    let serialized: string;
-    try {
-      serialized = JSON.stringify(request.reply_markup);
-    } catch {
-      throw new Error("Outbox request reply_markup must be JSON-serializable");
-    }
-    if (serialized.length > MAX_REQUEST_REPLY_MARKUP_BYTES) {
-      throw new Error(`Outbox request reply_markup must be at most ${MAX_REQUEST_REPLY_MARKUP_BYTES} bytes`);
-    }
-  }
-  if (request.reply_to_message_id !== undefined) {
-    if (typeof request.reply_to_message_id !== "number" || !Number.isSafeInteger(request.reply_to_message_id) || request.reply_to_message_id < 1) {
-      throw new Error("Outbox request reply_to_message_id must be a positive integer");
-    }
-  }
+  const replyMarkup = validateReplyMarkup(request);
+  let replyToMessageId: number | undefined;
+  if (request.reply_to_message_id !== undefined) replyToMessageId = validateMessageId(request, "reply_to_message_id");
   return {
     version: 1,
     id,
     type: "send_message",
     text: request.text,
     ...(request.parse_mode === undefined ? {} : { parse_mode: request.parse_mode }),
-    ...(request.reply_markup === undefined ? {} : { reply_markup: request.reply_markup }),
-    ...(request.reply_to_message_id === undefined ? {} : { reply_to_message_id: request.reply_to_message_id }),
+    ...(replyMarkup === undefined ? {} : { reply_markup: replyMarkup }),
+    ...(replyToMessageId === undefined ? {} : { reply_to_message_id: replyToMessageId }),
   };
+}
+
+function validateSendLocationRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendLocationRequest {
+  if (typeof request.latitude !== "number" || !Number.isFinite(request.latitude) || request.latitude < -90 || request.latitude > 90) {
+    throw new Error("Outbox request latitude must be a number between -90 and 90");
+  }
+  if (typeof request.longitude !== "number" || !Number.isFinite(request.longitude) || request.longitude < -180 || request.longitude > 180) {
+    throw new Error("Outbox request longitude must be a number between -180 and 180");
+  }
+  if (request.horizontal_accuracy !== undefined) {
+    if (typeof request.horizontal_accuracy !== "number" || !Number.isFinite(request.horizontal_accuracy) || request.horizontal_accuracy < 0 || request.horizontal_accuracy > MAX_HORIZONTAL_ACCURACY_METERS) {
+      throw new Error(`Outbox request horizontal_accuracy must be between 0 and ${MAX_HORIZONTAL_ACCURACY_METERS}`);
+    }
+  }
+  if (request.heading !== undefined) {
+    if (typeof request.heading !== "number" || !Number.isFinite(request.heading) || request.heading < 1 || request.heading > 360) {
+      throw new Error("Outbox request heading must be between 1 and 360");
+    }
+  }
+  if (request.live_period !== undefined) {
+    if (typeof request.live_period !== "number" || !Number.isSafeInteger(request.live_period) || request.live_period < MIN_LIVE_PERIOD_SECONDS || request.live_period > MAX_LIVE_PERIOD_SECONDS) {
+      throw new Error(`Outbox request live_period must be between ${MIN_LIVE_PERIOD_SECONDS} and ${MAX_LIVE_PERIOD_SECONDS} seconds`);
+    }
+  }
+  let venue: { title: string; address: string } | undefined;
+  if (request.venue !== undefined) {
+    if (request.venue === null || typeof request.venue !== "object" || Array.isArray(request.venue)) {
+      throw new Error("Outbox request venue must be an object with title and address");
+    }
+    const candidate = request.venue as Record<string, unknown>;
+    if (typeof candidate.title !== "string" || candidate.title.length === 0 || candidate.title.length > MAX_VENUE_FIELD_LENGTH) {
+      throw new Error(`Outbox request venue title must be a string of at most ${MAX_VENUE_FIELD_LENGTH} characters`);
+    }
+    if (typeof candidate.address !== "string" || candidate.address.length === 0 || candidate.address.length > MAX_VENUE_FIELD_LENGTH) {
+      throw new Error(`Outbox request venue address must be a string of at most ${MAX_VENUE_FIELD_LENGTH} characters`);
+    }
+    venue = { title: candidate.title, address: candidate.address };
+  }
+  return {
+    version: 1,
+    id,
+    type: "send_location",
+    latitude: request.latitude,
+    longitude: request.longitude,
+    ...(request.horizontal_accuracy === undefined ? {} : { horizontal_accuracy: request.horizontal_accuracy }),
+    ...(request.heading === undefined ? {} : { heading: request.heading }),
+    ...(request.live_period === undefined ? {} : { live_period: request.live_period }),
+    ...(venue === undefined ? {} : { venue }),
+  };
+}
+
+function validateSendPollRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendPollRequest {
+  if (typeof request.question !== "string" || request.question.length === 0 || request.question.length > MAX_POLL_QUESTION_LENGTH) {
+    throw new Error(`Outbox request question must be a string of at most ${MAX_POLL_QUESTION_LENGTH} characters`);
+  }
+  if (!Array.isArray(request.options) || request.options.length < MIN_POLL_OPTIONS || request.options.length > MAX_POLL_OPTIONS) {
+    throw new Error(`Outbox request options must have between ${MIN_POLL_OPTIONS} and ${MAX_POLL_OPTIONS} entries`);
+  }
+  const options = request.options.map((option, index) => {
+    if (typeof option !== "string" || option.length === 0 || option.length > MAX_POLL_OPTION_LENGTH) {
+      throw new Error(`Outbox request option ${index} must be a string of at most ${MAX_POLL_OPTION_LENGTH} characters`);
+    }
+    return option;
+  });
+  if (request.is_anonymous !== undefined && typeof request.is_anonymous !== "boolean") {
+    throw new Error("Outbox request is_anonymous must be a boolean");
+  }
+  if (request.allows_multiple_answers !== undefined && typeof request.allows_multiple_answers !== "boolean") {
+    throw new Error("Outbox request allows_multiple_answers must be a boolean");
+  }
+  if (request.poll_type !== undefined && request.poll_type !== "regular" && request.poll_type !== "quiz") {
+    throw new Error("Outbox request poll_type must be regular or quiz");
+  }
+  if (request.poll_type === "quiz" && request.correct_option_id === undefined) {
+    throw new Error("Outbox quiz requests require correct_option_id");
+  }
+  if (request.correct_option_id !== undefined) {
+    if (typeof request.correct_option_id !== "number" || !Number.isSafeInteger(request.correct_option_id) || request.correct_option_id < 0 || request.correct_option_id >= options.length) {
+      throw new Error("Outbox request correct_option_id must index an option");
+    }
+  }
+  return {
+    version: 1,
+    id,
+    type: "send_poll",
+    question: request.question,
+    options,
+    ...(request.is_anonymous === undefined ? {} : { is_anonymous: request.is_anonymous }),
+    ...(request.allows_multiple_answers === undefined ? {} : { allows_multiple_answers: request.allows_multiple_answers }),
+    ...(request.poll_type === undefined ? {} : { poll_type: request.poll_type }),
+    ...(request.correct_option_id === undefined ? {} : { correct_option_id: request.correct_option_id }),
+  };
+}
+
+function validateStopPollRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxStopPollRequest {
+  const messageId = validateMessageId(request, "message_id");
+  const replyMarkup = validateReplyMarkup(request);
+  return {
+    version: 1,
+    id,
+    type: "stop_poll",
+    message_id: messageId,
+    ...(replyMarkup === undefined ? {} : { reply_markup: replyMarkup }),
+  };
+}
+
+function validateSendReactionRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendReactionRequest {
+  const messageId = validateMessageId(request, "message_id");
+  if (!Array.isArray(request.emoji) || request.emoji.length > MAX_REACTIONS) {
+    throw new Error(`Outbox request emoji must be an array of at most ${MAX_REACTIONS} emoji (empty removes the reaction)`);
+  }
+  const emoji = request.emoji.map((entry, index) => {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_REACTION_EMOJI_LENGTH) {
+      throw new Error(`Outbox request emoji entry ${index} must be a string of at most ${MAX_REACTION_EMOJI_LENGTH} characters`);
+    }
+    return entry;
+  });
+  return { version: 1, id, type: "send_reaction", message_id: messageId, emoji };
 }
 
 
@@ -437,12 +636,22 @@ export class WorkspaceOutbox {
           lease = this.startClaimLease(claim, chatId);
           const request = await readRequest(claim.path);
           if (request.type === "send_file") validateWorkspacePath(workspace, request.path);
-          const messageId = await this.dispatch(chatId, request);
-          if (messageId !== undefined) {
+          const result = await this.dispatch(chatId, request);
+          if (result !== undefined) {
             try {
-              await this.appendDeliveryAck(metadata.path, request.id, messageId);
+              if (result.messageId !== undefined) {
+                const ack = {
+                  id: request.id,
+                  messageId: result.messageId,
+                  ...(result.pollId === undefined ? {} : { pollId: result.pollId }),
+                };
+                await this.appendBoundedJsonl(metadata.path, DELIVERY_ACK_NAME, JSON.stringify(ack));
+              }
+              if (result.data !== undefined) {
+                await this.appendBoundedJsonl(metadata.path, POLL_RESULTS_NAME, JSON.stringify({ id: request.id, result: result.data }));
+              }
             } catch (error) {
-              // Delivery succeeded; a lost ack must never resend the request.
+              // Delivery succeeded; a lost ack or result must never resend the request.
               this.reportRequestError(chatId, archiveName, error);
             }
           }
@@ -647,27 +856,27 @@ export class WorkspaceOutbox {
     }
     return { ok: true };
   }
-  /** Appends one ack line, rotating the file when it exceeds the line or byte caps. */
-  private async appendDeliveryAck(directoryPath: string, requestId: string, messageId: number): Promise<void> {
-    const filePath = path.join(directoryPath, DELIVERY_ACK_NAME);
-    const line = `${JSON.stringify({ id: requestId, messageId })}\n`;
-    const handle = await this.openDeliveryAck(filePath);
+  /** Appends one JSON line to a bounded store, rotating when line or byte caps are exceeded. */
+  private async appendBoundedJsonl(directoryPath: string, fileName: string, record: string): Promise<void> {
+    const filePath = path.join(directoryPath, fileName);
+    const line = `${record}\n`;
+    const handle = await this.openBoundedJsonl(filePath);
     try {
       const stat = await handle.stat();
-      if (!stat.isFile()) throw new Error("Outbox delivery ack is not a regular file");
+      if (!stat.isFile()) throw new Error("Outbox JSONL store is not a regular file");
       await handle.write(line, null, "utf8");
       const total = stat.size + Buffer.byteLength(line, "utf8");
-      const lines = await this.latestDeliveryAckLines(handle, total);
-      if (lines.length > MAX_DELIVERY_ACK_LINES || total > MAX_DELIVERY_ACK_BYTES) {
-        await this.replaceDeliveryAck(filePath, `${lines.slice(-MAX_DELIVERY_ACK_LINES).join("\n")}\n`);
+      const lines = await this.latestBoundedJsonlLines(handle, total);
+      if (lines.length > MAX_JSONL_LINES || total > MAX_JSONL_BYTES) {
+        await this.replaceBoundedJsonl(filePath, `${lines.slice(-MAX_JSONL_LINES).join("\n")}\n`);
       }
     } finally {
       await handle.close().catch(() => {});
     }
   }
 
-  /** Opens the ack file, replacing a symlink the workspace may have planted at its path. */
-  private async openDeliveryAck(filePath: string): Promise<Awaited<ReturnType<typeof open>>> {
+  /** Opens a store file, replacing a symlink the workspace may have planted at its path. */
+  private async openBoundedJsonl(filePath: string): Promise<Awaited<ReturnType<typeof open>>> {
     try {
       return await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
     } catch (error) {
@@ -681,9 +890,9 @@ export class WorkspaceOutbox {
     }
   }
 
-  /** Reads the tail of the ack file (bounded), dropping a possible partial first line. */
-  private async latestDeliveryAckLines(handle: Awaited<ReturnType<typeof open>>, size: number): Promise<string[]> {
-    const readLength = Math.min(size, MAX_DELIVERY_ACK_BYTES);
+  /** Reads the tail of the store (bounded), dropping a possible partial first line. */
+  private async latestBoundedJsonlLines(handle: Awaited<ReturnType<typeof open>>, size: number): Promise<string[]> {
+    const readLength = Math.min(size, MAX_JSONL_BYTES);
     const position = size - readLength;
     const buffer = Buffer.allocUnsafe(readLength);
     let bytesRead = 0;
@@ -697,11 +906,11 @@ export class WorkspaceOutbox {
     return complete.filter(Boolean);
   }
 
-  /** Atomically rewrites the ack file via a unique temporary file in the same directory. */
-  private async replaceDeliveryAck(filePath: string, content: string): Promise<void> {
+  /** Atomically rewrites a store file via a unique temporary file in the same directory. */
+  private async replaceBoundedJsonl(filePath: string, content: string): Promise<void> {
     const directory = path.dirname(filePath);
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const tempPath = path.join(directory, `.deliveries-${randomUUID()}.tmp`);
+      const tempPath = path.join(directory, `.jsonl-${randomUUID()}.tmp`);
       let handle: Awaited<ReturnType<typeof open>> | undefined;
       try {
         handle = await open(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
@@ -715,7 +924,7 @@ export class WorkspaceOutbox {
       await rename(tempPath, filePath);
       return;
     }
-    throw new Error("Unable to rewrite outbox delivery acks");
+    throw new Error("Unable to rewrite outbox JSONL store");
   }
 
 

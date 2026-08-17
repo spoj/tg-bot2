@@ -92,10 +92,16 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("reloaded after the current turn");
   expect(SYSTEM_PROMPT).not.toContain("install <source> -l");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/outbox/");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?,kind?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,reply_markup?,reply_to_message_id?}");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/deliveries.jsonl");
   expect(SYSTEM_PROMPT).toContain("[Telegram button press: data=...]");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_poll\",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"stop_poll\",message_id,reply_markup?}");
+  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_reaction\",message_id,emoji}");
+  expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/poll-results.jsonl");
+  expect(SYSTEM_PROMPT).toContain("[Poll answer: poll_id=..., options=[...]]");
   expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
   expect(SYSTEM_PROMPT).toContain("final unique *.json request name");
   expect(SYSTEM_PROMPT).toContain("{version:1,schedules:[...]}");

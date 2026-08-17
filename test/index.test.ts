@@ -82,8 +82,13 @@ vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
   closeTelegramIngress: state.closeTelegramIngress,
   flushTelegramIngress: state.flushTelegramIngress,
+  recordPollOwner: vi.fn(),
+  sendTelegramPoll: vi.fn(),
+  sendTelegramReaction: vi.fn(),
   sendTelegramRichMessage: vi.fn(),
   sendTelegramText: vi.fn(),
+  stopTelegramPoll: vi.fn(),
+  sendWorkspaceFile: vi.fn(),
   TelegramDeliveryQueue: state.delivery,
 }));
 
@@ -128,6 +133,9 @@ describe("application startup and shutdown wiring", () => {
     );
     expect(state.scheduler).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
+    expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
+      allowed_updates: ["message", "callback_query", "poll_answer"],
+    }));
   });
 
   it("raises the shutdown gate before waiting for ingress and treats signal abort as graceful", async () => {

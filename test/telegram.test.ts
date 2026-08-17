@@ -15,8 +15,13 @@ import {
   formatModelList,
   formatStatus,
   formatThinkingLevels,
+  recordPollOwner,
+  sendTelegramLocation,
+  sendTelegramPoll,
+  sendTelegramReaction,
   sendTelegramRichMessage,
   sendTelegramText,
+  stopTelegramPoll,
   sendWorkspaceFile,
   splitTelegramText,
   TelegramDeliveryQueue,
@@ -29,8 +34,17 @@ const execFile = promisify(execFileCallback);
 function fakeBot() {
   return {
     api: {
+      sendAudio: vi.fn(async () => ({ message_id: 123 })),
       sendDocument: vi.fn(async () => ({ message_id: 123 })),
+      sendLocation: vi.fn(async () => ({ message_id: 123 })),
       sendMessage: vi.fn(async () => ({ message_id: 123 })),
+      sendPhoto: vi.fn(async () => ({ message_id: 123 })),
+      sendPoll: vi.fn(async () => ({ message_id: 123, poll: { id: "poll-9" } })),
+      sendVenue: vi.fn(async () => ({ message_id: 123 })),
+      sendVideo: vi.fn(async () => ({ message_id: 123 })),
+      sendVoice: vi.fn(async () => ({ message_id: 123 })),
+      setMessageReaction: vi.fn(async () => true),
+      stopPoll: vi.fn(async () => ({ id: "poll-9", question: "Q", options: [], total_voter_count: 0, is_closed: true })),
     },
   } as unknown as Bot;
 }
@@ -509,6 +523,65 @@ it("sends a valid workspace file with a bounded caption", async () => {
     expect(sendDocument.mock.calls[0]?.[2]).toEqual({ caption: Array.from(caption).slice(0, 1_024).join("") });
   });
 });
+it("sends detected media kinds with the matching API methods", async () => {
+  await withWorkspace(async (workspace) => {
+    const cases = [
+      ["shot.png", "sendPhoto"],
+      ["clip.mp4", "sendVideo"],
+      ["song.mp3", "sendAudio"],
+    ] as const;
+    for (const [name, method] of cases) {
+      await writeFile(path.join(workspace, name), "payload");
+      const bot = fakeBot();
+      await expect(sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: name })).resolves.toBe(123);
+      const api = bot.api[method] as unknown as ReturnType<typeof vi.fn>;
+      expect(api).toHaveBeenCalledTimes(1);
+      expect(api.mock.calls[0]?.[0]).toBe(42);
+      const others = (["sendPhoto", "sendVideo", "sendAudio", "sendVoice", "sendDocument"] as const).filter((entry) => entry !== method);
+      for (const other of others) expect(bot.api[other] as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    }
+  });
+});
+
+it("honors explicit kinds and voice overrides", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "note.ogg"), "payload");
+    const bot = fakeBot();
+    await sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: "note.ogg", kind: "voice" });
+    expect(bot.api.sendVoice as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendAudio as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+
+    const forcedDocument = fakeBot();
+    await sendWorkspaceFile(forcedDocument, { chatId: 42, workspace, sandboxPath: "note.ogg", kind: "document" });
+    expect(forcedDocument.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+    expect(forcedDocument.api.sendAudio as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+  });
+});
+
+it("sends oversized images as documents instead of photos", async () => {
+  await withWorkspace(async (workspace) => {
+    const big = path.join(workspace, "big.png");
+    await writeFile(big, "");
+    await truncate(big, 10 * 1024 * 1024 + 1);
+    const bot = fakeBot();
+    await expect(sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: "big.png" })).resolves.toBe(123);
+    expect(bot.api.sendPhoto as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    expect(bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+  });
+});
+it("applies the photo cap to explicit photo overrides as well", async () => {
+  await withWorkspace(async (workspace) => {
+    const big = path.join(workspace, "big.bin");
+    await writeFile(big, "");
+    await truncate(big, 10 * 1024 * 1024 + 1);
+    const bot = fakeBot();
+    await expect(sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: "big.bin", kind: "photo" })).resolves.toBe(123);
+    expect(bot.api.sendPhoto as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    expect(bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+  });
+});
+
+
 
 it("rejects FIFOs without blocking when FIFO creation is supported", async () => {
   await withWorkspace(async (workspace) => {
@@ -1029,6 +1102,135 @@ describe("Telegram callback queries", () => {
 
 
 
+
+describe("Telegram locations, polls, and reactions", () => {
+  it("sends a location pin with optional fields", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramLocation(bot, 42, {
+      latitude: 52.52,
+      longitude: 13.405,
+      heading: 180,
+      livePeriod: 120,
+    })).resolves.toBe(123);
+    const sendLocation = bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>;
+    expect(sendLocation).toHaveBeenCalledWith(42, 52.52, 13.405, { heading: 180, live_period: 120 });
+  });
+
+  it("sends a venue when venue fields are present", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramLocation(bot, 42, {
+      latitude: 52.5163,
+      longitude: 13.3777,
+      venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
+    })).resolves.toBe(123);
+    expect(bot.api.sendVenue as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, 52.5163, 13.3777, "Brandenburg Gate", "Pariser Platz 1");
+    expect(bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+  });
+
+  it("sends a poll and returns its message and poll ids", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramPoll(bot, 42, {
+      question: "Pick one",
+      options: ["a", "b"],
+      isAnonymous: false,
+      pollType: "quiz",
+      correctOptionId: 1,
+    })).resolves.toEqual({ messageId: 123, pollId: "poll-9" });
+    expect(bot.api.sendPoll as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, "Pick one", ["a", "b"], {
+      is_anonymous: false,
+      type: "quiz",
+      correct_option_id: 1,
+    });
+  });
+
+  it("stops a poll and returns the final poll", async () => {
+    const bot = fakeBot();
+    const poll = await stopTelegramPoll(bot, 42, 123);
+    expect(poll.id).toBe("poll-9");
+    expect(bot.api.stopPoll as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, 123, undefined);
+  });
+
+  it("sets and clears reactions", async () => {
+    const bot = fakeBot();
+    await sendTelegramReaction(bot, 42, 123, ["👍", "🔥"]);
+    const setReaction = bot.api.setMessageReaction as unknown as ReturnType<typeof vi.fn>;
+    expect(setReaction).toHaveBeenCalledWith(42, 123, [{ type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" }]);
+    await sendTelegramReaction(bot, 42, 123, []);
+    expect(setReaction.mock.calls[1]).toEqual([42, 123, []]);
+  });
+});
+
+describe("Telegram poll answers", () => {
+  async function makePollBot(dataDir: string, prompt: ReturnType<typeof vi.fn>): Promise<Bot> {
+    const bot = createTelegramBot(
+      { token: "test-token", allowedUserIds: new Set([42]), dataDir },
+      { prompt, setAssistantProgress: vi.fn() } as never,
+    );
+    Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    Object.assign(bot, { clientConfig: { fetch: fakeFetch } });
+    return bot;
+  }
+
+  it("routes poll answers to the owning chat via the recorded poll id", async () => {
+    await withWorkspace(async (dataDir) => {
+      await recordPollOwner(dataDir, 42, "poll-9", 77);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makePollBot(dataDir, prompt);
+      await bot.handleUpdate({
+        update_id: 3,
+        poll_answer: {
+          poll_id: "poll-9",
+          user: { id: 42, is_bot: false, first_name: "Test" },
+          option_ids: [1, 2],
+        },
+      } as never);
+      await flushTelegramIngress(bot);
+      expect(prompt).toHaveBeenCalledWith(42, "Telegram message 0:\n[Poll answer: poll_id=poll-9, options=[1,2]]");
+    });
+  });
+
+  it("skips corrupt or non-object registry lines while resolving owners", async () => {
+    await withWorkspace(async (dataDir) => {
+      const storePath = path.join(dataDir, "poll-owners.jsonl");
+      await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
+      await recordPollOwner(dataDir, 42, "poll-9", 77);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makePollBot(dataDir, prompt);
+      await bot.handleUpdate({
+        update_id: 3,
+        poll_answer: {
+          poll_id: "poll-9",
+          user: { id: 42, is_bot: false, first_name: "Test" },
+          option_ids: [0],
+        },
+      } as never);
+      await flushTelegramIngress(bot);
+      expect(prompt).toHaveBeenCalledWith(42, "Telegram message 0:\n[Poll answer: poll_id=poll-9, options=[0]]");
+    });
+  });
+
+  it("drops poll answers from unknown polls", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makePollBot(dataDir, prompt);
+      await bot.handleUpdate({
+        update_id: 3,
+        poll_answer: {
+          poll_id: "poll-missing",
+          user: { id: 42, is_bot: false, first_name: "Test" },
+          option_ids: [0],
+        },
+      } as never);
+      await flushTelegramIngress(bot);
+      expect(prompt).not.toHaveBeenCalled();
+    });
+  });
+});
 
 describe("Telegram command formatting", () => {
   it("numbers models, marks the current one, and handles empty lists", () => {

@@ -318,8 +318,8 @@ export class PiRpcWorker {
   private readonly rpcTimeoutMs: number;
   private readonly promptTimeoutMs: number;
   private readonly lifecycleTimeoutMs: number;
-  private readonly workErrors = new Map<number, Error>();
-  private readonly promptSettlementTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  private workError: Error | undefined;
+  private promptSettlementTimer: ReturnType<typeof setTimeout> | undefined;
   private parser: StrictJsonlParser | undefined;
   private lastAssistantText: string | undefined;
   private assistantTextKnown = false;
@@ -333,10 +333,10 @@ export class PiRpcWorker {
   private readonly settledWaiters = new Set<SettledWaiter>();
   private requestId = 0;
   private workEpoch = 0;
-  private readonly unsettledWork = new Set<number>();
-  private readonly acceptedWork = new Set<number>();
-  private readonly startedWork = new Set<number>();
-  private readonly settledBeforeAcceptance = new Set<number>();
+  private activeEpoch: number | undefined;
+  private accepted = false;
+  private started = false;
+  private settledBeforeAcceptance = false;
   private terminalError: Error | undefined;
   private reportedWorkerError: Error | undefined;
   private stderr = "";
@@ -436,11 +436,11 @@ export class PiRpcWorker {
   }
 
   private clearWorkSets(): void {
-    this.unsettledWork.clear();
-    this.acceptedWork.clear();
-    this.startedWork.clear();
-    this.settledBeforeAcceptance.clear();
-    this.workErrors.clear();
+    this.activeEpoch = undefined;
+    this.accepted = false;
+    this.started = false;
+    this.settledBeforeAcceptance = false;
+    this.workError = undefined;
     this.settledError = undefined;
   }
 
@@ -458,7 +458,7 @@ export class PiRpcWorker {
     if (this.extensionReloadPromise || this.stopping || !this.process) return;
     if (!this.extensionResourceDirty && !this.extensionSettingsDirty) return;
     const epoch = this.lifecycleEpoch;
-    if (this.unsettledWork.size > 0 || this.pending.size > 0) {
+    if (this.activeEpoch !== undefined || this.pending.size > 0) {
       this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
       return;
     }
@@ -730,7 +730,7 @@ export class PiRpcWorker {
 
   async waitForSettled(): Promise<void> {
     if (this.terminalError) throw this.terminalError;
-    if (this.unsettledWork.size === 0) {
+    if (this.activeEpoch === undefined) {
       if (this.settledError) throw this.settledError;
       return;
     }
@@ -804,7 +804,7 @@ export class PiRpcWorker {
   async restart(): Promise<void> {
     const reload = this.extensionReloadPromise;
     if (reload) await reload;
-    if (this.unsettledWork.size > 0 || this.pending.size > 0) {
+    if (this.activeEpoch !== undefined || this.pending.size > 0) {
       throw new Error("Pi worker is busy");
     }
     await this.stopProcess(true);
@@ -817,8 +817,11 @@ export class PiRpcWorker {
   }
 
   private async queueWork(command: JsonRecord): Promise<void> {
+    if (this.activeEpoch !== undefined) {
+      throw new Error("Pi worker is already processing a prompt");
+    }
     const epoch = ++this.workEpoch;
-    this.unsettledWork.add(epoch);
+    this.activeEpoch = epoch;
     try {
       await this.request(command, epoch, command.type === "prompt" ? this.promptTimeoutMs : this.rpcTimeoutMs);
       if (command.type === "prompt") this.schedulePromptSettlementProbe(epoch);
@@ -860,34 +863,35 @@ export class PiRpcWorker {
     });
   }
   private schedulePromptSettlementProbe(epoch: number): void {
-    if (!this.unsettledWork.has(epoch)) return;
+    if (this.activeEpoch !== epoch) return;
     const timer = setTimeout(() => {
-      this.promptSettlementTimers.delete(epoch);
+      this.promptSettlementTimer = undefined;
       void this.request({ type: "get_state" }).then((response) => {
-        if (!this.unsettledWork.has(epoch) || this.startedWork.has(epoch)) return;
+        if (this.activeEpoch !== epoch || this.started) return;
         const record = asRecord(response);
         const data = asRecord(record?.data);
         if (data?.isStreaming === false && data.pendingMessageCount === 0) this.settleWork(epoch);
       }).catch((error) => {
-        if (this.unsettledWork.has(epoch)) this.failProcess(asError(error));
+        if (this.activeEpoch === epoch) this.failProcess(asError(error));
       });
     }, PROMPT_SETTLEMENT_PROBE_DELAY_MS);
     timer.unref?.();
-    this.promptSettlementTimers.set(epoch, timer);
+    this.promptSettlementTimer = timer;
   }
 
   private settleAllWork(): void {
-    for (const epoch of this.unsettledWork) this.settleWork(epoch);
+    if (this.activeEpoch !== undefined) this.settleWork(this.activeEpoch);
   }
 
   private settleWork(epoch: number): void {
-    this.clearPromptSettlementTimer(epoch);
-    this.unsettledWork.delete(epoch);
-    this.acceptedWork.delete(epoch);
-    this.startedWork.delete(epoch);
-    this.settledBeforeAcceptance.delete(epoch);
-    this.workErrors.delete(epoch);
-    if (this.unsettledWork.size === 0) this.finishSettledWaiters();
+    if (this.activeEpoch !== epoch) return;
+    this.clearPromptSettlementTimers();
+    this.activeEpoch = undefined;
+    this.accepted = false;
+    this.started = false;
+    this.settledBeforeAcceptance = false;
+    this.workError = undefined;
+    this.finishSettledWaiters();
   }
 
   private finishSettledWaiters(): void {
@@ -896,19 +900,13 @@ export class PiRpcWorker {
     else this.resolveSettledWaiters();
   }
 
-  private clearPromptSettlementTimer(epoch: number): void {
-    const timer = this.promptSettlementTimers.get(epoch);
-    if (timer) clearTimeout(timer);
-    this.promptSettlementTimers.delete(epoch);
-  }
-
   private clearPromptSettlementTimers(): void {
-    for (const timer of this.promptSettlementTimers.values()) clearTimeout(timer);
-    this.promptSettlementTimers.clear();
+    if (this.promptSettlementTimer) clearTimeout(this.promptSettlementTimer);
+    this.promptSettlementTimer = undefined;
   }
 
   private markAgentProgress(): void {
-    for (const epoch of this.acceptedWork) this.startedWork.add(epoch);
+    if (this.accepted) this.started = true;
   }
 
   private isAgentProgressEvent(type: unknown): boolean {
@@ -942,9 +940,9 @@ export class PiRpcWorker {
       this.pending.delete(id);
       if (pending.timeout) clearTimeout(pending.timeout);
       if (record.success === true) {
-        if (pending.workEpoch !== undefined && this.unsettledWork.has(pending.workEpoch)) {
-          this.acceptedWork.add(pending.workEpoch);
-          if (this.settledBeforeAcceptance.has(pending.workEpoch)) this.settleWork(pending.workEpoch);
+        if (pending.workEpoch !== undefined && this.activeEpoch === pending.workEpoch) {
+          this.accepted = true;
+          if (this.settledBeforeAcceptance) this.settleWork(pending.workEpoch);
         }
         pending.resolve(record);
       } else {
@@ -963,16 +961,7 @@ export class PiRpcWorker {
             : "Pi assistant turn failed";
           const failure = new Error(errorMessage);
           this.settledError = failure;
-          let assigned = false;
-          for (const epoch of this.unsettledWork) {
-            if (!this.acceptedWork.has(epoch)) continue;
-            this.workErrors.set(epoch, failure);
-            assigned = true;
-          }
-          if (!assigned && this.unsettledWork.size === 1) {
-            const epoch = this.unsettledWork.values().next().value as number;
-            this.workErrors.set(epoch, failure);
-          }
+          if (this.activeEpoch !== undefined) this.workError = failure;
           this.lastAssistantText = undefined;
         } else {
           this.lastAssistantText = text;
@@ -981,13 +970,10 @@ export class PiRpcWorker {
       }
     }
     if (record.type === "agent_settled") {
-      const turnError = [...this.unsettledWork]
-        .map((epoch) => this.workErrors.get(epoch))
-        .find((error): error is Error => error !== undefined);
-      if (turnError) this.settledError = turnError;
-      for (const epoch of [...this.unsettledWork]) {
-        if (this.acceptedWork.has(epoch)) this.settleWork(epoch);
-        else this.settledBeforeAcceptance.add(epoch);
+      if (this.workError !== undefined) this.settledError = this.workError;
+      if (this.activeEpoch !== undefined) {
+        if (this.accepted) this.settleWork(this.activeEpoch);
+        else this.settledBeforeAcceptance = true;
       }
     } else if (this.isAgentProgressEvent(record.type)) {
       this.markAgentProgress();
@@ -1016,7 +1002,7 @@ export class PiRpcWorker {
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
-    const unexpectedIdleExit = !this.stopping && !this.terminalError && this.unsettledWork.size === 0;
+    const unexpectedIdleExit = !this.stopping && !this.terminalError && this.activeEpoch === undefined;
     const error = this.terminalError ?? new Error(
       `Pi worker exited (${signal ?? (code === null ? "unknown" : code)}).${this.stderr ? ` Stderr: ${this.stderr}` : ""}`,
     );

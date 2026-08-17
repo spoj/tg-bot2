@@ -592,15 +592,15 @@ describe("PiRpcWorker", () => {
       record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
       await expect(prompt).resolves.toBeUndefined();
       const state = worker as unknown as {
-        acceptedWork: Set<number>;
-        unsettledWork: Set<number>;
-        startedWork: Set<number>;
-        settledBeforeAcceptance: Set<number>;
+        activeEpoch: number | undefined;
+        accepted: boolean;
+        started: boolean;
+        settledBeforeAcceptance: boolean;
       };
-      expect(state.acceptedWork.size).toBe(0);
-      expect(state.unsettledWork.size).toBe(0);
-      expect(state.startedWork.size).toBe(0);
-      expect(state.settledBeforeAcceptance.size).toBe(0);
+      expect(state.activeEpoch).toBeUndefined();
+      expect(state.accepted).toBe(false);
+      expect(state.started).toBe(false);
+      expect(state.settledBeforeAcceptance).toBe(false);
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

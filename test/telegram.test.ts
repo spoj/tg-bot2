@@ -16,6 +16,7 @@ import {
   formatStatus,
   formatThinkingLevels,
   recordPollOwner,
+  attachmentSource,
   sendTelegramLocation,
   sendTelegramPoll,
   sendTelegramReaction,
@@ -120,6 +121,32 @@ async function runAttachmentFixture(
   await flushTelegramIngress(bot);
   return prompt;
 }
+
+describe("attachmentSource table", () => {
+  const base = { message_id: 1, date: 1_700_000_000, chat: { id: 42, type: "private" } };
+  const file = { file_id: "f-1", file_size: 10, mime_type: "custom/x", file_name: "orig.bin" };
+  const cases: Array<{ name: string; message: Record<string, unknown>; expected: Record<string, unknown> }> = [
+    { name: "animation", message: { animation: file }, expected: { type: "animation", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
+    { name: "audio", message: { audio: file }, expected: { type: "audio", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
+    { name: "document", message: { document: file }, expected: { type: "document", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
+    { name: "photo", message: { photo: [{ file_id: "f-small", file_size: 5 }, { file_id: "f-large", file_size: 20 }] }, expected: { type: "photo", fileId: "f-large", mimeType: "image/jpeg" } },
+    { name: "animated sticker", message: { sticker: { file_id: "f-a", file_size: 3, is_animated: true } }, expected: { type: "sticker", fileId: "f-a", mimeType: "application/x-tgsticker" } },
+    { name: "video sticker", message: { sticker: { file_id: "f-v", file_size: 3, is_video: true } }, expected: { type: "sticker", fileId: "f-v", mimeType: "video/webm" } },
+    { name: "static sticker", message: { sticker: { file_id: "f-s", file_size: 3 } }, expected: { type: "sticker", fileId: "f-s", mimeType: "image/webp" } },
+    { name: "video", message: { video: file }, expected: { type: "video", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
+    { name: "video note", message: { video_note: file }, expected: { type: "video_note", fileId: "f-1", mimeType: "video/mp4" } },
+    { name: "voice", message: { voice: file }, expected: { type: "voice", fileId: "f-1", mimeType: "custom/x" } },
+  ];
+  for (const { name, message, expected } of cases) {
+    it(`picks the ${name} source`, () => {
+      expect(attachmentSource({ ...base, ...message } as never)).toMatchObject(expected);
+    });
+  }
+  it("returns undefined without media", () => {
+    expect(attachmentSource({ ...base, text: "hello" } as never)).toBeUndefined();
+    expect(attachmentSource({ ...base, photo: [] } as never)).toBeUndefined();
+  });
+});
 
 function chunkedResponse(chunks: readonly Uint8Array[], headers?: HeadersInit): Response {
   return new Response(new ReadableStream<Uint8Array>({

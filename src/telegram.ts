@@ -678,37 +678,83 @@ function safeFilename(name: string | undefined, fallback: string): string {
   return base || fallback;
 }
 
-function attachmentSource(message: Message): AttachmentSource | undefined {
-  if (message.animation) return {
-    type: "animation", fileId: message.animation.file_id, fileSize: message.animation.file_size,
-    mimeType: message.animation.mime_type, originalName: message.animation.file_name,
-  };
-  if (message.audio) return {
-    type: "audio", fileId: message.audio.file_id, fileSize: message.audio.file_size,
-    mimeType: message.audio.mime_type, originalName: message.audio.file_name,
-  };
-  if (message.document) return {
-    type: "document", fileId: message.document.file_id, fileSize: message.document.file_size,
-    mimeType: message.document.mime_type, originalName: message.document.file_name,
-  };
-  if (message.photo?.length) {
-    const photo = message.photo.at(-1)!;
-    return { type: "photo", fileId: photo.file_id, fileSize: photo.file_size, mimeType: "image/jpeg" };
+type AttachmentSourceRow = {
+  kind: string;
+  pick: (message: Message) => Omit<AttachmentSource, "type"> | undefined;
+};
+
+const ATTACHMENT_SOURCES: readonly AttachmentSourceRow[] = [
+  {
+    kind: "animation",
+    pick: (message) => {
+      const animation = message.animation;
+      if (!animation) return undefined;
+      return { fileId: animation.file_id, fileSize: animation.file_size, mimeType: animation.mime_type, originalName: animation.file_name };
+    },
+  },
+  {
+    kind: "audio",
+    pick: (message) => {
+      const audio = message.audio;
+      if (!audio) return undefined;
+      return { fileId: audio.file_id, fileSize: audio.file_size, mimeType: audio.mime_type, originalName: audio.file_name };
+    },
+  },
+  {
+    kind: "document",
+    pick: (message) => {
+      const document = message.document;
+      if (!document) return undefined;
+      return { fileId: document.file_id, fileSize: document.file_size, mimeType: document.mime_type, originalName: document.file_name };
+    },
+  },
+  {
+    kind: "photo",
+    pick: (message) => {
+      const photo = message.photo?.at(-1);
+      if (!photo) return undefined;
+      return { fileId: photo.file_id, fileSize: photo.file_size, mimeType: "image/jpeg" };
+    },
+  },
+  {
+    kind: "sticker",
+    pick: (message) => {
+      const sticker = message.sticker;
+      if (!sticker) return undefined;
+      return { fileId: sticker.file_id, fileSize: sticker.file_size, mimeType: sticker.is_animated ? "application/x-tgsticker" : sticker.is_video ? "video/webm" : "image/webp" };
+    },
+  },
+  {
+    kind: "video",
+    pick: (message) => {
+      const video = message.video;
+      if (!video) return undefined;
+      return { fileId: video.file_id, fileSize: video.file_size, mimeType: video.mime_type, originalName: video.file_name };
+    },
+  },
+  {
+    kind: "video_note",
+    pick: (message) => {
+      const videoNote = message.video_note;
+      if (!videoNote) return undefined;
+      return { fileId: videoNote.file_id, fileSize: videoNote.file_size, mimeType: "video/mp4" };
+    },
+  },
+  {
+    kind: "voice",
+    pick: (message) => {
+      const voice = message.voice;
+      if (!voice) return undefined;
+      return { fileId: voice.file_id, fileSize: voice.file_size, mimeType: voice.mime_type };
+    },
+  },
+];
+
+export function attachmentSource(message: Message): AttachmentSource | undefined {
+  for (const { kind, pick } of ATTACHMENT_SOURCES) {
+    const source = pick(message);
+    if (source) return { type: kind, ...source };
   }
-  if (message.sticker) return {
-    type: "sticker", fileId: message.sticker.file_id, fileSize: message.sticker.file_size,
-    mimeType: message.sticker.is_animated ? "application/x-tgsticker" : message.sticker.is_video ? "video/webm" : "image/webp",
-  };
-  if (message.video) return {
-    type: "video", fileId: message.video.file_id, fileSize: message.video.file_size,
-    mimeType: message.video.mime_type, originalName: message.video.file_name,
-  };
-  if (message.video_note) return {
-    type: "video_note", fileId: message.video_note.file_id, fileSize: message.video_note.file_size, mimeType: "video/mp4",
-  };
-  if (message.voice) return {
-    type: "voice", fileId: message.voice.file_id, fileSize: message.voice.file_size, mimeType: message.voice.mime_type,
-  };
   return undefined;
 }
 

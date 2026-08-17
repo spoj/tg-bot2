@@ -74,62 +74,66 @@ export async function main(): Promise<void> {
     dataDir,
     dispatch: async (chatId, request) => {
       return deliveryQueue.enqueue(chatId, async () => {
-        if (request.type === "send_file") {
-          return {
-            messageId: await sendWorkspaceFile(bot, {
-              chatId,
-              workspace: chatPaths(dataDir, chatId).workspace,
-              sandboxPath: request.path,
-              ...(request.caption === undefined ? {} : { caption: request.caption }),
-              ...(request.kind === undefined ? {} : { kind: request.kind }),
-            }),
-          };
-        }
-        if (request.type === "send_message") {
-          return {
-            messageId: await sendTelegramRichMessage(bot, chatId, {
-              text: request.text,
-              ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
-              ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
-              ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
-            }),
-          };
-        }
-        if (request.type === "send_location") {
-          return {
-            messageId: await sendTelegramLocation(bot, chatId, {
-              latitude: request.latitude,
-              longitude: request.longitude,
-              ...(request.horizontal_accuracy === undefined ? {} : { horizontalAccuracy: request.horizontal_accuracy }),
-              ...(request.heading === undefined ? {} : { heading: request.heading }),
-              ...(request.live_period === undefined ? {} : { livePeriod: request.live_period }),
-              ...(request.venue === undefined ? {} : { venue: request.venue }),
-            }),
-          };
-        }
-        if (request.type === "send_poll") {
-          const sent = await sendTelegramPoll(bot, chatId, {
-            question: request.question,
-            options: request.options,
-            ...(request.is_anonymous === undefined ? {} : { isAnonymous: request.is_anonymous }),
-            ...(request.allows_multiple_answers === undefined ? {} : { allowsMultipleAnswers: request.allows_multiple_answers }),
-            ...(request.poll_type === undefined ? {} : { pollType: request.poll_type }),
-            ...(request.correct_option_id === undefined ? {} : { correctOptionId: request.correct_option_id }),
-          });
-          try {
-            await recordPollOwner(dataDir, chatId, sent.pollId, sent.messageId);
-          } catch (error) {
-            console.error("Failed to record poll ownership", error);
+        switch (request.type) {
+          case "send_file":
+            return {
+              messageId: await sendWorkspaceFile(bot, {
+                chatId,
+                workspace: chatPaths(dataDir, chatId).workspace,
+                sandboxPath: request.path,
+                ...(request.caption === undefined ? {} : { caption: request.caption }),
+                ...(request.kind === undefined ? {} : { kind: request.kind }),
+              }),
+            };
+          case "send_message":
+            return {
+              messageId: await sendTelegramRichMessage(bot, chatId, {
+                text: request.text,
+                ...(request.parse_mode === undefined ? {} : { parseMode: request.parse_mode }),
+                ...(request.reply_markup === undefined ? {} : { replyMarkup: request.reply_markup }),
+                ...(request.reply_to_message_id === undefined ? {} : { replyToMessageId: request.reply_to_message_id }),
+              }),
+            };
+          case "send_location":
+            return {
+              messageId: await sendTelegramLocation(bot, chatId, {
+                latitude: request.latitude,
+                longitude: request.longitude,
+                ...(request.horizontal_accuracy === undefined ? {} : { horizontalAccuracy: request.horizontal_accuracy }),
+                ...(request.heading === undefined ? {} : { heading: request.heading }),
+                ...(request.live_period === undefined ? {} : { livePeriod: request.live_period }),
+                ...(request.venue === undefined ? {} : { venue: request.venue }),
+              }),
+            };
+          case "send_poll": {
+            const sent = await sendTelegramPoll(bot, chatId, {
+              question: request.question,
+              options: request.options,
+              ...(request.is_anonymous === undefined ? {} : { isAnonymous: request.is_anonymous }),
+              ...(request.allows_multiple_answers === undefined ? {} : { allowsMultipleAnswers: request.allows_multiple_answers }),
+              ...(request.poll_type === undefined ? {} : { pollType: request.poll_type }),
+              ...(request.correct_option_id === undefined ? {} : { correctOptionId: request.correct_option_id }),
+            });
+            try {
+              await recordPollOwner(dataDir, chatId, sent.pollId, sent.messageId);
+            } catch (error) {
+              console.error("Failed to record poll ownership", error);
+            }
+            return sent;
           }
-          return sent;
+          case "stop_poll":
+            return {
+              data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup),
+            };
+          case "send_reaction":
+            await sendTelegramReaction(bot, chatId, request.message_id, request.emoji);
+            return {};
+          default: {
+            const unhandled: never = request;
+            void unhandled;
+            throw new Error("Unhandled outbox request type");
+          }
         }
-        if (request.type === "stop_poll") {
-          return {
-            data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup),
-          };
-        }
-        await sendTelegramReaction(bot, chatId, request.message_id, request.emoji);
-        return {};
       });
     },
   });

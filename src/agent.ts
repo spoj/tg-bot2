@@ -86,7 +86,6 @@ export type AgentWorker = {
   abort(): Promise<void>;
   newSession(): Promise<void>;
   prompt(message: string): Promise<void>;
-  steer(message: string): Promise<void>;
   waitForSettled(): Promise<void>;
   getLastAssistantText(): Promise<string | undefined>;
   setModel(provider: string, modelId: string): Promise<void>;
@@ -119,7 +118,8 @@ export type AgentManagerOptions = {
 type ChatState = {
   worker: AgentWorker | undefined;
   workerPromise: Promise<AgentWorker> | undefined;
-  activeRun: Promise<string> | undefined;
+  activeRun: Promise<string | undefined> | undefined;
+  interruptRequested: boolean;
   workerTurnActive: boolean;
   queue: SerialQueue;
   unsubscribe: (() => void) | undefined;
@@ -135,12 +135,10 @@ type ChatState = {
   idleStopTimer: NodeJS.Timeout | undefined;
 };
 
-type PromptAction =
-  | { kind: "steer"; completion: Promise<void> }
-  | { kind: "prompt"; completion: Promise<string> };
-
+type PromptAction = { kind: "prompt"; completion: Promise<string | undefined> };
 const NO_TEXT_RESPONSE = "I completed the turn but produced no text response.";
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
+
 export const WORKER_IDLE_STOP_MS = 2 * 60 * 60 * 1000;
 
 
@@ -319,6 +317,7 @@ export class AgentManager {
       worker: undefined,
       workerPromise: undefined,
       activeRun: undefined,
+      interruptRequested: false,
       workerTurnActive: false,
       queue: new SerialQueue(),
       unsubscribe: undefined,
@@ -449,21 +448,19 @@ export class AgentManager {
       ? bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {})
       : progress;
   }
-
-
-  private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string> {
-    let run!: Promise<string>;
+  private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string | undefined> {
+    let run!: Promise<string | undefined>;
     state.workerTurnActive = true;
     const operation = (async () => {
       try {
         await command();
         await worker.waitForSettled();
         // activeRun remains set while progress callbacks drain, but the worker turn
-        // is no longer steerable once waitForSettled has completed.
+        // is no longer interruptible once waitForSettled has completed.
         state.workerTurnActive = false;
-        const result = (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
-        await this.drainProgress(state);
-        return result;
+        // An interrupted run must not reply with its stale or partial text.
+        if (state.interruptRequested) return undefined;
+        return (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
       } finally {
         state.workerTurnActive = false;
       }
@@ -483,11 +480,10 @@ export class AgentManager {
     return run;
   }
 
-  private steer(state: ChatState, worker: AgentWorker, text: string): Promise<void> {
-    return this.raceShutdown(state, worker.steer(text)).catch(async (error) => {
-      await this.invalidateWorker(state, worker).catch(() => {});
-      throw error;
-    });
+  /** True while a run is in flight or queued to start — used to shorten the ingress debounce. */
+  hasActiveRun(chatId: number): boolean {
+    const state = this.states.get(chatId);
+    return state !== undefined && (state.activeRun !== undefined || state.queue.size > 0);
   }
 
   async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<string | undefined> {
@@ -498,25 +494,22 @@ export class AgentManager {
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
       if (state.activeRun) {
         if (mode === "interactive" && state.workerTurnActive && state.worker) {
-          return { kind: "steer", completion: this.steer(state, state.worker, text) };
+          // Esc semantics: abort whatever is in flight (generation or tools, as pi's
+          // own Esc does) and reprompt fresh; the aborted run never replies.
+          state.interruptRequested = true;
+          await this.raceShutdown(state, state.worker.abort()).catch(() => {});
+          await this.raceShutdown(state, state.activeRun).catch(() => {});
+          state.interruptRequested = false;
+        } else {
+          // Settled or non-interactive: wait; the new message starts its own fresh run.
+          await this.raceShutdown(state, state.activeRun).catch(() => {});
         }
-        await this.raceShutdown(state, state.activeRun).catch(() => {});
       }
 
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const completion = this.beginRun(state, worker, () => worker.prompt(text));
-      return { kind: "prompt", completion };
+      return { kind: "prompt", completion: this.beginRun(state, worker, () => worker.prompt(text)) };
     });
-
-    if (action.kind === "steer") {
-      try {
-        await action.completion;
-      } finally {
-        await this.finishProgressDrain(state);
-      }
-      return undefined;
-    }
     return await action.completion;
   }
 

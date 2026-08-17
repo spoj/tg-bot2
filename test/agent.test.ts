@@ -46,7 +46,6 @@ function fakeWorker(initialText = "done"): FakeWorker {
       worker.lastText = undefined;
     }),
     prompt: vi.fn(async (_text: string) => {}),
-    steer: vi.fn(async (_text: string) => {}),
     waitForSettled: vi.fn(async () => {}),
     getLastAssistantText: vi.fn(async () => worker.lastText),
     setModel: vi.fn(async (_provider: string, _modelId: string) => {}),
@@ -147,23 +146,41 @@ it("creates one worker lazily per numeric chat and returns its final text", asyn
   expect(worker.prompt).toHaveBeenCalledTimes(2);
 });
 
-it("steers an interactive request while the active worker run owns the response", async () => {
+it("aborts an active run for an interactive request and reprompts without a stale reply", async () => {
   const worker = fakeWorker("combined");
   const firstDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await firstDone.promise;
   });
+  vi.mocked(worker.abort).mockImplementationOnce(async () => {
+    firstDone.resolve();
+  });
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
   const first = manager.prompt(1, "first");
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  await expect(manager.prompt(1, "second")).resolves.toBeUndefined();
-  expect(worker.steer).toHaveBeenCalledWith("second");
-
-  firstDone.resolve();
-  await expect(first).resolves.toBe("combined");
-  expect(worker.prompt).toHaveBeenCalledTimes(1);
+  const second = manager.prompt(1, "second");
+  await expect(first).resolves.toBeUndefined();
+  expect(worker.abort).toHaveBeenCalledOnce();
+  await expect(second).resolves.toBe("combined");
+  expect(worker.prompt).toHaveBeenLastCalledWith("second");
 });
+it("reports active runs for the ingress debounce probe", async () => {
+  const worker = fakeWorker();
+  const firstDone = deferred<void>();
+  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
+    await firstDone.promise;
+  });
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+  expect(manager.hasActiveRun(1)).toBe(false);
+  const first = manager.prompt(1, "first");
+  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
+  expect(manager.hasActiveRun(1)).toBe(true);
+  firstDone.resolve();
+  await first;
+  expect(manager.hasActiveRun(1)).toBe(false);
+});
+
 
 it("queues an independent prompt after the worker settles while progress drains", async () => {
   const worker = fakeWorker("first response");
@@ -190,7 +207,7 @@ it("queues an independent prompt after the worker settles while progress drains"
   await vi.waitFor(() => expect(progress).toHaveBeenCalledOnce());
   const second = manager.prompt(16, "second");
   await Promise.resolve();
-  expect(worker.steer).not.toHaveBeenCalled();
+  expect(worker.abort).not.toHaveBeenCalled();
   expect(worker.prompt).toHaveBeenCalledOnce();
 
   progressDone.resolve();
@@ -219,7 +236,7 @@ it("waits for active work when the current worker is invalidated", async () => {
   await vi.waitFor(() => expect(worker.stop).toHaveBeenCalledOnce());
   const second = manager.prompt(13, "second");
   await Promise.resolve();
-  expect(worker.steer).not.toHaveBeenCalled();
+  expect(worker.abort).not.toHaveBeenCalled();
   expect(replacement.prompt).not.toHaveBeenCalled();
 
   firstDone.resolve();

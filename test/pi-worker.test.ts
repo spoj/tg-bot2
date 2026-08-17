@@ -618,33 +618,6 @@ describe("PiRpcWorker", () => {
     }
   });
 
-  it("settles a steer whose response arrives after agent_settled", async () => {
-    const f = await fixture();
-    const child = new FakeChild();
-    const worker = new PiRpcWorker({
-      workspace: f.workspace,
-      appRoot: f.appRoot,
-      cliPath: f.cliPath,
-      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
-    });
-    try {
-      await worker.start();
-      const prompt = worker.prompt("first");
-      const promptCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
-      record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
-      await prompt;
-      const steer = worker.steer("late");
-      const settled = worker.waitForSettled();
-      const steerCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
-      record(child, { type: "agent_settled" });
-      record(child, { type: "response", id: steerCommand.id, command: "steer", success: true });
-      await expect(steer).resolves.toBeUndefined();
-      await expect(settled).resolves.toBeUndefined();
-    } finally {
-      await worker.stop();
-      await rm(f.root, { recursive: true, force: true });
-    }
-  });
 
   it("rejects settlement waiters when the state probe times out", async () => {
     vi.useFakeTimers();

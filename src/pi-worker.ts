@@ -732,12 +732,6 @@ export class PiRpcWorker {
     await this.queueWork({ type: "prompt", message });
   }
 
-  async steer(message: string): Promise<void> {
-    const reload = this.extensionReloadPromise;
-    if (reload) await reload;
-    await this.queueWork({ type: "steer", message });
-  }
-
   async waitForSettled(): Promise<void> {
     if (this.terminalError) throw this.terminalError;
     if (this.unsettledWork.size === 0) {

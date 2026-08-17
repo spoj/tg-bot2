@@ -594,12 +594,10 @@ describe("PiRpcWorker", () => {
       const state = worker as unknown as {
         activeEpoch: number | undefined;
         accepted: boolean;
-        started: boolean;
         settledBeforeAcceptance: boolean;
       };
       expect(state.activeEpoch).toBeUndefined();
       expect(state.accepted).toBe(false);
-      expect(state.started).toBe(false);
       expect(state.settledBeforeAcceptance).toBe(false);
     } finally {
       await worker.stop();

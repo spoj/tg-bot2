@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { assistantText, PiRpcWorker, type AvailableModel, type WorkerSessionState } from "./pi-worker.js";
+import { PiRpcWorker, type AvailableModel, type WorkerSessionState } from "./pi-worker.js";
 import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
 import { SerialQueue } from "./queue.js";
@@ -28,22 +28,25 @@ sends a location pin (venue {title,address} sends a named venue instead).
 {version:1,id,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?}
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
-normal message "[Poll answer: poll_id=..., options=[...]]"; the matching
-send line in events.jsonl records pollId.
+poll_answer event in events.jsonl; the matching send line in events.jsonl
+records pollId.
 {version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
 appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
-(latest 256 lines kept); poll_id matches the "[Poll answer: ...]" messages.
-{version:1,id,type:"send_reaction",message_id,emoji} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): emoji is a single emoji string or an array of 1-3 emoji strings; [] removes your reaction. message_id is the numeric id from the incoming "Telegram message N:" line.
+(latest 256 lines kept); poll_id matches the poll_answer events' pollId.
+{version:1,id,type:"send_reaction",message_id,emoji} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): emoji is a single emoji string or an array of 1-3 emoji strings; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
-Every inbound Telegram message is logged to /workspace/.tg-bot/events.jsonl
-(one JSON object per line, newest last: {t,type:'message',messageId,text,attachments}).
-After every message send the host appends a send line
-{t,type:'send',kind,id,messageId?,pollId?,ok,error?} there, and your chat replies are
-logged as {t,type:'reply',text}. Grep this file whenever you need recent chat
-history or sent message ids. When the user
-presses one of your inline keyboard buttons, the press arrives as a normal
-Telegram message of the form "[Telegram button press: data=...]".
+Every chat event is appended by the host to /workspace/.tg-bot/events.jsonl (one
+JSON object per line, newest last: {t,type,...}). Event types are message (a user
+message: {t,type:'message',messageId,text,attachments}), callback (an inline
+keyboard button press: {t,type:'callback',messageId,data}), poll_answer (a poll
+vote: {t,type:'poll_answer',messageId,pollId,optionIds}), and send (a
+confirmation of one of your outbox requests: {t,type:'send',kind,id,messageId?,pollId?,ok,error?}).
+When a user message arrives the host wakes you with a single "." prompt that
+carries no content. Read the newest events.jsonl lines, decide whether the user
+needs a response, and send ALL Telegram output through .tg-bot/outbox requests;
+never rely on the wake prompt for content. Grep events.jsonl whenever you need
+recent chat history or sent message ids.
 Schedules are stored in /workspace/.tg-bot/schedules.json. Its root object is
 {version:1,schedules:[...]}. Each schedule record requires id, prompt, dueAt,
 recurrence, enabled, lastRunAt, and runCount. dueAt must be a UTC timestamp ending
@@ -56,8 +59,6 @@ Every worker start begins a fresh session; previous conversations persist in /wo
 `;
 
 export type PromptMode = "interactive" | "follow-up";
-
-export type AssistantProgressCallback = (chatId: number, text: string) => void | Promise<void>;
 
 export type AgentEvent = Record<string, unknown>;
 
@@ -100,11 +101,9 @@ type ChatState = {
   worker: AgentWorker | undefined;
   workerPromise: Promise<AgentWorker> | undefined;
   activeRun: Promise<string | undefined> | undefined;
-  interruptRequested: boolean;
   workerTurnActive: boolean;
   queue: SerialQueue;
   unsubscribe: (() => void) | undefined;
-  progressTail: Promise<void>;
   invalidation: { worker: AgentWorker; completion: Promise<void> } | undefined;
   stoppedWorker: AgentWorker | undefined;
   closing: boolean;
@@ -173,7 +172,6 @@ export class AgentManager {
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
   private readonly shutdownTimeoutMs: number;
-  private assistantProgress: AssistantProgressCallback | undefined;
   private shutdownAbort: Promise<void> | undefined;
   private shuttingDown = false;
   constructor(private readonly config: Pick<Config, "dataDir">, options: AgentManagerOptions) {
@@ -184,10 +182,6 @@ export class AgentManager {
     if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 0) {
       throw new Error("shutdownTimeoutMs must be a non-negative integer");
     }
-  }
-
-  setAssistantProgress(callback: AssistantProgressCallback | undefined): void {
-    this.assistantProgress = callback;
   }
 
   /** Synchronous gate closes ingress before abort RPCs complete. */
@@ -298,11 +292,9 @@ export class AgentManager {
       worker: undefined,
       workerPromise: undefined,
       activeRun: undefined,
-      interruptRequested: false,
       workerTurnActive: false,
       queue: new SerialQueue(),
       unsubscribe: undefined,
-      progressTail: Promise.resolve(),
       invalidation: undefined,
       stoppedWorker: undefined,
       closing: false,
@@ -321,24 +313,12 @@ export class AgentManager {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
   }
 
-  private subscribeAssistantProgress(chatId: number, state: ChatState, worker: AgentWorker): void {
+  private subscribeWorkerErrors(state: ChatState, worker: AgentWorker): void {
     state.unsubscribe?.();
     state.unsubscribe = worker.onEvent((event) => {
       if (event.type === "worker_error") {
         void this.invalidateWorker(state, worker).catch(() => {});
-        return;
       }
-      if (event.type !== "message_end") return;
-      const message = record(event.message);
-      if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
-      const hasToolCall = message.content.some((block) => record(block)?.type === "toolCall");
-      if (!hasToolCall) return;
-      const text = assistantText(event);
-      const callback = this.assistantProgress;
-      if (!text || !callback) return;
-      state.progressTail = state.progressTail
-        .then(() => callback(chatId, text))
-        .catch(() => {});
     });
   }
 
@@ -396,7 +376,7 @@ export class AgentManager {
             throw new Error("Agent manager is shutting down");
           }
           state.worker = worker;
-          this.subscribeAssistantProgress(chatId, state, worker);
+          this.subscribeWorkerErrors(state, worker);
           return worker;
         } catch (error) {
           if (worker && !invalidated && state.worker !== worker && state.invalidation?.worker !== worker) {
@@ -415,19 +395,6 @@ export class AgentManager {
     }
   }
 
-  private async drainProgress(state: ChatState): Promise<void> {
-    while (true) {
-      const tail = state.progressTail;
-      await tail;
-      if (tail === state.progressTail) return;
-    }
-  }
-  private finishProgressDrain(state: ChatState): Promise<void> {
-    const progress = this.drainProgress(state);
-    return state.shutdownError
-      ? bounded(progress, this.shutdownTimeoutMs, "Agent progress drain timed out").catch(() => {})
-      : progress;
-  }
   private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string | undefined> {
     let run!: Promise<string | undefined>;
     state.workerTurnActive = true;
@@ -435,11 +402,9 @@ export class AgentManager {
       try {
         await command();
         await worker.waitForSettled();
-        // activeRun remains set while progress callbacks drain, but the worker turn
-        // is no longer interruptible once waitForSettled has completed.
+        // activeRun remains set until the run resolves; the worker turn is no
+        // longer interruptible once waitForSettled has completed.
         state.workerTurnActive = false;
-        // An interrupted run must not reply with its stale or partial text.
-        if (state.interruptRequested) return undefined;
         return (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
       } finally {
         state.workerTurnActive = false;
@@ -452,7 +417,6 @@ export class AgentManager {
         await this.invalidateWorker(state, worker).catch(() => {});
         throw error;
       } finally {
-        await this.finishProgressDrain(state);
         if (state.activeRun === run) state.activeRun = undefined;
       }
     })();
@@ -470,11 +434,9 @@ export class AgentManager {
       if (state.activeRun) {
         if (mode === "interactive" && state.workerTurnActive && state.worker) {
           // Esc semantics: abort whatever is in flight (generation or tools, as pi's
-          // own Esc does) and reprompt fresh; the aborted run never replies.
-          state.interruptRequested = true;
+          // own Esc does) and reprompt fresh; the aborted run's reply is ignored.
           await this.raceShutdown(state, state.worker.abort()).catch(() => {});
           await this.raceShutdown(state, state.activeRun).catch(() => {});
-          state.interruptRequested = false;
         } else {
           // Settled or non-interactive: wait; the new message starts its own fresh run.
           await this.raceShutdown(state, state.activeRun).catch(() => {});
@@ -496,7 +458,6 @@ export class AgentManager {
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
       const activeRun = state.activeRun;
       if (activeRun) await this.raceShutdown(state, activeRun).catch(() => {});
-      await this.raceShutdown(state, this.drainProgress(state)).catch(() => {});
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
       try {

@@ -4,7 +4,8 @@ import path from "node:path";
 
 export type ChatEvent =
   | { type: "message"; messageId: number; text?: string | undefined; attachments?: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }> }
-  | { type: "reply"; text: string }
+  | { type: "callback"; messageId: number; data: string }
+  | { type: "poll_answer"; messageId: number; pollId: string; optionIds: number[] }
   | { type: "send"; kind: string; id: string; messageId?: number; pollId?: string; ok: boolean; error?: string };
 
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
@@ -19,8 +20,8 @@ function errorCode(error: unknown): string | undefined {
  * Appends one chat event to the workspace events log. Best-effort: never throws and
  * never follows a symbolic link planted at the events directory or file.
  */
-export function appendChatEvent(workspace: string, event: ChatEvent): void {
-  void (async () => {
+export function appendChatEvent(workspace: string, event: ChatEvent): Promise<void> {
+  return (async () => {
     try {
       const directory = path.join(workspace, ".tg-bot");
       await mkdir(directory, { recursive: true, mode: 0o700 });

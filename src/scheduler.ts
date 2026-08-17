@@ -36,7 +36,6 @@ type MaybePromise<T> = T | PromiseLike<T>;
 export type WorkspaceSchedulerOptions = {
   dataDir: string;
   run: (chatId: number, prompt: string) => MaybePromise<string | undefined>;
-  send: (chatId: number, text: string) => MaybePromise<void>;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -197,7 +196,6 @@ async function readBoundedFile(handle: Awaited<ReturnType<typeof open>>): Promis
 export class WorkspaceScheduler {
   private readonly dataDir: string;
   private readonly run: WorkspaceSchedulerOptions["run"];
-  private readonly send: WorkspaceSchedulerOptions["send"];
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
@@ -215,7 +213,6 @@ export class WorkspaceScheduler {
     }
     this.dataDir = path.resolve(options.dataDir);
     this.run = options.run;
-    this.send = options.send;
     this.pollIntervalMs = pollIntervalMs;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
@@ -335,10 +332,8 @@ export class WorkspaceScheduler {
     const current = currentSnapshot?.file.schedules.find((record) => record.id === item.record.id);
     if (!current || !current.enabled || Date.parse(current.dueAt) > now) return;
 
-    let output: string | undefined;
     try {
-      output = await this.run(item.chatId, current.prompt);
-      if (typeof output === "string" && output.trim().length > 0) await this.send(item.chatId, output);
+      await this.run(item.chatId, current.prompt);
     } catch (error) {
       this.report(new Error(`Schedule ${current.id} for chat ${item.chatId} was not completed`, { cause: error }));
       return;

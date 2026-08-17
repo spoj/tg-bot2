@@ -335,7 +335,6 @@ export class PiRpcWorker {
   private workEpoch = 0;
   private activeEpoch: number | undefined;
   private accepted = false;
-  private started = false;
   private settledBeforeAcceptance = false;
   private terminalError: Error | undefined;
   private reportedWorkerError: Error | undefined;
@@ -438,7 +437,6 @@ export class PiRpcWorker {
   private clearWorkSets(): void {
     this.activeEpoch = undefined;
     this.accepted = false;
-    this.started = false;
     this.settledBeforeAcceptance = false;
     this.workError = undefined;
     this.settledError = undefined;
@@ -867,7 +865,7 @@ export class PiRpcWorker {
     const timer = setTimeout(() => {
       this.promptSettlementTimer = undefined;
       void this.request({ type: "get_state" }).then((response) => {
-        if (this.activeEpoch !== epoch || this.started) return;
+        if (this.activeEpoch !== epoch) return;
         const record = asRecord(response);
         const data = asRecord(record?.data);
         if (data?.isStreaming === false && data.pendingMessageCount === 0) this.settleWork(epoch);
@@ -888,7 +886,6 @@ export class PiRpcWorker {
     this.clearPromptSettlementTimers();
     this.activeEpoch = undefined;
     this.accepted = false;
-    this.started = false;
     this.settledBeforeAcceptance = false;
     this.workError = undefined;
     this.finishSettledWaiters();
@@ -903,17 +900,6 @@ export class PiRpcWorker {
   private clearPromptSettlementTimers(): void {
     if (this.promptSettlementTimer) clearTimeout(this.promptSettlementTimer);
     this.promptSettlementTimer = undefined;
-  }
-
-  private markAgentProgress(): void {
-    if (this.accepted) this.started = true;
-  }
-
-  private isAgentProgressEvent(type: unknown): boolean {
-    return [
-      "agent_start", "turn_start", "message_start", "message_update", "message_end",
-      "tool_execution_start", "tool_execution_update", "tool_execution_end", "agent_end",
-    ].includes(String(type));
   }
 
   private emitEvent(event: PiRpcEvent): void {
@@ -975,8 +961,6 @@ export class PiRpcWorker {
         if (this.accepted) this.settleWork(this.activeEpoch);
         else this.settledBeforeAcceptance = true;
       }
-    } else if (this.isAgentProgressEvent(record.type)) {
-      this.markAgentProgress();
     }
     this.emitEvent(record);
     if (record.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(String(record.method))) {

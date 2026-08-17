@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, watch } from "node:fs";
+import type { FSWatcher, Stats } from "node:fs";
 import { lstat, link, mkdir, open, opendir, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { appendChatEvent } from "./events.js";
@@ -92,9 +93,11 @@ export type WorkspaceOutboxOptions = {
   now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+  watch?: typeof watch;
   logger?: (error: unknown) => void;
 };
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -132,6 +135,10 @@ const DIRECTORY = fsConstants.O_DIRECTORY ?? 0;
 
 type ClaimLease = {
   stop: () => Promise<void>;
+};
+type ChatWatcher = {
+  watcher: FSWatcher;
+  debounce: ReturnType<typeof setTimeout> | undefined;
 };
 
 
@@ -501,8 +508,10 @@ export class WorkspaceOutbox {
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
+  private readonly watchFs: typeof watch;
   private readonly logger: (error: unknown) => void;
   private readonly chatOperations = new Map<number, SerialQueue>();
+  private readonly chatWatchers = new Map<number, ChatWatcher>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -519,6 +528,7 @@ export class WorkspaceOutbox {
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
     this.logger = options.logger ?? ((error) => console.error("Workspace outbox error", error));
+    this.watchFs = options.watch ?? watch;
   }
 
   async start(): Promise<void> {
@@ -544,6 +554,7 @@ export class WorkspaceOutbox {
 
   async stop(): Promise<void> {
     this.running = false;
+    this.closeWatchers();
     if (this.timer !== undefined) {
       this.cancelSchedule(this.timer);
       this.timer = undefined;
@@ -574,19 +585,91 @@ export class WorkspaceOutbox {
   async processChat(chatId: number): Promise<void> {
     if (!Number.isSafeInteger(chatId)) throw new Error("Outbox chat ID must be a safe integer");
     const workspace = path.join(this.dataDir, "chats", String(chatId), "workspace");
+    await this.enqueueChatScan(chatId, workspace);
+  }
 
+  /** Enqueue a scan of one chat's outbox on its dedicated serial queue. */
+  private enqueueChatScan(chatId: number, workspace: string): Promise<void> {
     let queue = this.chatOperations.get(chatId);
     if (!queue) {
       queue = new SerialQueue();
       this.chatOperations.set(chatId, queue);
     }
-    const operation = queue.run(() => this.processChatNow(chatId, workspace));
-    try {
-      await operation;
-    } finally {
-      if (queue.size === 0 && this.chatOperations.get(chatId) === queue) this.chatOperations.delete(chatId);
-    }
+    const activeQueue = queue;
+    return activeQueue.run(() => this.processChatNow(chatId, workspace)).finally(() => {
+      if (activeQueue.size === 0 && this.chatOperations.get(chatId) === activeQueue) {
+        this.chatOperations.delete(chatId);
+      }
+    });
   }
+
+  /** Fire-and-forget scan triggered by a watcher event; errors are reported, not thrown. */
+  private scheduleChatScan(chatId: number, workspace: string): void {
+    void this.enqueueChatScan(chatId, workspace).catch((error) => this.report(error));
+  }
+
+  /** Watch one chat's outbox directory, scheduling a debounced scan on filesystem events. */
+  private async ensureWatcher(chatId: number, workspace: string): Promise<void> {
+    if (!this.running || this.chatWatchers.has(chatId)) return;
+    const outboxDirectory = path.join(workspace, ".tg-bot", "outbox");
+    let stat: Stats;
+    try {
+      stat = await lstat(outboxDirectory);
+    } catch (error) {
+      if (!isMissing(error)) this.report(error);
+      return;
+    }
+    if (!this.running) return;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+    let watcher: FSWatcher;
+    try {
+      watcher = this.watchFs(outboxDirectory);
+    } catch (error) {
+      this.report(error);
+      return;
+    }
+    const entry: ChatWatcher = { watcher, debounce: undefined };
+    this.chatWatchers.set(chatId, entry);
+    watcher.on("change", () => this.debounceChatScan(chatId, workspace));
+    watcher.on("rename", () => this.debounceChatScan(chatId, workspace));
+    const disarm = (): void => {
+      if (this.chatWatchers.get(chatId) !== entry) return;
+      clearTimeout(entry.debounce);
+      entry.debounce = undefined;
+      this.chatWatchers.delete(chatId);
+    };
+    watcher.on("error", disarm);
+    watcher.on("close", disarm);
+  }
+
+  /** Debounce a burst of watcher events into a single scan. */
+  private debounceChatScan(chatId: number, workspace: string): void {
+    const entry = this.chatWatchers.get(chatId);
+    if (!entry) return;
+    clearTimeout(entry.debounce);
+    const timer = setTimeout(() => {
+      if (this.chatWatchers.get(chatId) !== entry) return;
+      entry.debounce = undefined;
+      this.scheduleChatScan(chatId, workspace);
+    }, WATCH_DEBOUNCE_MS);
+    entry.debounce = timer;
+    timer.unref();
+  }
+
+  /** Close every watcher and clear every pending debounce. */
+  private closeWatchers(): void {
+    for (const entry of this.chatWatchers.values()) {
+      clearTimeout(entry.debounce);
+      entry.debounce = undefined;
+      try {
+        entry.watcher.close();
+      } catch {
+        // Watcher teardown must never interrupt shutdown.
+      }
+    }
+    this.chatWatchers.clear();
+  }
+
 
   private async runPoll(): Promise<void> {
     let chatsRoot: PinnedDirectory | undefined;
@@ -600,6 +683,8 @@ export class WorkspaceOutbox {
         .sort((a, b) => a.name.localeCompare(b.name));
 
       for (const { chatId } of chats) {
+        const workspace = path.join(this.dataDir, "chats", String(chatId), "workspace");
+        if (this.running) await this.ensureWatcher(chatId, workspace);
         try {
           await this.processChat(chatId);
         } catch (error) {

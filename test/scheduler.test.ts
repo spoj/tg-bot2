@@ -84,7 +84,6 @@ describe("WorkspaceScheduler discovery and validation", () => {
         runs.push([chatId, prompt]);
         return "";
       },
-      send: async () => {},
       logger: (error) => errors.push(error),
     });
 
@@ -96,7 +95,7 @@ describe("WorkspaceScheduler discovery and validation", () => {
     const filePath = await writeSchedules(dataDir, 13, []);
     await writeFile(filePath, "x".repeat(64 * 1024 + 1), "utf8");
     const runs: string[] = [];
-    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; }, send: async () => {} });
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; } });
     await scheduler.poll(NOW);
     expect(runs).toEqual([]);
   }));
@@ -105,7 +104,7 @@ describe("WorkspaceScheduler discovery and validation", () => {
     const schedules = Array.from({ length: 257 }, (_value, index) => record({ id: `schedule-${index}` }));
     await writeSchedules(dataDir, 13, schedules);
     const runs: string[] = [];
-    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; }, send: async () => {} });
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; } });
     await scheduler.poll(NOW);
     expect(runs).toEqual([]);
   }));
@@ -116,7 +115,7 @@ describe("WorkspaceScheduler discovery and validation", () => {
   ])("rejects a schedule record with an oversized %s", async (_field, overrides) => withDirectory(async (dataDir) => {
     await writeSchedules(dataDir, 13, [record(overrides)]);
     const runs: string[] = [];
-    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; }, send: async () => {} });
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); return ""; } });
     await scheduler.poll(NOW);
     expect(runs).toEqual([]);
   }));
@@ -129,7 +128,6 @@ describe("WorkspaceScheduler discovery and validation", () => {
     const scheduler = new WorkspaceScheduler({
       dataDir,
       run: async (_chatId, prompt) => { runs.push(prompt); return ""; },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -152,7 +150,6 @@ describe("WorkspaceScheduler discovery and validation", () => {
     const scheduler = new WorkspaceScheduler({
       dataDir,
       run: async (_chatId, prompt) => { runs.push(prompt); return ""; },
-      send: async () => {},
     });
     await scheduler.poll(NOW);
     expect(runs).toEqual([]);
@@ -173,7 +170,6 @@ describe("WorkspaceScheduler discovery and validation", () => {
         await symlink(replacement, metadata);
         return "";
       },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -202,7 +198,6 @@ describe("WorkspaceScheduler discovery and validation", () => {
         }
         return "";
       },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -217,7 +212,6 @@ describe("WorkspaceScheduler discovery and validation", () => {
     const scheduler = new WorkspaceScheduler({
       dataDir,
       run: async (chatId, prompt) => { runs.push([chatId, prompt]); return ""; },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -238,16 +232,13 @@ describe("WorkspaceScheduler processing", () => {
       record({ id: "future", dueAt: new Date(NOW + 60_000).toISOString() }),
     ]);
     const runs: string[] = [];
-    const sent: string[] = [];
     const scheduler = new WorkspaceScheduler({
       dataDir,
-      run: async (_chatId, prompt) => { runs.push(prompt); return prompt === "first id" ? "answer" : ""; },
-      send: async (_chatId, text) => { sent.push(text); },
+      run: async (_chatId, prompt) => { runs.push(prompt); return ""; },
     });
 
     await scheduler.poll(NOW);
     expect(runs).toEqual(["hourly", "first id", "later id"]);
-    expect(sent).toEqual(["answer"]);
     const persisted = await readSchedules(filePath);
     expect(persisted.schedules.find((item) => item.id === "a")).toMatchObject({ enabled: false, runCount: 1, lastRunAt: new Date(NOW).toISOString() });
     expect(persisted.schedules.find((item) => item.id === "z")).toMatchObject({ enabled: false, runCount: 1 });
@@ -272,7 +263,6 @@ describe("WorkspaceScheduler processing", () => {
         }
         return "";
       },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -291,7 +281,6 @@ describe("WorkspaceScheduler processing", () => {
         if (attempts === 1) throw new Error("temporary failure");
         return "done";
       },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -314,7 +303,6 @@ describe("WorkspaceScheduler processing", () => {
         await writeFile(filePath, JSON.stringify(current), "utf8");
         return "done";
       },
-      send: async () => {},
     });
 
     await scheduler.poll(NOW);
@@ -352,7 +340,6 @@ describe("WorkspaceScheduler processing", () => {
       const scheduler = new WorkspaceScheduler({
         dataDir,
         run: async () => "done",
-        send: async () => {},
         logger: (error) => errors.push(error),
       });
       await scheduler.poll(NOW);
@@ -396,7 +383,6 @@ describe("WorkspaceScheduler processing", () => {
       const scheduler = new WorkspaceScheduler({
         dataDir,
         run: async () => "done",
-        send: async () => {},
         logger: (error) => errors.push(error),
       });
       await scheduler.poll(NOW);
@@ -415,7 +401,7 @@ describe("WorkspaceScheduler processing", () => {
 
   it("uses an atomic replacement without leaving temporary files", async () => withDirectory(async (dataDir) => {
     const filePath = await writeSchedules(dataDir, 10, [record()]);
-    const scheduler = new WorkspaceScheduler({ dataDir, run: async () => "ok", send: async () => {} });
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async () => "ok" });
     await scheduler.poll(NOW);
     expect((await readdir(path.dirname(filePath))).filter((name) => name.endsWith(".tmp"))).toEqual([]);
     expect((await readSchedules(filePath)).schedules[0]!.enabled).toBe(false);
@@ -435,7 +421,6 @@ describe("WorkspaceScheduler lifecycle", () => {
         await blocked;
         return "";
       },
-      send: async () => {},
     });
     const first = scheduler.poll(NOW);
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -456,7 +441,6 @@ describe("WorkspaceScheduler lifecycle", () => {
       }) as typeof setInterval,
       clearInterval: timers.clearInterval,
       run: async () => { polls += 1; return ""; },
-      send: async () => {},
     });
     await scheduler.start();
     expect(timers.callbacks).toHaveLength(1);

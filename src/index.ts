@@ -3,7 +3,7 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, recordPollOwner, sendTelegramLocation, sendTelegramPoll, sendTelegramReaction, sendTelegramRichMessage, sendTelegramText, sendWorkspaceFile, stopTelegramPoll, TelegramDeliveryQueue } from "./telegram.js";
+import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, recordPollOwner, sendTelegramLocation, sendTelegramPoll, sendTelegramReaction, sendTelegramRichMessage, sendWorkspaceFile, stopTelegramPoll, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -64,11 +64,6 @@ export async function main(): Promise<void> {
   const schedulerInstance = new WorkspaceScheduler({
     dataDir,
     run: (chatId, prompt) => agentManager.prompt(chatId, prompt, "follow-up"),
-    send: async (chatId, text) => {
-      if (text.trim().length > 0) {
-        await deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text));
-      }
-    },
   });
   const outboxInstance = new WorkspaceOutbox({
     dataDir,

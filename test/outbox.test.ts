@@ -1,3 +1,4 @@
+import type { watch } from "node:fs";
 import { link, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -52,6 +53,35 @@ function fakeInterval() {
     cleared.push(timer);
   }) as typeof globalThis.clearInterval);
   return { callbacks, cleared, setIntervalMock, setInterval, clearInterval };
+}
+
+interface FakeWatcher {
+  closed: boolean;
+  on(event: string, listener: (event: string, filename: string | null) => void): void;
+  emit(event: string, filename?: string | null): void;
+  close(): void;
+}
+
+function fakeWatch() {
+  const watchers: Array<{ path: string; watcher: FakeWatcher }> = [];
+  const watchMock = vi.fn((watchPath: string): FakeWatcher => {
+    const listeners: Record<string, Array<(event: string, filename: string | null) => void>> = {};
+    const watcher: FakeWatcher = {
+      closed: false,
+      on(event, listener) {
+        (listeners[event] ??= []).push(listener);
+      },
+      emit(event, filename = null) {
+        for (const listener of listeners[event] ?? []) listener(event, filename);
+      },
+      close() {
+        this.closed = true;
+      },
+    };
+    watchers.push({ path: watchPath, watcher });
+    return watcher;
+  });
+  return { watchers, watchMock: watchMock as unknown as typeof watch };
 }
 
 describe("WorkspaceOutbox", () => {
@@ -492,5 +522,103 @@ describe("WorkspaceOutbox", () => {
         { type: "send", kind: "send_file", id: "one", ok: false, error: "upload failed" },
       ]);
     });
+  });
+
+  it("dispatches a queued request on a watcher event without waiting for the poll interval", async () => {
+    vi.useFakeTimers();
+    try {
+      const { dataDir, workspace } = await fixture();
+      const dispatch = vi.fn(async () => undefined);
+      const { setInterval, clearInterval } = fakeInterval();
+      const { watchMock, watchers } = fakeWatch();
+      const outbox = new WorkspaceOutbox({ dataDir, dispatch, setInterval, clearInterval, watch: watchMock });
+      await outbox.start();
+      await request(workspace, "one.json", valid());
+
+      const watcher = watchers.find(({ path: watcherPath }) => watcherPath === path.join(workspace, ".tg-bot", "outbox"))?.watcher;
+      expect(watcher).toBeDefined();
+      watcher?.emit("rename", "one.json");
+
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+      expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "one", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
+      await outbox.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("debounces a burst of watcher events into a single scan", async () => {
+    vi.useFakeTimers();
+    try {
+      const { dataDir, workspace } = await fixture();
+      const dispatch = vi.fn(async () => undefined);
+      const { setInterval, clearInterval } = fakeInterval();
+      const { watchMock, watchers } = fakeWatch();
+      const outbox = new WorkspaceOutbox({ dataDir, dispatch, setInterval, clearInterval, watch: watchMock });
+      await outbox.start();
+      await request(workspace, "one.json", valid());
+
+      const watcher = watchers.find(({ path: watcherPath }) => watcherPath === path.join(workspace, ".tg-bot", "outbox"))?.watcher;
+      watcher?.emit("rename", "one.json");
+      watcher?.emit("change", "one.json");
+      watcher?.emit("rename", "one.json");
+
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+      await outbox.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("removes a watcher on error and re-arms it on the next poll", async () => {
+    vi.useFakeTimers();
+    try {
+      const { dataDir, workspace } = await fixture();
+      const dispatch = vi.fn(async () => undefined);
+      const { callbacks, setInterval, clearInterval } = fakeInterval();
+      const { watchMock, watchers } = fakeWatch();
+      const outbox = new WorkspaceOutbox({ dataDir, dispatch, setInterval, clearInterval, watch: watchMock });
+      await outbox.start();
+
+      const watcher = watchers.find(({ path: watcherPath }) => watcherPath === path.join(workspace, ".tg-bot", "outbox"))?.watcher;
+      expect(watcher).toBeDefined();
+      watcher?.emit("error");
+
+      await request(workspace, "one.json", valid());
+      callbacks[0]?.();
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+      expect(watchMock).toHaveBeenCalledTimes(2);
+      await outbox.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop closes every watcher and clears pending debounce timers", async () => {
+    vi.useFakeTimers();
+    try {
+      const { dataDir, workspace } = await fixture();
+      const dispatch = vi.fn(async () => undefined);
+      const { setInterval, clearInterval } = fakeInterval();
+      const { watchMock, watchers } = fakeWatch();
+      const outbox = new WorkspaceOutbox({ dataDir, dispatch, setInterval, clearInterval, watch: watchMock });
+      await outbox.start();
+      await request(workspace, "one.json", valid());
+
+      const watcher = watchers.find(({ path: watcherPath }) => watcherPath === path.join(workspace, ".tg-bot", "outbox"))?.watcher;
+      expect(watcher).toBeDefined();
+      expect(watcher?.closed).toBe(false);
+      watcher?.emit("rename", "one.json");
+
+      await outbox.stop();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(watcher?.closed).toBe(true);
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

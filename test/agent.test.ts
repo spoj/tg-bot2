@@ -78,7 +78,12 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?,kind?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,reply_markup?,reply_to_message_id?}");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/events.jsonl");
-  expect(SYSTEM_PROMPT).toContain("[Telegram button press: data=...]");
+  expect(SYSTEM_PROMPT).toContain("{t,type:'message',messageId,text,attachments}");
+  expect(SYSTEM_PROMPT).toContain("{t,type:'callback',messageId,data}");
+  expect(SYSTEM_PROMPT).toContain("{t,type:'poll_answer',messageId,pollId,optionIds}");
+  expect(SYSTEM_PROMPT).toContain("{t,type:'send',kind,id,messageId?,pollId?,ok,error?}");
+  expect(SYSTEM_PROMPT).toContain("wakes you with a single \".\" prompt");
+  expect(SYSTEM_PROMPT).toContain("send ALL Telegram output through");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_poll\",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"stop_poll\",message_id,reply_markup?}");
@@ -86,7 +91,6 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("sets a Telegram reaction on any message in the chat");
   expect(SYSTEM_PROMPT).toContain("emoji is a single emoji string or an array of 1-3 emoji strings");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/poll-results.jsonl");
-  expect(SYSTEM_PROMPT).toContain("[Poll answer: poll_id=..., options=[...]]");
   expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
   expect(SYSTEM_PROMPT).toContain("final unique *.json request name");
   expect(SYSTEM_PROMPT).toContain("{version:1,schedules:[...]}");
@@ -114,7 +118,7 @@ it("creates one worker lazily per numeric chat and returns its final text", asyn
   expect(worker.prompt).toHaveBeenCalledTimes(2);
 });
 
-it("aborts an active run for an interactive request and reprompts without a stale reply", async () => {
+it("aborts an active run for an interactive request and reprompts fresh", async () => {
   const worker = fakeWorker("combined");
   const firstDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
@@ -128,45 +132,10 @@ it("aborts an active run for an interactive request and reprompts without a stal
   const first = manager.prompt(1, "first");
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
   const second = manager.prompt(1, "second");
-  await expect(first).resolves.toBeUndefined();
+  await expect(first).resolves.toBe("combined");
   expect(worker.abort).toHaveBeenCalledOnce();
   await expect(second).resolves.toBe("combined");
   expect(worker.prompt).toHaveBeenLastCalledWith("second");
-});
-
-
-it("queues an independent prompt after the worker settles while progress drains", async () => {
-  const worker = fakeWorker("first response");
-  const progressStarted = deferred<void>();
-  const progressDone = deferred<void>();
-  const progress = vi.fn(async () => {
-    progressStarted.resolve();
-    await progressDone.promise;
-  });
-  vi.mocked(worker.prompt)
-    .mockImplementationOnce(async () => {
-      worker.emit({ type: "message_end", message: {
-        role: "assistant",
-        content: [{ type: "text", text: "working" }, { type: "toolCall", name: "bash" }],
-      } });
-    })
-    .mockImplementationOnce(async () => {
-      worker.lastText = "second response";
-    });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-  manager.setAssistantProgress(progress);
-
-  const first = manager.prompt(16, "first");
-  await vi.waitFor(() => expect(progress).toHaveBeenCalledOnce());
-  const second = manager.prompt(16, "second");
-  await Promise.resolve();
-  expect(worker.abort).not.toHaveBeenCalled();
-  expect(worker.prompt).toHaveBeenCalledOnce();
-
-  progressDone.resolve();
-  await expect(first).resolves.toBe("first response");
-  await expect(second).resolves.toBe("second response");
-  expect(worker.prompt).toHaveBeenNthCalledWith(2, "second");
 });
 
 it("waits for active work when the current worker is invalidated", async () => {
@@ -225,40 +194,6 @@ it("waits for active work before issuing an independent follow-up prompt", async
   expect(worker.prompt).toHaveBeenNthCalledWith(2, "follow-up");
 });
 
-it("forwards ordered tool-call progress and drains it before the final response", async () => {
-  const worker = fakeWorker("finished");
-  const firstProgressDone = deferred<void>();
-  const started: string[] = [];
-  const finished: string[] = [];
-  const progress = vi.fn(async (_chatId: number, text: string) => {
-    started.push(text);
-    if (text === "working") await firstProgressDone.promise;
-    finished.push(text);
-  });
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    worker.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ignored" }] } });
-    worker.emit({ type: "message_end", message: {
-      role: "assistant",
-      content: [{ type: "text", text: "working" }, { type: "toolCall", name: "bash" }],
-    } });
-    worker.emit({ type: "message_end", message: {
-      role: "assistant",
-      content: [{ type: "text", text: "next" }, { type: "toolCall", name: "bash" }],
-    } });
-  });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-  manager.setAssistantProgress(progress);
-
-  const completion = manager.prompt(3, "request");
-  await vi.waitFor(() => expect(progress).toHaveBeenCalledOnce());
-  expect(started).toEqual(["working"]);
-  expect(finished).toEqual([]);
-  firstProgressDone.resolve();
-
-  await expect(completion).resolves.toBe("finished");
-  expect(started).toEqual(["working", "next"]);
-  expect(finished).toEqual(["working", "next"]);
-});
 it("uses the no-text fallback for a completed worker turn", async () => {
   const worker = fakeWorker();
   vi.mocked(worker.getLastAssistantText).mockResolvedValueOnce(undefined);

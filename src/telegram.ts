@@ -11,6 +11,7 @@ import { SerialQueue } from "./queue.js";
 import { appendChatEvent } from "./events.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
+const WAKE_PROMPT = ".";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
@@ -45,7 +46,6 @@ export type BufferedTelegramMessage = {
 
 type BufferEntry = {
   value: PromiseLike<BufferedTelegramMessage>;
-  respond: (text: string) => void | PromiseLike<void>;
   typing?: () => void | PromiseLike<void>;
 };
 
@@ -75,8 +75,6 @@ export type TelegramIngressBarrier = {
   release: () => void;
 };
 
-const DELIVERY_FAILURE_MESSAGE = "I could not complete that request. Please try again.";
-
 function invokeCallback<T>(callback: () => T | PromiseLike<T>): Promise<T> {
   return Promise.resolve().then(callback);
 }
@@ -86,7 +84,7 @@ export class TelegramIngressBuffer {
   private readonly states = new Map<number, BufferState>();
 
   constructor(
-    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => string | undefined | PromiseLike<string | undefined>,
+    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => void | PromiseLike<void>,
     private readonly cooldownMs = INGRESS_COOLDOWN_MS,
   ) {}
 
@@ -178,7 +176,7 @@ export class TelegramIngressBuffer {
     this.cancelTimer(state);
     const batch: PendingBatch = Object.freeze({
       chatId,
-      entries: Object.freeze(entries),
+      entries,
       owner,
     });
     const job = state.tail.then(() => this.executeBatch(batch));
@@ -220,22 +218,10 @@ export class TelegramIngressBuffer {
         typing.unref?.();
       }
 
-      const messages = await Promise.all(batch.entries.map((entry) => Promise.resolve(entry.value)));
-      const text = await invokeCallback(() => this.flushBatch(batch.chatId, messages));
-      if (text !== undefined) {
-        try {
-          await invokeCallback(() => batch.owner.respond(text));
-        } catch (error) {
-          console.error("Buffered Telegram response delivery failed", error);
-        }
-      }
+      const messages = await Promise.all(batch.entries.map((entry) => entry.value));
+      await invokeCallback(() => this.flushBatch(batch.chatId, messages));
     } catch (error) {
       console.error("Buffered Telegram request failed", error);
-      try {
-        await invokeCallback(() => batch.owner.respond(DELIVERY_FAILURE_MESSAGE));
-      } catch (deliveryError) {
-        console.error("Buffered Telegram failure response delivery failed", deliveryError);
-      }
     } finally {
       if (typing) clearInterval(typing);
     }
@@ -768,31 +754,6 @@ function fallbackName(source: AttachmentSource, remotePath?: string): string {
   };
   return `${source.type}${extension[source.type] ?? ".bin"}`;
 }
-function locationText(message: Message): string | undefined {
-  const location = message.location;
-  if (location) {
-    const fields = [
-      `latitude=${location.latitude}`,
-      `longitude=${location.longitude}`,
-      location.horizontal_accuracy === undefined ? undefined : `horizontal accuracy=±${location.horizontal_accuracy} m`,
-      location.heading === undefined ? undefined : `heading=${location.heading}°`,
-      location.live_period === undefined ? undefined : `live period=${location.live_period} s`,
-    ].filter((field): field is string => field !== undefined);
-    return `[Location pin: ${fields.join(", ")}]`;
-  }
-  const venue = message.venue;
-  if (venue) {
-    const fields = [
-      `latitude=${venue.location.latitude}`,
-      `longitude=${venue.location.longitude}`,
-      `venue=${JSON.stringify(venue.title)}`,
-      `address=${JSON.stringify(venue.address)}`,
-    ];
-    return `[Location pin: ${fields.join(", ")}]`;
-  }
-  return undefined;
-}
-
 
 class AttachmentDownloadFailure extends Error {}
 
@@ -901,32 +862,7 @@ async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<B
   const attachments = source
     ? [await downloadAttachment(bot, config, ctx.chat!.id, message, source)]
     : [];
-  const text = [message.text ?? message.caption, locationText(message)].filter(Boolean).join("\n") || undefined;
-  if (!text && attachments.length === 0) {
-    return {
-      messageId: message.message_id,
-      text: `[Unsupported Telegram message type received: ${Object.keys(message).filter((key) => !["message_id", "date", "chat", "from"].includes(key)).join(", ") || "unknown"}]`,
-      attachments,
-    };
-  }
-  return { messageId: message.message_id, text, attachments };
-}
-
-export function formatBufferedPrompt(messages: BufferedTelegramMessage[]): string {
-  return messages.map((message) => {
-    const parts = [`Telegram message ${message.messageId}:`];
-    if (message.text) parts.push(message.text);
-    for (const attachment of message.attachments) {
-      const metadata = [
-        `type=${attachment.type}`,
-        attachment.mimeType ? `MIME=${attachment.mimeType}` : undefined,
-        attachment.originalName ? `original name=${JSON.stringify(attachment.originalName)}` : undefined,
-      ].filter(Boolean).join(", ");
-      if (attachment.path) parts.push(`Attachment: ${attachment.path} (${metadata})`);
-      else parts.push(`Attachment download failed (${metadata}): ${attachment.failure ?? "unknown failure"}`);
-    }
-    return parts.join("\n");
-  }).join("\n\n");
+  return { messageId: message.message_id, text: message.text ?? message.caption, attachments };
 }
 
 const ingressByBot = new WeakMap<Bot, TelegramIngressBuffer>();
@@ -988,7 +924,7 @@ export function createTelegramBot(
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
 ): Bot {
   const bot = new Bot(config.token);
-  agents.setAssistantProgress((chatId, text) => deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text)));
+
   const queuedReply = (ctx: Context, text: string): Promise<void> => {
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return Promise.resolve();
@@ -1003,19 +939,15 @@ export function createTelegramBot(
 
   const ingress = new TelegramIngressBuffer(async (chatId, messages) => {
     const workspace = chatPaths(config.dataDir, chatId).workspace;
-    for (const message of messages) {
-      appendChatEvent(workspace, {
-        type: "message",
-        messageId: message.messageId,
-        ...(message.text === undefined ? {} : { text: message.text }),
-        attachments: message.attachments,
-      });
-    }
-    const response = await agents.prompt(chatId, formatBufferedPrompt(messages));
-    if (response !== undefined && response !== "") {
-      appendChatEvent(workspace, { type: "reply", text: response });
-    }
-    return response;
+    await Promise.all(messages.map((message) => appendChatEvent(workspace, {
+      type: "message",
+      messageId: message.messageId,
+      ...(message.text === undefined ? {} : { text: message.text }),
+      attachments: message.attachments,
+    })));
+    await agents.prompt(chatId, WAKE_PROMPT).catch((error) => {
+      console.error("Telegram wake prompt failed", error);
+    });
   });
   ingressByBot.set(bot, ingress);
 
@@ -1136,14 +1068,14 @@ export function createTelegramBot(
     }
   });
 
-  bot.on("message", async (ctx) => {
+  bot.on("message", (ctx) => {
+    const chatId = ctx.chat.id;
     let startPreparation!: () => void;
     const prepared = new Promise<BufferedTelegramMessage>((resolve, reject) => {
       startPreparation = () => { void prepareMessage(bot, config, ctx).then(resolve, reject); };
     });
-    const admission = ingress.add(ctx.chat.id, {
+    const admission = ingress.add(chatId, {
       value: prepared,
-      respond: (text) => deliveryQueue.enqueue(ctx.chat.id, () => replyChunks(ctx, text)),
       typing: async () => { await ctx.replyWithChatAction("typing"); },
     });
     if (admission) startPreparation();
@@ -1153,33 +1085,26 @@ export function createTelegramBot(
     const chatId = ctx.chat?.id;
     const messageId = query.message?.message_id;
     if (chatId === undefined || messageId === undefined) return;
-    // Answer promptly so Telegram does not retry the update; the batch replies later.
+    // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
     const data = (query.data ?? "").slice(0, MAX_CALLBACK_DATA_LENGTH);
-    ingress.add(chatId, {
-      value: Promise.resolve({
-        messageId,
-        text: `[Telegram button press: data=${JSON.stringify(data)}]`,
-        attachments: [],
-      }),
-      respond: (text) => deliveryQueue.enqueue(chatId, () => replyChunks(ctx, text)),
+    void appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
+      type: "callback",
+      messageId,
+      data,
     });
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
     const chatId = await findPollOwnerChat(config.dataDir, answer.poll_id);
     if (chatId === undefined) return;
-    ingress.add(chatId, {
-      value: Promise.resolve({
-        messageId: 0,
-        text: `[Poll answer: poll_id=${answer.poll_id}, options=${JSON.stringify(answer.option_ids)}]`,
-        attachments: [],
-      }),
-      respond: (text) => deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text)),
+    void appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
+      type: "poll_answer",
+      messageId: 0,
+      pollId: answer.poll_id,
+      optionIds: answer.option_ids,
     });
   });
-
-
 
   bot.catch((error) => {
     const cause = error.error;

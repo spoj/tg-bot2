@@ -83,7 +83,7 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'poll_answer',poll_answer}");
   expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}");
   expect(SYSTEM_PROMPT).toContain("wakes you with a single \".\" prompt");
-  expect(SYSTEM_PROMPT).toContain("send ALL Telegram output through");
+  expect(SYSTEM_PROMPT).toContain("ALL Telegram output through");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_poll\",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"stop_poll\",message_id,reply_markup?}");

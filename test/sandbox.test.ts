@@ -1,8 +1,10 @@
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildBwrapArgs, buildPiWorkerBwrapArgs, checkSandboxEnvironment, runSandbox } from "../src/sandbox.js";
+import { buildBwrapArgs, buildPiWorkerBwrapArgs, checkSandboxEnvironment, runSandbox, spawnProcess, terminateProcessGroup } from "../src/sandbox.js";
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-test-"));
@@ -10,6 +12,32 @@ async function fixture() {
   const sessions = path.join(root, "sessions");
   await mkdir(workspace); await mkdir(sessions);
   return { root, workspace, sessions };
+}
+
+function bwrapAvailable(): boolean {
+  try {
+    return spawnSync("bwrap", ["--version"], { stdio: "ignore", timeout: 5_000 }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// Integration tests must poll real OS state — a host file appearing and the
+// bwrap process group being reaped — which fake timers cannot drive.
+async function until(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 50): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+function hostPids(pattern: string): string[] {
+  const result = spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
+  if (result.status === 1) return [];
+  if (result.status !== 0) throw new Error(`pgrep failed: ${result.stderr}`);
+  return result.stdout.trim().split("\n").filter(Boolean);
 }
 
 it("constructs the restrictive common profile and direct executable argv", async () => {
@@ -107,8 +135,9 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     expect(workerArgs.args.slice(workerArgs.args.indexOf("--") + 1)).toEqual([
       await realpath(node),
       "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-      "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
+      "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
     ]);
+    expect(workerArgs.args).not.toContain("--continue");
     const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });
     expect(result).toEqual({ dataDir: target, bwrapPath: await realpath(bwrap) });
     const args = await readFile(log, "utf8");
@@ -138,7 +167,7 @@ it("does not follow or clobber a write-probe symlink", async () => {
 });
 
 
-const integration = process.env.RUN_BWRAP_TESTS === "1" ? describe : describe.skip;
+const integration = process.env.RUN_BWRAP_TESTS === "1" && bwrapAvailable() ? describe : describe.skip;
 integration("Bubblewrap integration", () => {
   it("persists workspace, reads sessions, blocks writes, hides secrets, truncates, and times out", async () => {
     const f = await fixture();
@@ -184,4 +213,80 @@ integration("Bubblewrap integration", () => {
       expect(timeout.timedOut).toBe(true);
     } finally { delete process.env.SUPER_SECRET_CANARY; await rm(f.root, { recursive: true, force: true }); }
   }, 15_000);
+
+  it("cannot see host-only files outside the bound workspace", async () => {
+    const f = await fixture();
+    try {
+      const hostOnly = path.join(f.root, "host-only");
+      await mkdir(hostOnly);
+      const canary = path.join(hostOnly, "canary.txt");
+      await writeFile(canary, "must-not-leak\n");
+      await access(canary);
+      const result = await runSandbox(f, { executable: "/bin/bash", args: ["-lc", `test ! -e '${canary}'`] });
+      expect(result.exitCode).toBe(0);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it("reaches a host loopback server through the shared network namespace", async () => {
+    const f = await fixture();
+    const server = createServer((_req, res) => { res.end("pong"); });
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      const result = await runSandbox(f, { executable: "/usr/bin/curl", args: ["-s", `http://127.0.0.1:${port}/ping`] });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("pong");
+    } finally {
+      await new Promise<void>((resolve) => {
+        if (server.listening) server.close(() => resolve());
+        else resolve();
+      });
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists npm and uv cache writes back into the host workspace", async () => {
+    const f = await fixture();
+    try {
+      const result = await runSandbox(f, {
+        executable: "/bin/bash",
+        args: ["-lc", 'mkdir -p "$NPM_CONFIG_CACHE" "$UV_CACHE_DIR"; echo npm-marker > "$NPM_CONFIG_CACHE/npm.txt"; echo uv-marker > "$UV_CACHE_DIR/uv.txt"'],
+      });
+      expect(result.exitCode).toBe(0);
+      expect(await readFile(path.join(f.workspace, ".cache", "npm", "npm.txt"), "utf8")).toBe("npm-marker\n");
+      expect(await readFile(path.join(f.workspace, ".cache", "uv", "uv.txt"), "utf8")).toBe("uv-marker\n");
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it("kills detached descendants when the sandbox process group is terminated", async () => {
+    const f = await fixture();
+    const marker = `tg-bot2-descendant-${process.pid}`;
+    const pidFile = path.join(f.workspace, "descendant.pid");
+    let child: ChildProcess | undefined;
+    const stderr: string[] = [];
+    try {
+      const { args } = await buildBwrapArgs(f, {
+        executable: "/bin/bash",
+        args: ["-lc", `exec -a ${marker} sleep 300 & echo started; pgrep -f '^${marker}' > descendant.pid; wait`],
+      });
+      const proc = spawnProcess("bwrap", args, { stdio: ["ignore", "ignore", "pipe"], detached: true, env: {} });
+      child = proc;
+      proc.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk.toString()));
+      const appeared = await until(async () => {
+        try { return /^\d+$/.test((await readFile(pidFile, "utf8")).trim()); }
+        catch { return false; }
+      }, 5_000);
+      if (!appeared) throw new Error(`descendant did not appear in the sandbox; stderr: ${stderr.join("")}`);
+      expect((await readFile(pidFile, "utf8")).trim()).toMatch(/^\d+$/);
+      expect(hostPids(`^${marker}`)).toHaveLength(1);
+      const closed = new Promise<void>((resolve) => proc.once("close", () => resolve()));
+      terminateProcessGroup(proc, "SIGKILL");
+      await closed;
+      expect(await until(() => hostPids(`^${marker}`).length === 0, 5_000)).toBe(true);
+    } finally {
+      if (child) terminateProcessGroup(child, "SIGKILL");
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
 });

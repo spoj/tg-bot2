@@ -15,6 +15,16 @@ export type { PiWorkerSpawn } from "./sandbox.js";
 
 export type PiRpcEvent = Record<string, unknown>;
 export type PiRpcEventListener = (event: PiRpcEvent) => void;
+export type AvailableModel = { provider: string; id: string; name?: string };
+
+export type WorkerSessionState = {
+  model?: { provider: string; id: string };
+  thinkingLevel: string;
+  sessionId: string;
+  sessionFile?: string;
+  messageCount: number;
+  autoCompactionEnabled: boolean;
+};
 
 /** Parse strict LF-delimited JSONL; U+2028/U+2029 are data. */
 export class StrictJsonlParser {
@@ -751,6 +761,64 @@ export class PiRpcWorker {
     this.lastAssistantText = typeof text === "string" ? text.trim() || undefined : undefined;
     this.assistantTextKnown = true;
     return this.lastAssistantText;
+  }
+
+  async setModel(provider: string, modelId: string): Promise<void> {
+    await this.request({ type: "set_model", provider, modelId });
+  }
+
+  async setThinkingLevel(level: string): Promise<void> {
+    await this.request({ type: "set_thinking_level", level });
+  }
+
+  async getAvailableModels(): Promise<AvailableModel[]> {
+    const response = await this.request({ type: "get_available_models" });
+    const record = asRecord(response);
+    const data = asRecord(record?.data);
+    const models = Array.isArray(data?.models) ? data.models : [];
+    return models.map((model) => {
+      const m = asRecord(model);
+      return {
+        provider: typeof m?.provider === "string" ? m.provider : "",
+        id: typeof m?.id === "string" ? m.id : "",
+        ...(typeof m?.name === "string" ? { name: m.name } : {}),
+      };
+    });
+  }
+
+  async getAvailableThinkingLevels(): Promise<string[]> {
+    const response = await this.request({ type: "get_available_thinking_levels" });
+    const record = asRecord(response);
+    const data = asRecord(record?.data);
+    const levels = Array.isArray(data?.levels) ? data.levels : [];
+    return levels.filter((level): level is string => typeof level === "string");
+  }
+
+  async getSessionState(): Promise<WorkerSessionState> {
+    const response = await this.request({ type: "get_state" });
+    const record = asRecord(response);
+    const data = asRecord(record?.data);
+    const model = asRecord(data?.model);
+    return {
+      ...(model && typeof model.provider === "string" && typeof model.id === "string"
+        ? { model: { provider: model.provider, id: model.id } }
+        : {}),
+      thinkingLevel: typeof data?.thinkingLevel === "string" ? data.thinkingLevel : "",
+      sessionId: typeof data?.sessionId === "string" ? data.sessionId : "",
+      ...(typeof data?.sessionFile === "string" ? { sessionFile: data.sessionFile } : {}),
+      messageCount: typeof data?.messageCount === "number" ? data.messageCount : 0,
+      autoCompactionEnabled: data?.autoCompactionEnabled === true,
+    };
+  }
+
+  async restart(): Promise<void> {
+    const reload = this.extensionReloadPromise;
+    if (reload) await reload;
+    if (this.unsettledWork.size > 0 || this.pending.size > 0) {
+      throw new Error("Pi worker is busy");
+    }
+    await this.stopProcess(true);
+    await this.start();
   }
 
   onEvent(listener: PiRpcEventListener): () => void {

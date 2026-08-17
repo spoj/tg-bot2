@@ -116,7 +116,8 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
 }
 describe("application startup and shutdown wiring", () => {
   it("passes canonical sandbox paths through every runtime component", async () => {
-    await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
     await vi.waitFor(() => expect(state.agentManager).toHaveBeenCalledOnce());
     expect(state.checkSandboxEnvironment).toHaveBeenCalledOnce();
@@ -130,16 +131,16 @@ describe("application startup and shutdown wiring", () => {
   });
 
   it("raises the shutdown gate before waiting for ingress and treats signal abort as graceful", async () => {
-    const startFailure = new Error("Aborted delay");
     const start = deferred<void>();
-    await importIndex(() => state.bot.start.mockReturnValue(start.promise));
+    const index = await importIndex(() => state.bot.start.mockReturnValue(start.promise));
+    void index.main();
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
 
     state.signalHandlers.SIGTERM?.();
     await vi.waitFor(() => expect(state.order).toEqual(["bot.stop", "closeTelegramIngress", "agents.beginShutdown", "flushTelegramIngress"]));
     expect(process.exitCode).toBeUndefined();
 
-    start.reject(startFailure);
+    start.reject(Object.assign(new Error("telegram polling aborted"), { name: "AbortError" }));
     state.flush?.resolve();
     await vi.waitFor(() => expect(state.agents.disposeAll).toHaveBeenCalledOnce());
     expect(process.exitCode).toBeUndefined();
@@ -150,5 +151,47 @@ describe("application startup and shutdown wiring", () => {
     expect(isIntentionalSignalAbort(new Error("Telegram polling failed"))).toBe(false);
     expect(isIntentionalSignalAbort(new Error("Aborted delay"))).toBe(true);
     expect(isIntentionalSignalAbort(Object.assign(new Error("cancelled"), { name: "AbortError" }))).toBe(true);
+  });
+});
+
+describe("disposeServices", () => {
+  it("runs every disposal step in order and forces agent disposal", async () => {
+    const { disposeServices } = await importIndex();
+    const calls: string[] = [];
+    const services = {
+      agents: {
+        beginShutdown: vi.fn(async () => { calls.push("beginShutdown"); }),
+        disposeAll: vi.fn(async () => { calls.push("disposeAll"); }),
+      },
+      scheduler: { stop: vi.fn(async () => { calls.push("scheduler.stop"); }) },
+      outbox: { stop: vi.fn(async () => { calls.push("outbox.stop"); }) },
+      delivery: { drain: vi.fn(async () => { calls.push("delivery.drain"); }) },
+    };
+
+    await disposeServices(services);
+
+    expect(calls).toEqual(["beginShutdown", "scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
+    expect(services.agents.disposeAll).toHaveBeenCalledWith(true);
+    expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
+  });
+
+  it("runs every step even when earlier steps throw and swallows the errors", async () => {
+    const { disposeServices } = await importIndex();
+    const calls: string[] = [];
+    const services = {
+      agents: {
+        beginShutdown: vi.fn(async () => { calls.push("beginShutdown"); throw new Error("abort failed"); }),
+        disposeAll: vi.fn(async () => { calls.push("disposeAll"); }),
+      },
+      scheduler: { stop: vi.fn(async () => { calls.push("scheduler.stop"); throw new Error("scheduler failed"); }) },
+      outbox: { stop: vi.fn(async () => { calls.push("outbox.stop"); throw new Error("outbox failed"); }) },
+      delivery: { drain: vi.fn(async () => { calls.push("delivery.drain"); throw new Error("drain failed"); }) },
+    };
+
+    await expect(disposeServices(services)).resolves.toBeUndefined();
+
+    expect(calls).toEqual(["beginShutdown", "scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
+    expect(services.agents.disposeAll).toHaveBeenCalledWith(true);
+    expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
 });

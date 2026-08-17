@@ -4,6 +4,7 @@ import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, terminateActiveSandboxes } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { createTelegramBot, closeTelegramIngress, flushTelegramIngress, sendTelegramText, sendWorkspaceFile, TelegramDeliveryQueue } from "./telegram.js";
+import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -12,28 +13,84 @@ export function isIntentionalSignalAbort(error: unknown): boolean {
   return candidate.message === "Aborted delay" || candidate.message === "This operation was aborted";
 }
 
-async function main(): Promise<void> {
+export interface DisposableServices {
+  agents: Pick<AgentManager, "beginShutdown" | "disposeAll">;
+  scheduler: Pick<WorkspaceScheduler, "stop">;
+  outbox: Pick<WorkspaceOutbox, "stop">;
+  delivery: Pick<TelegramDeliveryQueue, "drain">;
+}
+
+// Stops the scheduler and outbox, disposes agents, terminates sandboxes, and
+// drains the delivery queue. Each step is guarded so a failure in one never
+// skips the rest. Shared by the graceful shutdown() path (which overlaps
+// beginShutdown with the ingress drain) and disposeServices() (which runs
+// beginShutdown first).
+async function finishDisposal(services: DisposableServices): Promise<void> {
+  try {
+    await services.scheduler.stop();
+  } catch (error) {
+    console.error("Scheduler shutdown failed", error);
+  }
+  try {
+    await services.outbox.stop();
+  } catch (error) {
+    console.error("Outbox shutdown failed", error);
+  }
+  try {
+    await services.agents.disposeAll(true);
+  } catch (error) {
+    console.error("Agent shutdown failed", error);
+  }
+  try {
+    terminateActiveSandboxes();
+  } catch (error) {
+    console.error("Sandbox shutdown failed", error);
+  }
+  try {
+    await services.delivery.drain();
+  } catch (error) {
+    console.error("Telegram delivery drain failed", error);
+  }
+}
+
+export async function disposeServices(services: DisposableServices): Promise<void> {
+  try {
+    await services.agents.beginShutdown();
+  } catch (error) {
+    console.error("Agent abort failed", error);
+  }
+  await finishDisposal(services);
+}
+
+// Hoisted to module scope so the startup-failure path (main().catch) can reach
+// and dispose them even after main() has rejected.
+let agents: AgentManager | undefined;
+let scheduler: WorkspaceScheduler | undefined;
+let outbox: WorkspaceOutbox | undefined;
+let delivery: TelegramDeliveryQueue | undefined;
+
+export async function main(): Promise<void> {
   const config = parseConfig();
   const sandbox = await checkSandboxEnvironment(config.dataDir);
   const { dataDir, bwrapPath } = sandbox;
   const runtimeConfig = { ...config, dataDir };
 
-  const agents = new AgentManager(runtimeConfig, { appRoot: process.cwd(), bwrapPath });
-  const delivery = new TelegramDeliveryQueue();
-  let bot: ReturnType<typeof createTelegramBot>;
-  const scheduler = new WorkspaceScheduler({
+  const agentManager = new AgentManager(runtimeConfig, { appRoot: process.cwd(), bwrapPath });
+  const deliveryQueue = new TelegramDeliveryQueue();
+  const bot = createTelegramBot(runtimeConfig, agentManager, deliveryQueue);
+  const schedulerInstance = new WorkspaceScheduler({
     dataDir,
-    run: (chatId, prompt) => agents.prompt(chatId, prompt, "follow-up"),
+    run: (chatId, prompt) => agentManager.prompt(chatId, prompt, "follow-up"),
     send: async (chatId, text) => {
       if (text.trim().length > 0) {
-        await delivery.enqueue(chatId, () => sendTelegramText(bot, chatId, text));
+        await deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text));
       }
     },
   });
-  const outbox = new WorkspaceOutbox({
+  const outboxInstance = new WorkspaceOutbox({
     dataDir,
     sendFile: async (chatId, sandboxPath, caption) => {
-      await delivery.enqueue(chatId, async () => {
+      await deliveryQueue.enqueue(chatId, async () => {
         await sendWorkspaceFile(bot, {
           chatId,
           workspace: chatPaths(dataDir, chatId).workspace,
@@ -44,7 +101,10 @@ async function main(): Promise<void> {
     },
   });
 
-  bot = createTelegramBot(runtimeConfig, agents, delivery);
+  agents = agentManager;
+  scheduler = schedulerInstance;
+  outbox = outboxInstance;
+  delivery = deliveryQueue;
 
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -59,7 +119,7 @@ async function main(): Promise<void> {
         console.error("Telegram stop failed", error);
       }
       closeTelegramIngress(bot);
-      const agentShutdown = agents.beginShutdown().catch((error) => {
+      const agentShutdown = agentManager.beginShutdown().catch((error) => {
         console.error("Agent abort failed", error);
       });
       try {
@@ -68,31 +128,7 @@ async function main(): Promise<void> {
         console.error("Telegram ingress drain failed", error);
       }
       await agentShutdown;
-      try {
-        await scheduler.stop();
-      } catch (error) {
-        console.error("Scheduler shutdown failed", error);
-      }
-      try {
-        await outbox.stop();
-      } catch (error) {
-        console.error("Outbox shutdown failed", error);
-      }
-      try {
-        await agents.disposeAll(true);
-      } catch (error) {
-        console.error("Agent shutdown failed", error);
-      }
-      try {
-        terminateActiveSandboxes();
-      } catch (error) {
-        console.error("Sandbox shutdown failed", error);
-      }
-      try {
-        await delivery.drain();
-      } catch (error) {
-        console.error("Telegram delivery drain failed", error);
-      }
+      await finishDisposal({ agents: agentManager, scheduler: schedulerInstance, outbox: outboxInstance, delivery: deliveryQueue });
     })();
     return shutdownPromise;
   };
@@ -100,12 +136,12 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => { void shutdown("SIGINT"); });
   process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
   try {
-    await scheduler.start();
+    await schedulerInstance.start();
     if (shuttingDown) {
       await shutdown("startup interrupted");
       return;
     }
-    await outbox.start();
+    await outboxInstance.start();
     if (shuttingDown) {
       await shutdown("startup interrupted");
       return;
@@ -122,12 +158,13 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  console.error("Fatal startup/polling failure", error);
-  try {
-    terminateActiveSandboxes();
-  } catch (terminationError) {
-    console.error("Sandbox cleanup failed", terminationError);
-  }
-  process.exitCode = 1;
-});
+const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch(async (error) => {
+    console.error("Fatal startup/polling failure", error);
+    if (agents && scheduler && outbox && delivery) {
+      await disposeServices({ agents, scheduler, outbox, delivery });
+    }
+    process.exitCode = 1;
+  });
+}

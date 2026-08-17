@@ -111,7 +111,7 @@ describe("PiRpcWorker", () => {
         "--setenv", "HOME", "/workspace",
         "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
         "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
-        "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
+        "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
         "--append-system-prompt", "runtime prompt",
       ]));
       expect(calls[0]?.args).not.toEqual(expect.arrayContaining(["--ro-bind", f.appRoot, "/app"]));
@@ -901,6 +901,216 @@ describe("PiRpcWorker", () => {
       const state = worker as unknown as { stderr: string };
       expect(state.stderr.length).toBeLessThanOrEqual(64 * 1024);
       expect(state.stderr.endsWith("tail")).toBe(true);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("sets the model via RPC", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const setModel = worker.setModel("anthropic", "claude-sonnet-4-20250514");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string; type?: string; provider?: string; modelId?: string };
+      expect(command.type).toBe("set_model");
+      expect(command.provider).toBe("anthropic");
+      expect(command.modelId).toBe("claude-sonnet-4-20250514");
+      record(child, { type: "response", id: command.id, command: "set_model", success: true });
+      await expect(setModel).resolves.toBeUndefined();
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("sets the thinking level via RPC", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const setThinkingLevel = worker.setThinkingLevel("high");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string; type?: string; level?: string };
+      expect(command.type).toBe("set_thinking_level");
+      expect(command.level).toBe("high");
+      record(child, { type: "response", id: command.id, command: "set_thinking_level", success: true });
+      await expect(setThinkingLevel).resolves.toBeUndefined();
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes available models", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const models = worker.getAvailableModels();
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string; type?: string };
+      expect(command.type).toBe("get_available_models");
+      record(child, {
+        type: "response",
+        id: command.id,
+        command: "get_available_models",
+        success: true,
+        data: {
+          models: [
+            { provider: "anthropic", id: "claude-sonnet-4-20250514", name: "Claude 4 Sonnet" },
+            { provider: "openai", id: "gpt-5" },
+          ],
+        },
+      });
+      await expect(models).resolves.toEqual([
+        { provider: "anthropic", id: "claude-sonnet-4-20250514", name: "Claude 4 Sonnet" },
+        { provider: "openai", id: "gpt-5" },
+      ]);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes available thinking levels", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const levels = worker.getAvailableThinkingLevels();
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string; type?: string };
+      expect(command.type).toBe("get_available_thinking_levels");
+      record(child, {
+        type: "response",
+        id: command.id,
+        command: "get_available_thinking_levels",
+        success: true,
+        data: { levels: ["off", "minimal", "medium", "high", "max"] },
+      });
+      await expect(levels).resolves.toEqual(["off", "minimal", "medium", "high", "max"]);
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes session state", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const state = worker.getSessionState();
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string; type?: string };
+      expect(command.type).toBe("get_state");
+      record(child, {
+        type: "response",
+        id: command.id,
+        command: "get_state",
+        success: true,
+        data: {
+          model: { provider: "anthropic", id: "claude-sonnet-4-20250514", name: "Claude 4 Sonnet", contextWindow: 200_000 },
+          thinkingLevel: "medium",
+          isStreaming: false,
+          isCompacting: false,
+          steeringMode: "all",
+          followUpMode: "all",
+          sessionFile: "/workspace/.pi/sessions/abc.json",
+          sessionId: "abc",
+          sessionName: "named session",
+          autoCompactionEnabled: true,
+          messageCount: 42,
+          pendingMessageCount: 0,
+        },
+      });
+      await expect(state).resolves.toEqual({
+        model: { provider: "anthropic", id: "claude-sonnet-4-20250514" },
+        thinkingLevel: "medium",
+        sessionId: "abc",
+        sessionFile: "/workspace/.pi/sessions/abc.json",
+        messageCount: 42,
+        autoCompactionEnabled: true,
+      });
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects restart while a turn is unsettled", async () => {
+    const f = await fixture();
+    const child = new FakeChild();
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => child as unknown as ReturnType<PiWorkerSpawn>) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      const prompt = worker.prompt("active");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      await expect(worker.restart()).rejects.toThrow("Pi worker is busy");
+      record(child, { type: "response", id: command.id, command: "prompt", success: true });
+      await prompt;
+    } finally {
+      await worker.stop();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("restarts an idle worker and keeps it live", async () => {
+    const f = await fixture();
+    const children: FakeChild[] = [];
+    const worker = new PiRpcWorker({
+      workspace: f.workspace,
+      appRoot: f.appRoot,
+      cliPath: f.cliPath,
+      spawn: (() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn,
+    });
+    try {
+      await worker.start();
+      expect(children).toHaveLength(1);
+      await worker.restart();
+      expect(children).toHaveLength(2);
+      const prompt = worker.prompt("after restart");
+      const command = JSON.parse(children[1]?.commands[0] ?? "{}") as { id?: string; type?: string };
+      expect(command.type).toBe("prompt");
+      record(children[1]!, { type: "response", id: command.id, command: "prompt", success: true });
+      await prompt;
     } finally {
       await worker.stop();
       await rm(f.root, { recursive: true, force: true });

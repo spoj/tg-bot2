@@ -213,7 +213,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
     "--chdir", "/workspace", "--", nodePath, cliMountPath,
-    "--mode", "rpc", "--continue", "--session-dir", "/workspace/.pi/sessions", "--approve",
+    "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
   );
   return { args, resolved: { workspace, appRoot, cliPath } };

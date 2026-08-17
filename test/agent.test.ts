@@ -1,9 +1,14 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 import {
   AgentManager,
   extractFinalAssistantText,
+  loadUserSettings,
   SYSTEM_PROMPT,
+  WORKER_IDLE_STOP_MS,
+  writeUserSettings,
   type AgentEvent,
   type AgentWorker,
 } from "../src/agent.js";
@@ -44,6 +49,17 @@ function fakeWorker(initialText = "done"): FakeWorker {
     steer: vi.fn(async (_text: string) => {}),
     waitForSettled: vi.fn(async () => {}),
     getLastAssistantText: vi.fn(async () => worker.lastText),
+    setModel: vi.fn(async (_provider: string, _modelId: string) => {}),
+    setThinkingLevel: vi.fn(async (_level: string) => {}),
+    getAvailableModels: vi.fn(async () => []),
+    getAvailableThinkingLevels: vi.fn(async () => []),
+    getSessionState: vi.fn(async () => ({
+      thinkingLevel: "low",
+      sessionId: "session-id",
+      messageCount: 0,
+      autoCompactionEnabled: false,
+    })),
+    restart: vi.fn(async () => {}),
     onEvent: vi.fn((listener: (event: AgentEvent) => void) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -552,4 +568,224 @@ it("cleans up a worker that appears after an aborted hanging startup", async () 
   const lateWorker = fakeWorker();
   startup.resolve(lateWorker);
   await vi.waitFor(() => expect(lateWorker.stop).toHaveBeenCalledOnce());
+});
+
+it("loadUserSettings tolerates missing and corrupt settings files", async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-settings-"));
+  try {
+    expect(await loadUserSettings(workspace)).toEqual({});
+    const directory = path.join(workspace, ".pi", "agent");
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, "settings.json"), "{not valid json", "utf8");
+    expect(await loadUserSettings(workspace)).toEqual({});
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+it("writeUserSettings merges patches and preserves untouched keys", async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-settings-"));
+  try {
+    const directory = path.join(workspace, ".pi", "agent");
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      path.join(directory, "settings.json"),
+      JSON.stringify({ custom: true, defaultProvider: "old" }),
+      "utf8",
+    );
+
+    await writeUserSettings(workspace, { defaultProvider: "new", defaultModel: "claude" });
+    await writeUserSettings(workspace, { defaultThinkingLevel: "high" });
+
+    expect(await loadUserSettings(workspace)).toEqual({
+      custom: true,
+      defaultProvider: "new",
+      defaultModel: "claude",
+      defaultThinkingLevel: "high",
+    });
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+it("setModel and setThinkingLevel persist defaults while preserving existing settings", async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-data-"));
+  const worker = fakeWorker();
+  const manager = new AgentManager({ ...config, dataDir }, { ...managerOptions, workerFactory: () => worker });
+  try {
+    const directory = path.join(dataDir, "chats", "42", "workspace", ".pi", "agent");
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, "settings.json"), JSON.stringify({ custom: true }), "utf8");
+
+    await manager.setModel(42, "anthropic", "claude");
+    await manager.setThinkingLevel(42, "high");
+
+    expect(worker.setModel).toHaveBeenCalledWith("anthropic", "claude");
+    expect(worker.setThinkingLevel).toHaveBeenCalledWith("high");
+    const settings = JSON.parse(await readFile(path.join(directory, "settings.json"), "utf8"));
+    expect(settings).toEqual({
+      custom: true,
+      defaultProvider: "anthropic",
+      defaultModel: "claude",
+      defaultThinkingLevel: "high",
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+it("status reports the worker session state through the per-chat queue", async () => {
+  const worker = fakeWorker();
+  vi.mocked(worker.getSessionState).mockResolvedValueOnce({
+    model: { provider: "anthropic", id: "claude" },
+    thinkingLevel: "high",
+    sessionId: "s1",
+    sessionFile: "/workspace/.pi/session.json",
+    messageCount: 3,
+    autoCompactionEnabled: true,
+  });
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+  await expect(manager.status(4)).resolves.toEqual({
+    model: { provider: "anthropic", id: "claude" },
+    thinkingLevel: "high",
+    sessionId: "s1",
+    sessionFile: "/workspace/.pi/session.json",
+    messageCount: 3,
+    autoCompactionEnabled: true,
+  });
+  expect(worker.getSessionState).toHaveBeenCalledOnce();
+});
+
+it("getAvailableModels and getAvailableThinkingLevels route to the worker", async () => {
+  const worker = fakeWorker();
+  vi.mocked(worker.getAvailableModels).mockResolvedValueOnce([{ provider: "anthropic", id: "claude", name: "Claude" }]);
+  vi.mocked(worker.getAvailableThinkingLevels).mockResolvedValueOnce(["low", "high"]);
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+  await expect(manager.getAvailableModels(5)).resolves.toEqual([{ provider: "anthropic", id: "claude", name: "Claude" }]);
+  await expect(manager.getAvailableThinkingLevels(5)).resolves.toEqual(["low", "high"]);
+});
+
+it("restart drains the active run before restarting the worker", async () => {
+  const worker = fakeWorker("done");
+  const activeDone = deferred<void>();
+  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
+    await activeDone.promise;
+  });
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+  const active = manager.prompt(9, "running");
+  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
+  const restart = manager.restart(9);
+  await Promise.resolve();
+  expect(worker.restart).not.toHaveBeenCalled();
+
+  activeDone.resolve();
+  await expect(active).resolves.toBe("done");
+  await expect(restart).resolves.toBeUndefined();
+  expect(worker.restart).toHaveBeenCalledOnce();
+});
+
+it("serializes configuration commands through the per-chat queue", async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-data-"));
+  const worker = fakeWorker();
+  const firstDone = deferred<void>();
+  vi.mocked(worker.setModel).mockImplementationOnce(async () => {
+    await firstDone.promise;
+  });
+  const manager = new AgentManager({ ...config, dataDir }, { ...managerOptions, workerFactory: () => worker });
+  try {
+    const first = manager.setModel(3, "anthropic", "claude");
+    await vi.waitFor(() => expect(worker.setModel).toHaveBeenCalledOnce());
+    const second = manager.setThinkingLevel(3, "high");
+    await Promise.resolve();
+    expect(worker.setThinkingLevel).not.toHaveBeenCalled();
+
+    firstDone.resolve();
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+    expect(worker.setThinkingLevel).toHaveBeenCalledWith("high");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+it("stops an idle worker after two hours without activity", async () => {
+  vi.useFakeTimers();
+  try {
+    const worker = fakeWorker("done");
+    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+    await manager.prompt(1, "hello");
+    expect(worker.stop).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS);
+    expect(worker.stop).toHaveBeenCalledOnce();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("re-arms the idle timer when a prompt arrives before expiry", async () => {
+  vi.useFakeTimers();
+  try {
+    const worker = fakeWorker("done");
+    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+    await manager.prompt(1, "first");
+    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS / 2);
+    await manager.prompt(1, "second");
+    // The original deadline has passed, but the second prompt re-armed the timer.
+    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS / 2);
+
+    expect(worker.stop).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("re-arms instead of stopping while a run is active at expiry", async () => {
+  vi.useFakeTimers();
+  try {
+    const worker = fakeWorker("done");
+    const promptStarted = deferred<void>();
+    const activeDone = deferred<void>();
+    vi.mocked(worker.prompt).mockImplementationOnce(async () => {
+      promptStarted.resolve();
+      await activeDone.promise;
+    });
+    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+    const active = manager.prompt(1, "long running");
+    await promptStarted.promise;
+    expect(worker.prompt).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS);
+    expect(worker.stop).not.toHaveBeenCalled();
+
+    activeDone.resolve();
+    await expect(active).resolves.toBe("done");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("disposeAll clears the idle timer and stops the worker", async () => {
+  vi.useFakeTimers();
+  try {
+    const worker = fakeWorker("done");
+    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+
+    await manager.prompt(1, "hello");
+    expect(worker.stop).not.toHaveBeenCalled();
+
+    await manager.disposeAll();
+    expect(worker.stop).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS * 2);
+    expect(worker.stop).toHaveBeenCalledOnce();
+  } finally {
+    vi.useRealTimers();
+  }
 });

@@ -12,6 +12,9 @@ import {
   createTelegramBot,
   flushTelegramIngress,
   formatBufferedPrompt,
+  formatModelList,
+  formatStatus,
+  formatThinkingLevels,
   sendTelegramText,
   sendWorkspaceFile,
   splitTelegramText,
@@ -841,5 +844,314 @@ describe("Telegram attachment downloads", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("Telegram command formatting", () => {
+  it("numbers models, marks the current one, and handles empty lists", () => {
+    expect(formatModelList([], undefined)).toBe("No models available.");
+    expect(formatModelList([
+      { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
+      { provider: "anthropic", id: "claude-3-5-sonnet" },
+    ], { provider: "anthropic", id: "claude-3-5-sonnet" })).toBe(
+      "1. openrouter/deepseek/deepseek-chat — DeepSeek Chat\n2. anthropic/claude-3-5-sonnet (current)",
+    );
+  });
+
+  it("numbers thinking levels, marks the current one, and handles empty lists", () => {
+    expect(formatThinkingLevels([], undefined)).toBe("No thinking levels available.");
+    expect(formatThinkingLevels(["low", "medium", "high"], "medium")).toBe(
+      "1. low\n2. medium (current)\n3. high",
+    );
+  });
+
+  it("formats session state on one line", () => {
+    expect(formatStatus({
+      model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
+      thinkingLevel: "medium",
+      sessionId: "42",
+      sessionFile: "42.jsonl",
+      messageCount: 7,
+      autoCompactionEnabled: true,
+    })).toBe("Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7");
+    expect(formatStatus({
+      thinkingLevel: "low",
+      sessionId: "42",
+      messageCount: 0,
+      autoCompactionEnabled: false,
+    })).toBe("Model: unset | Thinking: low | Session: 42 | Messages: 0");
+  });
+});
+
+describe("Telegram commands", () => {
+  const defaultStatus = {
+    model: undefined,
+    thinkingLevel: "medium",
+    sessionId: "42",
+    sessionFile: undefined,
+    messageCount: 0,
+    autoCompactionEnabled: true,
+  };
+
+  type FakeAgents = {
+    prompt: ReturnType<typeof vi.fn>;
+    newSession: ReturnType<typeof vi.fn>;
+    setAssistantProgress: ReturnType<typeof vi.fn>;
+    getAvailableModels: ReturnType<typeof vi.fn>;
+    getAvailableThinkingLevels: ReturnType<typeof vi.fn>;
+    status: ReturnType<typeof vi.fn>;
+    setModel: ReturnType<typeof vi.fn>;
+    setThinkingLevel: ReturnType<typeof vi.fn>;
+    restart: ReturnType<typeof vi.fn>;
+  };
+
+  function makeAgents(overrides: Partial<FakeAgents> = {}): FakeAgents {
+    return {
+      prompt: vi.fn(async () => undefined),
+      newSession: vi.fn(async () => {}),
+      setAssistantProgress: vi.fn(),
+      getAvailableModels: vi.fn(async () => []),
+      getAvailableThinkingLevels: vi.fn(async () => []),
+      status: vi.fn(async () => defaultStatus),
+      setModel: vi.fn(async () => {}),
+      setThinkingLevel: vi.fn(async () => {}),
+      restart: vi.fn(async () => {}),
+      ...overrides,
+    };
+  }
+
+  let sentRequests: Array<{ url: string; body: string }> = [];
+
+  async function makeBot(agents: FakeAgents): Promise<Bot> {
+    sentRequests = [];
+    const bot = createTelegramBot(
+      { token: "test-token", allowedUserIds: new Set([42]), dataDir: "/tmp/ignored" },
+      agents as never,
+    );
+    (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = {
+      id: 999, is_bot: true, first_name: "Test", username: "test_bot",
+    };
+    const fakeFetch: typeof fetch = async (input, init) => {
+      sentRequests.push({
+        url: String(input),
+        body: typeof init?.body === "string" ? init.body : "",
+      });
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    (bot as unknown as { clientConfig: { fetch: typeof fetch } }).clientConfig = { fetch: fakeFetch };
+    return bot;
+  }
+
+  function commandLength(text: string): number {
+    const end = text.search(/[\s@]/);
+    return end === -1 ? text.length : end;
+  }
+
+  async function sendCommand(bot: Bot, text: string, fromId = 42): Promise<void> {
+    await bot.handleUpdate({
+      update_id: 1,
+      message: {
+        message_id: 1,
+        date: 1_700_000_000,
+        chat: { id: fromId, type: "private" },
+        from: { id: fromId, is_bot: false, first_name: "Test" },
+        text,
+        entities: [{ type: "bot_command", offset: 0, length: commandLength(text) }],
+      },
+    } as never);
+  }
+
+  function replies(_bot: Bot): string[] {
+    return sentRequests
+      .filter((request) => request.url.endsWith("/sendMessage"))
+      .map((request) => (JSON.parse(request.body) as { text: string }).text);
+  }
+
+  it("rejects unauthorized users before running command handlers", async () => {
+    const agents = makeAgents();
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/status", 999);
+    expect(replies(bot)).toEqual(["Unauthorized."]);
+    expect(agents.status).not.toHaveBeenCalled();
+  });
+
+  it("/start sends the personal-agent help text", async () => {
+    const agents = makeAgents();
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/start");
+    expect(replies(bot)).toEqual([
+      "Personal agent. Send text or attachments to continue your persistent session, or /new to start a fresh one.",
+    ]);
+  });
+
+  it("rejects unauthorized /start and /new before running handlers", async () => {
+    const agents = makeAgents();
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/start", 999);
+    await sendCommand(bot, "/new", 999);
+    expect(replies(bot)).toEqual(["Unauthorized.", "Unauthorized."]);
+    expect(agents.newSession).not.toHaveBeenCalled();
+  });
+
+  it("/new starts a new session and confirms", async () => {
+    const newSession = vi.fn(async () => {});
+    const agents = makeAgents({ newSession });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/new");
+    expect(newSession).toHaveBeenCalledWith(42);
+    expect(replies(bot)).toEqual([
+      "Started a new session. Earlier session files remain searchable.",
+    ]);
+  });
+
+  it("/new reports a friendly failure when newSession rejects", async () => {
+    const newSession = vi.fn(async () => { throw new Error("boom"); });
+    const agents = makeAgents({ newSession });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/new");
+    expect(replies(bot)).toEqual([
+      "I could not start a new session. Please try again.",
+    ]);
+  });
+
+  it("delivers /new and /status replies in command order", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const agents = makeAgents({ newSession: vi.fn(() => gate) });
+    const bot = await makeBot(agents);
+
+    const newDone = sendCommand(bot, "/new");
+    const statusDone = sendCommand(bot, "/status");
+    release();
+    await Promise.all([newDone, statusDone]);
+
+    expect(replies(bot)).toEqual([
+      "Started a new session. Earlier session files remain searchable.",
+      "Model: unset | Thinking: medium | Session: 42 | Messages: 0",
+    ]);
+  });
+
+  it("/model lists available models with the current one marked", async () => {
+    const agents = makeAgents({
+      getAvailableModels: vi.fn(async () => [
+        { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
+        { provider: "anthropic", id: "claude-3-5-sonnet" },
+      ]),
+      status: vi.fn(async () => ({ ...defaultStatus, model: { provider: "anthropic", id: "claude-3-5-sonnet" } })),
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/model");
+    expect(replies(bot)).toEqual([
+      "1. openrouter/deepseek/deepseek-chat — DeepSeek Chat\n2. anthropic/claude-3-5-sonnet (current)",
+    ]);
+  });
+
+  it("/model sets a uniquely matched model", async () => {
+    const setModel = vi.fn(async () => {});
+    const agents = makeAgents({
+      getAvailableModels: vi.fn(async () => [
+        { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
+        { provider: "anthropic", id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet" },
+      ]),
+      setModel,
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/model claude");
+    expect(setModel).toHaveBeenCalledWith(42, "anthropic", "claude-3-5-sonnet");
+    expect(replies(bot)).toEqual(["Model set to anthropic/claude-3-5-sonnet."]);
+  });
+
+  it("/model lists matches when the query is ambiguous", async () => {
+    const agents = makeAgents({
+      getAvailableModels: vi.fn(async () => [
+        { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
+        { provider: "openrouter", id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner" },
+      ]),
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/model deepseek");
+    expect(agents.setModel).not.toHaveBeenCalled();
+    expect(replies(bot)[0]).toContain('Multiple models match "deepseek":');
+  });
+
+  it("/model reports when nothing matches", async () => {
+    const agents = makeAgents({
+      getAvailableModels: vi.fn(async () => [
+        { provider: "openrouter", id: "deepseek/deepseek-chat" },
+      ]),
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/model nonexistent");
+    expect(replies(bot)).toEqual(['No model matches "nonexistent".']);
+  });
+
+  it("/thinking lists levels with the current one marked", async () => {
+    const agents = makeAgents({
+      getAvailableThinkingLevels: vi.fn(async () => ["low", "medium", "high"]),
+      status: vi.fn(async () => ({ ...defaultStatus, thinkingLevel: "medium" })),
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/thinking");
+    expect(replies(bot)).toEqual(["1. low\n2. medium (current)\n3. high"]);
+  });
+
+  it("/thinking sets a valid level", async () => {
+    const setThinkingLevel = vi.fn(async () => {});
+    const agents = makeAgents({
+      getAvailableThinkingLevels: vi.fn(async () => ["low", "high"]),
+      setThinkingLevel,
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/thinking high");
+    expect(setThinkingLevel).toHaveBeenCalledWith(42, "high");
+    expect(replies(bot)).toEqual(["Thinking level set to high."]);
+  });
+
+  it("/thinking rejects an invalid level and lists valid ones", async () => {
+    const agents = makeAgents({
+      getAvailableThinkingLevels: vi.fn(async () => ["low", "high"]),
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/thinking extreme");
+    expect(agents.setThinkingLevel).not.toHaveBeenCalled();
+    expect(replies(bot)).toEqual(['Unknown thinking level "extreme". Valid levels: low, high.']);
+  });
+
+  it("/status reports the session state", async () => {
+    const agents = makeAgents({
+      status: vi.fn(async () => ({
+        model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
+        thinkingLevel: "medium",
+        sessionId: "42",
+        sessionFile: "42.jsonl",
+        messageCount: 7,
+        autoCompactionEnabled: true,
+      })),
+    });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/status");
+    expect(replies(bot)).toEqual([
+      "Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7",
+    ]);
+  });
+
+  it("/restart restarts the agent and confirms", async () => {
+    const restart = vi.fn(async () => {});
+    const agents = makeAgents({ restart });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/restart");
+    expect(restart).toHaveBeenCalledWith(42);
+    expect(replies(bot)).toEqual(["Restarting agent…", "Agent restarted."]);
+  });
+
+  it("/restart reports a friendly failure", async () => {
+    const restart = vi.fn(async () => { throw new Error("Pi worker is busy"); });
+    const agents = makeAgents({ restart });
+    const bot = await makeBot(agents);
+    await sendCommand(bot, "/restart");
+    expect(replies(bot)).toEqual(["Restarting agent…", "I could not restart the agent. Please try again."]);
   });
 });

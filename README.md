@@ -46,6 +46,17 @@ All non-command updates in a chat share an ingress buffer. Each update resets a 
 
 If a request arrives during an active run, it is sent through Pi's native steering mechanism; the active run sends the eventual response. `/new` establishes a per-chat ingress boundary: accepted earlier updates drain first, later updates wait until the new JSONL session starts, and older session files remain searchable. Replies, assistant progress, scheduled text, and outbox files use one per-chat FIFO delivery queue: same-chat sends retain production order, different chats can send concurrently, and one failed send does not block later sends. Shutdown stops polling and producers, drains accepted ingress and outbound sends, and terminates workers.
 
+### Telegram commands
+
+The bot answers a few user-gated commands in private chats:
+
+- `/model` — list available models (the current one is marked), or set one by a case-insensitive substring of its name or id, e.g. `/model claude`.
+- `/thinking` — list available thinking levels (the current one is marked), or set one, e.g. `/thinking high`.
+- `/status` — show the current model, thinking level, session file, and message count.
+- `/restart` — restart the chat's Pi worker.
+
+Model and thinking-level changes persist as defaults in the chat's project `settings.json`. Authorization is enforced by `ALLOWED_USER_IDS`; provider credentials and model selection remain workspace-owned, and auth provisioning stays out-of-band: place the provider's Pi files under `DATA_DIR/chats/<numeric-chat-id>/workspace/.pi/agent/` before the first prompt.
+
 ## Configuration
 
 Required:
@@ -58,7 +69,18 @@ Pi provider credentials and model selection are workspace-owned. Before a chat's
 
 The workspace `.pi/` directory is the chat's project layer. Project settings and resources live under `.pi/`; `settings.json` and installed resources override user-layer resources where Pi allows it. Install optional extensions into this project layer with an explicit source and approval: `pi install npm:<package> -l --approve` for npm packages, `pi install https://... -l --approve` or `pi install git:... -l --approve` for git URLs, and `pi install ./... -l --approve` for local paths. Do not use a bare package name: Pi requires the `npm:` source form. In the non-interactive worker, use `pi list --approve` to inspect project-local packages. The base Pi CLI remains the only Pi package bundled by the application. The worker discovers resources from both `.pi/agent/` and `.pi/`. These are Pi precedence and lifecycle scopes, not an access-control boundary: the worker can read both.
 
-Pi runs headless with `--mode rpc --continue --approve` and exchanges newline-delimited JSON requests/events with the host. Optional extension behavior, including media analysis, is available only after its package is installed and may require provider consent. The host watches project and user extension resources, debounces changes, and reloads an idle worker after the current turn so newly installed or edited extensions load without a bot-wide restart.
+Pi runs headless with `--mode rpc --approve` and exchanges newline-delimited JSON requests/events with the host. Optional extension behavior, including media analysis, is available only after its package is installed and may require provider consent. The host watches project and user extension resources, debounces changes, and reloads an idle worker after the current turn so newly installed or edited extensions load without a bot-wide restart.
+
+Session lifecycle: every worker start begins a fresh session. The worker is stopped after 2 hours of chat inactivity; the next message starts a fresh worker. Older transcripts persist under `.pi/sessions/*.jsonl` for the agent to grep when the user references history.
+
+### Configuration files
+
+| Item | Single source of truth |
+| --- | --- |
+| `auth.json`, `models.json`, `settings.json` | `.pi/agent/` only — never create `.pi/settings.json` |
+| `AGENTS.md` | workspace root only — never `.pi/agent/AGENTS.md` |
+| `models-store.json`, `run-history.jsonl`, `web-search.json`, `missions` | Pi-managed |
+| `.pi/` project layer | Pi `-l` package bookkeeping only |
 
 ## Persistent layout
 

@@ -703,6 +703,49 @@ export function closeTelegramIngress(bot: Bot): void {
   ingressByBot.get(bot)?.close();
 }
 
+export type TelegramAvailableModel = {
+  provider: string;
+  id: string;
+  name?: string;
+};
+
+export type TelegramSessionState = {
+  model?: { provider: string; id: string };
+  thinkingLevel: string;
+  sessionId: string;
+  sessionFile?: string;
+  messageCount: number;
+  autoCompactionEnabled: boolean;
+};
+
+export function formatModelList(
+  models: readonly TelegramAvailableModel[],
+  current?: { provider: string; id: string },
+): string {
+  if (models.length === 0) return "No models available.";
+  return models
+    .map((model, index) => {
+      const identifier = `${model.provider}/${model.id}`;
+      const label = model.name ? `${identifier} — ${model.name}` : identifier;
+      const marker = current && current.provider === model.provider && current.id === model.id ? " (current)" : "";
+      return `${index + 1}. ${label}${marker}`;
+    })
+    .join("\n");
+}
+
+export function formatThinkingLevels(levels: readonly string[], current?: string): string {
+  if (levels.length === 0) return "No thinking levels available.";
+  return levels
+    .map((level, index) => `${index + 1}. ${level}${level === current ? " (current)" : ""}`)
+    .join("\n");
+}
+
+export function formatStatus(state: TelegramSessionState): string {
+  const model = state.model ? `${state.model.provider}/${state.model.id}` : "unset";
+  const session = state.sessionFile ?? state.sessionId;
+  return `Model: ${model} | Thinking: ${state.thinkingLevel} | Session: ${session} | Messages: ${state.messageCount}`;
+}
+
 export function createTelegramBot(
   config: Config,
   agents: AgentManager,
@@ -714,6 +757,12 @@ export function createTelegramBot(
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return Promise.resolve();
     return deliveryQueue.enqueue(chatId, () => ctx.reply(text)).then(() => undefined);
+  };
+
+  const queuedReplyChunks = (ctx: Context, text: string): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return Promise.resolve();
+    return deliveryQueue.enqueue(chatId, () => replyChunks(ctx, text)).then(() => undefined);
   };
 
   const ingress = new TelegramIngressBuffer(async (chatId, messages) => {
@@ -758,6 +807,85 @@ export function createTelegramBot(
     } catch (error) {
       console.error("Failed to start new session", error);
       await queuedReply(ctx, "I could not start a new session. Please try again.");
+    }
+  });
+
+  bot.command("model", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    try {
+      const query = (ctx.match ?? "").trim();
+      const models = await agents.getAvailableModels(chatId);
+      const current = (await agents.status(chatId)).model;
+      if (!query) {
+        await queuedReplyChunks(ctx, formatModelList(models, current));
+        return;
+      }
+      const needle = query.toLowerCase();
+      const matches = models.filter((model) =>
+        `${model.id} ${model.name ?? ""}`.toLowerCase().includes(needle),
+      );
+      if (matches.length === 0) {
+        await queuedReply(ctx, `No model matches "${query}".`);
+        return;
+      }
+      if (matches.length > 1) {
+        await queuedReplyChunks(ctx, `Multiple models match "${query}":\n\n${formatModelList(matches, current)}`);
+        return;
+      }
+      const model = matches[0]!;
+      await agents.setModel(chatId, model.provider, model.id);
+      await queuedReply(ctx, `Model set to ${model.provider}/${model.id}.`);
+    } catch (error) {
+      console.error("Failed to set model", error);
+      await queuedReply(ctx, "I could not set the model. Please try again.");
+    }
+  });
+
+  bot.command("thinking", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    try {
+      const level = (ctx.match ?? "").trim();
+      const levels = await agents.getAvailableThinkingLevels(chatId);
+      const current = (await agents.status(chatId)).thinkingLevel;
+      if (!level) {
+        await queuedReply(ctx, formatThinkingLevels(levels, current));
+        return;
+      }
+      if (!levels.includes(level)) {
+        await queuedReply(ctx, `Unknown thinking level "${level}". Valid levels: ${levels.join(", ")}.`);
+        return;
+      }
+      await agents.setThinkingLevel(chatId, level);
+      await queuedReply(ctx, `Thinking level set to ${level}.`);
+    } catch (error) {
+      console.error("Failed to set thinking level", error);
+      await queuedReply(ctx, "I could not set the thinking level. Please try again.");
+    }
+  });
+
+  bot.command("status", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    try {
+      await queuedReply(ctx, formatStatus(await agents.status(chatId)));
+    } catch (error) {
+      console.error("Failed to get status", error);
+      await queuedReply(ctx, "I could not get the status. Please try again.");
+    }
+  });
+
+  bot.command("restart", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    await queuedReply(ctx, "Restarting agent…");
+    try {
+      await agents.restart(chatId);
+      await queuedReply(ctx, "Agent restarted.");
+    } catch (error) {
+      console.error("Failed to restart agent", error);
+      await queuedReply(ctx, "I could not restart the agent. Please try again.");
     }
   });
 

@@ -17,7 +17,7 @@
     "check:layers": "node scripts/check-layer-boundaries.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.2",
     "grammy": "1.45.1"
   },
   "devDependencies": {

@@ -27,6 +27,11 @@ async function names(directory: string): Promise<string[]> {
   return (await readdir(directory)).sort();
 }
 
+async function chatEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
+  const contents = await readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8");
+  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
 const valid = (id = "one", filePath = "/workspace/report.txt") => ({
   version: 1,
   id,
@@ -330,35 +335,41 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["msg.json"]);
   });
 
-  it("records a delivery ack for each sent message id", async () => {
+  it("records a send event for each sent message id", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "one.json", valid());
     await request(workspace, "two.json", valid("two"));
     const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => ({ messageId: request.id === "one" ? 100 : 200 }));
     await new WorkspaceOutbox({ dataDir, dispatch }).poll();
-    const acks = (await readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).trim().split("\n");
-    expect(acks).toEqual(['{"id":"one","messageId":100}', '{"id":"two","messageId":200}']);
+    await vi.waitFor(async () => {
+      const recorded = await chatEvents(workspace);
+      recorded.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      expect(recorded).toMatchObject([
+        { type: "send", kind: "send_file", id: "one", messageId: 100, ok: true },
+        { type: "send", kind: "send_file", id: "two", messageId: 200, ok: true },
+      ]);
+    });
   });
 
-  it("skips delivery acks when the dispatcher reports no message id", async () => {
+  it("skips send events when the dispatcher reports no message id", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "one.json", valid());
     await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => undefined) }).poll();
-    await expect(readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["one.json"]);
   });
 
-  it("bounds the delivery ack file to the latest lines", async () => {
+  it("bounds the poll results file to the latest lines", async () => {
     const { dataDir, workspace } = await fixture();
-    const ackPath = path.join(workspace, ".tg-bot", "deliveries.jsonl");
-    const oldLines = Array.from({ length: 300 }, (_unused, index) => JSON.stringify({ id: `old-${index}`, messageId: index }));
-    await writeFile(ackPath, `${oldLines.join("\n")}\n`, "utf8");
-    await request(workspace, "one.json", valid());
-    await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => ({ messageId: 777 })) }).poll();
-    const lines = (await readFile(ackPath, "utf8")).trim().split("\n");
+    const resultsPath = path.join(workspace, ".tg-bot", "poll-results.jsonl");
+    const oldLines = Array.from({ length: 300 }, (_unused, index) => JSON.stringify({ id: `old-${index}`, result: index }));
+    await writeFile(resultsPath, `${oldLines.join("\n")}\n`, "utf8");
+    await request(workspace, "stop.json", { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
+    await new WorkspaceOutbox({ dataDir, dispatch: vi.fn(async () => ({ data: 777 })) }).poll();
+    const lines = (await readFile(resultsPath, "utf8")).trim().split("\n");
     expect(lines).toHaveLength(256);
-    expect(lines.at(-1)).toBe('{"id":"one","messageId":777}');
-    expect(lines.at(-2)).toBe('{"id":"old-299","messageId":299}');
+    expect(lines.at(-1)).toBe('{"id":"stop","result":777}');
+    expect(lines.at(-2)).toBe('{"id":"old-299","result":299}');
   });
 
   it("quarantines invalid send_message requests without delivery", async () => {
@@ -408,8 +419,14 @@ describe("WorkspaceOutbox", () => {
     expect(dispatch).toHaveBeenCalledWith(42, {
       version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍", "🔥"],
     });
-    const acks = (await readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).trim().split("\n");
-    expect(acks).toEqual(['{"id":"loc","messageId":301}', '{"id":"poll","messageId":302,"pollId":"poll-abc"}']);
+    await vi.waitFor(async () => {
+      const recorded = await chatEvents(workspace);
+      recorded.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      expect(recorded).toMatchObject([
+        { type: "send", kind: "send_location", id: "loc", messageId: 301, ok: true },
+        { type: "send", kind: "send_poll", id: "poll", messageId: 302, pollId: "poll-abc", ok: true },
+      ]);
+    });
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["loc.json", "poll.json", "react.json"]);
   });
 
@@ -423,7 +440,7 @@ describe("WorkspaceOutbox", () => {
     const results = (await readFile(path.join(workspace, ".tg-bot", "poll-results.jsonl"), "utf8")).trim();
     expect(JSON.parse(results)).toEqual({ id: "stop", result: poll });
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["stop.json"]);
-    await expect(readFile(path.join(workspace, ".tg-bot", "deliveries.jsonl"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
   });
 
   it("quarantines invalid location, poll, and reaction requests without delivery", async () => {
@@ -443,5 +460,37 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(outbox, "failed"))).toEqual([
       "bad-answer-index.json", "bad-emoji.json", "bad-kind.json", "bad-lat.json", "bad-stop.json", "bad-venue.json", "few-options.json", "quiz-no-answer.json",
     ]);
+  });
+
+  it("accepts a single-string reaction emoji and dispatches it as an array", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "react.json", { version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: "👍" });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "react", type: "send_reaction", message_id: 12, emoji: ["👍"] });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["react.json"]);
+  });
+
+  it("rejects reaction requests with too many entries or an empty string", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    await request(workspace, "too-many.json", { version: 1, id: "too-many", type: "send_reaction", message_id: 3, emoji: ["👍", "🔥", "😀", "😎"] });
+    await request(workspace, "empty-string.json", { version: 1, id: "empty-string", type: "send_reaction", message_id: 3, emoji: "" });
+    const dispatch = vi.fn(async () => undefined);
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(outbox, "failed"))).toEqual(["empty-string.json", "too-many.json"]);
+  });
+
+  it("records a failed send event when the dispatcher throws", async () => {
+    const { dataDir, workspace } = await fixture();
+    await request(workspace, "one.json", valid());
+    const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
+    await new WorkspaceOutbox({ dataDir, dispatch }).poll();
+    await vi.waitFor(async () => {
+      expect(await chatEvents(workspace)).toMatchObject([
+        { type: "send", kind: "send_file", id: "one", ok: false, error: "upload failed" },
+      ]);
+    });
   });
 });

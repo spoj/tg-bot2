@@ -8,6 +8,7 @@ import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
 import { SerialQueue } from "./queue.js";
+import { appendChatEvent } from "./events.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
@@ -1001,7 +1002,19 @@ export function createTelegramBot(
   };
 
   const ingress = new TelegramIngressBuffer(async (chatId, messages) => {
+    const workspace = chatPaths(config.dataDir, chatId).workspace;
+    for (const message of messages) {
+      appendChatEvent(workspace, {
+        type: "message",
+        messageId: message.messageId,
+        ...(message.text === undefined ? {} : { text: message.text }),
+        attachments: message.attachments,
+      });
+    }
     const response = await agents.prompt(chatId, formatBufferedPrompt(messages));
+    if (response !== undefined && response !== "") {
+      appendChatEvent(workspace, { type: "reply", text: response });
+    }
     return response;
   });
   ingressByBot.set(bot, ingress);

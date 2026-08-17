@@ -29,18 +29,19 @@ sends a location pin (venue {title,address} sends a named venue instead).
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
 normal message "[Poll answer: poll_id=..., options=[...]]"; the matching
-deliveries.jsonl line records pollId.
+send line in events.jsonl records pollId.
 {version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
 appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
 (latest 256 lines kept); poll_id matches the "[Poll answer: ...]" messages.
-{version:1,id,type:"send_reaction",message_id,emoji} reacts to a message you
-sent: emoji is 1-3 emoji strings, or [] to remove your reaction. Telegram
-rejects reactions it cannot apply.
+{version:1,id,type:"send_reaction",message_id,emoji} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): emoji is a single emoji string or an array of 1-3 emoji strings; [] removes your reaction. message_id is the numeric id from the incoming "Telegram message N:" line.
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
-After every message send the host appends {id,messageId[,pollId]} to
-/workspace/.tg-bot/deliveries.jsonl (only the latest 256 lines are kept), so
-sent message ids are recoverable for later replies and edits. When the user
+Every inbound Telegram message is logged to /workspace/.tg-bot/events.jsonl
+(one JSON object per line, newest last: {t,type:'message',messageId,text,attachments}).
+After every message send the host appends a send line
+{t,type:'send',kind,id,messageId?,pollId?,ok,error?} there, and your chat replies are
+logged as {t,type:'reply',text}. Grep this file whenever you need recent chat
+history or sent message ids. When the user
 presses one of your inline keyboard buttons, the press arrives as a normal
 Telegram message of the form "[Telegram button press: data=...]".
 Schedules are stored in /workspace/.tg-bot/schedules.json. Its root object is

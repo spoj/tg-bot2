@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, link, mkdir, open, opendir, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
+import { appendChatEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
 
 export type WorkspaceOutboxFileKind = "auto" | "photo" | "audio" | "video" | "voice" | "document";
@@ -104,7 +105,6 @@ const MAX_REQUEST_TEXT_LENGTH = 4_096;
 const MAX_REQUEST_REPLY_MARKUP_BYTES = 8_192;
 const MAX_JSONL_LINES = 256;
 const MAX_JSONL_BYTES = 64 * 1024;
-const DELIVERY_ACK_NAME = "deliveries.jsonl";
 const POLL_RESULTS_NAME = "poll-results.jsonl";
 const MAX_POLL_QUESTION_LENGTH = 300;
 const MAX_POLL_OPTION_LENGTH = 100;
@@ -159,6 +159,16 @@ function isMissing(error: unknown): boolean {
 
 function isExisting(error: unknown): boolean {
   return errorCode(error) === "EEXIST";
+}
+
+function errorMessage(error: unknown): string {
+  let detail: string;
+  try {
+    detail = error instanceof Error ? error.message : String(error);
+  } catch {
+    detail = "unknown error";
+  }
+  return detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
 }
 
 function isNotLinkable(error: unknown): boolean {
@@ -368,15 +378,23 @@ function validateStopPollRequest(id: string, request: Record<string, unknown>): 
 }
 
 function validateSendReactionRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendReactionRequest {
-  if (!Array.isArray(request.emoji) || request.emoji.length > MAX_REACTIONS) {
-    throw new Error(`Outbox request emoji must be an array of at most ${MAX_REACTIONS} emoji (empty removes the reaction)`);
+  const raw = request.emoji;
+  const invalid = `Outbox request emoji must be a non-empty string of at most ${MAX_REACTION_EMOJI_LENGTH} characters, or an array of at most ${MAX_REACTIONS} such strings`;
+  let emoji: string[];
+  if (typeof raw === "string") {
+    if (raw.length === 0 || raw.length > MAX_REACTION_EMOJI_LENGTH) throw new Error(invalid);
+    emoji = [raw];
+  } else if (Array.isArray(raw)) {
+    if (raw.length > MAX_REACTIONS) throw new Error(invalid);
+    emoji = raw.map((entry, index) => {
+      if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_REACTION_EMOJI_LENGTH) {
+        throw new Error(`Outbox request emoji entry ${index} must be a string of at most ${MAX_REACTION_EMOJI_LENGTH} characters`);
+      }
+      return entry;
+    });
+  } else {
+    throw new Error(invalid);
   }
-  const emoji = request.emoji.map((entry, index) => {
-    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_REACTION_EMOJI_LENGTH) {
-      throw new Error(`Outbox request emoji entry ${index} must be a string of at most ${MAX_REACTION_EMOJI_LENGTH} characters`);
-    }
-    return entry;
-  });
   return { version: 1, id, type: "send_reaction", message_id: validateMessageId(request, "message_id"), emoji };
 }
 
@@ -630,20 +648,23 @@ export class WorkspaceOutbox {
         if (!claim) continue;
         const archiveName = claim.originalName ?? entry.name;
         let lease: ClaimLease | undefined;
+        let request: WorkspaceOutboxRequest | undefined;
         try {
           lease = this.startClaimLease(claim, chatId);
-          const request = await readRequest(claim.path);
+          request = await readRequest(claim.path);
           if (request.type === "send_file") validateWorkspacePath(workspace, request.path);
           const result = await this.dispatch(chatId, request);
           if (result !== undefined) {
             try {
               if (result.messageId !== undefined) {
-                const ack = {
+                appendChatEvent(workspace, {
+                  type: "send",
+                  kind: request.type,
                   id: request.id,
                   messageId: result.messageId,
                   ...(result.pollId === undefined ? {} : { pollId: result.pollId }),
-                };
-                await this.appendBoundedJsonl(metadata.path, DELIVERY_ACK_NAME, JSON.stringify(ack));
+                  ok: true,
+                });
               }
               if (result.data !== undefined) {
                 await this.appendBoundedJsonl(metadata.path, POLL_RESULTS_NAME, JSON.stringify({ id: request.id, result: result.data }));
@@ -662,6 +683,15 @@ export class WorkspaceOutbox {
             await this.archiveClaimed(claim.path, failed, archiveName);
           } catch (moveError) {
             this.report(moveError);
+          }
+          if (request !== undefined) {
+            appendChatEvent(workspace, {
+              type: "send",
+              kind: request.type,
+              id: request.id,
+              ok: false,
+              error: errorMessage(error),
+            });
           }
           this.reportRequestError(chatId, archiveName, error);
           continue;
@@ -926,14 +956,7 @@ export class WorkspaceOutbox {
 
 
   private reportRequestError(chatId: number, name: string, error: unknown): void {
-    let detail: string;
-    try {
-      detail = error instanceof Error ? error.message : String(error);
-    } catch {
-      detail = "unknown error";
-    }
-    const bounded = detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
-    this.report(new Error(`Outbox request ${chatId}/${name} failed: ${bounded}`));
+    this.report(new Error(`Outbox request ${chatId}/${name} failed: ${errorMessage(error)}`));
   }
 
   private report(error: unknown): void {

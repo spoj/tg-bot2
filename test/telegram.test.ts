@@ -1128,6 +1128,77 @@ describe("Telegram callback queries", () => {
   });
 });
 
+describe("Telegram chat events", () => {
+  async function withDataDir(run: (dataDir: string) => Promise<void>): Promise<void> {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-events-"));
+    try {
+      await run(dataDir);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  function textUpdate(text: string): Record<string, unknown> {
+    return {
+      update_id: 1,
+      message: {
+        message_id: 7,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Test" },
+        text,
+      },
+    };
+  }
+
+  async function readEvents(dataDir: string): Promise<Record<string, unknown>[]> {
+    const content = await readFile(path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
+    return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  async function waitForEvents(dataDir: string, predicate: (events: Record<string, unknown>[]) => boolean): Promise<Record<string, unknown>[]> {
+    let events: Record<string, unknown>[] = [];
+    await vi.waitFor(async () => {
+      events = await readEvents(dataDir);
+      if (!predicate(events)) throw new Error("chat events not yet flushed");
+    });
+    return events;
+  }
+
+  it("logs a flushed text message", async () => {
+    await withDataDir(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate(textUpdate("hello") as never);
+      await flushTelegramIngress(bot);
+      const events = await waitForEvents(dataDir, (events) => events.some((event) => event.type === "message"));
+      expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", messageId: 7, text: "hello" });
+    });
+  });
+
+  it("logs a reply line when the agent responds", async () => {
+    await withDataDir(async (dataDir) => {
+      const prompt = vi.fn(async () => "hello back");
+      const bot = await makeTestBot(dataDir, { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate(textUpdate("hello") as never);
+      await flushTelegramIngress(bot);
+      const events = await waitForEvents(dataDir, (events) => events.some((event) => event.type === "reply"));
+      expect(events.find((event) => event.type === "reply")).toMatchObject({ type: "reply", text: "hello back" });
+    });
+  });
+
+  it("writes no reply line when the agent stays silent", async () => {
+    await withDataDir(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate(textUpdate("hello") as never);
+      await flushTelegramIngress(bot);
+      const events = await waitForEvents(dataDir, (events) => events.some((event) => event.type === "message"));
+      expect(events.some((event) => event.type === "reply")).toBe(false);
+    });
+  });
+});
+
 
 
 

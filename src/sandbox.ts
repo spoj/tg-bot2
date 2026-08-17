@@ -64,7 +64,7 @@ async function runtimeLibraryPaths(): Promise<string[]> {
 export async function buildBwrapArgs(
   paths: SandboxPaths,
   request: SandboxRequest,
-): Promise<{ args: string[]; resolved: SandboxPaths }> {
+): Promise<{ args: string[] }> {
   const sessionsStat = await lstat(paths.sessions);
   if (!sessionsStat.isDirectory() || sessionsStat.isSymbolicLink()) {
     throw new Error("Sandbox sessions must be a real directory");
@@ -128,7 +128,7 @@ export async function buildBwrapArgs(
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
     "--chdir", "/workspace", "--", request.executable, ...request.args,
   );
-  return { args, resolved: { workspace, sessions } };
+  return { args };
 }
 
 export type PiWorkerSandboxPaths = {
@@ -137,7 +137,7 @@ export type PiWorkerSandboxPaths = {
   cliPath?: string;
   appendSystemPrompt?: string;
 };
-export type PiWorkerBwrapResult = { args: string[]; resolved: { workspace: string; appRoot: string; cliPath: string } };
+export type PiWorkerBwrapResult = { args: string[] };
 
 function relativeMountPath(root: string, candidate: string, mountPoint: string, label: string): string {
   const relative = path.relative(root, candidate);
@@ -216,7 +216,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
   );
-  return { args, resolved: { workspace, appRoot, cliPath } };
+  return { args };
 }
 
 function outputCapture(limit: number): {

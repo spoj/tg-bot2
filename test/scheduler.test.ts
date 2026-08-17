@@ -210,29 +210,21 @@ describe("WorkspaceScheduler discovery and validation", () => {
     expect((await readSchedules(path.join(metadata, "schedules.json"))).schedules.find((item) => item.id === "later")).toMatchObject({ enabled: false });
   }));
 
-  it("releases per-chat directory handles before processing due work", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 20, [record({ id: "due" })]);
-    await writeSchedules(dataDir, 21, [record({ id: "future", dueAt: new Date(NOW + 60_000).toISOString() })]);
-    const closedDirectories: string[] = [];
-    let closedAtRun: string[] = [];
+  it("runs due work from one chat while leaving a later chat's future record untouched", async () => withDirectory(async (dataDir) => {
+    await writeSchedules(dataDir, 20, [record({ id: "due", prompt: "due now" })]);
+    await writeSchedules(dataDir, 21, [record({ id: "future", prompt: "future later", dueAt: new Date(NOW + 60_000).toISOString() })]);
+    const runs: [number, string][] = [];
     const scheduler = new WorkspaceScheduler({
       dataDir,
-      onDirectoryHandleClosed: (realPath) => { closedDirectories.push(realPath); },
-      run: async () => {
-        closedAtRun = [...closedDirectories];
-        return "";
-      },
+      run: async (chatId, prompt) => { runs.push([chatId, prompt]); return ""; },
       send: async () => {},
     });
 
     await scheduler.poll(NOW);
 
-    const perChatDirectories = ["20", "21"].flatMap((chatId) => {
-      const chatDirectory = path.join(dataDir, "chats", chatId);
-      const workspaceDirectory = path.join(chatDirectory, "workspace");
-      return [chatDirectory, workspaceDirectory, path.join(workspaceDirectory, ".tg-bot")];
-    });
-    expect(closedAtRun).toEqual(expect.arrayContaining(perChatDirectories));
+    expect(runs).toEqual([[20, "due now"]]);
+    const futurePath = path.join(dataDir, "chats", "21", "workspace", ".tg-bot", "schedules.json");
+    expect((await readSchedules(futurePath)).schedules[0]).toMatchObject({ id: "future", enabled: true, runCount: 0 });
   }));
 
 });

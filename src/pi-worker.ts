@@ -106,7 +106,7 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function assistantText(event: JsonRecord): string | undefined {
+export function assistantText(event: JsonRecord): string | undefined {
   if (event.type !== "message_end") return undefined;
   const message = asRecord(event.message);
   if (!message || message.role !== "assistant") return undefined;
@@ -653,10 +653,6 @@ export class PiRpcWorker {
       if (this.process !== child) return;
       this.handleExit(code, signal);
     });
-    child.once("close", (code, signal) => {
-      if (this.process !== child) return;
-      this.handleExit(code, signal);
-    });
     stdin.once("error", (error) => {
       if (this.process !== child) return;
       this.failProcess(new Error(`Pi worker stdin error: ${error.message}. Stderr: ${this.stderr}`));
@@ -824,18 +820,12 @@ export class PiRpcWorker {
     const epoch = ++this.workEpoch;
     this.unsettledWork.add(epoch);
     try {
-      await this.request(command, epoch, this.workTimeout(command.type));
+      await this.request(command, epoch, command.type === "prompt" ? this.promptTimeoutMs : this.rpcTimeoutMs);
       if (command.type === "prompt") this.schedulePromptSettlementProbe(epoch);
     } catch (error) {
       this.settleWork(epoch);
       throw error;
     }
-  }
-
-  private workTimeout(commandType: unknown): number {
-    return commandType === "prompt"
-      ? this.promptTimeoutMs
-      : this.rpcTimeoutMs;
   }
 
   private request(command: JsonRecord, workEpoch?: number, timeoutMs?: number): Promise<unknown> {

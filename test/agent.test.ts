@@ -4,7 +4,6 @@ import path from "node:path";
 import { expect, it, vi } from "vitest";
 import {
   AgentManager,
-  extractFinalAssistantText,
   loadUserSettings,
   SYSTEM_PROMPT,
   WORKER_IDLE_STOP_MS,
@@ -13,22 +12,7 @@ import {
   type AgentWorker,
 } from "../src/agent.js";
 import type { Config } from "../src/config.js";
-
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-};
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
+import { deferred } from "./helpers.js";
 
 type FakeWorker = AgentWorker & {
   emit(event: AgentEvent): void;
@@ -107,24 +91,6 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("recurrence must be hourly, daily, weekly, or null");
   expect(SYSTEM_PROMPT).toContain("UTC timestamp ending\nin Z");
   expect(SYSTEM_PROMPT).toContain("runCount must be a nonnegative integer");
-});
-
-it("extracts only final assistant text and ignores thinking and tool calls", () => {
-  expect(extractFinalAssistantText([
-    { role: "assistant", content: "old" },
-    { role: "toolResult", content: [{ type: "text", text: "tool" }] },
-    {
-      role: "assistant",
-      content: [
-        { type: "thinking", thinking: "private" },
-        { type: "text", text: "hello " },
-        { type: "toolCall", name: "bash" },
-        { type: "text", text: "world" },
-      ],
-    },
-  ])).toBe("hello world");
-  expect(extractFinalAssistantText([{ role: "assistant", content: " answer " }])).toBe("answer");
-  expect(extractFinalAssistantText([{ role: "assistant", content: [{ type: "thinking", thinking: "x" }] }])).toBeUndefined();
 });
 
 it("creates one worker lazily per numeric chat and returns its final text", async () => {
@@ -436,7 +402,7 @@ it("aborts active work and drains queued disposal work without replacement", asy
   const queued = manager.prompt(8, "queued", "follow-up");
   const queuedResult = expect(queued).rejects.toThrow("shutting down");
 
-  await manager.disposeAll(true);
+  await manager.disposeAll();
   await expect(active).resolves.toBe("done");
   await queuedResult;
   expect(worker.prompt).toHaveBeenCalledOnce();
@@ -460,7 +426,7 @@ it("aborts, drains, stops all workers, and clears manager state", async () => {
   const active = manager.prompt(7, "active");
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
 
-  await manager.disposeAll(true);
+  await manager.disposeAll();
   await expect(active).resolves.toBe("done");
   expect(worker.abort).toHaveBeenCalledOnce();
   expect(worker.stop).toHaveBeenCalledOnce();
@@ -495,7 +461,7 @@ it("gates new work and aborts each known worker only once", async () => {
   await expect(manager.prompt(9, "replacement", "follow-up")).rejects.toThrow("shutting down");
   expect(factory).toHaveBeenCalledOnce();
 
-  await manager.disposeAll(true);
+  await manager.disposeAll();
   expect(worker.stop).toHaveBeenCalledOnce();
 });
 it("disposes an idle worker normally and clears its state", async () => {
@@ -551,7 +517,7 @@ it("bounds abort disposal and rejects active and queued work", async () => {
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
   const queued = manager.newSession(11);
   await Promise.resolve();
-  const disposal = manager.disposeAll(true);
+  const disposal = manager.disposeAll();
 
   await expect(disposal).resolves.toBeUndefined();
   await expect(active).rejects.toThrow("timed out");
@@ -559,7 +525,7 @@ it("bounds abort disposal and rejects active and queued work", async () => {
   expect(worker.stop).toHaveBeenCalledOnce();
   activeDone.resolve();
   abortDone.resolve();
-  await manager.disposeAll(true);
+  await manager.disposeAll();
   expect(worker.stop).toHaveBeenCalledOnce();
 });
 
@@ -573,7 +539,7 @@ it("cleans up a worker that appears after an aborted hanging startup", async () 
 
   const pendingPrompt = manager.prompt(12, "during startup");
   await Promise.resolve();
-  await expect(manager.disposeAll(true)).resolves.toBeUndefined();
+  await expect(manager.disposeAll()).resolves.toBeUndefined();
   await expect(pendingPrompt).rejects.toThrow();
   const lateWorker = fakeWorker();
   startup.resolve(lateWorker);

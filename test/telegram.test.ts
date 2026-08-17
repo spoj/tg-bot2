@@ -26,7 +26,6 @@ import {
   splitTelegramText,
   TelegramDeliveryQueue,
   TelegramIngressBuffer,
-  type TelegramBatchResult,
   type BufferedTelegramMessage,
 } from "../src/telegram.js";
 
@@ -56,6 +55,35 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+}
+
+let sentRequests: Array<{ url: string; body: string }> = [];
+
+async function makeTestBot(
+  dataDir: string,
+  agents: { prompt: ReturnType<typeof vi.fn>; setAssistantProgress: ReturnType<typeof vi.fn> },
+  { fetchResult, recordRequests = false }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean } = {},
+): Promise<Bot> {
+  if (recordRequests) sentRequests = [];
+  const bot = createTelegramBot(
+    { token: "test-token", allowedUserIds: new Set([42]), dataDir },
+    agents as never,
+  );
+  Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
+  const fakeFetch: typeof fetch = async (input, init) => {
+    if (recordRequests) {
+      sentRequests.push({
+        url: String(input),
+        body: typeof init?.body === "string" ? init.body : "",
+      });
+    }
+    return new Response(JSON.stringify({ ok: true, result: fetchResult ?? {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  Object.assign(bot, { clientConfig: { fetch: fakeFetch } });
+  return bot;
 }
 
 async function runAttachmentFixture(
@@ -170,7 +198,6 @@ describe("TelegramIngressBuffer", () => {
   const entry = (messageId: number, respond: (text: string) => void | Promise<void> = async () => {}) => ({
     value: Promise.resolve(message(messageId)),
     respond,
-    typing: async () => {},
   });
 
   it("batches a quiet window and gives the latest entry ownership", async () => {
@@ -180,12 +207,12 @@ describe("TelegramIngressBuffer", () => {
       const replies: string[] = [];
       const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
         batches.push(messages);
-        return { kind: "reply", text: "combined response" };
+        return "combined response";
       }, 2_000);
 
-      expect(buffer.add(7, entry(1, (text) => { replies.push(`one:${text}`); })).kind).toBe("accepted");
+      expect(buffer.add(7, entry(1, (text) => { replies.push(`one:${text}`); }))).toBe(true);
       await vi.advanceTimersByTimeAsync(1_500);
-      expect(buffer.add(7, entry(2, (text) => { replies.push(`two:${text}`); })).kind).toBe("accepted");
+      expect(buffer.add(7, entry(2, (text) => { replies.push(`two:${text}`); }))).toBe(true);
       await vi.advanceTimersByTimeAsync(2_000);
 
       expect(batches).toEqual([[message(1), message(2)]]);
@@ -199,7 +226,7 @@ describe("TelegramIngressBuffer", () => {
     const batches: number[][] = [];
     const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
       batches.push(messages.map(({ messageId }) => messageId));
-      return { kind: "no-reply", reason: "steered" };
+      return undefined;
     }, 60_000);
 
     buffer.add(7, entry(1));
@@ -225,7 +252,7 @@ describe("TelegramIngressBuffer", () => {
         resolveFirstStarted();
         await firstFinished;
       }
-      return { kind: "no-reply", reason: "steered" };
+      return undefined;
     }, 60_000);
 
     buffer.add(7, entry(1));
@@ -248,7 +275,7 @@ describe("TelegramIngressBuffer", () => {
     const batches: number[][] = [];
     const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
       batches.push(messages.map(({ messageId }) => messageId));
-      return { kind: "no-reply", reason: "steered" };
+      return undefined;
     }, 60_000);
     const newSession = vi.fn(async () => {
       throw new Error("session failed");
@@ -275,7 +302,7 @@ describe("TelegramIngressBuffer", () => {
     const batches: number[][] = [];
     const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
       batches.push(messages.map(({ messageId }) => messageId));
-      return { kind: "no-reply", reason: "steered" };
+      return undefined;
     }, 60_000);
     const barrier = buffer.acquireBarrier(7);
     buffer.add(7, entry(1));
@@ -293,12 +320,12 @@ describe("TelegramIngressBuffer", () => {
     let resolveSecondStarted!: () => void;
     const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
     const secondStarted = new Promise<void>((resolve) => { resolveSecondStarted = resolve; });
-    const buffer = new TelegramIngressBuffer((_chatId, messages) => new Promise<TelegramBatchResult>((resolve) => {
+    const buffer = new TelegramIngressBuffer((_chatId, messages) => new Promise<string>((resolve) => {
       const messageId = messages[0]!.messageId;
       callbacks.push(messageId);
       if (messageId === 1) resolveFirstStarted();
       else resolveSecondStarted();
-      completions.push(() => resolve({ kind: "reply", text: `reply-${messageId}` }));
+      completions.push(() => resolve(`reply-${messageId}`));
     }), 60_000);
 
     buffer.add(7, entry(1, (text) => { replies.push(text); }));
@@ -318,7 +345,7 @@ describe("TelegramIngressBuffer", () => {
 
   it("keeps accepted pending work deliverable after close", async () => {
     const replies: string[] = [];
-    const buffer = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "pending" }), 60_000);
+    const buffer = new TelegramIngressBuffer(async () => "pending", 60_000);
     buffer.add(7, entry(1, (text) => { replies.push(text); }));
     buffer.close();
     await buffer.flushAll();
@@ -331,7 +358,7 @@ describe("TelegramIngressBuffer", () => {
     let releaseResponse!: () => void;
     const responseFinished = new Promise<void>((resolve) => { releaseResponse = resolve; });
     let attempts = 0;
-    const buffer = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "in flight" }), 60_000);
+    const buffer = new TelegramIngressBuffer(async () => "in flight", 60_000);
     buffer.add(7, entry(1, () => {
       attempts += 1;
       responseStarted();
@@ -348,16 +375,16 @@ describe("TelegramIngressBuffer", () => {
   });
 
   it("reports quiesced admission after close", () => {
-    const buffer = new TelegramIngressBuffer(async () => ({ kind: "no-reply", reason: "steered" }));
+    const buffer = new TelegramIngressBuffer(async () => undefined);
     buffer.close();
-    expect(buffer.add(7, entry(1))).toEqual({ kind: "quiesced", reason: "closed" });
+    expect(buffer.add(7, entry(1))).toBe(false);
   });
   it("does not block batch processing on deferred initial typing", async () => {
     let releaseTyping!: () => void;
     const deferredTyping = new Promise<void>((resolve) => { releaseTyping = resolve; });
     let typingStarted = false;
     const replies: string[] = [];
-    const buffer = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "reply" }), 60_000);
+    const buffer = new TelegramIngressBuffer(async () => "reply", 60_000);
     buffer.add(7, {
       value: Promise.resolve(message(1)),
       respond: (text) => { replies.push(text); },
@@ -375,7 +402,7 @@ describe("TelegramIngressBuffer", () => {
 
   it("does not deliver a reply for a steered batch", async () => {
     let attempts = 0;
-    const buffer = new TelegramIngressBuffer(async () => ({ kind: "no-reply", reason: "steered" }));
+    const buffer = new TelegramIngressBuffer(async () => undefined);
     buffer.add(7, entry(1, () => { attempts += 1; }));
     await buffer.flushAll();
     expect(attempts).toBe(0);
@@ -388,9 +415,9 @@ describe("TelegramIngressBuffer", () => {
       calls += 1;
       if (calls === 1) {
         buffer.add(7, entry(2, (text) => { replies.push(text); }));
-        return { kind: "reply", text: "first" };
+        return "first";
       }
-      return { kind: "reply", text: "second" };
+      return "second";
     }, 60_000);
     buffer.add(7, entry(1, (text) => { replies.push(text); }));
     await buffer.flushAll();
@@ -407,7 +434,7 @@ describe("TelegramIngressBuffer", () => {
     expect(fallbackReplies).toEqual(["I could not complete that request. Please try again."]);
 
     const sendAttempts: string[] = [];
-    const failingSend = new TelegramIngressBuffer(async () => ({ kind: "reply", text: "reply" }));
+    const failingSend = new TelegramIngressBuffer(async () => "reply");
     failingSend.add(7, entry(1, () => {
       sendAttempts.push("attempt");
       throw new Error("send failed");
@@ -1028,31 +1055,6 @@ describe("Telegram rich messages", () => {
 });
 
 describe("Telegram callback queries", () => {
-  let sentRequests: Array<{ url: string; body: string }> = [];
-
-  async function makeCallbackBot(agents: {
-    prompt: ReturnType<typeof vi.fn>;
-    setAssistantProgress: ReturnType<typeof vi.fn>;
-  }): Promise<Bot> {
-    sentRequests = [];
-    const bot = createTelegramBot(
-      { token: "test-token", allowedUserIds: new Set([42]), dataDir: "/tmp/ignored" },
-      agents as never,
-    );
-    Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
-    const fakeFetch: typeof fetch = async (input, init) => {
-      sentRequests.push({
-        url: String(input),
-        body: typeof init?.body === "string" ? init.body : "",
-      });
-      return new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    };
-    Object.assign(bot, { clientConfig: { fetch: fakeFetch } });
-    return bot;
-  }
 
   function callbackUpdate(fromId: number, data: string) {
     return {
@@ -1074,7 +1076,7 @@ describe("Telegram callback queries", () => {
 
   it("routes authorized button presses into the ingress buffer", async () => {
     const prompt = vi.fn(async () => "acknowledged");
-    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
+    const bot = await makeTestBot("/tmp/ignored", { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 }, recordRequests: true });
     await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
     await flushTelegramIngress(bot);
     expect(prompt).toHaveBeenCalledWith(42, 'Telegram message 7:\n[Telegram button press: data="do_thing"]');
@@ -1084,7 +1086,7 @@ describe("Telegram callback queries", () => {
 
   it("rejects unauthorized button presses", async () => {
     const prompt = vi.fn(async () => undefined);
-    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
+    const bot = await makeTestBot("/tmp/ignored", { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 }, recordRequests: true });
     await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
     await flushTelegramIngress(bot);
     expect(prompt).not.toHaveBeenCalled();
@@ -1092,7 +1094,7 @@ describe("Telegram callback queries", () => {
 
   it("bounds the button data forwarded to the agent", async () => {
     const prompt = vi.fn(async () => undefined);
-    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
+    const bot = await makeTestBot("/tmp/ignored", { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 }, recordRequests: true });
     await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
     await flushTelegramIngress(bot);
     expect(prompt).toHaveBeenCalledWith(42, `Telegram message 7:\n[Telegram button press: data="${"x".repeat(64)}"]`);
@@ -1161,26 +1163,12 @@ describe("Telegram locations, polls, and reactions", () => {
 });
 
 describe("Telegram poll answers", () => {
-  async function makePollBot(dataDir: string, prompt: ReturnType<typeof vi.fn>): Promise<Bot> {
-    const bot = createTelegramBot(
-      { token: "test-token", allowedUserIds: new Set([42]), dataDir },
-      { prompt, setAssistantProgress: vi.fn() } as never,
-    );
-    Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
-    const fakeFetch: typeof fetch = async () =>
-      new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    Object.assign(bot, { clientConfig: { fetch: fakeFetch } });
-    return bot;
-  }
 
   it("routes poll answers to the owning chat via the recorded poll id", async () => {
     await withWorkspace(async (dataDir) => {
       await recordPollOwner(dataDir, 42, "poll-9", 77);
       const prompt = vi.fn(async () => undefined);
-      const bot = await makePollBot(dataDir, prompt);
+      const bot = await makeTestBot(dataDir, { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1200,7 +1188,7 @@ describe("Telegram poll answers", () => {
       await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
       await recordPollOwner(dataDir, 42, "poll-9", 77);
       const prompt = vi.fn(async () => undefined);
-      const bot = await makePollBot(dataDir, prompt);
+      const bot = await makeTestBot(dataDir, { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1217,7 +1205,7 @@ describe("Telegram poll answers", () => {
   it("drops poll answers from unknown polls", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
-      const bot = await makePollBot(dataDir, prompt);
+      const bot = await makeTestBot(dataDir, { prompt, setAssistantProgress: vi.fn() }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1305,31 +1293,6 @@ describe("Telegram commands", () => {
     };
   }
 
-  let sentRequests: Array<{ url: string; body: string }> = [];
-
-  async function makeBot(agents: FakeAgents): Promise<Bot> {
-    sentRequests = [];
-    const bot = createTelegramBot(
-      { token: "test-token", allowedUserIds: new Set([42]), dataDir: "/tmp/ignored" },
-      agents as never,
-    );
-    (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = {
-      id: 999, is_bot: true, first_name: "Test", username: "test_bot",
-    };
-    const fakeFetch: typeof fetch = async (input, init) => {
-      sentRequests.push({
-        url: String(input),
-        body: typeof init?.body === "string" ? init.body : "",
-      });
-      return new Response(JSON.stringify({ ok: true, result: {} }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    };
-    (bot as unknown as { clientConfig: { fetch: typeof fetch } }).clientConfig = { fetch: fakeFetch };
-    return bot;
-  }
-
   function commandLength(text: string): number {
     const end = text.search(/[\s@]/);
     return end === -1 ? text.length : end;
@@ -1357,7 +1320,7 @@ describe("Telegram commands", () => {
 
   it("rejects unauthorized users before running command handlers", async () => {
     const agents = makeAgents();
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/status", 999);
     expect(replies(bot)).toEqual(["Unauthorized."]);
     expect(agents.status).not.toHaveBeenCalled();
@@ -1365,7 +1328,7 @@ describe("Telegram commands", () => {
 
   it("/start sends the personal-agent help text", async () => {
     const agents = makeAgents();
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/start");
     expect(replies(bot)).toEqual([
       "Personal agent. Send text, attachments, or a location pin to continue your persistent session, or /new to start a fresh one.",
@@ -1374,7 +1337,7 @@ describe("Telegram commands", () => {
 
   it("rejects unauthorized /start and /new before running handlers", async () => {
     const agents = makeAgents();
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/start", 999);
     await sendCommand(bot, "/new", 999);
     expect(replies(bot)).toEqual(["Unauthorized.", "Unauthorized."]);
@@ -1384,7 +1347,7 @@ describe("Telegram commands", () => {
   it("/new starts a new session and confirms", async () => {
     const newSession = vi.fn(async () => {});
     const agents = makeAgents({ newSession });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/new");
     expect(newSession).toHaveBeenCalledWith(42);
     expect(replies(bot)).toEqual([
@@ -1395,7 +1358,7 @@ describe("Telegram commands", () => {
   it("/new reports a friendly failure when newSession rejects", async () => {
     const newSession = vi.fn(async () => { throw new Error("boom"); });
     const agents = makeAgents({ newSession });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/new");
     expect(replies(bot)).toEqual([
       "I could not start a new session. Please try again.",
@@ -1406,7 +1369,7 @@ describe("Telegram commands", () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const agents = makeAgents({ newSession: vi.fn(() => gate) });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
 
     const newDone = sendCommand(bot, "/new");
     const statusDone = sendCommand(bot, "/status");
@@ -1427,7 +1390,7 @@ describe("Telegram commands", () => {
       ]),
       status: vi.fn(async () => ({ ...defaultStatus, model: { provider: "anthropic", id: "claude-3-5-sonnet" } })),
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/model");
     expect(replies(bot)).toEqual([
       "1. openrouter/deepseek/deepseek-chat — DeepSeek Chat\n2. anthropic/claude-3-5-sonnet (current)",
@@ -1443,7 +1406,7 @@ describe("Telegram commands", () => {
       ]),
       setModel,
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/model claude");
     expect(setModel).toHaveBeenCalledWith(42, "anthropic", "claude-3-5-sonnet");
     expect(replies(bot)).toEqual(["Model set to anthropic/claude-3-5-sonnet."]);
@@ -1456,7 +1419,7 @@ describe("Telegram commands", () => {
         { provider: "openrouter", id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner" },
       ]),
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/model deepseek");
     expect(agents.setModel).not.toHaveBeenCalled();
     expect(replies(bot)[0]).toContain('Multiple models match "deepseek":');
@@ -1468,7 +1431,7 @@ describe("Telegram commands", () => {
         { provider: "openrouter", id: "deepseek/deepseek-chat" },
       ]),
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/model nonexistent");
     expect(replies(bot)).toEqual(['No model matches "nonexistent".']);
   });
@@ -1478,7 +1441,7 @@ describe("Telegram commands", () => {
       getAvailableThinkingLevels: vi.fn(async () => ["low", "medium", "high"]),
       status: vi.fn(async () => ({ ...defaultStatus, thinkingLevel: "medium" })),
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/thinking");
     expect(replies(bot)).toEqual(["1. low\n2. medium (current)\n3. high"]);
   });
@@ -1489,7 +1452,7 @@ describe("Telegram commands", () => {
       getAvailableThinkingLevels: vi.fn(async () => ["low", "high"]),
       setThinkingLevel,
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/thinking high");
     expect(setThinkingLevel).toHaveBeenCalledWith(42, "high");
     expect(replies(bot)).toEqual(["Thinking level set to high."]);
@@ -1499,7 +1462,7 @@ describe("Telegram commands", () => {
     const agents = makeAgents({
       getAvailableThinkingLevels: vi.fn(async () => ["low", "high"]),
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/thinking extreme");
     expect(agents.setThinkingLevel).not.toHaveBeenCalled();
     expect(replies(bot)).toEqual(['Unknown thinking level "extreme". Valid levels: low, high.']);
@@ -1516,7 +1479,7 @@ describe("Telegram commands", () => {
         autoCompactionEnabled: true,
       })),
     });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/status");
     expect(replies(bot)).toEqual([
       "Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7",
@@ -1526,7 +1489,7 @@ describe("Telegram commands", () => {
   it("/restart restarts the agent and confirms", async () => {
     const restart = vi.fn(async () => {});
     const agents = makeAgents({ restart });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/restart");
     expect(restart).toHaveBeenCalledWith(42);
     expect(replies(bot)).toEqual(["Restarting agent…", "Agent restarted."]);
@@ -1535,7 +1498,7 @@ describe("Telegram commands", () => {
   it("/restart reports a friendly failure", async () => {
     const restart = vi.fn(async () => { throw new Error("Pi worker is busy"); });
     const agents = makeAgents({ restart });
-    const bot = await makeBot(agents);
+    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/restart");
     expect(replies(bot)).toEqual(["Restarting agent…", "I could not restart the agent. Please try again."]);
   });

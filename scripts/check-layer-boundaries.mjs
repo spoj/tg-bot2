@@ -311,7 +311,6 @@ for (const file of sourceFiles) {
     const agent = isLocalModule(specifier, "agent");
     const scheduler = isLocalModule(specifier, "scheduler");
     const sandbox = isLocalModule(specifier, "sandbox");
-    const tools = isLocalModule(specifier, "tools");
     const childProcess = specifier === "child_process" || specifier === "node:child_process" || specifier.endsWith("/child_process");
     const importedSpawn = /\bspawn\b/.test(clause);
     const importedAgentSession = /\bAgentSession\b/.test(clause);
@@ -319,19 +318,13 @@ for (const file of sourceFiles) {
     if (layer === "sandbox" && (telegram || agent || scheduler || isModelSpecifier(specifier) || isPackage(specifier, "@earendil-works/pi-coding-agent"))) {
       addViolation(violations, file, specifier, "sandbox may not import Telegram, agent, scheduler, or model modules");
     }
-    if (layer === "tools" && (telegram || agent || scheduler)) {
-      addViolation(violations, file, specifier, "tools may not import Telegram, agent, or scheduler modules");
-    }
-    if (layer === "tools" && childProcess) {
-      addViolation(violations, file, specifier, "tools may not import child_process");
-    }
     if (layer === "agent" && (telegram || scheduler)) {
       addViolation(violations, file, specifier, "agent may not import grammY, Telegram, or scheduler modules");
     }
-    if (layer === "config" && (isLocalModule(specifier, "agent") || isLocalModule(specifier, "telegram") || isLocalModule(specifier, "sandbox") || isLocalModule(specifier, "tools") || isLocalModule(specifier, "scheduler") || isLocalModule(specifier, "queue") || isLocalModule(specifier, "index") || isPackage(specifier, "grammy") || isPackage(specifier, "@earendil-works/pi-coding-agent"))) {
+    if (layer === "config" && (isLocalModule(specifier, "agent") || isLocalModule(specifier, "telegram") || isLocalModule(specifier, "sandbox") || isLocalModule(specifier, "scheduler") || isLocalModule(specifier, "queue") || isLocalModule(specifier, "index") || isPackage(specifier, "grammy") || isPackage(specifier, "@earendil-works/pi-coding-agent"))) {
       addViolation(violations, file, specifier, "config may not import runtime or transport modules");
     }
-    if (layer === "scheduler" && (telegram || importedAgentSession || sandbox || tools)) {
+    if (layer === "scheduler" && (telegram || importedAgentSession || sandbox)) {
       addViolation(violations, file, specifier, "scheduler may not import grammY, AgentSession, sandbox, or tools");
     }
     if (layer !== "sandbox" && childProcess && layer !== "tools") {

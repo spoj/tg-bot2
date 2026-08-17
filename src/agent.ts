@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { PiRpcWorker, type AvailableModel, type WorkerSessionState } from "./pi-worker.js";
+import { assistantText, PiRpcWorker, type AvailableModel, type WorkerSessionState } from "./pi-worker.js";
 import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
 import { SerialQueue } from "./queue.js";
@@ -53,26 +53,6 @@ Keep Telegram-facing answers concise unless the user asks for detail.
 Host commands /model, /thinking, /status, and /restart manage configuration; do not edit .pi config files yourself.
 Every worker start begins a fresh session; previous conversations persist in /workspace/.pi/sessions/*.jsonl and the agent should read/grep them when the user references history.
 `;
-
-export function extractFinalAssistantText(messages: readonly unknown[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const candidate = messages[i] as { role?: unknown; content?: unknown } | undefined;
-    if (!candidate || candidate.role !== "assistant") continue;
-    if (typeof candidate.content === "string") return candidate.content.trim() || undefined;
-    if (Array.isArray(candidate.content)) {
-      const text = candidate.content
-        .filter((block): block is { type: "text"; text: string } =>
-          !!block && typeof block === "object" && (block as { type?: unknown }).type === "text" &&
-          typeof (block as { text?: unknown }).text === "string")
-        .map((block) => block.text)
-        .join("")
-        .trim();
-      return text || undefined;
-    }
-    return undefined;
-  }
-  return undefined;
-}
 
 export type PromptMode = "interactive" | "follow-up";
 
@@ -352,7 +332,7 @@ export class AgentManager {
       if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
       const hasToolCall = message.content.some((block) => record(block)?.type === "toolCall");
       if (!hasToolCall) return;
-      const text = extractFinalAssistantText([message]);
+      const text = assistantText(event);
       const callback = this.assistantProgress;
       if (!text || !callback) return;
       state.progressTail = state.progressTail
@@ -427,7 +407,6 @@ export class AgentManager {
       state.workerPromise = pending;
     }
     const pending = state.workerPromise;
-    if (!pending) throw new Error("Pi worker startup was not scheduled");
     try {
       return await this.raceShutdown(state, pending);
     } finally {
@@ -606,7 +585,7 @@ export class AgentManager {
     });
   }
 
-  async disposeAll(abort = false): Promise<void> {
+  async disposeAll(): Promise<void> {
     const permanentlyClosed = this.shuttingDown;
     for (const state of this.states.values()) state.closing = true;
 
@@ -615,39 +594,26 @@ export class AgentManager {
       if (states.length === 0) break;
       for (const state of states) this.disarmIdleStop(state);
 
-      if (abort) {
-        await Promise.allSettled(states.map((state) => this.requestAbort(state)));
-        await Promise.all(states.map(async (state) => {
-          try {
-            await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out");
-          } catch {
-            this.cancelState(state, "Agent manager shutdown timed out");
-          }
-        }));
-        const activeRuns = states.flatMap((state) =>
-          state.activeRun ? [{ state, run: state.activeRun }] : [],
-        );
-        await Promise.all(activeRuns.map(async ({ state, run }) => {
-          const completed = run.then(() => false, () => false);
-          try {
-            await bounded(completed, this.shutdownTimeoutMs, "Agent worker run drain timed out");
-          } catch {
-            this.cancelState(state, "Agent worker run drain timed out");
-          }
-        }));
-        break;
-      }
-
-      await Promise.allSettled(states.map((state) => state.queue.idle()));
-      const activeRuns = states.map((state) => state.activeRun).filter(
-        (run): run is Promise<string> => run !== undefined,
+      await Promise.allSettled(states.map((state) => this.requestAbort(state)));
+      await Promise.all(states.map(async (state) => {
+        try {
+          await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out");
+        } catch {
+          this.cancelState(state, "Agent manager shutdown timed out");
+        }
+      }));
+      const activeRuns = states.flatMap((state) =>
+        state.activeRun ? [{ state, run: state.activeRun }] : [],
       );
-      await Promise.allSettled(activeRuns);
-      const current = [...this.states.values()];
-      if (
-        current.length === states.length &&
-        current.every((state) => state.queue.size === 0 && !state.activeRun && !state.workerPromise)
-      ) break;
+      await Promise.all(activeRuns.map(async ({ state, run }) => {
+        const completed = run.then(() => false, () => false);
+        try {
+          await bounded(completed, this.shutdownTimeoutMs, "Agent worker run drain timed out");
+        } catch {
+          this.cancelState(state, "Agent worker run drain timed out");
+        }
+      }));
+      break;
     }
     while (true) {
       const states = [...this.states.values()];
@@ -655,29 +621,17 @@ export class AgentManager {
       for (const state of states) state.closing = true;
       for (const state of states) this.disarmIdleStop(state);
       await Promise.allSettled(states.map(async (state) => {
-        if (abort) {
-          await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out").catch(() => {});
-        } else {
-          await state.queue.idle().catch(() => {});
-        }
+        await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out").catch(() => {});
         state.unsubscribe?.();
         state.unsubscribe = undefined;
         const invalidation = state.invalidation;
         if (invalidation) {
-          if (abort) {
-            await bounded(invalidation.completion, this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
-          } else {
-            await invalidation.completion.catch(() => {});
-          }
+          await bounded(invalidation.completion, this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
           return;
         }
         const worker = state.worker;
         if (!worker) return;
-        if (abort) {
-          await bounded(this.invalidateWorker(state, worker), this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
-        } else {
-          await this.invalidateWorker(state, worker).catch(() => {});
-        }
+        await bounded(this.invalidateWorker(state, worker), this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
       }));
       const disposing = new Set(states);
       for (const [chatId, state] of this.states) {

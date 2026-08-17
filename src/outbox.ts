@@ -357,19 +357,17 @@ function validateSendPollRequest(id: string, request: Record<string, unknown>): 
 }
 
 function validateStopPollRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxStopPollRequest {
-  const messageId = validateMessageId(request, "message_id");
   const replyMarkup = validateReplyMarkup(request);
   return {
     version: 1,
     id,
     type: "stop_poll",
-    message_id: messageId,
+    message_id: validateMessageId(request, "message_id"),
     ...(replyMarkup === undefined ? {} : { reply_markup: replyMarkup }),
   };
 }
 
 function validateSendReactionRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxSendReactionRequest {
-  const messageId = validateMessageId(request, "message_id");
   if (!Array.isArray(request.emoji) || request.emoji.length > MAX_REACTIONS) {
     throw new Error(`Outbox request emoji must be an array of at most ${MAX_REACTIONS} emoji (empty removes the reaction)`);
   }
@@ -379,7 +377,7 @@ function validateSendReactionRequest(id: string, request: Record<string, unknown
     }
     return entry;
   });
-  return { version: 1, id, type: "send_reaction", message_id: messageId, emoji };
+  return { version: 1, id, type: "send_reaction", message_id: validateMessageId(request, "message_id"), emoji };
 }
 
 
@@ -518,7 +516,7 @@ export class WorkspaceOutbox {
     } finally {
       if (this.startInFlight === initialPoll) this.startInFlight = undefined;
     }
-    if (!this.running || this.timer !== undefined) return;
+    if (!this.running) return;
     this.timer = this.schedule(() => {
       void this.poll().catch((error) => this.report(error));
     }, this.pollIntervalMs);
@@ -795,7 +793,6 @@ export class WorkspaceOutbox {
     chatId: number,
     stale = false,
   ): Promise<OutboxEntry | undefined> {
-    if (stale && !this.isStaleClaim(entry.name)) return undefined;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       let claimName: string;
       try {
@@ -955,5 +952,3 @@ export class WorkspaceOutbox {
     }
   }
 }
-
-export const DEFAULT_WORKSPACE_OUTBOX_POLL_INTERVAL_MS = DEFAULT_POLL_INTERVAL_MS;

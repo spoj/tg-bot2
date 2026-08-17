@@ -42,7 +42,6 @@ export type WorkspaceSchedulerOptions = {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   logger?: (error: unknown) => void;
-  onDirectoryHandleClosed?: (realPath: string) => void;
 };
 
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1_000;
@@ -204,7 +203,6 @@ export class WorkspaceScheduler {
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
-  private readonly onDirectoryHandleClosed: WorkspaceSchedulerOptions["onDirectoryHandleClosed"];
   private timer: ReturnType<typeof setInterval> | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -223,7 +221,6 @@ export class WorkspaceScheduler {
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
     this.logger = options.logger ?? ((error) => console.error("Workspace scheduler error", error));
-    this.onDirectoryHandleClosed = options.onDirectoryHandleClosed;
   }
 
   async start(): Promise<void> {
@@ -239,7 +236,7 @@ export class WorkspaceScheduler {
     } finally {
       if (this.startInFlight === initialPoll) this.startInFlight = undefined;
     }
-    if (!this.running || this.timer !== undefined) return;
+    if (!this.running) return;
     this.timer = this.schedule(() => {
       void this.poll().catch((error) => this.report(error));
     }, this.pollIntervalMs);
@@ -301,9 +298,9 @@ export class WorkspaceScheduler {
         } catch (error) {
           if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
         } finally {
-          if (metadata) await this.closeDirectory(metadata);
-          if (workspace) await this.closeDirectory(workspace);
-          if (chatDirectory) await this.closeDirectory(chatDirectory);
+          if (metadata) await closeQuietly(metadata.handle);
+          if (workspace) await closeQuietly(workspace.handle);
+          if (chatDirectory) await closeQuietly(chatDirectory.handle);
         }
       }
 
@@ -313,16 +310,6 @@ export class WorkspaceScheduler {
       if (!isMissing(error)) this.report(error);
     } finally {
       if (chatsRoot) await closeQuietly(chatsRoot.handle);
-    }
-  }
-
-  private async closeDirectory(directory: PinnedDirectory): Promise<void> {
-    const closed = await closeQuietly(directory.handle);
-    if (!closed || !this.onDirectoryHandleClosed) return;
-    try {
-      this.onDirectoryHandleClosed(directory.realPath);
-    } catch (error) {
-      this.report(error);
     }
   }
 
@@ -343,7 +330,7 @@ export class WorkspaceScheduler {
     try {
       currentSnapshot = await this.readSchedule(metadata, item.chatId);
     } finally {
-      await this.closeDirectory(metadata);
+      await closeQuietly(metadata.handle);
     }
     const current = currentSnapshot?.file.schedules.find((record) => record.id === item.record.id);
     if (!current || !current.enabled || Date.parse(current.dueAt) > now) return;
@@ -396,7 +383,7 @@ export class WorkspaceScheduler {
     try {
       snapshot = await this.readSchedule(metadata, item.chatId);
     } finally {
-      await this.closeDirectory(metadata);
+      await closeQuietly(metadata.handle);
     }
     if (!snapshot) return;
     const { file } = snapshot;
@@ -487,7 +474,7 @@ export class WorkspaceScheduler {
       }
     } finally {
       if (handle) await closeQuietly(handle);
-      await this.closeDirectory(metadata);
+      await closeQuietly(metadata.handle);
       await rm(temporaryPath, { force: true }).catch(() => {});
     }
   }

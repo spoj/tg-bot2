@@ -42,21 +42,11 @@ export type BufferedTelegramMessage = {
   attachments: SavedAttachment[];
 };
 
-export type TelegramBatchResult =
-  | { readonly kind: "reply"; readonly text: string }
-  | { readonly kind: "no-reply"; readonly reason: "steered" };
-
-export type TelegramIngressAdmission =
-  | { readonly kind: "accepted" }
-  | { readonly kind: "quiesced"; readonly reason: "closed" };
-
-export type TelegramIngressEntry = {
+type BufferEntry = {
   value: PromiseLike<BufferedTelegramMessage>;
   respond: (text: string) => void | PromiseLike<void>;
-  typing: () => void | PromiseLike<void>;
+  typing?: () => void | PromiseLike<void>;
 };
-
-type BufferEntry = TelegramIngressEntry;
 
 type PendingBatch = {
   readonly chatId: number;
@@ -90,24 +80,24 @@ function invokeCallback<T>(callback: () => T | PromiseLike<T>): Promise<T> {
   return Promise.resolve().then(callback);
 }
 
-function isTelegramBatchResult(value: unknown): value is TelegramBatchResult {
-  if (typeof value !== "object" || value === null || !("kind" in value)) return false;
-  const result = value as { kind?: unknown; text?: unknown; reason?: unknown };
-  if (result.kind === "reply") return typeof result.text === "string";
-  return result.kind === "no-reply" && result.reason === "steered";
-}
-
 export class TelegramIngressBuffer {
   private closed = false;
   private readonly states = new Map<number, BufferState>();
 
   constructor(
-    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => TelegramBatchResult | PromiseLike<TelegramBatchResult>,
+    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => string | undefined | PromiseLike<string | undefined>,
     private readonly cooldownMs = INGRESS_COOLDOWN_MS,
   ) {}
 
-  add(chatId: number, entry: BufferEntry): TelegramIngressAdmission {
-    if (this.closed) return { kind: "quiesced", reason: "closed" };
+  add(chatId: number, entry: BufferEntry): boolean {
+    if (this.closed) return false;
+    const state = this.stateFor(chatId);
+    state.pending.push(entry);
+    if (!state.barrier) this.schedule(chatId, state);
+    return true;
+  }
+
+  private stateFor(chatId: number): BufferState {
     let state = this.states.get(chatId);
     if (!state) {
       state = {
@@ -120,24 +110,11 @@ export class TelegramIngressBuffer {
       };
       this.states.set(chatId, state);
     }
-    state.pending.push(entry);
-    if (!state.barrier) this.schedule(chatId, state);
-    return { kind: "accepted" };
+    return state;
   }
 
   acquireBarrier(chatId: number): TelegramIngressBarrier {
-    let state = this.states.get(chatId);
-    if (!state) {
-      state = {
-        pending: [],
-        timer: undefined,
-        generation: 0,
-        tail: Promise.resolve(),
-        running: new Set(),
-        barrier: undefined,
-      };
-      this.states.set(chatId, state);
-    }
+    const state = this.stateFor(chatId);
     if (!state.barrier) {
       this.cancelTimer(state);
       let resolveReleased!: () => void;
@@ -203,10 +180,7 @@ export class TelegramIngressBuffer {
       entries: Object.freeze(entries),
       owner,
     });
-    const job = state.tail.then(
-      () => this.executeBatch(batch),
-      () => this.executeBatch(batch),
-    );
+    const job = state.tail.then(() => this.executeBatch(batch));
     state.tail = job;
     state.running.add(job);
     void job.then(
@@ -232,22 +206,24 @@ export class TelegramIngressBuffer {
   private async executeBatch(batch: PendingBatch): Promise<void> {
     let typing: NodeJS.Timeout | undefined;
     try {
-      void invokeCallback(batch.owner.typing).catch((error) => {
-        console.error("Buffered Telegram initial typing notification failed", error);
-      });
-      typing = setInterval(() => {
-        void invokeCallback(batch.owner.typing).catch((error) => {
-          console.error("Buffered Telegram typing notification failed", error);
+      const typingCallback = batch.owner.typing;
+      if (typingCallback) {
+        void invokeCallback(typingCallback).catch((error) => {
+          console.error("Buffered Telegram initial typing notification failed", error);
         });
-      }, 4_000);
-      typing.unref?.();
+        typing = setInterval(() => {
+          void invokeCallback(typingCallback).catch((error) => {
+            console.error("Buffered Telegram typing notification failed", error);
+          });
+        }, 4_000);
+        typing.unref?.();
+      }
 
       const messages = await Promise.all(batch.entries.map((entry) => Promise.resolve(entry.value)));
-      const result = await invokeCallback(() => this.flushBatch(batch.chatId, messages));
-      if (!isTelegramBatchResult(result)) throw new Error("Buffered Telegram handler returned an invalid batch result");
-      if (result.kind === "reply") {
+      const text = await invokeCallback(() => this.flushBatch(batch.chatId, messages));
+      if (text !== undefined) {
         try {
-          await invokeCallback(() => batch.owner.respond(result.text));
+          await invokeCallback(() => batch.owner.respond(text));
         } catch (error) {
           console.error("Buffered Telegram response delivery failed", error);
         }
@@ -309,13 +285,12 @@ export class TelegramIngressBuffer {
     }
   }
 }
-type TelegramDeliveryOperation<T> = () => T | PromiseLike<T>;
 
 export class TelegramDeliveryQueue {
   private readonly states = new Map<number, SerialQueue>();
   private readonly pending = new Set<Promise<unknown>>();
 
-  enqueue<T>(chatId: number, operation: TelegramDeliveryOperation<T>): Promise<T> {
+  enqueue<T>(chatId: number, operation: () => T | PromiseLike<T>): Promise<T> {
     let state = this.states.get(chatId);
     if (!state) {
       state = new SerialQueue();
@@ -981,9 +956,7 @@ export function createTelegramBot(
 
   const ingress = new TelegramIngressBuffer(async (chatId, messages) => {
     const response = await agents.prompt(chatId, formatBufferedPrompt(messages));
-    return response === undefined
-      ? { kind: "no-reply", reason: "steered" }
-      : { kind: "reply", text: response };
+    return response;
   });
   ingressByBot.set(bot, ingress);
 
@@ -1114,7 +1087,7 @@ export function createTelegramBot(
       respond: (text) => deliveryQueue.enqueue(ctx.chat.id, () => replyChunks(ctx, text)),
       typing: async () => { await ctx.replyWithChatAction("typing"); },
     });
-    if (admission.kind === "accepted") startPreparation();
+    if (admission) startPreparation();
   });
   bot.on("callback_query", (ctx) => {
     const query = ctx.callbackQuery;
@@ -1131,7 +1104,6 @@ export function createTelegramBot(
         attachments: [],
       }),
       respond: (text) => deliveryQueue.enqueue(chatId, () => replyChunks(ctx, text)),
-      typing: async () => {},
     });
   });
   bot.on("poll_answer", async (ctx) => {
@@ -1145,7 +1117,6 @@ export function createTelegramBot(
         attachments: [],
       }),
       respond: (text) => deliveryQueue.enqueue(chatId, () => sendTelegramText(bot, chatId, text)),
-      typing: async () => {},
     });
   });
 

@@ -1,20 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-};
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
+import { deferred, type Deferred } from "./helpers.js";
 
 const state = vi.hoisted(() => {
   const order: string[] = [];
@@ -162,44 +147,43 @@ describe("application startup and shutdown wiring", () => {
   });
 });
 
-describe("disposeServices", () => {
-  it("runs every disposal step in order and forces agent disposal", async () => {
-    const { disposeServices } = await importIndex();
+describe("finishDisposal", () => {
+  function makeServices(throws = false) {
     const calls: string[] = [];
-    const services = {
-      agents: {
-        beginShutdown: vi.fn(async () => { calls.push("beginShutdown"); }),
-        disposeAll: vi.fn(async () => { calls.push("disposeAll"); }),
+    const step = (name: string) => vi.fn(async () => {
+      calls.push(name);
+      if (throws) throw new Error(`${name} failed`);
+    });
+    return {
+      calls,
+      services: {
+        agents: { disposeAll: step("disposeAll") },
+        scheduler: { stop: step("scheduler.stop") },
+        outbox: { stop: step("outbox.stop") },
+        delivery: { drain: step("delivery.drain") },
       },
-      scheduler: { stop: vi.fn(async () => { calls.push("scheduler.stop"); }) },
-      outbox: { stop: vi.fn(async () => { calls.push("outbox.stop"); }) },
-      delivery: { drain: vi.fn(async () => { calls.push("delivery.drain"); }) },
     };
+  }
 
-    await disposeServices(services);
+  it("runs every disposal step in order and forces agent disposal", async () => {
+    const { finishDisposal } = await importIndex();
+    const { calls, services } = makeServices();
 
-    expect(calls).toEqual(["beginShutdown", "scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
-    expect(services.agents.disposeAll).toHaveBeenCalledWith(true);
+    await finishDisposal(services);
+
+    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
+    expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
 
   it("runs every step even when earlier steps throw and swallows the errors", async () => {
-    const { disposeServices } = await importIndex();
-    const calls: string[] = [];
-    const services = {
-      agents: {
-        beginShutdown: vi.fn(async () => { calls.push("beginShutdown"); throw new Error("abort failed"); }),
-        disposeAll: vi.fn(async () => { calls.push("disposeAll"); }),
-      },
-      scheduler: { stop: vi.fn(async () => { calls.push("scheduler.stop"); throw new Error("scheduler failed"); }) },
-      outbox: { stop: vi.fn(async () => { calls.push("outbox.stop"); throw new Error("outbox failed"); }) },
-      delivery: { drain: vi.fn(async () => { calls.push("delivery.drain"); throw new Error("drain failed"); }) },
-    };
+    const { finishDisposal } = await importIndex();
+    const { calls, services } = makeServices(true);
 
-    await expect(disposeServices(services)).resolves.toBeUndefined();
+    await expect(finishDisposal(services)).resolves.toBeUndefined();
 
-    expect(calls).toEqual(["beginShutdown", "scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
-    expect(services.agents.disposeAll).toHaveBeenCalledWith(true);
+    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
+    expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
 });

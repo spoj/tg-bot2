@@ -2,7 +2,7 @@ import { link, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkspaceOutbox, type WorkspaceOutboxOptions } from "../src/outbox.js";
+import { WorkspaceOutbox } from "../src/outbox.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -34,6 +34,20 @@ const valid = (id = "one", filePath = "/workspace/report.txt") => ({
   path: filePath,
   caption: "Report",
 });
+
+function fakeInterval() {
+  const callbacks: (() => void)[] = [];
+  const cleared: unknown[] = [];
+  const setIntervalMock = vi.fn(((callback: () => void, _delay?: number) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  }) as typeof globalThis.setInterval);
+  const setInterval = setIntervalMock as unknown as typeof globalThis.setInterval;
+  const clearInterval = vi.fn(((timer: unknown) => {
+    cleared.push(timer);
+  }) as typeof globalThis.clearInterval);
+  return { callbacks, cleared, setIntervalMock, setInterval, clearInterval };
+}
 
 describe("WorkspaceOutbox", () => {
   it("rejects poll intervals above the timer-safe limit", async () => {
@@ -252,13 +266,7 @@ describe("WorkspaceOutbox", () => {
   it("renews a live claim before stale recovery can reclaim a long send", async () => {
     const { dataDir, workspace } = await fixture();
     await request(workspace, "long.json", valid("long"));
-    const callbacks: (() => void)[] = [];
-    const setIntervalMock = vi.fn(((callback: Parameters<NonNullable<WorkspaceOutboxOptions["setInterval"]>>[0]) => {
-      callbacks.push(callback);
-      return callbacks.length as unknown as ReturnType<NonNullable<WorkspaceOutboxOptions["setInterval"]>>;
-    }) as NonNullable<WorkspaceOutboxOptions["setInterval"]>);
-    const setInterval = setIntervalMock as unknown as NonNullable<WorkspaceOutboxOptions["setInterval"]>;
-    const clearInterval = vi.fn(((timer: unknown) => {}) as typeof globalThis.clearInterval);
+    const { callbacks, setInterval, clearInterval } = fakeInterval();
     let now = 0;
     let finishSend!: () => void;
     let markSendStarted!: () => void;
@@ -289,19 +297,12 @@ describe("WorkspaceOutbox", () => {
 
   it("stops and clears its polling timer", async () => {
     const { dataDir } = await fixture();
-    const callbacks: (() => void)[] = [];
-    const cleared: unknown[] = [];
-    const setIntervalMock = vi.fn(((callback: Parameters<NonNullable<WorkspaceOutboxOptions["setInterval"]>>[0]) => {
-      callbacks.push(callback);
-      return callbacks.length as unknown as ReturnType<NonNullable<WorkspaceOutboxOptions["setInterval"]>>;
-    }) as NonNullable<WorkspaceOutboxOptions["setInterval"]>);
-    const setInterval = setIntervalMock as unknown as NonNullable<WorkspaceOutboxOptions["setInterval"]>;
-    const clearInterval = vi.fn(((timer: unknown) => { cleared.push(timer); }) as typeof globalThis.clearInterval);
+    const { callbacks, cleared, setIntervalMock, setInterval, clearInterval } = fakeInterval();
     const outbox = new WorkspaceOutbox({ dataDir, dispatch: async () => undefined, setInterval, clearInterval });
     await outbox.start();
     expect(setIntervalMock).toHaveBeenCalledWith(expect.any(Function), 5_000);
     await outbox.stop();
-    expect(clearInterval).toHaveBeenCalledWith(1);
+    expect(cleared).toEqual([1]);
     expect(callbacks).toHaveLength(1);
   });
   it("dispatches send_message requests with their message fields", async () => {

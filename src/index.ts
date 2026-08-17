@@ -14,7 +14,7 @@ export function isIntentionalSignalAbort(error: unknown): boolean {
 }
 
 export interface DisposableServices {
-  agents: Pick<AgentManager, "beginShutdown" | "disposeAll">;
+  agents: Pick<AgentManager, "disposeAll">;
   scheduler: Pick<WorkspaceScheduler, "stop">;
   outbox: Pick<WorkspaceOutbox, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
@@ -22,10 +22,9 @@ export interface DisposableServices {
 
 // Stops the scheduler and outbox, disposes agents, terminates sandboxes, and
 // drains the delivery queue. Each step is guarded so a failure in one never
-// skips the rest. Shared by the graceful shutdown() path (which overlaps
-// beginShutdown with the ingress drain) and disposeServices() (which runs
-// beginShutdown first).
-async function finishDisposal(services: DisposableServices): Promise<void> {
+// skips the rest. Called by the graceful shutdown() path after it overlaps
+// beginShutdown with the ingress drain.
+export async function finishDisposal(services: DisposableServices): Promise<void> {
   try {
     await services.scheduler.stop();
   } catch (error) {
@@ -37,7 +36,7 @@ async function finishDisposal(services: DisposableServices): Promise<void> {
     console.error("Outbox shutdown failed", error);
   }
   try {
-    await services.agents.disposeAll(true);
+    await services.agents.disposeAll();
   } catch (error) {
     console.error("Agent shutdown failed", error);
   }
@@ -52,22 +51,6 @@ async function finishDisposal(services: DisposableServices): Promise<void> {
     console.error("Telegram delivery drain failed", error);
   }
 }
-
-export async function disposeServices(services: DisposableServices): Promise<void> {
-  try {
-    await services.agents.beginShutdown();
-  } catch (error) {
-    console.error("Agent abort failed", error);
-  }
-  await finishDisposal(services);
-}
-
-// Hoisted to module scope so the startup-failure path (main().catch) can reach
-// and dispose them even after main() has rejected.
-let agents: AgentManager | undefined;
-let scheduler: WorkspaceScheduler | undefined;
-let outbox: WorkspaceOutbox | undefined;
-let delivery: TelegramDeliveryQueue | undefined;
 
 export async function main(): Promise<void> {
   const config = parseConfig();
@@ -151,11 +134,6 @@ export async function main(): Promise<void> {
     },
   });
 
-  agents = agentManager;
-  scheduler = schedulerInstance;
-  outbox = outboxInstance;
-  delivery = deliveryQueue;
-
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = (signal: string): Promise<void> => {
@@ -210,11 +188,8 @@ export async function main(): Promise<void> {
 
 const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
-  main().catch(async (error) => {
+  main().catch((error) => {
     console.error("Fatal startup/polling failure", error);
-    if (agents && scheduler && outbox && delivery) {
-      await disposeServices({ agents, scheduler, outbox, delivery });
-    }
     process.exitCode = 1;
   });
 }

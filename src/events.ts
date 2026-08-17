@@ -2,11 +2,40 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, open, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
+/**
+ * One chat event, logged to `.tg-bot/events.jsonl` as one JSON line:
+ * `{v:1, t:"<ISO-8601>", ...event}`. Inbound events carry Telegram's raw
+ * objects verbatim (snake_case Bot API field names) so the log stays stable
+ * and lossless as Telegram evolves; host-added fields are the `attachments`
+ * array on message events and the outbox confirmation fields on send events.
+ */
 export type ChatEvent =
-  | { type: "message"; messageId: number; text?: string | undefined; attachments?: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }> }
-  | { type: "callback"; messageId: number; data: string }
-  | { type: "poll_answer"; messageId: number; pollId: string; optionIds: number[] }
-  | { type: "send"; kind: string; id: string; messageId?: number; pollId?: string; ok: boolean; error?: string };
+  | {
+    /** A user message (text, media, location, venue, …). `message` is the raw Telegram Message object; `attachments` are files the host downloaded into the workspace. */
+    type: "message";
+    message: unknown;
+    attachments: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }>;
+  }
+  | {
+    /** An inline-keyboard button press. `callback_query` is the raw Telegram CallbackQuery object (includes id, from, message, data, chat_instance). */
+    type: "callback";
+    callback_query: unknown;
+  }
+  | {
+    /** A vote on a poll this bot sent. `poll_answer` is the raw Telegram PollAnswer object (poll_id, user, option_ids). */
+    type: "poll_answer";
+    poll_answer: unknown;
+  }
+  | {
+    /** Confirmation of one outbox request. Host-side protocol fields, not a Telegram object. */
+    type: "send";
+    kind: string;
+    id: string;
+    messageId?: number | undefined;
+    pollId?: string | undefined;
+    ok: boolean;
+    error?: string | undefined;
+  };
 
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 
@@ -17,7 +46,7 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /**
- * Appends one chat event to the workspace events log. Best-effort: never throws and
+ * Appends one chat event to the workspace events log. Best-effort: never rejects and
  * never follows a symbolic link planted at the events directory or file.
  */
 export function appendChatEvent(workspace: string, event: ChatEvent): Promise<void> {
@@ -30,7 +59,7 @@ export function appendChatEvent(workspace: string, event: ChatEvent): Promise<vo
       if (!stat.isDirectory()) throw new Error(`Chat events directory is not a directory: ${directory}`);
 
       const filePath = path.join(directory, "events.jsonl");
-      const line = `${JSON.stringify({ t: new Date().toISOString(), ...event })}\n`;
+      const line = `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...event })}\n`;
       const handle = await openEventsFile(filePath);
       try {
         await handle.write(line, null, "utf8");

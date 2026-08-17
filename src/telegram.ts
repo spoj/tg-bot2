@@ -17,7 +17,6 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limi
 
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
-const MAX_CALLBACK_DATA_LENGTH = 64; // Telegram's callback_data limit.
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
@@ -38,11 +37,6 @@ export type SavedAttachment = {
   failure?: string | undefined;
 };
 
-export type BufferedTelegramMessage = {
-  messageId: number;
-  text?: string | undefined;
-  attachments: SavedAttachment[];
-};
 
 type BufferEntry = {
   value: PromiseLike<ChatEvent>;
@@ -854,13 +848,12 @@ async function downloadAttachment(
   }
 }
 
-async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<BufferedTelegramMessage> {
+async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<SavedAttachment[]> {
   const message = ctx.message!;
   const source = attachmentSource(message);
-  const attachments = source
+  return source
     ? [await downloadAttachment(bot, config, ctx.chat!.id, message, source)]
     : [];
-  return { messageId: message.message_id, text: message.text ?? message.caption, attachments };
 }
 
 const ingressByBot = new WeakMap<Bot, TelegramIngressBuffer>();
@@ -1067,12 +1060,7 @@ export function createTelegramBot(
     const prepared = new Promise<ChatEvent>((resolve, reject) => {
       startPreparation = () => {
         void prepareMessage(bot, config, ctx).then(
-          (message) => resolve({
-            type: "message",
-            messageId: message.messageId,
-            ...(message.text === undefined ? {} : { text: message.text }),
-            attachments: message.attachments,
-          }),
+          (attachments) => resolve({ type: "message", message: ctx.message, attachments }),
           reject,
         );
       };
@@ -1086,13 +1074,11 @@ export function createTelegramBot(
   bot.on("callback_query", (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
-    const messageId = query.message?.message_id;
-    if (chatId === undefined || messageId === undefined) return;
+    if (chatId === undefined || query.message?.message_id === undefined) return;
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
-    const data = (query.data ?? "").slice(0, MAX_CALLBACK_DATA_LENGTH);
     ingress.add(chatId, {
-      value: Promise.resolve({ type: "callback", messageId, data }),
+      value: Promise.resolve({ type: "callback", callback_query: query }),
     });
   });
   bot.on("poll_answer", async (ctx) => {
@@ -1101,9 +1087,7 @@ export function createTelegramBot(
     if (chatId === undefined) return;
     void appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
       type: "poll_answer",
-      messageId: 0,
-      pollId: answer.poll_id,
-      optionIds: answer.option_ids,
+      poll_answer: answer,
     });
   });
 

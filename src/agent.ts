@@ -36,17 +36,25 @@ appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
 {version:1,id,type:"send_reaction",message_id,emoji} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): emoji is a single emoji string or an array of 1-3 emoji strings; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
-Every chat event is appended by the host to /workspace/.tg-bot/events.jsonl (one
-JSON object per line, newest last: {t,type,...}). Event types are message (a user
-message: {t,type:'message',messageId,text,attachments}), callback (an inline
-keyboard button press: {t,type:'callback',messageId,data}), poll_answer (a poll
-vote: {t,type:'poll_answer',messageId,pollId,optionIds}), and send (a
-confirmation of one of your outbox requests: {t,type:'send',kind,id,messageId?,pollId?,ok,error?}).
-When a user message arrives the host wakes you with a single "." prompt that
-carries no content. Read the newest events.jsonl lines, decide whether the user
-needs a response, and send ALL Telegram output through .tg-bot/outbox requests;
-never rely on the wake prompt for content. Grep events.jsonl whenever you need
-recent chat history or sent message ids.
+Every chat event is appended by the host to /workspace/.tg-bot/events.jsonl (one JSON
+object per line, newest last; every line starts with {v:1,t,...} where t is an ISO-8601
+timestamp). Event types:
+- message: {v:1,t,type:'message',message,attachments} where message is the raw Telegram
+  Message object (message_id, date, from, chat, text, caption, location, venue, photo,
+  document, reply_to_message, and any other Bot API Message field) and attachments lists
+  files the host downloaded into /workspace/attachments/... for you
+  ({type,path,mimeType,originalName} or {type,failure}).
+- callback: {v:1,t,type:'callback',callback_query} where callback_query is the raw
+  Telegram CallbackQuery object (id, from, message, data, chat_instance).
+- poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
+  Telegram PollAnswer object (poll_id, user, option_ids).
+- send: a confirmation of one of your outbox requests:
+  {v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}.
+Grep events.jsonl whenever you need recent chat history or sent message ids.
+When a user message or button press arrives the host wakes you with a single "." prompt
+that carries no content. Read the newest events.jsonl lines and decide whether the user
+needs a response. Send ALL Telegram output through .tg-bot/outbox requests; never rely
+on the wake prompt for content.
 Schedules are stored in /workspace/.tg-bot/schedules.json. Its root object is
 {version:1,schedules:[...]}. Each schedule record requires id, prompt, dueAt,
 recurrence, enabled, lastRunAt, and runCount. dueAt must be a UTC timestamp ending

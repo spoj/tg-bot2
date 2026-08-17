@@ -78,10 +78,10 @@ it("describes the exact workspace file protocols", () => {
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?,kind?}");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,reply_markup?,reply_to_message_id?}");
   expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/events.jsonl");
-  expect(SYSTEM_PROMPT).toContain("{t,type:'message',messageId,text,attachments}");
-  expect(SYSTEM_PROMPT).toContain("{t,type:'callback',messageId,data}");
-  expect(SYSTEM_PROMPT).toContain("{t,type:'poll_answer',messageId,pollId,optionIds}");
-  expect(SYSTEM_PROMPT).toContain("{t,type:'send',kind,id,messageId?,pollId?,ok,error?}");
+  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'message',message,attachments}");
+  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'callback',callback_query}");
+  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'poll_answer',poll_answer}");
+  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}");
   expect(SYSTEM_PROMPT).toContain("wakes you with a single \".\" prompt");
   expect(SYSTEM_PROMPT).toContain("send ALL Telegram output through");
   expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?}");

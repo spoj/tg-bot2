@@ -210,7 +210,7 @@ describe("splitTelegramText", () => {
 
 describe("TelegramIngressBuffer", () => {
   const entry = (typing?: () => void | Promise<void>) => ({
-    value: Promise.resolve<ChatEvent>({ type: "message", messageId: 1, text: "m1", attachments: [] }),
+    value: Promise.resolve<ChatEvent>({ type: "message", message: { message_id: 1, text: "m1" }, attachments: [] }),
     ...(typing === undefined ? {} : { typing }),
   });
 
@@ -959,7 +959,7 @@ describe("Telegram location and venue updates", () => {
     await withWorkspace(async (dataDir) => {
       const prompt = await sendLocationUpdate(dataDir, { location: { latitude: 52.52, longitude: 13.405 } });
       expect(prompt).toHaveBeenCalledWith(42, ".");
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", messageId: 7, attachments: [] });
+      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } }, attachments: [] });
     });
   });
 
@@ -973,7 +973,7 @@ describe("Telegram location and venue updates", () => {
         },
       });
       expect(prompt).toHaveBeenCalledWith(42, ".");
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", messageId: 7, attachments: [] });
+      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } }, attachments: [] });
     });
   });
 });
@@ -1054,7 +1054,7 @@ describe("Telegram callback queries", () => {
       expect(prompt).toHaveBeenCalledWith(42, ".");
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
-      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", messageId: 7, data: "do_thing" });
+      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "do_thing", message: { message_id: 7 } } });
     });
   });
 
@@ -1070,7 +1070,7 @@ describe("Telegram callback queries", () => {
     });
   });
 
-  it("bounds the button data recorded in the callback event", async () => {
+  it("embeds the raw callback query in the callback event", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
@@ -1078,7 +1078,7 @@ describe("Telegram callback queries", () => {
       await flushTelegramIngress(bot);
       expect(prompt).toHaveBeenCalledWith(42, ".");
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
-      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", messageId: 7, data: "x".repeat(64) });
+      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "x".repeat(100) } });
     });
   });
 });
@@ -1104,7 +1104,7 @@ describe("Telegram chat events", () => {
       await bot.handleUpdate(textUpdate("hello") as never);
       await flushTelegramIngress(bot);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
-      expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", messageId: 7, text: "hello" });
+      expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", message: { message_id: 7, text: "hello" } });
       expect(prompt).toHaveBeenCalledWith(42, ".");
     });
   });
@@ -1190,9 +1190,10 @@ describe("Telegram poll answers", () => {
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
         type: "poll_answer",
-        messageId: 0,
-        pollId: "poll-9",
-        optionIds: [1, 2],
+        poll_answer: {
+          poll_id: "poll-9",
+          option_ids: [1, 2],
+        },
       });
     });
   });
@@ -1217,12 +1218,13 @@ describe("Telegram poll answers", () => {
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
         type: "poll_answer",
-        messageId: 0,
-        pollId: "poll-9",
-        optionIds: [0],
+        poll_answer: {
+          poll_id: "poll-9",
+          option_ids: [0],
+        },
+      });
       });
     });
-  });
 
   it("drops poll answers from unknown polls", async () => {
     await withWorkspace(async (dataDir) => {

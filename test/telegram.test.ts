@@ -27,6 +27,7 @@ import {
   TelegramDeliveryQueue,
   TelegramIngressBuffer,
 } from "../src/telegram.js";
+import type { ChatEvent } from "../src/events.js";
 
 const execFile = promisify(execFileCallback);
 function fakeBot() {
@@ -209,7 +210,7 @@ describe("splitTelegramText", () => {
 
 describe("TelegramIngressBuffer", () => {
   const entry = (typing?: () => void | Promise<void>) => ({
-    value: Promise.resolve({ messageId: 1, text: "m1", attachments: [] }),
+    value: Promise.resolve<ChatEvent>({ type: "message", messageId: 1, text: "m1", attachments: [] }),
     ...(typing === undefined ? {} : { typing }),
   });
 
@@ -1044,13 +1045,13 @@ describe("Telegram callback queries", () => {
     };
   }
 
-  it("records an authorized button press as a callback event and answers without waking", async () => {
+  it("records an authorized button press as a callback event and wakes the agent", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
       await flushTelegramIngress(bot);
-      expect(prompt).not.toHaveBeenCalled();
+      expect(prompt).toHaveBeenCalledWith(42, ".");
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
       expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", messageId: 7, data: "do_thing" });
@@ -1075,7 +1076,7 @@ describe("Telegram callback queries", () => {
       const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
       await flushTelegramIngress(bot);
-      expect(prompt).not.toHaveBeenCalled();
+      expect(prompt).toHaveBeenCalledWith(42, ".");
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
       expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", messageId: 7, data: "x".repeat(64) });
     });

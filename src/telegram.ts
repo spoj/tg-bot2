@@ -8,7 +8,7 @@ import type { Config } from "./config.js";
 import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
 import { SerialQueue } from "./queue.js";
-import { appendChatEvent } from "./events.js";
+import { appendChatEvent, type ChatEvent } from "./events.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
 const WAKE_PROMPT = ".";
@@ -45,7 +45,7 @@ export type BufferedTelegramMessage = {
 };
 
 type BufferEntry = {
-  value: PromiseLike<BufferedTelegramMessage>;
+  value: PromiseLike<ChatEvent>;
   typing?: () => void | PromiseLike<void>;
 };
 
@@ -82,9 +82,8 @@ function invokeCallback<T>(callback: () => T | PromiseLike<T>): Promise<T> {
 export class TelegramIngressBuffer {
   private closed = false;
   private readonly states = new Map<number, BufferState>();
-
   constructor(
-    private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => void | PromiseLike<void>,
+    private readonly flushBatch: (chatId: number, events: ChatEvent[]) => void | PromiseLike<void>,
     private readonly cooldownMs = INGRESS_COOLDOWN_MS,
   ) {}
 
@@ -217,9 +216,8 @@ export class TelegramIngressBuffer {
         }, 4_000);
         typing.unref?.();
       }
-
-      const messages = await Promise.all(batch.entries.map((entry) => entry.value));
-      await invokeCallback(() => this.flushBatch(batch.chatId, messages));
+      const events = await Promise.all(batch.entries.map((entry) => entry.value));
+      await invokeCallback(() => this.flushBatch(batch.chatId, events));
     } catch (error) {
       console.error("Buffered Telegram request failed", error);
     } finally {
@@ -937,14 +935,9 @@ export function createTelegramBot(
     return deliveryQueue.enqueue(chatId, () => replyChunks(ctx, text)).then(() => undefined);
   };
 
-  const ingress = new TelegramIngressBuffer(async (chatId, messages) => {
+  const ingress = new TelegramIngressBuffer(async (chatId, events) => {
     const workspace = chatPaths(config.dataDir, chatId).workspace;
-    await Promise.all(messages.map((message) => appendChatEvent(workspace, {
-      type: "message",
-      messageId: message.messageId,
-      ...(message.text === undefined ? {} : { text: message.text }),
-      attachments: message.attachments,
-    })));
+    await Promise.all(events.map((event) => appendChatEvent(workspace, event)));
     await agents.prompt(chatId, WAKE_PROMPT).catch((error) => {
       console.error("Telegram wake prompt failed", error);
     });
@@ -1071,8 +1064,18 @@ export function createTelegramBot(
   bot.on("message", (ctx) => {
     const chatId = ctx.chat.id;
     let startPreparation!: () => void;
-    const prepared = new Promise<BufferedTelegramMessage>((resolve, reject) => {
-      startPreparation = () => { void prepareMessage(bot, config, ctx).then(resolve, reject); };
+    const prepared = new Promise<ChatEvent>((resolve, reject) => {
+      startPreparation = () => {
+        void prepareMessage(bot, config, ctx).then(
+          (message) => resolve({
+            type: "message",
+            messageId: message.messageId,
+            ...(message.text === undefined ? {} : { text: message.text }),
+            attachments: message.attachments,
+          }),
+          reject,
+        );
+      };
     });
     const admission = ingress.add(chatId, {
       value: prepared,
@@ -1088,10 +1091,8 @@ export function createTelegramBot(
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
     const data = (query.data ?? "").slice(0, MAX_CALLBACK_DATA_LENGTH);
-    void appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
-      type: "callback",
-      messageId,
-      data,
+    ingress.add(chatId, {
+      value: Promise.resolve({ type: "callback", messageId, data }),
     });
   });
   bot.on("poll_answer", async (ctx) => {

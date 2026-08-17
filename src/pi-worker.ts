@@ -833,17 +833,17 @@ export class PiRpcWorker {
   }
 
   private workTimeout(commandType: unknown): number {
-    return commandType === "prompt" || commandType === "steer"
+    return commandType === "prompt"
       ? this.promptTimeoutMs
       : this.rpcTimeoutMs;
   }
 
   private request(command: JsonRecord, workEpoch?: number, timeoutMs?: number): Promise<unknown> {
     const child = this.process;
-    const stdin = child?.stdin;
-    if (!child || !stdin || this.terminalError) {
+    if (!child || !child.stdin) {
       return Promise.reject(this.terminalError ?? new Error("Pi worker is not started"));
     }
+    const stdin = child.stdin;
     const id = `pi-rpc-${++this.requestId}`;
     const line = `${JSON.stringify({ id, ...command })}\n`;
     const effectiveTimeout = timeoutMs ?? this.rpcTimeoutMs;

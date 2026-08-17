@@ -73,7 +73,6 @@ async function runAttachmentFixture(
   }, {
     prompt,
     setAssistantProgress: vi.fn(),
-    hasActiveRun: vi.fn(() => false),
   } as never);
   (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
   bot.api.getFile = vi.fn(getFileImplementation) as unknown as typeof bot.api.getFile;
@@ -191,41 +190,6 @@ describe("TelegramIngressBuffer", () => {
 
       expect(batches).toEqual([[message(1), message(2)]]);
       expect(replies).toEqual(["two:combined response"]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-  it("shortens the debounce for bursts admitted while the agent is busy", async () => {
-    vi.useFakeTimers();
-    try {
-      const batches: number[][] = [];
-      let busy = false;
-      const isBusy = vi.fn(() => busy);
-      const buffer = new TelegramIngressBuffer(async (_chatId, messages) => {
-        batches.push(messages.map(({ messageId }) => messageId));
-        return { kind: "no-reply", reason: "steered" };
-      }, 60_000, isBusy);
-
-      buffer.add(7, entry(1));
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(batches).toEqual([[1]]);
-
-      busy = true;
-      buffer.add(7, entry(2));
-      await vi.advanceTimersByTimeAsync(400);
-      expect(batches).toEqual([[1], [2]]);
-
-      buffer.add(7, entry(3));
-      await vi.advanceTimersByTimeAsync(100);
-      buffer.add(7, entry(4));
-      await vi.advanceTimersByTimeAsync(400);
-      expect(batches).toEqual([[1], [2], [3, 4]]);
-
-      busy = false;
-      buffer.add(7, entry(5));
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(batches).toEqual([[1], [2], [3, 4], [5]]);
-      expect(isBusy).toHaveBeenCalledTimes(4);
     } finally {
       vi.useRealTimers();
     }
@@ -968,7 +932,6 @@ describe("Telegram location pins", () => {
     }, {
       prompt,
       setAssistantProgress: vi.fn(),
-      hasActiveRun: vi.fn(() => false),
     } as never);
     Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
     Object.assign(bot.api, { sendChatAction: vi.fn(async () => ({})) });
@@ -1070,7 +1033,6 @@ describe("Telegram callback queries", () => {
   async function makeCallbackBot(agents: {
     prompt: ReturnType<typeof vi.fn>;
     setAssistantProgress: ReturnType<typeof vi.fn>;
-    hasActiveRun: ReturnType<typeof vi.fn>;
   }): Promise<Bot> {
     sentRequests = [];
     const bot = createTelegramBot(
@@ -1112,7 +1074,7 @@ describe("Telegram callback queries", () => {
 
   it("routes authorized button presses into the ingress buffer", async () => {
     const prompt = vi.fn(async () => "acknowledged");
-    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn(), hasActiveRun: vi.fn(() => false) });
+    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
     await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
     await flushTelegramIngress(bot);
     expect(prompt).toHaveBeenCalledWith(42, 'Telegram message 7:\n[Telegram button press: data="do_thing"]');
@@ -1122,7 +1084,7 @@ describe("Telegram callback queries", () => {
 
   it("rejects unauthorized button presses", async () => {
     const prompt = vi.fn(async () => undefined);
-    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn(), hasActiveRun: vi.fn(() => false) });
+    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
     await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
     await flushTelegramIngress(bot);
     expect(prompt).not.toHaveBeenCalled();
@@ -1130,7 +1092,7 @@ describe("Telegram callback queries", () => {
 
   it("bounds the button data forwarded to the agent", async () => {
     const prompt = vi.fn(async () => undefined);
-    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn(), hasActiveRun: vi.fn(() => false) });
+    const bot = await makeCallbackBot({ prompt, setAssistantProgress: vi.fn() });
     await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
     await flushTelegramIngress(bot);
     expect(prompt).toHaveBeenCalledWith(42, `Telegram message 7:\n[Telegram button press: data="${"x".repeat(64)}"]`);
@@ -1202,7 +1164,7 @@ describe("Telegram poll answers", () => {
   async function makePollBot(dataDir: string, prompt: ReturnType<typeof vi.fn>): Promise<Bot> {
     const bot = createTelegramBot(
       { token: "test-token", allowedUserIds: new Set([42]), dataDir },
-      { prompt, setAssistantProgress: vi.fn(), hasActiveRun: vi.fn(() => false) } as never,
+      { prompt, setAssistantProgress: vi.fn() } as never,
     );
     Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
     const fakeFetch: typeof fetch = async () =>
@@ -1320,7 +1282,6 @@ describe("Telegram commands", () => {
     prompt: ReturnType<typeof vi.fn>;
     newSession: ReturnType<typeof vi.fn>;
     setAssistantProgress: ReturnType<typeof vi.fn>;
-    hasActiveRun: ReturnType<typeof vi.fn>;
     getAvailableModels: ReturnType<typeof vi.fn>;
     getAvailableThinkingLevels: ReturnType<typeof vi.fn>;
     status: ReturnType<typeof vi.fn>;
@@ -1334,7 +1295,6 @@ describe("Telegram commands", () => {
       prompt: vi.fn(async () => undefined),
       newSession: vi.fn(async () => {}),
       setAssistantProgress: vi.fn(),
-      hasActiveRun: vi.fn(() => false),
       getAvailableModels: vi.fn(async () => []),
       getAvailableThinkingLevels: vi.fn(async () => []),
       status: vi.fn(async () => defaultStatus),

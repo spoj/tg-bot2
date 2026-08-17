@@ -10,7 +10,6 @@ import type { AgentManager } from "./agent.js";
 import { SerialQueue } from "./queue.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
-const INGRESS_BUSY_COOLDOWN_MS = 400;
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
@@ -71,6 +70,7 @@ type IngressBarrierState = {
   released: Promise<void>;
   resolveReleased: () => void;
 };
+
 type BufferState = {
   pending: BufferEntry[];
   timer: NodeJS.Timeout | undefined;
@@ -78,7 +78,6 @@ type BufferState = {
   tail: Promise<void>;
   running: Set<Promise<void>>;
   barrier: IngressBarrierState | undefined;
-  cooldownMs: number;
 };
 
 export type TelegramIngressBarrier = {
@@ -105,7 +104,6 @@ export class TelegramIngressBuffer {
   constructor(
     private readonly flushBatch: (chatId: number, messages: BufferedTelegramMessage[]) => TelegramBatchResult | PromiseLike<TelegramBatchResult>,
     private readonly cooldownMs = INGRESS_COOLDOWN_MS,
-    private readonly isBusy?: (chatId: number) => boolean,
   ) {}
 
   add(chatId: number, entry: BufferEntry): TelegramIngressAdmission {
@@ -119,16 +117,10 @@ export class TelegramIngressBuffer {
         tail: Promise.resolve(),
         running: new Set(),
         barrier: undefined,
-        cooldownMs: this.cooldownMs,
       };
       this.states.set(chatId, state);
     }
     state.pending.push(entry);
-    if (state.pending.length === 1) {
-      // First message of a burst: a busy agent gets the short debounce so the
-      // redirect (interrupt/steer) lands promptly; an idle agent keeps the long one.
-      state.cooldownMs = this.isBusy?.(chatId) ? INGRESS_BUSY_COOLDOWN_MS : this.cooldownMs;
-    }
     if (!state.barrier) this.schedule(chatId, state);
     return { kind: "accepted" };
   }
@@ -143,7 +135,6 @@ export class TelegramIngressBuffer {
         tail: Promise.resolve(),
         running: new Set(),
         barrier: undefined,
-        cooldownMs: this.cooldownMs,
       };
       this.states.set(chatId, state);
     }
@@ -189,7 +180,7 @@ export class TelegramIngressBuffer {
       void this.flush(chatId).catch((error) => {
         console.error("Buffered Telegram timer flush failed", error);
       });
-    }, state.cooldownMs);
+    }, this.cooldownMs);
     state.timer.unref?.();
   }
 
@@ -993,7 +984,7 @@ export function createTelegramBot(
     return response === undefined
       ? { kind: "no-reply", reason: "steered" }
       : { kind: "reply", text: response };
-  }, INGRESS_COOLDOWN_MS, (chatId) => agents.hasActiveRun(chatId));
+  });
   ingressByBot.set(bot, ingress);
 
   bot.use(async (ctx, next) => {

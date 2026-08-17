@@ -135,7 +135,7 @@ type ChatState = {
   idleStopTimer: NodeJS.Timeout | undefined;
 };
 
-type PromptAction = { kind: "prompt"; completion: Promise<string | undefined> };
+type PromptAction = { completion: Promise<string | undefined> };
 const NO_TEXT_RESPONSE = "I completed the turn but produced no text response.";
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
 
@@ -480,11 +480,6 @@ export class AgentManager {
     return run;
   }
 
-  /** True while a run is in flight or queued to start — used to shorten the ingress debounce. */
-  hasActiveRun(chatId: number): boolean {
-    const state = this.states.get(chatId);
-    return state !== undefined && (state.activeRun !== undefined || state.queue.size > 0);
-  }
 
   async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<string | undefined> {
     this.ensureOpen();
@@ -508,7 +503,7 @@ export class AgentManager {
 
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      return { kind: "prompt", completion: this.beginRun(state, worker, () => worker.prompt(text)) };
+      return { completion: this.beginRun(state, worker, () => worker.prompt(text)) };
     });
     return await action.completion;
   }

@@ -165,21 +165,6 @@ it("aborts an active run for an interactive request and reprompts without a stal
   await expect(second).resolves.toBe("combined");
   expect(worker.prompt).toHaveBeenLastCalledWith("second");
 });
-it("reports active runs for the ingress debounce probe", async () => {
-  const worker = fakeWorker();
-  const firstDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await firstDone.promise;
-  });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-  expect(manager.hasActiveRun(1)).toBe(false);
-  const first = manager.prompt(1, "first");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  expect(manager.hasActiveRun(1)).toBe(true);
-  firstDone.resolve();
-  await first;
-  expect(manager.hasActiveRun(1)).toBe(false);
-});
 
 
 it("queues an independent prompt after the worker settles while progress drains", async () => {

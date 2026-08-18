@@ -4,14 +4,11 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   buildPiWorkerBwrapArgs,
-  spawnProcess as sandboxSpawnProcess,
-  terminateProcessGroup,
   type PiWorkerChildProcess,
   type PiWorkerSandboxPaths,
   type PiWorkerSpawn,
 } from "./sandbox.js";
-
-export type { PiWorkerSpawn } from "./sandbox.js";
+import { defined } from "./util.js";
 
 export type PiRpcEvent = Record<string, unknown>;
 export type PiRpcEventListener = (event: PiRpcEvent) => void;
@@ -72,8 +69,10 @@ export class StrictJsonlParser {
 
 export type PiRpcWorkerOptions = PiWorkerSandboxPaths & {
   bwrapPath?: string;
-  /** Test seam; production spawning stays in sandbox.ts. */
+  /** Test seam; production spawning is injected by the composition root. */
   spawn?: PiWorkerSpawn;
+  /** Test seam; production teardown is injected by the composition root. */
+  terminateProcessGroup?: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   /** Bound fast RPC control requests so a silent worker cannot strand operations. */
   rpcTimeoutMs?: number;
@@ -313,7 +312,8 @@ export class PiRpcWorker {
   private readonly bwrapPath: string;
   private readonly cliPath: string | undefined;
   private readonly appendSystemPrompt: string | undefined;
-  private readonly spawnProcess: PiWorkerSpawn;
+  private readonly spawnProcess: PiWorkerSpawn | undefined;
+  private readonly terminateProcessGroup: ((child: PiWorkerChildProcess, signal: NodeJS.Signals) => void) | undefined;
   private readonly stopGraceMs: number;
   private readonly rpcTimeoutMs: number;
   private readonly promptTimeoutMs: number;
@@ -359,7 +359,8 @@ export class PiRpcWorker {
     this.bwrapPath = options.bwrapPath ?? "bwrap";
     this.cliPath = options.cliPath;
     this.appendSystemPrompt = options.appendSystemPrompt;
-    this.spawnProcess = options.spawn ?? sandboxSpawnProcess;
+    this.spawnProcess = options.spawn;
+    this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs ?? 1_000;
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     this.promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
@@ -434,12 +435,16 @@ export class PiRpcWorker {
     this.extensionChangeVersion = 0;
   }
 
-  private clearWorkSets(): void {
+  private resetWorkFields(): void {
     this.activeEpoch = undefined;
     this.accepted = false;
     this.settledBeforeAcceptance = false;
     this.workError = undefined;
     this.settledError = undefined;
+  }
+
+  private clearWorkSets(): void {
+    this.resetWorkFields();
   }
 
   private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
@@ -523,15 +528,12 @@ export class PiRpcWorker {
     const done = this.processDone;
     if (!child || !done) {
       const stopped = this.terminalError ?? new Error("Pi worker stopped");
-      this.clearPromptSettlementTimers();
-      this.rejectPending(stopped);
-      this.rejectSettledWaiters(stopped);
-      this.clearWorkSets();
+      this.teardownWork(stopped);
       if (!keepExtensionWatcher) this.clearExtensionChangeState();
       return;
     }
     this.stopping = true;
-    terminateProcessGroup(child, "SIGTERM");
+    this.terminateProcessGroup?.(child, "SIGTERM");
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
       done,
@@ -542,7 +544,7 @@ export class PiRpcWorker {
     if (timer) clearTimeout(timer);
     if (this.process === child) {
       const forcedStopError = new Error("Pi worker did not exit after SIGKILL");
-      terminateProcessGroup(child, "SIGKILL");
+      this.terminateProcessGroup?.(child, "SIGKILL");
       await Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, this.stopGraceMs))]);
       if (this.process === child) {
         this.rejectPending(forcedStopError);
@@ -550,8 +552,7 @@ export class PiRpcWorker {
         this.finishProcess();
       }
     }
-    this.clearPromptSettlementTimers();
-    this.clearWorkSets();
+    this.teardownWork(this.terminalError ?? new Error("Pi worker stopped"));
     this.process = undefined;
     this.processDone = undefined;
     this.resolveProcessDone = undefined;
@@ -591,12 +592,14 @@ export class PiRpcWorker {
     const built = await buildPiWorkerBwrapArgs({
       workspace: this.workspace,
       appRoot: this.appRoot,
-      ...(this.cliPath === undefined ? {} : { cliPath: this.cliPath }),
-      ...(this.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: this.appendSystemPrompt }),
+      ...defined({ cliPath: this.cliPath, appendSystemPrompt: this.appendSystemPrompt }),
     });
     if (epoch !== this.lifecycleEpoch) throw new Error("Pi worker start was superseded by stop");
     let child: PiWorkerChildProcess;
     try {
+      if (!this.spawnProcess) {
+        throw new Error("Pi worker spawn was not injected; the composition root must supply spawnProcess");
+      }
       child = this.spawnProcess(this.bwrapPath, built.args, {
         detached: true,
         env: {},
@@ -704,11 +707,10 @@ export class PiRpcWorker {
   }
 
   async newSession(): Promise<void> {
-    const reload = this.extensionReloadPromise;
+    const reload = this.awaitPendingReload();
     if (reload) await reload;
     const response = await this.request({ type: "new_session" }, undefined, this.lifecycleTimeoutMs);
-    const record = asRecord(response);
-    const data = asRecord(record?.data);
+    const data = this.responseData(response);
     if (data?.cancelled === true) throw new Error("Pi worker new session was cancelled");
     this.lastAssistantText = undefined;
     this.assistantTextKnown = false;
@@ -717,7 +719,7 @@ export class PiRpcWorker {
   }
 
   async prompt(message: string): Promise<void> {
-    const reload = this.extensionReloadPromise;
+    const reload = this.awaitPendingReload();
     if (reload) await reload;
     this.currentPromptText = message;
     this.lastAssistantText = undefined;
@@ -738,13 +740,11 @@ export class PiRpcWorker {
   }
 
   async getLastAssistantText(): Promise<string | undefined> {
-    const reload = this.extensionReloadPromise;
+    const reload = this.awaitPendingReload();
     if (reload) await reload;
     if (this.assistantTextKnown) return this.lastAssistantText;
     if (this.currentPromptText !== undefined) return undefined;
-    const response = await this.request({ type: "get_last_assistant_text" });
-    const record = asRecord(response);
-    const data = asRecord(record?.data);
+    const data = this.responseData(await this.request({ type: "get_last_assistant_text" }));
     const text = data?.text;
     this.lastAssistantText = typeof text === "string" ? text.trim() || undefined : undefined;
     this.assistantTextKnown = true;
@@ -760,32 +760,27 @@ export class PiRpcWorker {
   }
 
   async getAvailableModels(): Promise<AvailableModel[]> {
-    const response = await this.request({ type: "get_available_models" });
-    const record = asRecord(response);
-    const data = asRecord(record?.data);
+    const data = this.responseData(await this.request({ type: "get_available_models" }));
     const models = Array.isArray(data?.models) ? data.models : [];
     return models.map((model) => {
       const m = asRecord(model);
+      const name = typeof m?.name === "string" ? m.name : undefined;
       return {
         provider: typeof m?.provider === "string" ? m.provider : "",
         id: typeof m?.id === "string" ? m.id : "",
-        ...(typeof m?.name === "string" ? { name: m.name } : {}),
+        ...defined({ name }),
       };
     });
   }
 
   async getAvailableThinkingLevels(): Promise<string[]> {
-    const response = await this.request({ type: "get_available_thinking_levels" });
-    const record = asRecord(response);
-    const data = asRecord(record?.data);
+    const data = this.responseData(await this.request({ type: "get_available_thinking_levels" }));
     const levels = Array.isArray(data?.levels) ? data.levels : [];
     return levels.filter((level): level is string => typeof level === "string");
   }
 
   async getSessionState(): Promise<WorkerSessionState> {
-    const response = await this.request({ type: "get_state" });
-    const record = asRecord(response);
-    const data = asRecord(record?.data);
+    const data = this.responseData(await this.request({ type: "get_state" }));
     const model = asRecord(data?.model);
     return {
       ...(model && typeof model.provider === "string" && typeof model.id === "string"
@@ -800,7 +795,7 @@ export class PiRpcWorker {
   }
 
   async restart(): Promise<void> {
-    const reload = this.extensionReloadPromise;
+    const reload = this.awaitPendingReload();
     if (reload) await reload;
     if (this.activeEpoch !== undefined || this.pending.size > 0) {
       throw new Error("Pi worker is busy");
@@ -866,8 +861,7 @@ export class PiRpcWorker {
       this.promptSettlementTimer = undefined;
       void this.request({ type: "get_state" }).then((response) => {
         if (this.activeEpoch !== epoch) return;
-        const record = asRecord(response);
-        const data = asRecord(record?.data);
+        const data = this.responseData(response);
         if (data?.isStreaming === false && data.pendingMessageCount === 0) this.settleWork(epoch);
       }).catch((error) => {
         if (this.activeEpoch === epoch) this.failProcess(asError(error));
@@ -884,15 +878,12 @@ export class PiRpcWorker {
   private settleWork(epoch: number): void {
     if (this.activeEpoch !== epoch) return;
     this.clearPromptSettlementTimers();
-    this.activeEpoch = undefined;
-    this.accepted = false;
-    this.settledBeforeAcceptance = false;
-    this.workError = undefined;
-    this.finishSettledWaiters();
+    const error = this.settledError;
+    this.resetWorkFields();
+    this.finishSettledWaiters(error);
   }
 
-  private finishSettledWaiters(): void {
-    const error = this.settledError;
+  private finishSettledWaiters(error: Error | undefined): void {
     if (error) this.rejectSettledWaiters(error);
     else this.resolveSettledWaiters();
   }
@@ -900,6 +891,14 @@ export class PiRpcWorker {
   private clearPromptSettlementTimers(): void {
     if (this.promptSettlementTimer) clearTimeout(this.promptSettlementTimer);
     this.promptSettlementTimer = undefined;
+  }
+
+  private awaitPendingReload(): Promise<void> | undefined {
+    return this.extensionReloadPromise;
+  }
+
+  private responseData(response: unknown): JsonRecord | undefined {
+    return asRecord(asRecord(response)?.data);
   }
 
   private emitEvent(event: PiRpcEvent): void {
@@ -918,55 +917,79 @@ export class PiRpcWorker {
   private handleRecord(value: unknown): void {
     const record = asRecord(value);
     if (!record) return;
-    if (record.type === "response") {
-      const id = record.id;
-      if (typeof id !== "string") return;
-      const pending = this.pending.get(id);
-      if (!pending) return;
-      this.pending.delete(id);
-      if (pending.timeout) clearTimeout(pending.timeout);
-      if (record.success === true) {
-        if (pending.workEpoch !== undefined && this.activeEpoch === pending.workEpoch) {
-          this.accepted = true;
-          if (this.settledBeforeAcceptance) this.settleWork(pending.workEpoch);
-        }
-        pending.resolve(record);
-      } else {
-        pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC command failed"));
-      }
-      return;
-    }
-    const text = assistantText(record);
-    if (record.type === "message_end") {
-      const message = asRecord(record.message);
-      if (message?.role === "assistant") {
-        const stopReason = message.stopReason;
-        if (stopReason === "error") {
-          const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
-            ? message.errorMessage
-            : "Pi assistant turn failed";
-          const failure = new Error(errorMessage);
-          this.settledError = failure;
-          if (this.activeEpoch !== undefined) this.workError = failure;
-          this.lastAssistantText = undefined;
-        } else {
-          this.lastAssistantText = text;
-        }
-        this.assistantTextKnown = true;
-      }
-    }
-    if (record.type === "agent_settled") {
-      if (this.workError !== undefined) this.settledError = this.workError;
-      if (this.activeEpoch !== undefined) {
-        if (this.accepted) this.settleWork(this.activeEpoch);
-        else this.settledBeforeAcceptance = true;
-      }
+    switch (record.type) {
+      case "response":
+        this.handleResponse(record);
+        return;
+      case "message_end":
+        this.handleMessageEnd(record);
+        break;
+      case "agent_settled":
+        this.handleAgentSettled();
+        break;
     }
     this.emitEvent(record);
-    if (record.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(String(record.method))) {
-      const id = record.id;
-      if (typeof id === "string") this.writeFireAndForget({ type: "extension_ui_response", id, cancelled: true });
+    if (record.type === "extension_ui_request") this.cancelExtensionUiRequest(record);
+  }
+
+  private handleResponse(record: JsonRecord): void {
+    const id = record.id;
+    if (typeof id !== "string") return;
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    if (pending.timeout) clearTimeout(pending.timeout);
+    if (record.success === true) {
+      if (pending.workEpoch !== undefined && this.activeEpoch === pending.workEpoch) {
+        this.accepted = true;
+        if (this.settledBeforeAcceptance) this.settleWork(pending.workEpoch);
+      }
+      pending.resolve(record);
+    } else {
+      pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC command failed"));
     }
+  }
+
+  private handleMessageEnd(record: JsonRecord): void {
+    const message = asRecord(record.message);
+    if (!message || message.role !== "assistant") return;
+    if (message.stopReason === "error") {
+      const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+        ? message.errorMessage
+        : "Pi assistant turn failed";
+      const failure = new Error(errorMessage);
+      this.settledError = failure;
+      if (this.activeEpoch !== undefined) this.workError = failure;
+      this.lastAssistantText = undefined;
+    } else if (typeof message.content === "string") {
+      this.lastAssistantText = message.content.trim() || undefined;
+    } else if (Array.isArray(message.content)) {
+      const text = message.content
+        .map((block) => {
+          const record = asRecord(block);
+          return record?.type === "text" && typeof record.text === "string" ? record.text : "";
+        })
+        .join("")
+        .trim();
+      this.lastAssistantText = text || undefined;
+    } else {
+      this.lastAssistantText = undefined;
+    }
+    this.assistantTextKnown = true;
+  }
+
+  private handleAgentSettled(): void {
+    if (this.workError !== undefined) this.settledError = this.workError;
+    if (this.activeEpoch !== undefined) {
+      if (this.accepted) this.settleWork(this.activeEpoch);
+      else this.settledBeforeAcceptance = true;
+    }
+  }
+
+  private cancelExtensionUiRequest(record: JsonRecord): void {
+    if (!["select", "confirm", "input", "editor"].includes(String(record.method))) return;
+    const id = record.id;
+    if (typeof id === "string") this.writeFireAndForget({ type: "extension_ui_response", id, cancelled: true });
   }
 
   private writeFireAndForget(value: JsonRecord): void {
@@ -975,14 +998,19 @@ export class PiRpcWorker {
     try { stdin.write(`${JSON.stringify(value)}\n`); } catch { /* process exit handles write failure */ }
   }
 
-  private failProcess(error: Error): void {
-    if (!this.terminalError && !this.stopping) this.terminalError = error;
+  private teardownWork(error: Error): void {
     this.clearPromptSettlementTimers();
     this.rejectPending(error);
     this.rejectSettledWaiters(error);
+    this.clearWorkSets();
+  }
+
+  private failProcess(error: Error): void {
+    if (!this.terminalError && !this.stopping) this.terminalError = error;
+    this.teardownWork(error);
     this.settleAllWork();
     const child = this.process;
-    if (child && !this.stopping) terminateProcessGroup(child, "SIGKILL");
+    if (child && !this.stopping) this.terminateProcessGroup?.(child, "SIGKILL");
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
@@ -990,9 +1018,7 @@ export class PiRpcWorker {
     const error = this.terminalError ?? new Error(
       `Pi worker exited (${signal ?? (code === null ? "unknown" : code)}).${this.stderr ? ` Stderr: ${this.stderr}` : ""}`,
     );
-    this.clearPromptSettlementTimers();
-    this.rejectPending(error);
-    this.rejectSettledWaiters(error);
+    this.teardownWork(error);
     this.settleAllWork();
     if (!this.stopping && !this.terminalError) this.terminalError = error;
     this.process = undefined;

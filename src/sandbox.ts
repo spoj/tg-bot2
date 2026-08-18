@@ -3,6 +3,7 @@ import { access, lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node
 import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { requireRealDirectory } from "./util.js";
 export type PiWorkerChildProcess = ChildProcess;
 export type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
 export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
@@ -60,20 +61,75 @@ async function runtimeLibraryPaths(): Promise<string[]> {
     .map((entry) => path.join("/", entry.name));
   return await existing(candidates);
 }
+async function piWorkerRuntimePaths(): Promise<string[]> {
+  return [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
+}
+
+type SandboxProfile = {
+  workspace: string;
+  runtimePaths: Promise<string[]>;
+  /** Args inserted between `--tmpfs /tmp` and `--bind workspace /workspace`. */
+  middleArgs?: string[];
+  /** Args inserted after `--bind workspace /workspace`, before the environment. */
+  tailArgs?: string[];
+  pathValue: string;
+  /** Extra `--setenv` args placed after PATH. */
+  extraSetenv?: string[];
+  executable: string[];
+};
+
+function baseProfileArgs(): string[] {
+  return [
+    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
+    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
+    "--ro-bind", "/usr", "/usr",
+  ];
+}
+
+async function etcMountArgs(): Promise<string[]> {
+  const args = ["--dir", "/etc"];
+  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
+    args.push("--ro-bind", etcPath, etcPath);
+  }
+  return args;
+}
+
+function profileTailArgs(profile: SandboxProfile): string[] {
+  return [
+    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    ...(profile.middleArgs ?? []),
+    "--bind", profile.workspace, "/workspace",
+    ...(profile.tailArgs ?? []),
+    "--setenv", "HOME", "/workspace",
+    "--setenv", "TMPDIR", "/tmp",
+    "--setenv", "PATH", profile.pathValue,
+    ...(profile.extraSetenv ?? []),
+    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
+    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
+    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
+    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
+    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
+    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
+  ];
+}
+
+async function buildProfileArgs(profile: SandboxProfile): Promise<{ args: string[] }> {
+  const args = [...baseProfileArgs()];
+  for (const runtimePath of await profile.runtimePaths) {
+    args.push("--ro-bind", runtimePath, runtimePath);
+  }
+  args.push(...(await etcMountArgs()));
+  args.push(...profileTailArgs(profile));
+  args.push("--chdir", "/workspace", "--", ...profile.executable);
+  return { args };
+}
 
 export async function buildBwrapArgs(
   paths: SandboxPaths,
   request: SandboxRequest,
 ): Promise<{ args: string[] }> {
-  const sessionsStat = await lstat(paths.sessions);
-  if (!sessionsStat.isDirectory() || sessionsStat.isSymbolicLink()) {
-    throw new Error("Sandbox sessions must be a real directory");
-  }
-  const workspace = await realpath(paths.workspace);
-  const sessions = await realpath(paths.sessions);
-  if (workspace !== path.resolve(paths.workspace) || sessions !== path.resolve(paths.sessions)) {
-    throw new Error("Sandbox workspace and session paths must be resolved canonical directories");
-  }
+  const sessions = await requireRealDirectory(paths.sessions, "Sandbox sessions", path.resolve(paths.sessions));
+  const workspace = await requireRealDirectory(paths.workspace, "Sandbox workspace", path.resolve(paths.workspace));
   const mountPoint = path.join(workspace, "sessions_ro");
   await mkdir(mountPoint, { recursive: true, mode: 0o700 });
   const mountStat = await lstat(mountPoint);
@@ -81,19 +137,7 @@ export async function buildBwrapArgs(
     throw new Error("workspace/sessions_ro must be a real directory mount point");
   }
 
-  const args = [
-    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
-    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
-    "--ro-bind", "/usr", "/usr",
-  ];
-  for (const runtimePath of await existing(["/bin", "/lib", "/lib64"])) {
-    args.push("--ro-bind", runtimePath, runtimePath);
-  }
-  args.push("--dir", "/etc");
-  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
-    args.push("--ro-bind", etcPath, etcPath);
-  }
-  const protectedMounts: Array<[string, string]> = [];
+  const tailArgs: string[] = [];
   for (const candidate of paths.readOnlyPaths ?? []) {
     let resolved: string;
     try {
@@ -108,27 +152,16 @@ export async function buildBwrapArgs(
     if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error("Sandbox read-only paths must remain under the workspace");
     }
-    protectedMounts.push([resolved, path.posix.join("/workspace", relative.split(path.sep).join("/"))]);
+    tailArgs.push("--ro-bind", resolved, path.posix.join("/workspace", relative.split(path.sep).join("/")));
   }
-  args.push(
-    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-    "--bind", workspace, "/workspace",
-  );
-  for (const [source, target] of protectedMounts) args.push("--ro-bind", source, target);
-  args.push(
-    "--ro-bind", sessions, "/workspace/sessions_ro",
-    "--setenv", "HOME", "/workspace",
-    "--setenv", "TMPDIR", "/tmp",
-    "--setenv", "PATH", "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
-    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
-    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
-    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
-    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
-    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
-    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
-    "--chdir", "/workspace", "--", request.executable, ...request.args,
-  );
-  return { args };
+  tailArgs.push("--ro-bind", sessions, "/workspace/sessions_ro");
+  return buildProfileArgs({
+    workspace,
+    runtimePaths: existing(["/bin", "/lib", "/lib64"]),
+    tailArgs,
+    pathValue: "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    executable: [request.executable, ...request.args],
+  });
 }
 
 export type PiWorkerSandboxPaths = {
@@ -149,19 +182,8 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
 
 /** Build the Pi worker profile; appRoot, source, and .env stay out while dependencies remain read-only. */
 export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promise<PiWorkerBwrapResult> {
-  const workspace = await realpath(paths.workspace);
-  const appRoot = await realpath(paths.appRoot);
-  if (workspace !== path.resolve(paths.workspace) || appRoot !== path.resolve(paths.appRoot)) {
-    throw new Error("Pi worker workspace and appRoot must be resolved canonical directories");
-  }
-  const workspaceStat = await lstat(workspace);
-  const appRootStat = await lstat(appRoot);
-  if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) {
-    throw new Error("Pi worker workspace must be a real directory");
-  }
-  if (!appRootStat.isDirectory() || appRootStat.isSymbolicLink()) {
-    throw new Error("Pi worker appRoot must be a real directory");
-  }
+  const workspace = await requireRealDirectory(paths.workspace, "Pi worker workspace", path.resolve(paths.workspace));
+  const appRoot = await requireRealDirectory(paths.appRoot, "Pi worker appRoot", path.resolve(paths.appRoot));
 
   const nodeModulesPath = path.join(appRoot, "node_modules");
   const nodeModulesStat = await lstat(nodeModulesPath);
@@ -184,39 +206,18 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
 
   const nodePath = await requireExecutable("node");
-  const args = [
-    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
-    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
-    "--ro-bind", "/usr", "/usr",
-  ];
-  for (const runtimePath of await existing(["/bin"])) {
-    args.push("--ro-bind", runtimePath, runtimePath);
-  }
-  for (const runtimePath of await runtimeLibraryPaths()) {
-    args.push("--ro-bind", runtimePath, runtimePath);
-  }
-  args.push("--dir", "/etc");
-  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
-    args.push("--ro-bind", etcPath, etcPath);
-  }
-  args.push(
-    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-    "--ro-bind", nodeModules, "/app/node_modules", "--bind", workspace, "/workspace",
-    "--setenv", "HOME", "/workspace",
-    "--setenv", "TMPDIR", "/tmp",
-    "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
-    "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
-    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
-    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
-    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
-    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
-    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
-    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
-    "--chdir", "/workspace", "--", nodePath, cliMountPath,
-    "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
-    ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
-  );
-  return { args };
+  return buildProfileArgs({
+    workspace,
+    runtimePaths: piWorkerRuntimePaths(),
+    middleArgs: ["--ro-bind", nodeModules, "/app/node_modules"],
+    pathValue: "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
+    extraSetenv: ["--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent"],
+    executable: [
+      nodePath, cliMountPath,
+      "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
+      ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
+    ],
+  });
 }
 
 function outputCapture(limit: number): {

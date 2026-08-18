@@ -36,19 +36,27 @@ const state = vi.hoisted(() => {
       stop = vi.fn(async () => { order.push("scheduler.stop"); });
     }),
     outbox: vi.fn(class WorkspaceOutboxMock {
+      dispatch: unknown;
+      constructor(options: { dispatch: unknown }) {
+        this.dispatch = options.dispatch;
+      }
       start = vi.fn(async () => {});
       stop = vi.fn(async () => { order.push("outbox.stop"); });
     }),
     createTelegramBot: vi.fn(() => bot),
+    dispatchOutboxRequest: vi.fn(),
     closeTelegramIngress: vi.fn(() => { order.push("closeTelegramIngress"); }),
     flushTelegramIngress: vi.fn(async () => {
       order.push("flushTelegramIngress");
       await flushState.current?.promise;
     }),
     delivery: vi.fn(class TelegramDeliveryQueueMock {
+      enqueue = vi.fn(async (_chatId: number, run: () => unknown) => run());
       drain = vi.fn(async () => { order.push("delivery.drain"); });
     }),
     terminateActiveSandboxes: vi.fn(),
+    spawnProcess: vi.fn(),
+    terminateProcessGroup: vi.fn(),
   };
 });
 
@@ -58,7 +66,9 @@ vi.mock("../src/config.js", () => ({
 }));
 vi.mock("../src/sandbox.js", () => ({
   checkSandboxEnvironment: state.checkSandboxEnvironment,
+  spawnProcess: state.spawnProcess,
   terminateActiveSandboxes: state.terminateActiveSandboxes,
+  terminateProcessGroup: state.terminateProcessGroup,
 }));
 vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
@@ -67,12 +77,7 @@ vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
   closeTelegramIngress: state.closeTelegramIngress,
   flushTelegramIngress: state.flushTelegramIngress,
-  recordPollOwner: vi.fn(),
-  sendTelegramPoll: vi.fn(),
-  sendTelegramReaction: vi.fn(),
-  sendTelegramRichMessage: vi.fn(),
-  stopTelegramPoll: vi.fn(),
-  sendWorkspaceFile: vi.fn(),
+  dispatchOutboxRequest: state.dispatchOutboxRequest,
   TelegramDeliveryQueue: state.delivery,
 }));
 
@@ -86,6 +91,7 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   state.scheduler.mockClear();
   state.outbox.mockClear();
   state.createTelegramBot.mockClear();
+  state.dispatchOutboxRequest.mockClear();
   state.closeTelegramIngress.mockClear();
   state.flushTelegramIngress.mockClear();
   state.terminateActiveSandboxes.mockClear();
@@ -120,6 +126,20 @@ describe("application startup and shutdown wiring", () => {
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: ["message", "callback_query", "poll_answer"],
     }));
+  });
+
+  it("delegates outbox dispatch to dispatchOutboxRequest via the delivery queue", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+
+    state.dispatchOutboxRequest.mockResolvedValue({ messageId: 7 });
+    const outbox = state.outbox.mock.instances[0] as { dispatch: (chatId: number, req: unknown) => Promise<unknown> };
+    const request = { type: "send_message", version: 1, id: "x", text: "hi" };
+    const result = await outbox.dispatch(42, request);
+
+    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(state.bot, "/canonical-data", 42, request);
+    expect(result).toEqual({ messageId: 7 });
   });
 
   it("raises the shutdown gate before waiting for ingress and treats signal abort as graceful", async () => {

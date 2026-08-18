@@ -2,75 +2,30 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PiRpcWorker, type AvailableModel, type WorkerSessionState } from "./pi-worker.js";
+import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { Config } from "./config.js";
-import { chatPaths } from "./config.js";
 import { SerialQueue } from "./queue.js";
+import { chatPaths, defined, withTimeout } from "./util.js";
+import { renderOutboxPrompt } from "./outbox-protocol.js";
+import { renderEventsPrompt } from "./events.js";
+import { renderSchedulesPrompt } from "./schedule-protocol.js";
 
-export const SYSTEM_PROMPT = `You are a persistent personal agent reached through Telegram.
+export const SYSTEM_PROMPT = [
+`You are a persistent personal agent reached through Telegram.
 Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
 Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Extension changes are debounced and automatically reloaded after the current turn.
-To send files or messages through Telegram, write one request per send under
-/workspace/.tg-bot/outbox/. Request types:
-{version:1,id,type:"send_file",path,caption?,kind?,reply_to_message_id?,disable_notification?}
-sends the file at path (relative to /workspace or an absolute /workspace/... path)
-with an optional caption; kind is "auto" (default: images are sent as photos,
-audio as audio, video as video, other files as documents, and images over 10 MB
-as documents) or an explicit "photo", "audio", "video", "voice", or "document".
-{version:1,id,type:"send_message",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
-sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
-plain text; malformed markup is resent as plain text; parse_mode and entities
-are mutually exclusive), entities is a list of {type,offset,length} message
-entities, link_preview_options is a Telegram LinkPreviewOptions object,
-reply_markup is Telegram reply-markup JSON such as an inline_keyboard button
-list, reply_to_message_id targets an earlier message, and
-disable_notification sends silently.
-{version:1,id,type:"send_location",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
-sends a location pin (venue {title,address} sends a named venue instead).
-{version:1,id,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
-sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
-requires correct_option_id). Set is_anonymous:false to receive each vote as a
-poll_answer event in events.jsonl; the matching send line in events.jsonl
-records pollId.
-{version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
-appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
-(latest 256 lines kept); poll_id matches the poll_answer events' pollId.
-{version:1,id,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
-{version:1,id,type:"edit_message",message_id,text?,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (at least one of text/reply_markup/link_preview_options required; message_id is the numeric messageId of that message).
-{version:1,id,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
-id must be unique. Write each request to a temporary filename that does not
-end in .json, then atomically rename it to the final unique *.json request name.
-Every chat event is appended by the host to /workspace/.tg-bot/events.jsonl (one JSON
-object per line, newest last; every line starts with {v:1,t,...} where t is an ISO-8601
-timestamp). Event types:
-- message: {v:1,t,type:'message',message,attachments} where message is the raw Telegram
-  Message object (message_id, date, from, chat, text, caption, location, venue, photo,
-  document, reply_to_message, and any other Bot API Message field) and attachments lists
-  files the host downloaded into /workspace/attachments/... for you
-  ({type,path,mimeType,originalName} or {type,failure}).
-- callback: {v:1,t,type:'callback',callback_query} where callback_query is the raw
-  Telegram CallbackQuery object (id, from, message, data, chat_instance).
-- poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
-  Telegram PollAnswer object (poll_id, user, option_ids).
-- send: a confirmation of one of your outbox requests:
-  {v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}.
-Grep events.jsonl whenever you need recent chat history or sent message ids.
-When a user message or button press arrives the host wakes you with a single "." prompt
-that carries no content. Read the newest events.jsonl lines and decide whether the user
-needs a response. Send ALL Telegram output through .tg-bot/outbox requests; never rely
-on the wake prompt for content.
-Schedules are stored in /workspace/.tg-bot/schedules.json. Its root object is
-{version:1,schedules:[...]}. Each schedule record requires id, prompt, dueAt,
-recurrence, enabled, lastRunAt, and runCount. dueAt must be a UTC timestamp ending
-in Z; recurrence must be hourly, daily, weekly, or null; enabled is a boolean;
-lastRunAt is nullable and, when present, must be a UTC timestamp ending in Z; and
-runCount must be a nonnegative integer.
-Keep Telegram-facing answers concise unless the user asks for detail.
+`,
+  renderOutboxPrompt(),
+  renderEventsPrompt(),
+  renderSchedulesPrompt(),
+  `Keep Telegram-facing answers concise unless the user asks for detail.
 Host commands /model, /thinking, /status, and /restart manage configuration; do not edit .pi config files yourself.
 Every worker start begins a fresh session; previous conversations persist in /workspace/.pi/sessions/*.jsonl and the agent should read/grep them when the user references history.
-`;
+`,
+].join("");
 
 export type PromptMode = "interactive" | "follow-up";
 
@@ -106,6 +61,9 @@ export type AgentManagerOptions = {
   appRoot: string;
   bwrapPath?: string;
   workerFactory?: AgentWorkerFactory;
+  /** Process-control seams injected by the composition root; the default worker factory passes them to the Pi worker. */
+  spawnProcess?: PiWorkerSpawn;
+  terminateProcessGroup?: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   /** Bounds worker abort and active-run draining during shutdown. */
   shutdownTimeoutMs?: number;
 };
@@ -135,23 +93,6 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
 
 export const WORKER_IDLE_STOP_MS = 2 * 60 * 60 * 1000;
 
-
-function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -191,7 +132,10 @@ export class AgentManager {
   constructor(private readonly config: Pick<Config, "dataDir">, options: AgentManagerOptions) {
     this.appRoot = path.resolve(options.appRoot);
     this.bwrapPath = options.bwrapPath;
-    this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRpcWorker(workerOptions));
+    this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRpcWorker({
+      ...workerOptions,
+      ...defined({ spawn: options.spawnProcess, terminateProcessGroup: options.terminateProcessGroup }),
+    }));
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 0) {
       throw new Error("shutdownTimeoutMs must be a non-negative integer");
@@ -244,7 +188,7 @@ export class AgentManager {
         await this.abortWorker(state, startedWorker);
       };
       void workerPromise.then((startedWorker) => handle(startedWorker), () => {});
-      state.abortPromise = bounded(workerPromise, this.shutdownTimeoutMs, "Agent worker startup timed out")
+      state.abortPromise = withTimeout(workerPromise, this.shutdownTimeoutMs, () => new Error("Agent worker startup timed out"))
         .then((startedWorker) => handle(startedWorker), () => {});
       return state.abortPromise;
     }
@@ -254,12 +198,12 @@ export class AgentManager {
 
   private async abortWorker(state: ChatState, worker: AgentWorker): Promise<void> {
     try {
-      await bounded(worker.abort(), this.shutdownTimeoutMs, "Agent worker abort timed out");
+      await withTimeout(worker.abort(), this.shutdownTimeoutMs, () => new Error("Agent worker abort timed out"));
     } catch {
-      await bounded(
+      await withTimeout(
         this.invalidateWorker(state, worker),
         this.shutdownTimeoutMs,
-        "Agent worker stop timed out",
+        () => new Error("Agent worker stop timed out"),
       ).catch(() => {});
     }
   }
@@ -379,7 +323,7 @@ export class AgentManager {
           worker = await this.workerFactory({
             workspace: paths.workspace,
             appRoot: this.appRoot,
-            ...(this.bwrapPath === undefined ? {} : { bwrapPath: this.bwrapPath }),
+            ...defined({ bwrapPath: this.bwrapPath }),
             appendSystemPrompt: SYSTEM_PROMPT,
           });
           state.stoppedWorker = undefined;
@@ -439,41 +383,82 @@ export class AgentManager {
   }
 
 
-  async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<string | undefined> {
+  private withWorker<T>(
+    chatId: number,
+    opts: {
+      armIdle?: boolean;
+      waitActiveRun?: boolean;
+      beforeWorker?: (state: ChatState) => Promise<void> | void;
+    },
+    op: (worker: AgentWorker, state: ChatState) => Promise<T>,
+  ): Promise<T> {
     this.ensureOpen();
     const state = this.state(chatId);
-    const action = await state.queue.run(async (): Promise<PromptAction> => {
-      this.armIdleStop(state);
+    return state.queue.run(async () => {
+      if (opts.armIdle) this.armIdleStop(state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      if (state.activeRun) {
-        if (mode === "interactive" && state.workerTurnActive && state.worker) {
-          // Esc semantics: abort whatever is in flight (generation or tools, as pi's
-          // own Esc does) and reprompt fresh; the aborted run's reply is ignored.
-          await this.raceShutdown(state, state.worker.abort()).catch(() => {});
-          await this.raceShutdown(state, state.activeRun).catch(() => {});
-        } else {
-          // Settled or non-interactive: wait; the new message starts its own fresh run.
-          await this.raceShutdown(state, state.activeRun).catch(() => {});
-        }
+      if (opts.waitActiveRun) {
+        const activeRun = state.activeRun;
+        if (activeRun) await this.raceShutdown(state, activeRun).catch(() => {});
       }
-
+      if (opts.beforeWorker) {
+        // Await only when the hook actually has work: an unconditional await
+        // would suspend an in-flight prompt past disposeAll's closing mark, so
+        // its worker startup would never be initiated and a late-resolving
+        // factory promise could never be stopped.
+        const result = opts.beforeWorker(state);
+        if (result) await result;
+      }
       const worker = await this.ensureWorker(chatId, state);
       if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      return { completion: this.beginRun(state, worker, () => worker.prompt(text)) };
+      return op(worker, state);
     });
+  }
+
+  private call<A>(
+    chatId: number,
+    opts: { armIdle?: boolean; waitActiveRun?: boolean },
+    op: (worker: AgentWorker) => Promise<A>,
+  ): Promise<A> {
+    return this.withWorker(chatId, opts, (worker, state) => this.raceShutdown(state, op(worker)));
+  }
+
+  async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<string | undefined> {
+    const action = await this.withWorker(
+      chatId,
+      {
+        armIdle: true,
+        // Resolve active work before acquiring a worker: a run that failed
+        // invalidates its worker as part of settling, so the next worker is only
+        // created once the failed worker's stop() has finished, and the queued
+        // request is never dispatched on the failed worker.
+        beforeWorker: (state) => {
+          const run = state.activeRun;
+          if (!run) return;
+          if (mode === "interactive" && state.workerTurnActive && state.worker) {
+            const activeWorker = state.worker;
+            // Esc semantics: abort whatever is in flight (generation or tools, as pi's
+            // own Esc does) and reprompt fresh; the aborted run's reply is ignored.
+            return (async () => {
+              await this.raceShutdown(state, activeWorker.abort()).catch(() => {});
+              await this.raceShutdown(state, run).catch(() => {});
+            })();
+          }
+          // Settled or non-interactive: wait; the new message starts its own fresh run.
+          return (async () => {
+            await this.raceShutdown(state, run).catch(() => {});
+          })();
+        },
+      },
+      async (worker, state) => {
+        return { completion: this.beginRun(state, worker, () => worker.prompt(text)) };
+      },
+    );
     return await action.completion;
   }
 
   newSession(chatId: number): Promise<void> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      this.armIdleStop(state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const activeRun = state.activeRun;
-      if (activeRun) await this.raceShutdown(state, activeRun).catch(() => {});
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
+    return this.withWorker(chatId, { armIdle: true, waitActiveRun: true }, async (worker, state) => {
       try {
         await this.raceShutdown(state, worker.newSession());
       } catch (error) {
@@ -484,13 +469,7 @@ export class AgentManager {
   }
 
   setModel(chatId: number, provider: string, modelId: string): Promise<void> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      this.armIdleStop(state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
+    return this.withWorker(chatId, { armIdle: true }, async (worker, state) => {
       await this.raceShutdown(state, worker.setModel(provider, modelId));
       await writeUserSettings(chatPaths(this.config.dataDir, chatId).workspace, {
         defaultProvider: provider,
@@ -500,13 +479,7 @@ export class AgentManager {
   }
 
   setThinkingLevel(chatId: number, level: string): Promise<void> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      this.armIdleStop(state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
+    return this.withWorker(chatId, { armIdle: true }, async (worker, state) => {
       await this.raceShutdown(state, worker.setThinkingLevel(level));
       await writeUserSettings(chatPaths(this.config.dataDir, chatId).workspace, {
         defaultThinkingLevel: level,
@@ -515,105 +488,84 @@ export class AgentManager {
   }
 
   status(chatId: number): Promise<WorkerSessionState> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      return await this.raceShutdown(state, worker.getSessionState());
-    });
+    return this.call(chatId, {}, (worker) => worker.getSessionState());
   }
 
   getAvailableModels(chatId: number): Promise<AvailableModel[]> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      return await this.raceShutdown(state, worker.getAvailableModels());
-    });
+    return this.call(chatId, {}, (worker) => worker.getAvailableModels());
   }
 
   getAvailableThinkingLevels(chatId: number): Promise<string[]> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      return await this.raceShutdown(state, worker.getAvailableThinkingLevels());
-    });
+    return this.call(chatId, {}, (worker) => worker.getAvailableThinkingLevels());
   }
 
   restart(chatId: number): Promise<void> {
-    this.ensureOpen();
-    const state = this.state(chatId);
-    return state.queue.run(async () => {
-      this.armIdleStop(state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      const activeRun = state.activeRun;
-      if (activeRun) await this.raceShutdown(state, activeRun).catch(() => {});
-      const worker = await this.ensureWorker(chatId, state);
-      if (this.shuttingDown || state.closing) throw new Error("Agent manager is shutting down");
-      await this.raceShutdown(state, worker.restart());
-    });
+    return this.call(chatId, { armIdle: true, waitActiveRun: true }, (worker) => worker.restart());
   }
 
   async disposeAll(): Promise<void> {
     const permanentlyClosed = this.shuttingDown;
     for (const state of this.states.values()) state.closing = true;
 
-    while (true) {
-      const states = [...this.states.values()];
-      if (states.length === 0) break;
-      for (const state of states) this.disarmIdleStop(state);
+    const states = [...this.states.values()];
+    for (const state of states) this.disarmIdleStop(state);
 
-      await Promise.allSettled(states.map((state) => this.requestAbort(state)));
-      await Promise.all(states.map(async (state) => {
-        try {
-          await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out");
-        } catch {
-          this.cancelState(state, "Agent manager shutdown timed out");
-        }
-      }));
-      const activeRuns = states.flatMap((state) =>
-        state.activeRun ? [{ state, run: state.activeRun }] : [],
-      );
-      await Promise.all(activeRuns.map(async ({ state, run }) => {
-        const completed = run.then(() => false, () => false);
-        try {
-          await bounded(completed, this.shutdownTimeoutMs, "Agent worker run drain timed out");
-        } catch {
-          this.cancelState(state, "Agent worker run drain timed out");
-        }
-      }));
-      break;
-    }
-    while (true) {
-      const states = [...this.states.values()];
-      if (states.length === 0) break;
-      for (const state of states) state.closing = true;
-      for (const state of states) this.disarmIdleStop(state);
-      await Promise.allSettled(states.map(async (state) => {
-        await bounded(state.queue.idle(), this.shutdownTimeoutMs, "Agent queue drain timed out").catch(() => {});
-        state.unsubscribe?.();
-        state.unsubscribe = undefined;
-        const invalidation = state.invalidation;
-        if (invalidation) {
-          await bounded(invalidation.completion, this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
-          return;
-        }
-        const worker = state.worker;
-        if (!worker) return;
-        await bounded(this.invalidateWorker(state, worker), this.shutdownTimeoutMs, "Agent worker stop timed out").catch(() => {});
-      }));
-      const disposing = new Set(states);
-      for (const [chatId, state] of this.states) {
-        if (disposing.has(state)) this.states.delete(chatId);
+    await Promise.allSettled(states.map((state) => this.requestAbort(state)));
+    await Promise.all(states.map(async (state) => {
+      try {
+        await withTimeout(state.queue.idle(), this.shutdownTimeoutMs, () => new Error("Agent queue drain timed out"));
+      } catch {
+        this.cancelState(state, "Agent manager shutdown timed out");
       }
+    }));
+    const activeRuns = states.flatMap((state) =>
+      state.activeRun ? [{ state, run: state.activeRun }] : [],
+    );
+    await Promise.all(activeRuns.map(async ({ state, run }) => {
+      const completed = run.then(() => false, () => false);
+      try {
+        await withTimeout(completed, this.shutdownTimeoutMs, () => new Error("Agent worker run drain timed out"));
+      } catch {
+        this.cancelState(state, "Agent worker run drain timed out");
+      }
+    }));
+
+    // Phase 2: drain each state's queue (a prompt for a chat state created
+    // mid-disposal enqueues here), then stop its worker. The follow-up pass
+    // covers states created while another worker was stopping.
+    const remaining = [...this.states.values()];
+    await this.disposeStates(remaining);
+    const disposing = new Set(remaining);
+    for (const [chatId, state] of this.states) {
+      if (disposing.has(state)) this.states.delete(chatId);
     }
+    const late = [...this.states.values()];
+    await this.disposeStates(late);
+    const lateDisposing = new Set(late);
+    for (const [chatId, state] of this.states) {
+      if (lateDisposing.has(state)) this.states.delete(chatId);
+    }
+
     if (!permanentlyClosed) this.shuttingDown = false;
+  }
+
+  private async disposeStates(states: ChatState[]): Promise<void> {
+    await Promise.allSettled(states.map(async (state) => {
+      try {
+        await withTimeout(state.queue.idle(), this.shutdownTimeoutMs, () => new Error("Agent queue drain timed out"));
+      } catch {
+        this.cancelState(state, "Agent manager shutdown timed out");
+      }
+      state.unsubscribe?.();
+      state.unsubscribe = undefined;
+      const invalidation = state.invalidation;
+      if (invalidation) {
+        await withTimeout(invalidation.completion, this.shutdownTimeoutMs, () => new Error("Agent worker stop timed out")).catch(() => {});
+        return;
+      }
+      const worker = state.worker;
+      if (!worker) return;
+      await withTimeout(this.invalidateWorker(state, worker), this.shutdownTimeoutMs, () => new Error("Agent worker stop timed out")).catch(() => {});
+    }));
   }
 }

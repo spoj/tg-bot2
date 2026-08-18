@@ -2,7 +2,8 @@ import { mkdir, mkdtemp, open as openFile, readFile, readdir, rename, rm, symlin
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { WorkspaceScheduler, type ScheduleRecord } from "../src/scheduler.js";
+import { WorkspaceScheduler } from "../src/scheduler.js";
+import type { ScheduleRecord } from "../src/schedule-protocol.js";
 
 const NOW = Date.parse("2026-01-10T12:30:00.000Z");
 

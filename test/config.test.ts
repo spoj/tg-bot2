@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { canonicalChatId, chatPaths, parseConfig } from "../src/config.js";
+import { parseConfig } from "../src/config.js";
+import { canonicalChatId, chatPaths } from "../src/util.js";
 
 const base = { TG_BOT_TOKEN: "token", ALLOWED_USER_IDS: "123, 456", DATA_DIR: "/tmp/data" };
 

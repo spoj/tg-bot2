@@ -22,7 +22,6 @@ import {
   sendTelegramPoll,
   sendTelegramReaction,
   sendTelegramRichMessage,
-  sendTelegramText,
   stopTelegramPoll,
   sendWorkspaceFile,
   splitTelegramText,
@@ -30,6 +29,13 @@ import {
   TelegramIngressBuffer,
 } from "../src/telegram.js";
 import type { ChatEvent } from "../src/events.js";
+import type {
+  WorkspaceOutboxEditMessageRequest,
+  WorkspaceOutboxReaction,
+  WorkspaceOutboxSendLocationRequest,
+  WorkspaceOutboxSendMessageRequest,
+  WorkspaceOutboxSendPollRequest,
+} from "../src/outbox-protocol.js";
 
 const execFile = promisify(execFileCallback);
 function fakeBot() {
@@ -656,16 +662,6 @@ it("rejects FIFOs without blocking when FIFO creation is supported", async () =>
   });
 }, 2_000);
 
-it("exports chunked text delivery through the Bot API", async () => {
-  const bot = fakeBot();
-  const text = "a".repeat(4_001);
-  await sendTelegramText(bot, 9, text);
-  const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
-  expect(sendMessage.mock.calls.map(([chatId, chunk]) => [chatId, chunk])).toEqual(
-    splitTelegramText(text).map((chunk) => [9, chunk]),
-  );
-});
-
 it("rejects traversal and symlinks that resolve outside the workspace", async () => {
 
   const parent = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-parent-"));
@@ -1003,10 +999,13 @@ describe("Telegram rich messages", () => {
   it("sends a rich message with markup, keyboard, and reply target", async () => {
     const bot = fakeBot();
     await expect(sendTelegramRichMessage(bot, 42, {
+      version: 1,
+      id: "rich-1",
+      type: "send_message",
       text: "<b>hi</b>",
-      parseMode: "HTML",
-      replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-      replyToMessageId: 7,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      reply_to_message_id: 7,
     })).resolves.toBe(123);
     const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
     expect(sendMessage).toHaveBeenCalledWith(42, "<b>hi</b>", {
@@ -1026,9 +1025,12 @@ describe("Telegram rich messages", () => {
       { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
     ));
     await expect(sendTelegramRichMessage(bot, 42, {
+      version: 1,
+      id: "rich-2",
+      type: "send_message",
       text: "<b>hi</b>",
-      parseMode: "HTML",
-      replyToMessageId: 7,
+      parse_mode: "HTML",
+      reply_to_message_id: 7,
     })).resolves.toBe(123);
     expect(sendMessage).toHaveBeenCalledTimes(2);
     expect(sendMessage.mock.calls[1]).toEqual([42, "<b>hi</b>", { reply_to_message_id: 7 }]);
@@ -1043,17 +1045,20 @@ describe("Telegram rich messages", () => {
       "sendMessage",
       { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
     ));
-    await expect(sendTelegramRichMessage(bot, 42, { text: "<b>hi</b>", parseMode: "HTML" })).rejects.toThrow("chat not found");
+    await expect(sendTelegramRichMessage(bot, 42, { version: 1, id: "rich-3", type: "send_message", text: "<b>hi</b>", parse_mode: "HTML" })).rejects.toThrow("chat not found");
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("passes entities, link preview options, and notifications to sendMessage", async () => {
     const bot = fakeBot();
     await expect(sendTelegramRichMessage(bot, 42, {
+      version: 1,
+      id: "rich-4",
+      type: "send_message",
       text: "hi",
       entities: [{ type: "bold", offset: 0, length: 2 }],
-      linkPreviewOptions: { is_disabled: true },
-      disableNotification: true,
+      link_preview_options: { is_disabled: true },
+      disable_notification: true,
     })).resolves.toBe(123);
     const sendMessage = bot.api.sendMessage as unknown as Mock;
     expect(sendMessage).toHaveBeenCalledWith(42, "hi", {
@@ -1067,14 +1072,16 @@ describe("Telegram rich messages", () => {
 describe("Telegram message editing and deletion", () => {
   it("edits a message and returns the edited message id", async () => {
     const bot = fakeBot();
-    await expect(sendTelegramEditMessage(bot, {
-      chatId: 42,
-      messageId: 7,
+    await expect(sendTelegramEditMessage(bot, 42, {
+      version: 1,
+      id: "edit-1",
+      type: "edit_message",
+      message_id: 7,
       text: "<b>updated</b>",
-      parseMode: "HTML",
+      parse_mode: "HTML",
       entities: [{ type: "bold", offset: 0, length: 3 }],
-      linkPreviewOptions: { is_disabled: true },
-      replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
     })).resolves.toBe(123);
     const editMessageText = bot.api.editMessageText as unknown as Mock;
     expect(editMessageText).toHaveBeenCalledWith(42, 7, "<b>updated</b>", {
@@ -1094,13 +1101,15 @@ describe("Telegram message editing and deletion", () => {
       "editMessageText",
       { chat_id: 42, message_id: 7, text: "<b>updated</b>", parse_mode: "HTML" },
     ));
-    await expect(sendTelegramEditMessage(bot, {
-      chatId: 42,
-      messageId: 7,
+    await expect(sendTelegramEditMessage(bot, 42, {
+      version: 1,
+      id: "edit-2",
+      type: "edit_message",
+      message_id: 7,
       text: "<b>updated</b>",
-      parseMode: "HTML",
-      linkPreviewOptions: { is_disabled: true },
-      replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
     })).resolves.toBe(123);
     expect(editMessageText).toHaveBeenCalledTimes(2);
     expect(editMessageText.mock.calls[1]).toEqual([42, 7, "<b>updated</b>", {
@@ -1209,10 +1218,13 @@ describe("Telegram locations, polls, and reactions", () => {
   it("sends a location pin with optional fields", async () => {
     const bot = fakeBot();
     await expect(sendTelegramLocation(bot, 42, {
+      version: 1,
+      id: "loc-1",
+      type: "send_location",
       latitude: 52.52,
       longitude: 13.405,
       heading: 180,
-      livePeriod: 120,
+      live_period: 120,
     })).resolves.toBe(123);
     const sendLocation = bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>;
     expect(sendLocation).toHaveBeenCalledWith(42, 52.52, 13.405, { heading: 180, live_period: 120 });
@@ -1221,6 +1233,9 @@ describe("Telegram locations, polls, and reactions", () => {
   it("sends a venue when venue fields are present", async () => {
     const bot = fakeBot();
     await expect(sendTelegramLocation(bot, 42, {
+      version: 1,
+      id: "loc-2",
+      type: "send_location",
       latitude: 52.5163,
       longitude: 13.3777,
       venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
@@ -1229,14 +1244,33 @@ describe("Telegram locations, polls, and reactions", () => {
     expect(bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
   });
 
+  it("sends a venue with reply and notification options", async () => {
+    const bot = fakeBot();
+    await expect(sendTelegramLocation(bot, 42, {
+      version: 1,
+      id: "loc-3",
+      type: "send_location",
+      latitude: 52.5163,
+      longitude: 13.3777,
+      venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
+      reply_to_message_id: 9,
+      disable_notification: true,
+    })).resolves.toBe(123);
+    expect(bot.api.sendVenue as unknown as Mock).toHaveBeenCalledWith(42, 52.5163, 13.3777, "Brandenburg Gate", "Pariser Platz 1", { reply_to_message_id: 9, disable_notification: true });
+    expect(bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+  });
+
   it("sends a poll and returns its message and poll ids", async () => {
     const bot = fakeBot();
     await expect(sendTelegramPoll(bot, 42, {
+      version: 1,
+      id: "poll-1",
+      type: "send_poll",
       question: "Pick one",
       options: ["a", "b"],
-      isAnonymous: false,
-      pollType: "quiz",
-      correctOptionId: 1,
+      is_anonymous: false,
+      poll_type: "quiz",
+      correct_option_id: 1,
     })).resolves.toEqual({ messageId: 123, pollId: "poll-9" });
     expect(bot.api.sendPoll as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, "Pick one", ["a", "b"], {
       is_anonymous: false,

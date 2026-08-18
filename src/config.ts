@@ -33,12 +33,3 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir: path.resolve(required(env, "DATA_DIR")),
   };
 }
-
-export function canonicalChatId(chatId: number): string {
-  if (!Number.isSafeInteger(chatId)) throw new Error("Telegram chat ID must be a safe integer");
-  return String(chatId);
-}
-
-export function chatPaths(dataDir: string, chatId: number): { workspace: string } {
-  return { workspace: path.join(dataDir, "chats", canonicalChatId(chatId), "workspace") };
-}

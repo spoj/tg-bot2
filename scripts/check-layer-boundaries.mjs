@@ -270,6 +270,104 @@ function hasMemberCall(source, name, excludedObject) {
   return false;
 }
 
+/** Extract local names (after `as`) from an import/export clause like `type { A as B, C }`. */
+function clauseNames(clause) {
+  const braceStart = clause.indexOf("{");
+  const braceEnd = clause.lastIndexOf("}");
+  const inner = braceStart >= 0 && braceEnd > braceStart
+    ? clause.slice(braceStart + 1, braceEnd)
+    : clause;
+  const names = [];
+  for (const raw of inner.split(",")) {
+    const parts = raw.trim().split(/\s+/).filter((part) => part !== "" && part !== "type" && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(part));
+    if (parts.length === 0) continue;
+    let name = parts[parts.length - 1];
+    if (name === "as") name = parts[parts.length - 2];
+    if (name !== undefined) names.push(name);
+  }
+  return names;
+}
+
+/** Collect `export { ... }` / `export type { ... }` clauses with re-exported names and optional `from` specifier. */
+function collectExportBraceClauses(source) {
+  const clauses = [];
+  let cursor = 0;
+  let quote;
+  while (cursor < source.length) {
+    const character = source[cursor];
+    if (quote) {
+      if (character === "\\") cursor += 2;
+      else if (character === quote) {
+        quote = undefined;
+        cursor += 1;
+      } else cursor += 1;
+      continue;
+    }
+    if (character === "`" || character === "\"" || character === "'") {
+      quote = character;
+      cursor += 1;
+      continue;
+    }
+    if (source.startsWith("//", cursor)) {
+      const newline = source.indexOf("\n", cursor + 2);
+      cursor = newline === -1 ? source.length : newline + 1;
+      continue;
+    }
+    if (source.startsWith("/*", cursor)) {
+      const end = source.indexOf("*/", cursor + 2);
+      cursor = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    if (source.startsWith("export", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6])) {
+      let next = skipTrivia(source, cursor + 6);
+      if (source.startsWith("type", next) && !isIdentifierPart(source[next + 4])) {
+        next = skipTrivia(source, next + 4);
+      }
+      if (source[next] !== "{") {
+        cursor += 6;
+        continue;
+      }
+      let braceEnd = next + 1;
+      let depth = 1;
+      while (braceEnd < source.length && depth > 0) {
+        if (source[braceEnd] === "{") depth += 1;
+        else if (source[braceEnd] === "}") depth -= 1;
+        braceEnd += 1;
+      }
+      const names = clauseNames(source.slice(next + 1, braceEnd - 1));
+      let fromSpecifier;
+      let look = braceEnd;
+      while (look < source.length && look - braceEnd < 4_096) {
+        look = skipTrivia(source, look);
+        if (source[look] === ";") break;
+        if (isIdentifierStart(source[look])) {
+          const tokenStart = look;
+          look += 1;
+          while (isIdentifierPart(source[look])) look += 1;
+          if (source.slice(tokenStart, look) === "from") {
+            const moduleStart = skipTrivia(source, look);
+            const imported = readQuoted(source, moduleStart);
+            if (imported) fromSpecifier = imported.value;
+            break;
+          }
+          continue;
+        }
+        if (source[look] === "\"" || source[look] === "'") {
+          const string = readQuoted(source, look);
+          look = string?.end ?? look + 1;
+          continue;
+        }
+        look += 1;
+      }
+      clauses.push({ names, fromSpecifier });
+      cursor = braceEnd;
+      continue;
+    }
+    cursor += 1;
+  }
+  return clauses;
+}
+
 function moduleBase(specifier) {
   const withoutQuery = specifier.split(/[?#]/, 1)[0].replaceAll("\\", "/");
   const finalPart = withoutQuery.slice(withoutQuery.lastIndexOf("/") + 1);
@@ -332,6 +430,30 @@ for (const file of sourceFiles) {
     }
     if (layer !== "sandbox" && importedSpawn && !childProcess) {
       addViolation(violations, file, specifier, "spawn may only be used by sandbox.ts");
+    }
+  }
+
+  if (layer !== "sandbox") {
+    const sandboxLocalNames = new Set();
+    for (const imported of imports) {
+      if (isLocalModule(imported.specifier, "sandbox") && source.slice(imported.index, imported.index + 6) === "import") {
+        for (const name of clauseNames(imported.clause)) sandboxLocalNames.add(name);
+      }
+    }
+    for (const exported of collectExportBraceClauses(source)) {
+      if (exported.fromSpecifier !== undefined) {
+        if (isLocalModule(exported.fromSpecifier, "sandbox")) {
+          for (const name of exported.names) {
+            addViolation(violations, file, name, "sandbox capability may not be re-exported");
+          }
+        }
+      } else {
+        for (const name of exported.names) {
+          if (sandboxLocalNames.has(name)) {
+            addViolation(violations, file, name, "sandbox capability may not be re-exported");
+          }
+        }
+      }
     }
   }
 

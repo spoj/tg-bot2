@@ -1,19 +1,10 @@
 import { constants as fsConstants, type Dirent } from "node:fs";
-import { link, lstat, open, readdir, realpath, rename, rm } from "node:fs/promises";
+import { link, lstat, open, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { SCHEDULES_FILE, TG_BOT_DIR, chatPaths, errorCode, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
+import type { Recurrence, ScheduleRecord } from "./schedule-protocol.js";
 
-export type Recurrence = "hourly" | "daily" | "weekly";
-
-export type ScheduleRecord = {
-  id: string;
-  prompt: string;
-  dueAt: string;
-  recurrence: Recurrence | null;
-  enabled: boolean;
-  lastRunAt: string | null;
-  runCount: number;
-};
 type StoredScheduleRecord = ScheduleRecord & Record<string, unknown>;
 
 type ScheduleFile = {
@@ -48,10 +39,7 @@ const MAX_TIMER_MS = 2_147_483_647;
 const HOUR_MS = 60 * 60 * 1_000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
-const CHAT_DIRECTORY = /^-?(?:0|[1-9]\d*)$/u;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
-const DIRECTORY = fsConstants.O_DIRECTORY ?? 0;
-const READ_ONLY = fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW;
 const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
 const WRITE_NEW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW;
 const MAX_SCHEDULE_FILE_BYTES = 64 * 1024;
@@ -61,53 +49,7 @@ const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
 const UTC_ISO = /Z$/u;
 
 function isMissing(error: unknown): boolean {
-  return Boolean(
-    error &&
-      typeof error === "object" &&
-      "code" in error &&
-      (error as { code?: unknown }).code === "ENOENT",
-  );
-}
-
-type PinnedDirectory = {
-  handle: Awaited<ReturnType<typeof open>>;
-  path: string;
-  realPath: string;
-};
-
-async function openPinnedDirectory(directory: string, expectedRealPath?: string): Promise<PinnedDirectory> {
-  const initial = await lstat(directory);
-  if (!isDirectory(initial)) throw new Error(`Scheduler path is not a real directory: ${directory}`);
-  const canonical = await realpath(directory);
-  if (expectedRealPath !== undefined && canonical !== expectedRealPath) {
-    throw new Error(`Scheduler directory is not stable: ${directory}`);
-  }
-  const canonicalStat = await lstat(canonical);
-  if (!isDirectory(canonicalStat)) throw new Error(`Scheduler path is not a real directory: ${directory}`);
-  const handle = await open(canonical, READ_ONLY);
-  try {
-    const openedStat = await handle.stat();
-    if (!isDirectory(openedStat) || openedStat.dev !== canonicalStat.dev || openedStat.ino !== canonicalStat.ino) {
-      throw new Error(`Scheduler directory changed while opening: ${directory}`);
-    }
-    const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
-    if (openedPath !== canonical) throw new Error(`Scheduler directory is not stable: ${directory}`);
-    return { handle, path: `/proc/self/fd/${handle.fd}`, realPath: canonical };
-  } catch (error) {
-    await closeQuietly(handle);
-    throw error;
-  }
-}
-
-function isDirectory(stat: Awaited<ReturnType<typeof lstat>>): boolean {
-  return stat.isDirectory() && !stat.isSymbolicLink();
-}
-
-function numericChatId(name: string): number | undefined {
-  if (!CHAT_DIRECTORY.test(name)) return undefined;
-  const chatId = Number(name);
-  if (!Number.isSafeInteger(chatId) || String(chatId) !== name) return undefined;
-  return chatId;
+  return errorCode(error) === "ENOENT";
 }
 
 function isUtcIso(value: unknown): value is string {
@@ -284,7 +226,7 @@ export class WorkspaceScheduler {
           const expectedChat = path.join(chatsRoot.realPath, name);
           chatDirectory = await openPinnedDirectory(path.join(chatsRoot.path, name), expectedChat);
           workspace = await openPinnedDirectory(path.join(chatDirectory.path, "workspace"), path.join(chatDirectory.realPath, "workspace"));
-          metadata = await openPinnedDirectory(path.join(workspace.path, ".tg-bot"), path.join(workspace.realPath, ".tg-bot"));
+          metadata = await openPinnedDirectory(path.join(workspace.path, TG_BOT_DIR), path.join(workspace.realPath, TG_BOT_DIR));
           const scheduleSnapshot = await this.readSchedule(metadata, chatId);
           if (!scheduleSnapshot) continue;
           for (const record of scheduleSnapshot.file.schedules) {
@@ -311,7 +253,7 @@ export class WorkspaceScheduler {
   }
 
   private async openCurrentMetadata(item: DueRecord): Promise<PinnedDirectory | undefined> {
-    const metadataPath = path.join(this.dataDir, "chats", item.chatName, "workspace", ".tg-bot");
+    const metadataPath = path.join(chatPaths(this.dataDir, item.chatId).workspace, TG_BOT_DIR);
     try {
       return await openPinnedDirectory(metadataPath, item.metadataRealPath);
     } catch (error) {
@@ -347,7 +289,7 @@ export class WorkspaceScheduler {
   }
 
   private async readSchedule(metadata: PinnedDirectory, chatId: number): Promise<ScheduleSnapshot | undefined> {
-    const filePath = path.join(metadata.path, "schedules.json");
+    const filePath = path.join(metadata.path, SCHEDULES_FILE);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     let raw: string;
     try {
@@ -372,41 +314,42 @@ export class WorkspaceScheduler {
   }
 
   private async markRun(item: DueRecord, id: string, now: number): Promise<void> {
-    const metadata = await this.openCurrentMetadata(item);
-    if (!metadata) return;
-    let snapshot: ScheduleSnapshot | undefined;
-    try {
-      snapshot = await this.readSchedule(metadata, item.chatId);
-    } finally {
-      await closeQuietly(metadata.handle);
-    }
-    if (!snapshot) return;
-    const { file } = snapshot;
-    const index = file.schedules.findIndex((record) => record.id === id);
-    if (index < 0) return;
-    const current = file.schedules[index];
-    if (!current) return;
-    const updated: StoredScheduleRecord = {
-      ...current,
-      lastRunAt: new Date(now).toISOString(),
-      runCount: Math.min(current.runCount + 1, Number.MAX_SAFE_INTEGER),
-    };
-    if (current.recurrence === null) {
-      updated.enabled = false;
-    } else if (current.enabled) {
-      updated.dueAt = advanceRecurring(current.dueAt, current.recurrence, now);
-    }
-    file.schedules[index] = updated;
-    await this.writeSchedule(item, file, snapshot.raw);
+    await this.writeSchedule(item, (snapshot) => {
+      const { file } = snapshot;
+      const index = file.schedules.findIndex((record) => record.id === id);
+      if (index < 0) return undefined;
+      const current = file.schedules[index];
+      if (!current) return undefined;
+      const updated: StoredScheduleRecord = {
+        ...current,
+        lastRunAt: new Date(now).toISOString(),
+        runCount: Math.min(current.runCount + 1, Number.MAX_SAFE_INTEGER),
+      };
+      if (current.recurrence === null) {
+        updated.enabled = false;
+      } else if (current.enabled) {
+        updated.dueAt = advanceRecurring(current.dueAt, current.recurrence, now);
+      }
+      file.schedules[index] = updated;
+      return file;
+    });
   }
 
-  private async writeSchedule(item: DueRecord, file: ScheduleFile, expectedRaw: string): Promise<void> {
+  private async writeSchedule(
+    item: DueRecord,
+    update: (snapshot: ScheduleSnapshot) => ScheduleFile | undefined,
+  ): Promise<ScheduleSnapshot | undefined> {
     const metadata = await this.openCurrentMetadata(item);
-    if (!metadata) throw new Error("Schedule metadata is no longer live");
-    const filePath = path.join(metadata.path, "schedules.json");
+    if (!metadata) return undefined;
+    const filePath = path.join(metadata.path, SCHEDULES_FILE);
     const temporaryPath = path.join(metadata.path, `schedules.json.${randomUUID()}.tmp`);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      const snapshot = await this.readSchedule(metadata, item.chatId);
+      if (!snapshot) return undefined;
+      const file = update(snapshot);
+      if (!file) return snapshot;
+      const expectedRaw = snapshot.raw;
       handle = await open(temporaryPath, WRITE_NEW, 0o600);
       const encoded = `${JSON.stringify(file)}\n`;
       if (Buffer.byteLength(encoded, "utf8") > MAX_SCHEDULE_FILE_BYTES) {
@@ -467,6 +410,7 @@ export class WorkspaceScheduler {
           await rm(previousPath, { force: true }).catch(() => {});
         }
       }
+      return snapshot;
     } finally {
       if (handle) await closeQuietly(handle);
       await closeQuietly(metadata.handle);

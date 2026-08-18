@@ -5,10 +5,19 @@ import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message, Poll } from "grammy/types";
 import type { Config } from "./config.js";
-import { chatPaths } from "./config.js";
 import type { AgentManager } from "./agent.js";
-import { SerialQueue } from "./queue.js";
+import { SerialQueueRegistry } from "./queue.js";
 import { appendChatEvent, type ChatEvent } from "./events.js";
+import type {
+  WorkspaceOutboxSendMessageRequest,
+  WorkspaceOutboxSendLocationRequest,
+  WorkspaceOutboxSendPollRequest,
+  WorkspaceOutboxEditMessageRequest,
+  WorkspaceOutboxReaction,
+  WorkspaceOutboxRequest,
+  WorkspaceOutboxDispatchResult,
+} from "./outbox-protocol.js";
+import { ATTACHMENTS_DIR, appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
 const WAKE_PROMPT = ".";
@@ -159,12 +168,12 @@ export class TelegramIngressBuffer {
     state.timer = undefined;
   }
 
-  private claim(chatId: number, state: BufferState, maxEntries = Number.POSITIVE_INFINITY): Promise<void> | undefined {
-    if (state.pending.length === 0) return undefined;
+  private claim(chatId: number, state: BufferState, maxEntries = Number.POSITIVE_INFINITY): void {
+    if (state.pending.length === 0) return;
     const count = Math.min(maxEntries, state.pending.length);
     const entries = state.pending.splice(0, count);
     const owner = entries.at(-1);
-    if (!owner) return undefined;
+    if (!owner) return;
     if (state.barrier) state.barrier.pending -= entries.length;
     this.cancelTimer(state);
     const batch: PendingBatch = Object.freeze({
@@ -178,15 +187,12 @@ export class TelegramIngressBuffer {
     void job.then(
       () => {
         state.running.delete(job);
-        this.maybeDelete(chatId, state);
       },
       (error) => {
         state.running.delete(job);
         console.error("Buffered Telegram batch failed", error);
-        this.maybeDelete(chatId, state);
       },
     );
-    return job;
   }
 
   private maybeDelete(chatId: number, state: BufferState): void {
@@ -223,16 +229,13 @@ export class TelegramIngressBuffer {
     const state = this.states.get(chatId);
     if (!state) return;
     while (true) {
-      const barrier = state.barrier;
-      if (barrier) {
-        this.claim(chatId, state, barrier.pending);
+      if (state.barrier) {
+        this.claim(chatId, state, state.barrier.pending);
         await state.tail;
-        this.maybeDelete(chatId, state);
-        return;
+        break;
       }
       this.claim(chatId, state);
-      const tail = state.tail;
-      await tail;
+      await state.tail;
       if (state.pending.length === 0 && state.running.size === 0 && !state.barrier) break;
     }
     this.maybeDelete(chatId, state);
@@ -266,33 +269,22 @@ export class TelegramIngressBuffer {
 }
 
 export class TelegramDeliveryQueue {
-  private readonly states = new Map<number, SerialQueue>();
+  private readonly registry = new SerialQueueRegistry();
   private readonly pending = new Set<Promise<unknown>>();
 
   enqueue<T>(chatId: number, operation: () => T | PromiseLike<T>): Promise<T> {
-    let state = this.states.get(chatId);
-    if (!state) {
-      state = new SerialQueue();
-      this.states.set(chatId, state);
-    }
-
-    const result = state.run(() => invokeCallback(operation));
+    const result = this.registry.run(chatId, () => invokeCallback(operation));
     this.pending.add(result);
-    const complete = () => { this.complete(chatId, state!, result); };
+    const complete = () => { this.pending.delete(result); };
     void result.then(complete, complete);
     return result;
-  }
-
-  private complete(chatId: number, state: SerialQueue, result: Promise<unknown>): void {
-    this.pending.delete(result);
-    if (state.size === 0 && this.states.get(chatId) === state) this.states.delete(chatId);
   }
 
   async drain(): Promise<void> {
     while (this.pending.size > 0) {
       const accepted = [...this.pending];
       await Promise.all(accepted.map((operation) => operation.catch(() => undefined)));
-      await Promise.resolve();
+      await this.registry.idle();
     }
   }
 }
@@ -320,60 +312,23 @@ async function replyChunks(ctx: Context, text: string): Promise<void> {
   for (const chunk of splitTelegramText(text)) await ctx.reply(chunk);
 }
 
-export async function sendTelegramText(bot: Bot, chatId: number, text: string): Promise<void> {
-  for (const chunk of splitTelegramText(text)) await bot.api.sendMessage(chatId, chunk);
-}
-export type TelegramLocationRequest = {
-  latitude: number;
-  longitude: number;
-  horizontalAccuracy?: number | undefined;
-  heading?: number | undefined;
-  livePeriod?: number | undefined;
-  venue?: { title: string; address: string };
-  replyToMessageId?: number | undefined;
-  disableNotification?: boolean | undefined;
-};
-
-export async function sendTelegramLocation(bot: Bot, chatId: number, request: TelegramLocationRequest): Promise<number> {
-  const shared = {
-    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
-    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
-  };
+export async function sendTelegramLocation(bot: Bot, chatId: number, request: WorkspaceOutboxSendLocationRequest): Promise<number> {
+  const shared = defined({ reply_to_message_id: request.reply_to_message_id, disable_notification: request.disable_notification });
   if (request.venue) {
-    const sent = Object.keys(shared).length === 0
-      ? await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address)
-      : await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address, shared as never);
+    const extra = Object.keys(shared).length === 0 ? [] : [shared as never];
+    const sent = await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address, ...extra);
     return sent.message_id;
   }
   const sent = await bot.api.sendLocation(chatId, request.latitude, request.longitude, {
-    ...(request.horizontalAccuracy === undefined ? {} : { horizontal_accuracy: request.horizontalAccuracy }),
-    ...(request.heading === undefined ? {} : { heading: request.heading }),
-    ...(request.livePeriod === undefined ? {} : { live_period: request.livePeriod }),
+    ...defined({ horizontal_accuracy: request.horizontal_accuracy, heading: request.heading, live_period: request.live_period }),
     ...shared,
   });
   return sent.message_id;
 }
 
-export type TelegramPollRequest = {
-  question: string;
-  options: string[];
-  isAnonymous?: boolean | undefined;
-  allowsMultipleAnswers?: boolean | undefined;
-  pollType?: "regular" | "quiz" | undefined;
-  correctOptionId?: number | undefined;
-  replyToMessageId?: number | undefined;
-  disableNotification?: boolean | undefined;
-};
-
-export async function sendTelegramPoll(bot: Bot, chatId: number, request: TelegramPollRequest): Promise<{ messageId: number; pollId: string }> {
-  const sent = await bot.api.sendPoll(chatId, request.question, request.options, {
-    ...(request.isAnonymous === undefined ? {} : { is_anonymous: request.isAnonymous }),
-    ...(request.allowsMultipleAnswers === undefined ? {} : { allows_multiple_answers: request.allowsMultipleAnswers }),
-    ...(request.pollType === undefined ? {} : { type: request.pollType }),
-    ...(request.correctOptionId === undefined ? {} : { correct_option_id: request.correctOptionId }),
-    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
-    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
-  });
+export async function sendTelegramPoll(bot: Bot, chatId: number, request: WorkspaceOutboxSendPollRequest): Promise<{ messageId: number; pollId: string }> {
+  const options = defined({ is_anonymous: request.is_anonymous, allows_multiple_answers: request.allows_multiple_answers, type: request.poll_type, correct_option_id: request.correct_option_id, reply_to_message_id: request.reply_to_message_id, disable_notification: request.disable_notification });
+  const sent = await bot.api.sendPoll(chatId, request.question, request.options, options);
   return { messageId: sent.message_id, pollId: sent.poll.id };
 }
 
@@ -381,86 +336,55 @@ export async function stopTelegramPoll(bot: Bot, chatId: number, messageId: numb
   return bot.api.stopPoll(chatId, messageId, replyMarkup === undefined ? undefined : { reply_markup: replyMarkup as never });
 }
 
-export type TelegramReaction = { type: "emoji"; emoji: string } | { type: "custom_emoji"; custom_emoji_id: string };
-
-export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: number, reaction: TelegramReaction[]): Promise<void> {
+export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: number, reaction: WorkspaceOutboxReaction[]): Promise<void> {
   await bot.api.setMessageReaction(chatId, messageId, reaction as never);
 }
 
-export type TelegramRichMessageRequest = {
-  text: string;
-  parseMode?: "HTML" | "MarkdownV2" | undefined;
-  replyMarkup?: unknown;
-  replyToMessageId?: number | undefined;
-  entities?: Array<{ type: string; offset: number; length: number; [key: string]: unknown }>;
-  linkPreviewOptions?: unknown;
-  disableNotification?: boolean | undefined;
-};
 function isTelegramParseFailure(error: unknown): boolean {
   return error instanceof GrammyError && /can['’]t parse|cannot parse/i.test(error.description);
 }
 
-/** Sends one rich message; malformed markup falls back to the same text as plain. */
-export async function sendTelegramRichMessage(bot: Bot, chatId: number, request: TelegramRichMessageRequest): Promise<number> {
-  const options = {
-    ...(request.parseMode === undefined ? {} : { parse_mode: request.parseMode }),
-    ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
-    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
-    ...(request.entities === undefined ? {} : { entities: request.entities as never }),
-    ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
-    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
-  };
+async function withPlainFallback<T>(parseMode: "HTML" | "MarkdownV2" | undefined, send: (parseMode?: "HTML" | "MarkdownV2") => Promise<T>): Promise<T> {
   try {
-    const sent = await bot.api.sendMessage(chatId, request.text, options);
-    return sent.message_id;
+    return await send(parseMode);
   } catch (error) {
-    if (request.parseMode === undefined || !isTelegramParseFailure(error)) throw error;
-    const sent = await bot.api.sendMessage(chatId, request.text, {
-      ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
-      ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
-      ...(request.entities === undefined ? {} : { entities: request.entities as never }),
-      ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
-      ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
-    });
-    return sent.message_id;
+    if (parseMode === undefined || !isTelegramParseFailure(error)) throw error;
+    return await send(undefined);
   }
 }
-export type TelegramEditMessageRequest = {
-  chatId: number;
-  messageId: number;
-  text?: string;
-  parseMode?: "HTML" | "MarkdownV2" | undefined;
-  entities?: Array<{ type: string; offset: number; length: number }>;
-  linkPreviewOptions?: unknown;
-  replyMarkup?: unknown;
-};
 
+/** Sends one rich message; malformed markup falls back to the same text as plain. */
+export async function sendTelegramRichMessage(bot: Bot, chatId: number, request: WorkspaceOutboxSendMessageRequest): Promise<number> {
+  return withPlainFallback(request.parse_mode, async (parseMode) => {
+    const sent = await bot.api.sendMessage(chatId, request.text, defined({ parse_mode: parseMode, reply_markup: request.reply_markup as never, reply_to_message_id: request.reply_to_message_id, entities: request.entities as never, link_preview_options: request.link_preview_options as never, disable_notification: request.disable_notification }));
+    return sent.message_id;
+  });
+}
 /** Edits one message; malformed markup falls back to the same text as plain. */
-export async function sendTelegramEditMessage(bot: Bot, request: TelegramEditMessageRequest): Promise<number> {
-  const options = {
-    ...(request.parseMode === undefined ? {} : { parse_mode: request.parseMode }),
-    ...(request.entities === undefined ? {} : { entities: request.entities as never }),
-    ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
-    ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
-  };
-  try {
-    const sent = await bot.api.editMessageText(request.chatId, request.messageId, request.text as string, options);
+export async function sendTelegramEditMessage(bot: Bot, chatId: number, request: WorkspaceOutboxEditMessageRequest): Promise<number> {
+  return withPlainFallback(request.parse_mode, async (parseMode) => {
+    const sent = await bot.api.editMessageText(chatId, request.message_id, request.text as string, defined({ parse_mode: parseMode, entities: request.entities as never, link_preview_options: request.link_preview_options as never, reply_markup: request.reply_markup as never }));
     if (sent === true) throw new Error("editMessageText returned true for a chat message");
     return sent.message_id;
-  } catch (error) {
-    if (request.parseMode === undefined || !isTelegramParseFailure(error)) throw error;
-    const sent = await bot.api.editMessageText(request.chatId, request.messageId, request.text as string, {
-      ...(request.entities === undefined ? {} : { entities: request.entities as never }),
-      ...(request.linkPreviewOptions === undefined ? {} : { link_preview_options: request.linkPreviewOptions as never }),
-      ...(request.replyMarkup === undefined ? {} : { reply_markup: request.replyMarkup as never }),
-    });
-    if (sent === true) throw new Error("editMessageText returned true for a chat message");
-    return sent.message_id;
-  }
+  });
 }
 
 export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId: number): Promise<void> {
   await bot.api.deleteMessage(chatId, messageId);
+}
+
+export async function dispatchOutboxRequest(bot: Bot, dataDir: string, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
+  switch (request.type) {
+    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: chatPaths(dataDir, chatId).workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
+    case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
+    case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
+    case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId, sent.messageId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
+    case "stop_poll": return { data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
+    case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return {};
+    case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
+    case "delete_message": await deleteTelegramMessage(bot, chatId, request.message_id); return {};
+    default: { const unhandled: never = request; void unhandled; throw new Error("Unhandled outbox request type"); }
+  }
 }
 
 
@@ -580,82 +504,39 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
 const POLL_OWNER_STORE_NAME = "poll-owners.jsonl";
 const MAX_POLL_OWNER_LINES = 256;
 const MAX_POLL_OWNER_BYTES = 64 * 1024;
+const POLL_OWNER_CAPS = { maxLines: MAX_POLL_OWNER_LINES, maxBytes: MAX_POLL_OWNER_BYTES };
 
 /** Records poll ownership in a host-side store the sandbox cannot reach (only /workspace is mounted). */
 export async function recordPollOwner(dataDir: string, chatId: number, pollId: string, messageId: number): Promise<void> {
-  const filePath = path.join(dataDir, POLL_OWNER_STORE_NAME);
-  const line = `${JSON.stringify({ chatId, pollId, messageId })}\n`;
-  const handle = await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("Poll owner store is not a regular file");
-    await handle.write(line, null, "utf8");
-    const total = stat.size + Buffer.byteLength(line, "utf8");
-    const lines = await readPollOwnerLines(handle, total);
-    if (lines.length > MAX_POLL_OWNER_LINES || total > MAX_POLL_OWNER_BYTES) {
-      await replacePollOwnerStore(filePath, `${lines.slice(-MAX_POLL_OWNER_LINES).join("\n")}\n`);
-    }
-  } finally {
-    await handle.close().catch(() => {});
-  }
+  await appendBoundedJsonl(
+    path.join(dataDir, POLL_OWNER_STORE_NAME),
+    JSON.stringify({ chatId, pollId, messageId }),
+    POLL_OWNER_CAPS,
+  );
 }
 
 /** Maps a poll id back to the chat that sent it via the host-side owner store. */
 async function findPollOwnerChat(dataDir: string, pollId: string): Promise<number | undefined> {
-  let handle: Awaited<ReturnType<typeof open>>;
+  let lines: string[];
   try {
-    handle = await open(path.join(dataDir, POLL_OWNER_STORE_NAME), fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+    lines = await readBoundedJsonl(path.join(dataDir, POLL_OWNER_STORE_NAME), POLL_OWNER_CAPS);
   } catch {
     return undefined;
   }
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_POLL_OWNER_BYTES) return undefined;
-    const lines = await readPollOwnerLines(handle, stat.size);
-    for (const line of lines.slice(-MAX_POLL_OWNER_LINES)) {
-      let record: unknown;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
-      const candidate = record as Record<string, unknown>;
-      if (candidate.pollId !== pollId) continue;
-      if (typeof candidate.chatId !== "number" || !Number.isSafeInteger(candidate.chatId)) continue;
-      return candidate.chatId;
+  for (const line of lines.slice(-MAX_POLL_OWNER_LINES)) {
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
     }
-    return undefined;
-  } finally {
-    await handle.close().catch(() => {});
+    if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+    const candidate = record as Record<string, unknown>;
+    if (candidate.pollId !== pollId) continue;
+    if (typeof candidate.chatId !== "number" || !Number.isSafeInteger(candidate.chatId)) continue;
+    return candidate.chatId;
   }
-}
-
-async function readPollOwnerLines(handle: Awaited<ReturnType<typeof open>>, size: number): Promise<string[]> {
-  const readLength = Math.min(size, MAX_POLL_OWNER_BYTES);
-  const position = size - readLength;
-  const buffer = Buffer.allocUnsafe(readLength);
-  let bytesRead = 0;
-  while (bytesRead < readLength) {
-    const result = await handle.read(buffer, bytesRead, readLength - bytesRead, position + bytesRead);
-    if (result.bytesRead === 0) break;
-    bytesRead += result.bytesRead;
-  }
-  const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
-  const complete = position === 0 ? lines : lines.slice(1);
-  return complete.filter(Boolean);
-}
-
-async function replacePollOwnerStore(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  const tempPath = path.join(directory, `.poll-owners-${randomUUID()}.tmp`);
-  const handle = await open(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
-  try {
-    await handle.write(content, null, "utf8");
-  } finally {
-    await handle.close().catch(() => {});
-  }
-  await rename(tempPath, filePath);
+  return undefined;
 }
 type AttachmentDirectory = {
   path: string;
@@ -679,7 +560,7 @@ async function ensureAttachmentDirectory(workspace: string, date: string, messag
   const root = await realpath(expectedWorkspace);
   if (root !== expectedWorkspace) throw new Error("Attachment workspace is not safe.");
   let directory = root;
-  for (const segment of ["attachments", date, String(messageId)]) {
+  for (const segment of [ATTACHMENTS_DIR, date, String(messageId)]) {
     directory = path.join(directory, segment);
     try {
       await mkdir(directory, { mode: 0o700 });
@@ -901,7 +782,7 @@ async function downloadAttachment(
       await verifyAttachmentDirectory(attachmentDirectory);
       return {
         ...common,
-        path: `/workspace/attachments/${date}/${message.message_id}/${filename}`,
+        path: `/workspace/${ATTACHMENTS_DIR}/${date}/${message.message_id}/${filename}`,
       };
     } finally {
       await temporaryHandle?.close().catch(() => {});
@@ -982,17 +863,13 @@ export function createTelegramBot(
 ): Bot {
   const bot = new Bot(config.token);
 
-  const queuedReply = (ctx: Context, text: string): Promise<void> => {
+  const queuedSend = (ctx: Context, send: () => Promise<unknown>): Promise<void> => {
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return Promise.resolve();
-    return deliveryQueue.enqueue(chatId, () => ctx.reply(text)).then(() => undefined);
+    return deliveryQueue.enqueue(chatId, send).then(() => undefined);
   };
-
-  const queuedReplyChunks = (ctx: Context, text: string): Promise<void> => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined) return Promise.resolve();
-    return deliveryQueue.enqueue(chatId, () => replyChunks(ctx, text)).then(() => undefined);
-  };
+  const queuedReply = (ctx: Context, text: string): Promise<void> => queuedSend(ctx, () => ctx.reply(text));
+  const queuedReplyChunks = (ctx: Context, text: string): Promise<void> => queuedSend(ctx, () => replyChunks(ctx, text));
 
   const ingress = new TelegramIngressBuffer(async (chatId, events) => {
     const workspace = chatPaths(config.dataDir, chatId).workspace;

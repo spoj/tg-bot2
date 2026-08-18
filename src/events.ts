@@ -39,8 +39,8 @@ export type ChatEvent =
   };
 
 const EVENTS_FILE = "events.jsonl";
-const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
-const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
+const NO_FOLLOW = fsConstants.O_NOFOLLOW;
+const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 /**
  * Appends chat events to the workspace events log. Opens the `.tg-bot` directory

@@ -34,8 +34,8 @@ const MAX_PROCESSED_ENTRIES_TO_CHECK = 256;
 const STALE_CLAIM_AGE_MS = 5 * 60_000;
 const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
 const CLAIM_NAME = /^\.in-progress-(\d+)-[^/]+$/u;
-const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
-const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
+const NO_FOLLOW = fsConstants.O_NOFOLLOW;
+const NON_BLOCKING = fsConstants.O_NONBLOCK;
 const OUTBOX_DIR = "outbox";
 const POLL_RESULTS_FILE = "poll-results.jsonl";
 

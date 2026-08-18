@@ -30,8 +30,8 @@ const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
 const ATTACHMENTS_DIR = "attachments";
-const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
-const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
+const NO_FOLLOW = fsConstants.O_NOFOLLOW;
+const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 type AttachmentSource = {
   type: string;

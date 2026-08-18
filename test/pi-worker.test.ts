@@ -163,7 +163,6 @@ describe("PiRpcWorker", () => {
         record(child, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer" }] } });
         record(child, { type: "agent_settled" });
         await settled;
-        await expect(worker.getLastAssistantText()).resolves.toBe("answer");
       });
     } finally {
       delete process.env.TG_BOT_TOKEN;
@@ -349,34 +348,6 @@ describe("PiRpcWorker", () => {
     });
   });
 
-  it("does not return a prior assistant answer for a handled prompt", async () => {
-    await withWorker(await fixture(), {}, async ({ worker, child }) => {
-      const first = worker.prompt("first");
-      const firstCommand = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
-      record(child, { type: "response", id: firstCommand.id, command: "prompt", success: true });
-      await first;
-      record(child, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "old answer" }] } });
-      record(child, { type: "agent_settled" });
-      await worker.waitForSettled();
-
-      const handled = worker.prompt("/handled");
-      const handledCommand = JSON.parse(child.commands[1] ?? "{}") as { id?: string };
-      record(child, { type: "response", id: handledCommand.id, command: "prompt", success: true });
-      await handled;
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      const stateRequest = JSON.parse(child.commands[2] ?? "{}") as { id?: string };
-      const settled = worker.waitForSettled();
-      record(child, {
-        type: "response",
-        id: stateRequest.id,
-        command: "get_state",
-        success: true,
-        data: { isStreaming: false, pendingMessageCount: 0 },
-      });
-      await settled;
-      await expect(worker.getLastAssistantText()).resolves.toBeUndefined();
-    });
-  });
 
   it("rejects pending requests and settled waiters when the process exits", async () => {
     await withWorker(await fixture(), {}, async ({ worker, child }) => {
@@ -510,7 +481,6 @@ describe("PiRpcWorker", () => {
         });
         record(child, { type: "agent_settled" });
         await expect(settled).rejects.toThrow("provider failed");
-        await expect(worker.getLastAssistantText()).resolves.toBeUndefined();
         expect(events).toContainEqual(expect.objectContaining({
           type: "message_end",
           message: expect.objectContaining({ errorMessage: "provider failed" }),

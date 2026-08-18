@@ -302,9 +302,6 @@ export class PiRpcWorker {
   private workError: Error | undefined;
   private promptSettlementTimer: ReturnType<typeof setTimeout> | undefined;
   private parser: StrictJsonlParser | undefined;
-  private lastAssistantText: string | undefined;
-  private assistantTextKnown = false;
-  private currentPromptText: string | undefined;
   private settledError: Error | undefined;
   private process: PiWorkerChildProcess | undefined;
   private processDone: Promise<void> | undefined;
@@ -563,7 +560,6 @@ export class PiRpcWorker {
     if (!reloading) {
       this.extensionSettingsFingerprint = fingerprint ?? "";
       this.clearExtensionChangeState();
-      this.currentPromptText = undefined;
     }
     const built = await buildPiWorkerBwrapArgs({
       workspace: this.workspace,
@@ -584,8 +580,6 @@ export class PiRpcWorker {
       throw failure;
     }
     this.stderr = "";
-    this.lastAssistantText = undefined;
-    this.assistantTextKnown = false;
     this.workEpoch = 0;
     this.resetWorkFields();
     this.settledError = undefined;
@@ -686,18 +680,12 @@ export class PiRpcWorker {
     const response = await this.request({ type: "new_session" }, undefined, this.lifecycleTimeoutMs);
     const data = this.responseData(response);
     if (data?.cancelled === true) throw new Error("Pi worker new session was cancelled");
-    this.lastAssistantText = undefined;
-    this.assistantTextKnown = false;
-    this.currentPromptText = undefined;
     this.settledError = undefined;
   }
 
   async prompt(message: string): Promise<void> {
     const reload = this.awaitPendingReload();
     if (reload) await reload;
-    this.currentPromptText = message;
-    this.lastAssistantText = undefined;
-    this.assistantTextKnown = false;
     this.settledError = undefined;
     await this.queueWork({ type: "prompt", message });
   }
@@ -711,18 +699,6 @@ export class PiRpcWorker {
     return await new Promise<void>((resolve, reject) => {
       this.settledWaiters.add({ resolve, reject });
     });
-  }
-
-  async getLastAssistantText(): Promise<string | undefined> {
-    const reload = this.awaitPendingReload();
-    if (reload) await reload;
-    if (this.assistantTextKnown) return this.lastAssistantText;
-    if (this.currentPromptText !== undefined) return undefined;
-    const data = this.responseData(await this.request({ type: "get_last_assistant_text" }));
-    const text = data?.text;
-    this.lastAssistantText = typeof text === "string" ? text.trim() || undefined : undefined;
-    this.assistantTextKnown = true;
-    return this.lastAssistantText;
   }
 
   async setModel(provider: string, modelId: string): Promise<void> {
@@ -912,30 +888,13 @@ export class PiRpcWorker {
       }
       case "message_end": {
         const message = asRecord(record.message);
-        if (message && message.role === "assistant") {
-          if (message.stopReason === "error") {
-            const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
-              ? message.errorMessage
-              : "Pi assistant turn failed";
-            const failure = new Error(errorMessage);
-            this.settledError = failure;
-            if (this.activeEpoch !== undefined) this.workError = failure;
-            this.lastAssistantText = undefined;
-          } else if (typeof message.content === "string") {
-            this.lastAssistantText = message.content.trim() || undefined;
-          } else if (Array.isArray(message.content)) {
-            const text = message.content
-              .map((block) => {
-                const record = asRecord(block);
-                return record?.type === "text" && typeof record.text === "string" ? record.text : "";
-              })
-              .join("")
-              .trim();
-            this.lastAssistantText = text || undefined;
-          } else {
-            this.lastAssistantText = undefined;
-          }
-          this.assistantTextKnown = true;
+        if (message && message.role === "assistant" && message.stopReason === "error") {
+          const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+            ? message.errorMessage
+            : "Pi assistant turn failed";
+          const failure = new Error(errorMessage);
+          this.settledError = failure;
+          if (this.activeEpoch !== undefined) this.workError = failure;
         }
         break;
       }

@@ -16,22 +16,17 @@ import { deferred } from "./helpers.js";
 
 type FakeWorker = AgentWorker & {
   emit(event: AgentEvent): void;
-  lastText: string | undefined;
 };
 
-function fakeWorker(initialText = "done"): FakeWorker {
+function fakeWorker(): FakeWorker {
   const listeners = new Set<(event: AgentEvent) => void>();
   const worker = {
-    lastText: initialText,
     start: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
     abort: vi.fn(async () => {}),
-    newSession: vi.fn(async () => {
-      worker.lastText = undefined;
-    }),
+    newSession: vi.fn(async () => {}),
     prompt: vi.fn(async (_text: string) => {}),
     waitForSettled: vi.fn(async () => {}),
-    getLastAssistantText: vi.fn(async () => worker.lastText),
     setModel: vi.fn(async (_provider: string, _modelId: string) => {}),
     setThinkingLevel: vi.fn(async (_level: string) => {}),
     getAvailableModels: vi.fn(async () => []),
@@ -112,8 +107,9 @@ timestamp). Event types:
   may instead be game_short_name; logged callbacks are message-backed.
 - poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
   Telegram PollAnswer object (poll_id, user, option_ids).
-- send: a confirmation of one of your outbox requests:
-  {v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}.
+- send: a confirmation of one of your outbox requests that Telegram accepted:
+  {v:1,t,type:'send',kind,id,messageId?,pollId?}. Rejected requests never
+  appear here; the host reports each rejection to you directly.
 Grep events.jsonl whenever you need recent chat history or sent message ids.
 When a user message or button press arrives the host wakes you with a single "." prompt
 that carries no content. Read the newest events.jsonl lines and decide whether the user
@@ -131,14 +127,14 @@ Every worker start begins a fresh session; previous conversations persist in /wo
 `);
 });
 
-it("creates one worker lazily per numeric chat and returns its final text", async () => {
-  const worker = fakeWorker("answer");
+it("creates one worker lazily per numeric chat", async () => {
+  const worker = fakeWorker();
   const factory = vi.fn(() => worker);
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
 
   expect(factory).not.toHaveBeenCalled();
-  await expect(manager.prompt(42, "hello")).resolves.toBe("answer");
-  await expect(manager.prompt(42, "again")).resolves.toBe("answer");
+  await expect(manager.prompt(42, "hello")).resolves.toBeUndefined();
+  await expect(manager.prompt(42, "again")).resolves.toBeUndefined();
 
   expect(factory).toHaveBeenCalledOnce();
   expect(factory).toHaveBeenCalledWith({
@@ -151,7 +147,7 @@ it("creates one worker lazily per numeric chat and returns its final text", asyn
 });
 
 it("aborts an active run for an interactive request and reprompts fresh", async () => {
-  const worker = fakeWorker("combined");
+  const worker = fakeWorker();
   const firstDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await firstDone.promise;
@@ -164,15 +160,15 @@ it("aborts an active run for an interactive request and reprompts fresh", async 
   const first = manager.prompt(1, "first");
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
   const second = manager.prompt(1, "second");
-  await expect(first).resolves.toBe("combined");
+  await expect(first).resolves.toBeUndefined();
   expect(worker.abort).toHaveBeenCalledOnce();
-  await expect(second).resolves.toBe("combined");
+  await expect(second).resolves.toBeUndefined();
   expect(worker.prompt).toHaveBeenLastCalledWith("second");
 });
 
 it("waits for active work when the current worker is invalidated", async () => {
-  const worker = fakeWorker("first response");
-  const replacement = fakeWorker("replacement response");
+  const worker = fakeWorker();
+  const replacement = fakeWorker();
   const firstDone = deferred<void>();
   const stopDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
@@ -195,21 +191,19 @@ it("waits for active work when the current worker is invalidated", async () => {
 
   firstDone.resolve();
   stopDone.resolve();
-  await expect(first).resolves.toBe("first response");
-  await expect(second).resolves.toBe("replacement response");
+  await expect(first).resolves.toBeUndefined();
+  await expect(second).resolves.toBeUndefined();
   expect(replacement.prompt).toHaveBeenCalledWith("second");
 });
 
 it("waits for active work before issuing an independent follow-up prompt", async () => {
-  const worker = fakeWorker("follow-up response");
+  const worker = fakeWorker();
   const firstDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await firstDone.promise;
-    worker.lastText = "first response";
   });
   vi.mocked(worker.prompt).mockImplementationOnce(async (text: string) => {
     expect(text).toBe("follow-up");
-    worker.lastText = "follow-up response";
   });
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
@@ -220,21 +214,14 @@ it("waits for active work before issuing an independent follow-up prompt", async
   expect(worker.prompt).toHaveBeenCalledOnce();
 
   firstDone.resolve();
-  await expect(first).resolves.toBe("first response");
-  await expect(followUp).resolves.toBe("follow-up response");
+  await expect(first).resolves.toBeUndefined();
+  await expect(followUp).resolves.toBeUndefined();
   expect(worker.prompt).toHaveBeenCalledTimes(2);
   expect(worker.prompt).toHaveBeenNthCalledWith(2, "follow-up");
 });
 
-it("uses the no-text fallback for a completed worker turn", async () => {
-  const worker = fakeWorker();
-  vi.mocked(worker.getLastAssistantText).mockResolvedValueOnce(undefined);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-  await expect(manager.prompt(4, "silent")).resolves.toBe("I completed the turn but produced no text response.");
-});
-
 it("waits behind active work for /new and keeps the existing workspace", async () => {
-  const worker = fakeWorker("old");
+  const worker = fakeWorker();
   const firstDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await firstDone.promise;
@@ -248,7 +235,7 @@ it("waits behind active work for /new and keeps the existing workspace", async (
   expect(worker.newSession).not.toHaveBeenCalled();
 
   firstDone.resolve();
-  await expect(first).resolves.toBe("old");
+  await expect(first).resolves.toBeUndefined();
   await expect(reset).resolves.toBeUndefined();
   expect(worker.newSession).toHaveBeenCalledOnce();
   expect(worker.stop).not.toHaveBeenCalled();
@@ -256,7 +243,7 @@ it("waits behind active work for /new and keeps the existing workspace", async (
 
 it("stops a worker whose startup fails before assignment", async () => {
   const failed = fakeWorker();
-  const replacement = fakeWorker("fresh");
+  const replacement = fakeWorker();
   vi.mocked(failed.start).mockRejectedValueOnce(new Error("startup failed"));
   const factory = vi.fn().mockReturnValueOnce(failed).mockReturnValueOnce(replacement);
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
@@ -264,7 +251,7 @@ it("stops a worker whose startup fails before assignment", async () => {
 
   await expect(manager.prompt(6, "not replayed")).rejects.toThrow("startup failed");
   expect(failed.stop).toHaveBeenCalledOnce();
-  await expect(manager.prompt(6, "new request")).resolves.toBe("fresh");
+  await expect(manager.prompt(6, "new request")).resolves.toBeUndefined();
   expect(failed.prompt).not.toHaveBeenCalled();
   expect(replacement.prompt).toHaveBeenCalledWith("new request");
 });
@@ -289,7 +276,7 @@ it("preserves prompt failure when cleanup also fails", async () => {
 });
 it("retries stopping a worker after a rejected cleanup", async () => {
   const worker = fakeWorker();
-  const replacement = fakeWorker("fresh");
+  const replacement = fakeWorker();
   const promptFailure = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await promptFailure.promise;
@@ -313,13 +300,13 @@ it("retries stopping a worker after a rejected cleanup", async () => {
   expect(worker.stop).toHaveBeenCalledTimes(2);
 
   // Subsequent work runs on a replacement worker, not the failed one.
-  await expect(manager.prompt(14, "next")).resolves.toBe("fresh");
+  await expect(manager.prompt(14, "next")).resolves.toBeUndefined();
   expect(replacement.prompt).toHaveBeenCalledWith("next");
   expect(worker.prompt).toHaveBeenCalledTimes(1);
 });
 it("replaces an idle worker after a worker_error event", async () => {
-  const worker = fakeWorker("old");
-  const replacement = fakeWorker("fresh");
+  const worker = fakeWorker();
+  const replacement = fakeWorker();
   const stopDone = deferred<void>();
   vi.mocked(worker.stop).mockImplementationOnce(async () => {
     await stopDone.promise;
@@ -327,14 +314,14 @@ it("replaces an idle worker after a worker_error event", async () => {
   const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
 
-  await expect(manager.prompt(15, "first")).resolves.toBe("old");
+  await expect(manager.prompt(15, "first")).resolves.toBeUndefined();
   worker.emit({ type: "worker_error", error: "extension reload failed" });
   const next = manager.prompt(15, "next request");
   await Promise.resolve();
   expect(factory).toHaveBeenCalledOnce();
 
   stopDone.resolve();
-  await expect(next).resolves.toBe("fresh");
+  await expect(next).resolves.toBeUndefined();
   expect(worker.stop).toHaveBeenCalledOnce();
   expect(replacement.start).toHaveBeenCalledOnce();
   expect(replacement.prompt).toHaveBeenCalledWith("next request");
@@ -342,7 +329,7 @@ it("replaces an idle worker after a worker_error event", async () => {
 
 it("stops a failed worker before dispatching queued work without replaying it", async () => {
   const failed = fakeWorker();
-  const replacement = fakeWorker("fresh");
+  const replacement = fakeWorker();
   const runFailure = deferred<void>();
   const stopFinished = deferred<void>();
   vi.mocked(failed.prompt).mockImplementationOnce(async () => {
@@ -364,14 +351,14 @@ it("stops a failed worker before dispatching queued work without replaying it", 
 
   stopFinished.resolve();
   await expect(first).rejects.toThrow("worker failed");
-  await expect(later).resolves.toBe("fresh");
+  await expect(later).resolves.toBeUndefined();
   expect(failed.prompt).toHaveBeenCalledTimes(1);
   expect(replacement.prompt).toHaveBeenCalledWith("later request");
   expect(factory).toHaveBeenCalledTimes(2);
 });
 
 it("aborts active work and drains queued disposal work without replacement", async () => {
-  const worker = fakeWorker("done");
+  const worker = fakeWorker();
   const activeDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await activeDone.promise;
@@ -388,7 +375,7 @@ it("aborts active work and drains queued disposal work without replacement", asy
   const queuedResult = expect(queued).rejects.toThrow("shutting down");
 
   await manager.disposeAll();
-  await expect(active).resolves.toBe("done");
+  await expect(active).resolves.toBeUndefined();
   await queuedResult;
   expect(worker.prompt).toHaveBeenCalledOnce();
   expect(factory).toHaveBeenCalledOnce();
@@ -397,8 +384,8 @@ it("aborts active work and drains queued disposal work without replacement", asy
 });
 
 it("aborts, drains, stops all workers, and clears manager state", async () => {
-  const worker = fakeWorker("done");
-  const replacement = fakeWorker("new worker");
+  const worker = fakeWorker();
+  const replacement = fakeWorker();
   const activeDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await activeDone.promise;
@@ -412,18 +399,18 @@ it("aborts, drains, stops all workers, and clears manager state", async () => {
   await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
 
   await manager.disposeAll();
-  await expect(active).resolves.toBe("done");
+  await expect(active).resolves.toBeUndefined();
   expect(worker.abort).toHaveBeenCalledOnce();
   expect(worker.stop).toHaveBeenCalledOnce();
 
-  await expect(manager.prompt(7, "after dispose")).resolves.toBe("new worker");
+  await expect(manager.prompt(7, "after dispose")).resolves.toBeUndefined();
   expect(factory).toHaveBeenCalledTimes(2);
   await manager.disposeAll();
   expect(replacement.stop).toHaveBeenCalledOnce();
 });
 
 it("gates new work and aborts each known worker only once", async () => {
-  const worker = fakeWorker("done");
+  const worker = fakeWorker();
   const activeDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await activeDone.promise;
@@ -441,7 +428,7 @@ it("gates new work and aborts each known worker only once", async () => {
   const secondShutdown = manager.beginShutdown();
   await expect(firstShutdown).resolves.toBeUndefined();
   await expect(secondShutdown).resolves.toBeUndefined();
-  await expect(active).resolves.toBe("done");
+  await expect(active).resolves.toBeUndefined();
   expect(worker.abort).toHaveBeenCalledOnce();
   await expect(manager.prompt(9, "replacement", "follow-up")).rejects.toThrow("shutting down");
   expect(factory).toHaveBeenCalledOnce();
@@ -450,20 +437,20 @@ it("gates new work and aborts each known worker only once", async () => {
   expect(worker.stop).toHaveBeenCalledOnce();
 });
 it("disposes an idle worker normally and clears its state", async () => {
-  const worker = fakeWorker("done");
+  const worker = fakeWorker();
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
-  await expect(manager.prompt(10, "first")).resolves.toBe("done");
+  await expect(manager.prompt(10, "first")).resolves.toBeUndefined();
   await expect(manager.disposeAll()).resolves.toBeUndefined();
   expect(worker.stop).toHaveBeenCalledOnce();
 
-  await expect(manager.prompt(10, "after dispose")).resolves.toBe("done");
+  await expect(manager.prompt(10, "after dispose")).resolves.toBeUndefined();
   await manager.disposeAll();
   expect(worker.stop).toHaveBeenCalledTimes(2);
 });
 it("also disposes workers created while another worker is stopping", async () => {
-  const first = fakeWorker("first");
-  const second = fakeWorker("second");
+  const first = fakeWorker();
+  const second = fakeWorker();
   const stopDone = deferred<void>();
   vi.mocked(first.stop).mockImplementationOnce(async () => {
     await stopDone.promise;
@@ -471,11 +458,11 @@ it("also disposes workers created while another worker is stopping", async () =>
   const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second);
   const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
 
-  await expect(manager.prompt(12, "first request")).resolves.toBe("first");
+  await expect(manager.prompt(12, "first request")).resolves.toBeUndefined();
   const disposal = manager.disposeAll();
   await vi.waitFor(() => expect(first.stop).toHaveBeenCalledOnce());
 
-  await expect(manager.prompt(13, "during disposal")).resolves.toBe("second");
+  await expect(manager.prompt(13, "during disposal")).resolves.toBeUndefined();
   stopDone.resolve();
   await expect(disposal).resolves.toBeUndefined();
   expect(second.stop).toHaveBeenCalledOnce();
@@ -483,7 +470,7 @@ it("also disposes workers created while another worker is stopping", async () =>
 
 
 it("bounds abort disposal and rejects active and queued work", async () => {
-  const worker = fakeWorker("done");
+  const worker = fakeWorker();
   const activeDone = deferred<void>();
   const abortDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
@@ -629,7 +616,7 @@ it("getAvailableModels and getAvailableThinkingLevels route to the worker", asyn
 });
 
 it("restart drains the active run before restarting the worker", async () => {
-  const worker = fakeWorker("done");
+  const worker = fakeWorker();
   const activeDone = deferred<void>();
   vi.mocked(worker.prompt).mockImplementationOnce(async () => {
     await activeDone.promise;
@@ -643,7 +630,7 @@ it("restart drains the active run before restarting the worker", async () => {
   expect(worker.restart).not.toHaveBeenCalled();
 
   activeDone.resolve();
-  await expect(active).resolves.toBe("done");
+  await expect(active).resolves.toBeUndefined();
   await expect(restart).resolves.toBeUndefined();
   expect(worker.restart).toHaveBeenCalledOnce();
 });
@@ -675,7 +662,7 @@ it("serializes configuration commands through the per-chat queue", async () => {
 it("stops an idle worker after two hours without activity", async () => {
   vi.useFakeTimers();
   try {
-    const worker = fakeWorker("done");
+    const worker = fakeWorker();
     const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
     await manager.prompt(1, "hello");
@@ -691,7 +678,7 @@ it("stops an idle worker after two hours without activity", async () => {
 it("re-arms the idle timer when a prompt arrives before expiry", async () => {
   vi.useFakeTimers();
   try {
-    const worker = fakeWorker("done");
+    const worker = fakeWorker();
     const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
     await manager.prompt(1, "first");
@@ -709,7 +696,7 @@ it("re-arms the idle timer when a prompt arrives before expiry", async () => {
 it("re-arms instead of stopping while a run is active at expiry", async () => {
   vi.useFakeTimers();
   try {
-    const worker = fakeWorker("done");
+    const worker = fakeWorker();
     const promptStarted = deferred<void>();
     const activeDone = deferred<void>();
     vi.mocked(worker.prompt).mockImplementationOnce(async () => {
@@ -726,7 +713,7 @@ it("re-arms instead of stopping while a run is active at expiry", async () => {
     expect(worker.stop).not.toHaveBeenCalled();
 
     activeDone.resolve();
-    await expect(active).resolves.toBe("done");
+    await expect(active).resolves.toBeUndefined();
   } finally {
     vi.useRealTimers();
   }
@@ -735,7 +722,7 @@ it("re-arms instead of stopping while a run is active at expiry", async () => {
 it("disposeAll clears the idle timer and stops the worker", async () => {
   vi.useFakeTimers();
   try {
-    const worker = fakeWorker("done");
+    const worker = fakeWorker();
     const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
     await manager.prompt(1, "hello");

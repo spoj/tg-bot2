@@ -38,7 +38,6 @@ export type AgentWorker = {
   newSession(): Promise<void>;
   prompt(message: string): Promise<void>;
   waitForSettled(): Promise<void>;
-  getLastAssistantText(): Promise<string | undefined>;
   setModel(provider: string, modelId: string): Promise<void>;
   setThinkingLevel(level: string): Promise<void>;
   getAvailableModels(): Promise<AvailableModel[]>;
@@ -72,7 +71,7 @@ export type AgentManagerOptions = {
 type ChatState = {
   worker: AgentWorker | undefined;
   workerPromise: Promise<AgentWorker> | undefined;
-  activeRun: Promise<string | undefined> | undefined;
+  activeRun: Promise<void> | undefined;
   workerTurnActive: boolean;
   queue: SerialQueue;
   unsubscribe: (() => void) | undefined;
@@ -87,10 +86,9 @@ type ChatState = {
   idleStopTimer: NodeJS.Timeout | undefined;
 };
 
-const NO_TEXT_RESPONSE = "I completed the turn but produced no text response.";
-const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
-
 export const WORKER_IDLE_STOP_MS = 2 * 60 * 60 * 1000;
+
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
 
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
@@ -349,8 +347,8 @@ export class AgentManager {
     }
   }
 
-  private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<string | undefined> {
-    let run!: Promise<string | undefined>;
+  private beginRun(state: ChatState, worker: AgentWorker, command: () => Promise<void>): Promise<void> {
+    let run!: Promise<void>;
     state.workerTurnActive = true;
     const operation = (async () => {
       try {
@@ -359,7 +357,6 @@ export class AgentManager {
         // activeRun remains set until the run resolves; the worker turn is no
         // longer interruptible once waitForSettled has completed.
         state.workerTurnActive = false;
-        return (await worker.getLastAssistantText()) ?? NO_TEXT_RESPONSE;
       } finally {
         state.workerTurnActive = false;
       }
@@ -419,15 +416,14 @@ export class AgentManager {
     return this.withWorker(chatId, opts, (worker, state) => this.raceShutdown(state, op(worker)));
   }
 
-  async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<string | undefined> {
+  async prompt(chatId: number, text: string, mode: PromptMode = "interactive"): Promise<void> {
+    // The run promise is handed out inside an object so the queue entry itself
+    // settles immediately; awaiting the run here would serialize queued prompts
+    // behind the active run and starve the abort hook in beforeWorker.
     const action = await this.withWorker(
       chatId,
       {
         armIdle: true,
-        // Resolve active work before acquiring a worker: a run that failed
-        // invalidates its worker as part of settling, so the next worker is only
-        // created once the failed worker's stop() has finished, and the queued
-        // request is never dispatched on the failed worker.
         beforeWorker: (state) => {
           const run = state.activeRun;
           if (!run) return;

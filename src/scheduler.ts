@@ -25,7 +25,7 @@ type DueRecord = {
 type MaybePromise<T> = T | PromiseLike<T>;
 type WorkspaceSchedulerOptions = {
   dataDir: string;
-  run: (chatId: number, prompt: string) => MaybePromise<string | undefined>;
+  run: (chatId: number, prompt: string) => MaybePromise<void>;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;

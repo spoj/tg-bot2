@@ -192,13 +192,6 @@ integration("Pi RPC integration (requires RUN_BWRAP_TESTS=1)", () => {
       }
       const afterPrompt = await harness.getState();
       expect(afterPrompt.isStreaming).toBe(false);
-
-      // 6. get_last_assistant_text succeeds once the turn has settled. With no
-      // assistant message (offline prompt failed), the text is null/undefined.
-      const textResponse = await harness.request({ type: "get_last_assistant_text" });
-      const textData = textResponse.data;
-      const text = textData !== null && typeof textData === "object" ? (textData as JsonRecord).text : undefined;
-      expect(text === null || text === undefined || typeof text === "string").toBe(true);
     } finally {
       await stopChild(child);
       await rm(root, { recursive: true, force: true });

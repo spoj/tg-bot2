@@ -28,14 +28,12 @@ export type ChatEvent =
     poll_answer: unknown;
   }
   | {
-    /** Confirmation of one outbox request. Host-side protocol fields, not a Telegram object. */
+    /** Confirmation that one outbox request reached Telegram. Host-side protocol fields, not a Telegram object. Rejected requests are never logged. */
     type: "send";
     kind: string;
     id: string;
     messageId?: number | undefined;
     pollId?: string | undefined;
-    ok: boolean;
-    error?: string | undefined;
   };
 
 const EVENTS_FILE = "events.jsonl";
@@ -114,8 +112,9 @@ timestamp). Event types:
   may instead be game_short_name; logged callbacks are message-backed.
 - poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
   Telegram PollAnswer object (poll_id, user, option_ids).
-- send: a confirmation of one of your outbox requests:
-  {v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}.
+- send: a confirmation of one of your outbox requests that Telegram accepted:
+  {v:1,t,type:'send',kind,id,messageId?,pollId?}. Rejected requests never
+  appear here; the host reports each rejection to you directly.
 Grep events.jsonl whenever you need recent chat history or sent message ids.
 When a user message or button press arrives the host wakes you with a single "." prompt
 that carries no content. Read the newest events.jsonl lines and decide whether the user

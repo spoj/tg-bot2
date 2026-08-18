@@ -68,6 +68,9 @@ export async function main(): Promise<void> {
   const outboxInstance = new WorkspaceOutbox({
     dataDir,
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
+    notifyAgent: async (chatId, message) => {
+      await agentManager.prompt(chatId, message, "follow-up");
+    },
   });
 
   let shuttingDown = false;

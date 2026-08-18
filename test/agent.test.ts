@@ -59,45 +59,7 @@ const config: Config = {
   allowedUserIds: new Set([1]),
   dataDir: "/tmp/tg-bot2-test",
 };
-const managerOptions = { appRoot: "/tmp/tg-bot2-app" };
-
-it("describes the exact workspace file protocols", () => {
-  expect(SYSTEM_PROMPT).toContain("/workspace/.pi");
-  expect(SYSTEM_PROMPT).toContain("Runtime, authentication, and session files are writable");
-  expect(SYSTEM_PROMPT).toContain("Attachments are ordinary data paths");
-  expect(SYSTEM_PROMPT).toContain("Native tools and Pi-managed extensions");
-  expect(SYSTEM_PROMPT).toContain("pi install npm:<package> -l --approve");
-  expect(SYSTEM_PROMPT).toContain("pi install https://... -l --approve");
-  expect(SYSTEM_PROMPT).toContain("pi install git:... -l --approve");
-  expect(SYSTEM_PROMPT).toContain("pi install ./... -l --approve");
-  expect(SYSTEM_PROMPT).toContain("pi list --approve");
-  expect(SYSTEM_PROMPT).toContain("Project settings are stored at /workspace/.pi/settings.json");
-  expect(SYSTEM_PROMPT).toContain("reloaded after the current turn");
-  expect(SYSTEM_PROMPT).not.toContain("install <source> -l");
-  expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/outbox/");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_file\",path,caption?,kind?,reply_to_message_id?,disable_notification?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_message\",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}");
-  expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/events.jsonl");
-  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'message',message,attachments}");
-  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'callback',callback_query}");
-  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'poll_answer',poll_answer}");
-  expect(SYSTEM_PROMPT).toContain("{v:1,t,type:'send',kind,id,messageId?,pollId?,ok,error?}");
-  expect(SYSTEM_PROMPT).toContain("wakes you with a single \".\" prompt");
-  expect(SYSTEM_PROMPT).toContain("ALL Telegram output through");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_location\",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_poll\",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"stop_poll\",message_id,reply_markup?}");
-  expect(SYSTEM_PROMPT).toContain("{version:1,id,type:\"send_reaction\",message_id,reaction}");
-  expect(SYSTEM_PROMPT).toContain("sets a Telegram reaction on any message in the chat");
-  expect(SYSTEM_PROMPT).toContain("{type:\"custom_emoji\",custom_emoji_id}");
-  expect(SYSTEM_PROMPT).toContain("/workspace/.tg-bot/poll-results.jsonl");
-  expect(SYSTEM_PROMPT).toContain("temporary filename that does not\nend in .json");
-  expect(SYSTEM_PROMPT).toContain("final unique *.json request name");
-  expect(SYSTEM_PROMPT).toContain("{version:1,schedules:[...]}");
-  expect(SYSTEM_PROMPT).toContain("recurrence must be hourly, daily, weekly, or null");
-  expect(SYSTEM_PROMPT).toContain("UTC timestamp ending\nin Z");
-  expect(SYSTEM_PROMPT).toContain("runCount must be a nonnegative integer");
-});
+const managerOptions = { appRoot: "/tmp/tg-bot2-app", spawnProcess: vi.fn(), terminateProcessGroup: vi.fn() };
 
 it("renders the SYSTEM_PROMPT protocol sections from the schemas", () => {
   expect(SYSTEM_PROMPT).toBe(`You are a persistent personal agent reached through Telegram.
@@ -130,9 +92,10 @@ poll_answer event in events.jsonl; the matching send line in events.jsonl
 records pollId.
 {version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
 appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
-(latest 256 lines kept); poll_id matches the poll_answer events' pollId.
+(latest 256 lines kept); result.id matches the poll_answer events' poll_id and
+the matching send event's top-level pollId.
 {version:1,id,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
-{version:1,id,type:"edit_message",message_id,text?,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (at least one of text/reply_markup/link_preview_options required; message_id is the numeric messageId of that message).
+{version:1,id,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
 {version:1,id,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
@@ -145,7 +108,8 @@ timestamp). Event types:
   files the host downloaded into /workspace/attachments/... for you
   ({type,path,mimeType,originalName} or {type,failure}).
 - callback: {v:1,t,type:'callback',callback_query} where callback_query is the raw
-  Telegram CallbackQuery object (id, from, message, data, chat_instance).
+  Telegram CallbackQuery object (id, from, message, chat_instance). data is optional and
+  may instead be game_short_name; logged callbacks are message-backed.
 - poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
   Telegram PollAnswer object (poll_id, user, option_ids).
 - send: a confirmation of one of your outbox requests:
@@ -165,18 +129,6 @@ Keep Telegram-facing answers concise unless the user asks for detail.
 Host commands /model, /thinking, /status, and /restart manage configuration; do not edit .pi config files yourself.
 Every worker start begins a fresh session; previous conversations persist in /workspace/.pi/sessions/*.jsonl and the agent should read/grep them when the user references history.
 `);
-  for (const discriminator of [
-    "send_file",
-    "send_message",
-    "send_location",
-    "send_poll",
-    "stop_poll",
-    "send_reaction",
-    "edit_message",
-    "delete_message",
-  ]) {
-    expect(SYSTEM_PROMPT).toContain(discriminator);
-  }
 });
 
 it("creates one worker lazily per numeric chat and returns its final text", async () => {
@@ -337,18 +289,34 @@ it("preserves prompt failure when cleanup also fails", async () => {
 });
 it("retries stopping a worker after a rejected cleanup", async () => {
   const worker = fakeWorker();
+  const replacement = fakeWorker("fresh");
+  const promptFailure = deferred<void>();
+  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
+    await promptFailure.promise;
+    throw new Error("prompt failed");
+  });
   vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-  const state = (manager as unknown as { state(chatId: number): unknown }).state(14);
-  const invalidate = (manager as unknown as {
-    invalidateWorker(state: unknown, worker: AgentWorker): Promise<void>;
-  }).invalidateWorker.bind(manager);
+  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
+  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
 
-  await expect(invalidate(state, worker)).rejects.toThrow("stop failed");
-  await expect(invalidate(state, worker)).resolves.toBeUndefined();
+  const run = manager.prompt(14, "request");
+  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
+
+  // A worker_error event invalidates the worker; its stop rejects once.
+  worker.emit({ type: "worker_error", error: "reload failed" });
+  await vi.waitFor(() => expect(worker.stop).toHaveBeenCalledOnce());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  // The active run then fails: the manager retries stopping the same worker.
+  promptFailure.resolve();
+  await expect(run).rejects.toThrow("prompt failed");
   expect(worker.stop).toHaveBeenCalledTimes(2);
-});
 
+  // Subsequent work runs on a replacement worker, not the failed one.
+  await expect(manager.prompt(14, "next")).resolves.toBe("fresh");
+  expect(replacement.prompt).toHaveBeenCalledWith("next");
+  expect(worker.prompt).toHaveBeenCalledTimes(1);
+});
 it("replaces an idle worker after a worker_error event", async () => {
   const worker = fakeWorker("old");
   const replacement = fakeWorker("fresh");

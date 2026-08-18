@@ -6,9 +6,9 @@ import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { Config } from "./config.js";
 import { SerialQueue } from "./queue.js";
 import { chatPaths, defined, withTimeout } from "./util.js";
-import { renderOutboxPrompt } from "./outbox-protocol.js";
-import { renderEventsPrompt } from "./events.js";
-import { renderSchedulesPrompt } from "./schedule-protocol.js";
+import { OUTBOX_PROMPT } from "./outbox-protocol.js";
+import { EVENTS_PROMPT } from "./events.js";
+import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 
 export const SYSTEM_PROMPT = [
 `You are a persistent personal agent reached through Telegram.
@@ -18,9 +18,9 @@ Attachments are ordinary data paths under /workspace/...; read them from those p
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
 Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Extension changes are debounced and automatically reloaded after the current turn.
 `,
-  renderOutboxPrompt(),
-  renderEventsPrompt(),
-  renderSchedulesPrompt(),
+  OUTBOX_PROMPT,
+  EVENTS_PROMPT,
+  SCHEDULES_PROMPT,
   `Keep Telegram-facing answers concise unless the user asks for detail.
 Host commands /model, /thinking, /status, and /restart manage configuration; do not edit .pi config files yourself.
 Every worker start begins a fresh session; previous conversations persist in /workspace/.pi/sessions/*.jsonl and the agent should read/grep them when the user references history.
@@ -62,8 +62,8 @@ export type AgentManagerOptions = {
   bwrapPath?: string;
   workerFactory?: AgentWorkerFactory;
   /** Process-control seams injected by the composition root; the default worker factory passes them to the Pi worker. */
-  spawnProcess?: PiWorkerSpawn;
-  terminateProcessGroup?: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
+  spawnProcess: PiWorkerSpawn;
+  terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   /** Bounds worker abort and active-run draining during shutdown. */
   shutdownTimeoutMs?: number;
 };
@@ -87,25 +87,20 @@ type ChatState = {
   idleStopTimer: NodeJS.Timeout | undefined;
 };
 
-type PromptAction = { completion: Promise<string | undefined> };
 const NO_TEXT_RESPONSE = "I completed the turn but produced no text response.";
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000;
 
 export const WORKER_IDLE_STOP_MS = 2 * 60 * 60 * 1000;
-
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
 
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
   try {
     const raw = await readFile(path.join(workspace, USER_SETTINGS_RELATIVE_PATH), "utf8");
-    return record(JSON.parse(raw)) ?? {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
   } catch {
     return {};
   }
@@ -134,7 +129,8 @@ export class AgentManager {
     this.bwrapPath = options.bwrapPath;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRpcWorker({
       ...workerOptions,
-      ...defined({ spawn: options.spawnProcess, terminateProcessGroup: options.terminateProcessGroup }),
+      spawn: options.spawnProcess,
+      terminateProcessGroup: options.terminateProcessGroup,
     }));
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 0) {
@@ -167,7 +163,7 @@ export class AgentManager {
     return Promise.race([
       promise,
       state.shutdownSignal.then(() => {
-        throw state.shutdownError ?? new Error("Agent manager is shutting down");
+        throw state.shutdownError;
       }),
     ]);
   }

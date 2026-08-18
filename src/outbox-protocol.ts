@@ -2,14 +2,14 @@ import path from "node:path";
 import { defined } from "./util.js";
 
 export type WorkspaceOutboxFileKind = "auto" | "photo" | "audio" | "video" | "voice" | "document";
-export type WorkspaceOutboxMessageEntity = {
+type WorkspaceOutboxMessageEntity = {
   type: string;
   offset: number;
   length: number;
   [key: string]: unknown;
 };
 
-export type WorkspaceOutboxSendFileRequest = {
+type WorkspaceOutboxSendFileRequest = {
   version: 1;
   id: string;
   type: "send_file";
@@ -61,7 +61,7 @@ export type WorkspaceOutboxSendPollRequest = {
   disable_notification?: boolean;
 };
 
-export type WorkspaceOutboxStopPollRequest = {
+type WorkspaceOutboxStopPollRequest = {
   version: 1;
   id: string;
   type: "stop_poll";
@@ -73,7 +73,7 @@ export type WorkspaceOutboxReaction =
   | { type: "emoji"; emoji: string }
   | { type: "custom_emoji"; custom_emoji_id: string };
 
-export type WorkspaceOutboxSendReactionRequest = {
+type WorkspaceOutboxSendReactionRequest = {
   version: 1;
   id: string;
   type: "send_reaction";
@@ -86,14 +86,14 @@ export type WorkspaceOutboxEditMessageRequest = {
   id: string;
   type: "edit_message";
   message_id: number;
-  text?: string;
+  text: string;
   parse_mode?: "HTML" | "MarkdownV2";
   entities?: WorkspaceOutboxMessageEntity[];
   link_preview_options?: unknown;
   reply_markup?: unknown;
 };
 
-export type WorkspaceOutboxDeleteMessageRequest = {
+type WorkspaceOutboxDeleteMessageRequest = {
   version: 1;
   id: string;
   type: "delete_message";
@@ -186,7 +186,7 @@ function validateBoundedJsonObject(value: unknown, name: string, maxBytes: numbe
   } catch {
     throw new Error(`Outbox request ${name} must be JSON-serializable`);
   }
-  if (serialized.length > maxBytes) {
+  if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
     throw new Error(`Outbox request ${name} must be at most ${maxBytes} bytes`);
   }
   return value;
@@ -425,12 +425,8 @@ function validateSendReactionRequest(id: string, request: Record<string, unknown
 }
 
 function validateEditMessageRequest(id: string, request: Record<string, unknown>): WorkspaceOutboxEditMessageRequest {
-  let text: string | undefined;
-  if (request.text !== undefined) {
-    if (typeof request.text !== "string" || request.text.length === 0) throw new Error("Outbox request text must be a non-empty string");
-    if (request.text.length > MAX_REQUEST_TEXT_LENGTH) throw new Error(`Outbox request text must be at most ${MAX_REQUEST_TEXT_LENGTH} characters`);
-    text = request.text;
-  }
+  if (typeof request.text !== "string" || request.text.length === 0) throw new Error("Outbox request text must be a non-empty string");
+  if (request.text.length > MAX_REQUEST_TEXT_LENGTH) throw new Error(`Outbox request text must be at most ${MAX_REQUEST_TEXT_LENGTH} characters`);
   if (request.parse_mode !== undefined && request.parse_mode !== "HTML" && request.parse_mode !== "MarkdownV2") {
     throw new Error("Outbox request parse_mode must be HTML or MarkdownV2");
   }
@@ -440,15 +436,12 @@ function validateEditMessageRequest(id: string, request: Record<string, unknown>
   const entities = validateEntities(request);
   const replyMarkup = validateReplyMarkup(request);
   const linkPreviewOptions = validateLinkPreviewOptions(request);
-  if (text === undefined && replyMarkup === undefined && linkPreviewOptions === undefined) {
-    throw new Error("Outbox request edit_message must include text, reply_markup, or link_preview_options");
-  }
   return {
     version: 1,
     id,
     type: "edit_message",
     message_id: validateMessageId(request, "message_id"),
-    ...defined({ text }),
+    text: request.text,
     ...defined({ parse_mode: request.parse_mode }),
     ...defined({ entities }),
     ...defined({ reply_markup: replyMarkup }),
@@ -488,13 +481,7 @@ export function validateWorkspacePath(workspace: string, requestPath: string): v
   if (candidate === path.resolve(workspace) || outside(workspace, candidate)) throw new Error("Outbox request path escapes the workspace");
 }
 
-/**
- * Renders the OUTBOX protocol section of the SYSTEM_PROMPT: the per-request
- * JSON schemas sent through /workspace/.tg-bot/outbox/, derived from the
- * WorkspaceOutbox* request types validated by {@link validateRequest}.
- */
-export function renderOutboxPrompt(): string {
-  return `To send files or messages through Telegram, write one request per send under
+export const OUTBOX_PROMPT = `To send files or messages through Telegram, write one request per send under
 /workspace/.tg-bot/outbox/. Request types:
 {version:1,id,type:"send_file",path,caption?,kind?,reply_to_message_id?,disable_notification?}
 sends the file at path (relative to /workspace or an absolute /workspace/... path)
@@ -518,11 +505,11 @@ poll_answer event in events.jsonl; the matching send line in events.jsonl
 records pollId.
 {version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
 appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
-(latest 256 lines kept); poll_id matches the poll_answer events' pollId.
+(latest 256 lines kept); result.id matches the poll_answer events' poll_id and
+the matching send event's top-level pollId.
 {version:1,id,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
-{version:1,id,type:"edit_message",message_id,text?,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (at least one of text/reply_markup/link_preview_options required; message_id is the numeric messageId of that message).
+{version:1,id,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
 {version:1,id,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
 `;
-}

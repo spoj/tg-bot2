@@ -11,7 +11,7 @@ export { spawnProcess };
 
 /** Terminate the process group, then the child if needed. */
 export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.pid !== undefined && child.pid !== null && child.pid > 0) {
+  if (child.pid !== undefined && child.pid > 0) {
     try {
       process.kill(-child.pid, signal);
       return;
@@ -61,68 +61,6 @@ async function runtimeLibraryPaths(): Promise<string[]> {
     .map((entry) => path.join("/", entry.name));
   return await existing(candidates);
 }
-async function piWorkerRuntimePaths(): Promise<string[]> {
-  return [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
-}
-
-type SandboxProfile = {
-  workspace: string;
-  runtimePaths: Promise<string[]>;
-  /** Args inserted between `--tmpfs /tmp` and `--bind workspace /workspace`. */
-  middleArgs?: string[];
-  /** Args inserted after `--bind workspace /workspace`, before the environment. */
-  tailArgs?: string[];
-  pathValue: string;
-  /** Extra `--setenv` args placed after PATH. */
-  extraSetenv?: string[];
-  executable: string[];
-};
-
-function baseProfileArgs(): string[] {
-  return [
-    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
-    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
-    "--ro-bind", "/usr", "/usr",
-  ];
-}
-
-async function etcMountArgs(): Promise<string[]> {
-  const args = ["--dir", "/etc"];
-  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
-    args.push("--ro-bind", etcPath, etcPath);
-  }
-  return args;
-}
-
-function profileTailArgs(profile: SandboxProfile): string[] {
-  return [
-    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-    ...(profile.middleArgs ?? []),
-    "--bind", profile.workspace, "/workspace",
-    ...(profile.tailArgs ?? []),
-    "--setenv", "HOME", "/workspace",
-    "--setenv", "TMPDIR", "/tmp",
-    "--setenv", "PATH", profile.pathValue,
-    ...(profile.extraSetenv ?? []),
-    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
-    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
-    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
-    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
-    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
-    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
-  ];
-}
-
-async function buildProfileArgs(profile: SandboxProfile): Promise<{ args: string[] }> {
-  const args = [...baseProfileArgs()];
-  for (const runtimePath of await profile.runtimePaths) {
-    args.push("--ro-bind", runtimePath, runtimePath);
-  }
-  args.push(...(await etcMountArgs()));
-  args.push(...profileTailArgs(profile));
-  args.push("--chdir", "/workspace", "--", ...profile.executable);
-  return { args };
-}
 
 export async function buildBwrapArgs(
   paths: SandboxPaths,
@@ -133,7 +71,7 @@ export async function buildBwrapArgs(
   const mountPoint = path.join(workspace, "sessions_ro");
   await mkdir(mountPoint, { recursive: true, mode: 0o700 });
   const mountStat = await lstat(mountPoint);
-  if (!mountStat.isDirectory() || mountStat.isSymbolicLink()) {
+  if (!mountStat.isDirectory()) {
     throw new Error("workspace/sessions_ro must be a real directory mount point");
   }
 
@@ -155,13 +93,35 @@ export async function buildBwrapArgs(
     tailArgs.push("--ro-bind", resolved, path.posix.join("/workspace", relative.split(path.sep).join("/")));
   }
   tailArgs.push("--ro-bind", sessions, "/workspace/sessions_ro");
-  return buildProfileArgs({
-    workspace,
-    runtimePaths: existing(["/bin", "/lib", "/lib64"]),
-    tailArgs,
-    pathValue: "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
-    executable: [request.executable, ...request.args],
-  });
+
+  const args: string[] = [
+    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
+    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
+    "--ro-bind", "/usr", "/usr",
+  ];
+  for (const runtimePath of await existing(["/bin", "/lib", "/lib64"])) {
+    args.push("--ro-bind", runtimePath, runtimePath);
+  }
+  args.push("--dir", "/etc");
+  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
+    args.push("--ro-bind", etcPath, etcPath);
+  }
+  args.push(
+    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    "--bind", workspace, "/workspace",
+    ...tailArgs,
+    "--setenv", "HOME", "/workspace",
+    "--setenv", "TMPDIR", "/tmp",
+    "--setenv", "PATH", "/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
+    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
+    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
+    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
+    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
+    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
+  );
+  args.push("--chdir", "/workspace", "--", request.executable, ...request.args);
+  return { args };
 }
 
 export type PiWorkerSandboxPaths = {
@@ -187,7 +147,7 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
 
   const nodeModulesPath = path.join(appRoot, "node_modules");
   const nodeModulesStat = await lstat(nodeModulesPath);
-  if (!nodeModulesStat.isDirectory() || nodeModulesStat.isSymbolicLink()) {
+  if (!nodeModulesStat.isDirectory()) {
     throw new Error("Pi worker node_modules must be a real directory");
   }
   const nodeModules = await realpath(nodeModulesPath);
@@ -202,47 +162,73 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     : path.isAbsolute(requestedCli) ? requestedCli : path.resolve(appRoot, requestedCli);
   const cliStat = await lstat(hostCliPath);
   const cliPath = await realpath(hostCliPath);
-  if (!cliStat.isFile() || cliStat.isSymbolicLink()) throw new Error("Pi worker CLI must be a regular file");
+  if (!cliStat.isFile()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
 
   const nodePath = await requireExecutable("node");
-  return buildProfileArgs({
-    workspace,
-    runtimePaths: piWorkerRuntimePaths(),
-    middleArgs: ["--ro-bind", nodeModules, "/app/node_modules"],
-    pathValue: "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
-    extraSetenv: ["--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent"],
-    executable: [
-      nodePath, cliMountPath,
-      "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
-      ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
-    ],
-  });
+  const args: string[] = [
+    "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
+    "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
+    "--ro-bind", "/usr", "/usr",
+  ];
+  for (const runtimePath of [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())]) {
+    args.push("--ro-bind", runtimePath, runtimePath);
+  }
+  args.push("--dir", "/etc");
+  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
+    args.push("--ro-bind", etcPath, etcPath);
+  }
+  args.push(
+    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    "--ro-bind", nodeModules, "/app/node_modules",
+    "--bind", workspace, "/workspace",
+    "--setenv", "HOME", "/workspace",
+    "--setenv", "TMPDIR", "/tmp",
+    "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
+    "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
+    "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
+    "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
+    "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
+    "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
+    "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
+  );
+  args.push(
+    "--chdir", "/workspace", "--", nodePath, cliMountPath,
+    "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
+    ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
+  );
+  return { args };
 }
 
 function outputCapture(limit: number): {
   stdout: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
-  stderr: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
+  stderr: { add(chunk: Buffer): void; text(): string };
   readonly truncated: boolean;
 } {
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
   let remaining = limit;
   let wasTruncated = false;
-  const collector = (chunks: Buffer[]) => ({
-    add(chunk: Buffer) {
-      if (chunk.length > remaining) wasTruncated = true;
-      if (remaining <= 0) return;
-      const accepted = chunk.subarray(0, remaining);
-      chunks.push(accepted);
-      remaining -= accepted.length;
-    },
-    buffer: () => Buffer.concat(chunks),
-    text: () => Buffer.concat(chunks).toString("utf8"),
-  });
+  const add = (chunks: Buffer[]) => (chunk: Buffer): void => {
+    if (chunk.length > remaining) wasTruncated = true;
+    if (remaining <= 0) return;
+    const accepted = chunk.subarray(0, remaining);
+    chunks.push(accepted);
+    remaining -= accepted.length;
+  };
+  let materialized: Buffer | undefined;
+  const stdout = (): Buffer => (materialized ??= Buffer.concat(stdoutChunks));
   return {
-    stdout: collector(stdoutChunks),
-    stderr: collector(stderrChunks),
+    stdout: {
+      add: add(stdoutChunks),
+      buffer: stdout,
+      text: () => stdout().toString("utf8"),
+    },
+    stderr: {
+      add: add(stderrChunks),
+      text: () => Buffer.concat(stderrChunks).toString("utf8"),
+    },
     get truncated() { return wasTruncated; },
   };
 }

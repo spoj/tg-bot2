@@ -22,7 +22,6 @@ export function parseAllowedUserIds(value: string): ReadonlySet<number> {
     if (!Number.isSafeInteger(id)) throw new Error(`Telegram user ID is outside the safe integer range: ${item}`);
     ids.add(id);
   }
-  if (ids.size === 0) throw new Error("ALLOWED_USER_IDS must contain at least one ID");
   return ids;
 }
 

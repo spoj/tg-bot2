@@ -1,8 +1,8 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, execFileSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { promisify } from "node:util";
 import { describe, expect, it, vi, type Mock } from "vitest";
-import { appendFile, mkdtemp, mkdir, open as openFile, readFile, readdir, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdtemp, mkdir, open as openFile, readFile, readdir, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 
@@ -28,14 +28,7 @@ import {
   TelegramDeliveryQueue,
   TelegramIngressBuffer,
 } from "../src/telegram.js";
-import type { ChatEvent } from "../src/events.js";
-import type {
-  WorkspaceOutboxEditMessageRequest,
-  WorkspaceOutboxReaction,
-  WorkspaceOutboxSendLocationRequest,
-  WorkspaceOutboxSendMessageRequest,
-  WorkspaceOutboxSendPollRequest,
-} from "../src/outbox-protocol.js";
+import { appendChatEvents, type ChatEvent } from "../src/events.js";
 
 const execFile = promisify(execFileCallback);
 function fakeBot() {
@@ -1079,14 +1072,12 @@ describe("Telegram message editing and deletion", () => {
       message_id: 7,
       text: "<b>updated</b>",
       parse_mode: "HTML",
-      entities: [{ type: "bold", offset: 0, length: 3 }],
       link_preview_options: { is_disabled: true },
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
     })).resolves.toBe(123);
     const editMessageText = bot.api.editMessageText as unknown as Mock;
     expect(editMessageText).toHaveBeenCalledWith(42, 7, "<b>updated</b>", {
       parse_mode: "HTML",
-      entities: [{ type: "bold", offset: 0, length: 3 }],
       link_preview_options: { is_disabled: true },
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
     });
@@ -1208,6 +1199,17 @@ describe("Telegram chat events", () => {
       expect(prompt).toHaveBeenCalledWith(42, ".");
     });
   });
+
+  it("does not hang or follow a FIFO planted at the events file path", async () => {
+    await withWorkspace(async (workspace) => {
+      const eventsDir = path.join(workspace, ".tg-bot");
+      await mkdir(eventsDir, { recursive: true });
+      const fifoPath = path.join(eventsDir, "events.jsonl");
+      execFileSync("mkfifo", [fifoPath]);
+      await expect(appendChatEvents(workspace, [{ type: "message", message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
+      expect((await lstat(fifoPath)).isFIFO()).toBe(true);
+    });
+  }, 2_000);
 });
 
 
@@ -1305,7 +1307,7 @@ describe("Telegram locations, polls, and reactions", () => {
 describe("Telegram poll answers", () => {
   it("records a poll answer event for the owning chat without waking", async () => {
     await withWorkspace(async (dataDir) => {
-      await recordPollOwner(dataDir, 42, "poll-9", 77);
+      await recordPollOwner(dataDir, 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
@@ -1333,7 +1335,7 @@ describe("Telegram poll answers", () => {
     await withWorkspace(async (dataDir) => {
       const storePath = path.join(dataDir, "poll-owners.jsonl");
       await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
-      await recordPollOwner(dataDir, 42, "poll-9", 77);
+      await recordPollOwner(dataDir, 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({

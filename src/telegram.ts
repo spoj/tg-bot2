@@ -6,8 +6,8 @@ import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message, Poll } from "grammy/types";
 import type { Config } from "./config.js";
 import type { AgentManager } from "./agent.js";
-import { SerialQueueRegistry } from "./queue.js";
-import { appendChatEvent, type ChatEvent } from "./events.js";
+import { SerialQueue } from "./queue.js";
+import { appendChatEvent, appendChatEvents, type ChatEvent } from "./events.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
   WorkspaceOutboxSendLocationRequest,
@@ -16,8 +16,10 @@ import type {
   WorkspaceOutboxReaction,
   WorkspaceOutboxRequest,
   WorkspaceOutboxDispatchResult,
+  WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-import { ATTACHMENTS_DIR, appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
+import type { AvailableModel, WorkerSessionState } from "./pi-worker.js";
+import { appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
 const WAKE_PROMPT = ".";
@@ -27,6 +29,7 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limi
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
+const ATTACHMENTS_DIR = "attachments";
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
 
@@ -38,7 +41,7 @@ type AttachmentSource = {
   originalName?: string | undefined;
 };
 
-export type SavedAttachment = {
+type SavedAttachment = {
   type: string;
   path?: string | undefined;
   mimeType?: string | undefined;
@@ -74,7 +77,7 @@ type BufferState = {
   barrier: IngressBarrierState | undefined;
 };
 
-export type TelegramIngressBarrier = {
+type TelegramIngressBarrier = {
   release: () => void;
 };
 
@@ -155,9 +158,7 @@ export class TelegramIngressBuffer {
     state.timer = setTimeout(() => {
       if (this.states.get(chatId) !== state || state.generation !== generation) return;
       state.timer = undefined;
-      void this.flush(chatId).catch((error) => {
-        console.error("Buffered Telegram timer flush failed", error);
-      });
+      void this.flush(chatId);
     }, this.cooldownMs);
     state.timer.unref?.();
   }
@@ -184,15 +185,9 @@ export class TelegramIngressBuffer {
     const job = state.tail.then(() => this.executeBatch(batch));
     state.tail = job;
     state.running.add(job);
-    void job.then(
-      () => {
-        state.running.delete(job);
-      },
-      (error) => {
-        state.running.delete(job);
-        console.error("Buffered Telegram batch failed", error);
-      },
-    );
+    void job.then(() => {
+      state.running.delete(job);
+    });
   }
 
   private maybeDelete(chatId: number, state: BufferState): void {
@@ -269,22 +264,27 @@ export class TelegramIngressBuffer {
 }
 
 export class TelegramDeliveryQueue {
-  private readonly registry = new SerialQueueRegistry();
-  private readonly pending = new Set<Promise<unknown>>();
+  private readonly queues = new Map<number, SerialQueue>();
 
   enqueue<T>(chatId: number, operation: () => T | PromiseLike<T>): Promise<T> {
-    const result = this.registry.run(chatId, () => invokeCallback(operation));
-    this.pending.add(result);
-    const complete = () => { this.pending.delete(result); };
-    void result.then(complete, complete);
-    return result;
+    let queue = this.queues.get(chatId);
+    if (!queue) {
+      queue = new SerialQueue();
+      this.queues.set(chatId, queue);
+    }
+    return queue.run(() => Promise.resolve(operation())).finally(() => {
+      if (queue.size === 0 && this.queues.get(chatId) === queue) {
+        this.queues.delete(chatId);
+      }
+    });
   }
 
   async drain(): Promise<void> {
-    while (this.pending.size > 0) {
-      const accepted = [...this.pending];
-      await Promise.all(accepted.map((operation) => operation.catch(() => undefined)));
-      await this.registry.idle();
+    while (true) {
+      const live = [...this.queues.values()];
+      if (live.length === 0) return;
+      await Promise.all(live.map((queue) => queue.idle()));
+      await Promise.resolve();
     }
   }
 }
@@ -306,10 +306,6 @@ export function splitTelegramText(text: string, limit = 4000): string[] {
   }
   if (rest) chunks.push(rest);
   return chunks;
-}
-
-async function replyChunks(ctx: Context, text: string): Promise<void> {
-  for (const chunk of splitTelegramText(text)) await ctx.reply(chunk);
 }
 
 export async function sendTelegramLocation(bot: Bot, chatId: number, request: WorkspaceOutboxSendLocationRequest): Promise<number> {
@@ -363,8 +359,7 @@ export async function sendTelegramRichMessage(bot: Bot, chatId: number, request:
 /** Edits one message; malformed markup falls back to the same text as plain. */
 export async function sendTelegramEditMessage(bot: Bot, chatId: number, request: WorkspaceOutboxEditMessageRequest): Promise<number> {
   return withPlainFallback(request.parse_mode, async (parseMode) => {
-    const sent = await bot.api.editMessageText(chatId, request.message_id, request.text as string, defined({ parse_mode: parseMode, entities: request.entities as never, link_preview_options: request.link_preview_options as never, reply_markup: request.reply_markup as never }));
-    if (sent === true) throw new Error("editMessageText returned true for a chat message");
+    const sent = await bot.api.editMessageText(chatId, request.message_id, request.text, defined({ parse_mode: parseMode, entities: request.entities as never, link_preview_options: request.link_preview_options as never, reply_markup: request.reply_markup as never })) as { message_id: number };
     return sent.message_id;
   });
 }
@@ -378,37 +373,35 @@ export async function dispatchOutboxRequest(bot: Bot, dataDir: string, chatId: n
     case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: chatPaths(dataDir, chatId).workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
-    case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId, sent.messageId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
+    case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
     case "stop_poll": return { data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
-    case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return {};
+    case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return undefined;
     case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
-    case "delete_message": await deleteTelegramMessage(bot, chatId, request.message_id); return {};
+    case "delete_message": await deleteTelegramMessage(bot, chatId, request.message_id); return undefined;
     default: { const unhandled: never = request; void unhandled; throw new Error("Unhandled outbox request type"); }
   }
 }
 
 
-export type WorkspaceFileKind = "auto" | "photo" | "audio" | "video" | "voice" | "document";
-
-export type WorkspaceFileRequest = {
+type WorkspaceFileRequest = {
   chatId: number;
   workspace: string;
   sandboxPath: string;
   caption?: string | undefined;
-  kind?: WorkspaceFileKind;
+  kind?: WorkspaceOutboxFileKind;
   replyToMessageId?: number | undefined;
   disableNotification?: boolean | undefined;
 };
 
 const MAX_PHOTO_UPLOAD_BYTES = 10 * 1024 * 1024;
 
-const EXTENSION_KIND: Record<string, Exclude<WorkspaceFileKind, "auto" | "voice">> = {
+const EXTENSION_KIND: Record<string, Exclude<WorkspaceOutboxFileKind, "auto" | "voice">> = {
   jpg: "photo", jpeg: "photo", png: "photo", gif: "photo", webp: "photo", bmp: "photo",
   mp3: "audio", m4a: "audio", aac: "audio", flac: "audio", wav: "audio", opus: "audio",
   mp4: "video", webm: "video", mkv: "video", mov: "video", avi: "video",
 };
 
-function resolvedFileKind(name: string, size: number, override: WorkspaceFileKind | undefined): Exclude<WorkspaceFileKind, "auto"> {
+function resolvedFileKind(name: string, size: number, override: WorkspaceOutboxFileKind | undefined): Exclude<WorkspaceOutboxFileKind, "auto"> {
   const requested = override !== undefined && override !== "auto"
     ? override
     : EXTENSION_KIND[path.extname(name).slice(1).toLowerCase()];
@@ -507,10 +500,10 @@ const MAX_POLL_OWNER_BYTES = 64 * 1024;
 const POLL_OWNER_CAPS = { maxLines: MAX_POLL_OWNER_LINES, maxBytes: MAX_POLL_OWNER_BYTES };
 
 /** Records poll ownership in a host-side store the sandbox cannot reach (only /workspace is mounted). */
-export async function recordPollOwner(dataDir: string, chatId: number, pollId: string, messageId: number): Promise<void> {
+export async function recordPollOwner(dataDir: string, chatId: number, pollId: string): Promise<void> {
   await appendBoundedJsonl(
     path.join(dataDir, POLL_OWNER_STORE_NAME),
-    JSON.stringify({ chatId, pollId, messageId }),
+    JSON.stringify({ chatId, pollId }),
     POLL_OWNER_CAPS,
   );
 }
@@ -523,7 +516,7 @@ async function findPollOwnerChat(dataDir: string, pollId: string): Promise<numbe
   } catch {
     return undefined;
   }
-  for (const line of lines.slice(-MAX_POLL_OWNER_LINES)) {
+  for (const line of lines) {
     let record: unknown;
     try {
       record = JSON.parse(line);
@@ -813,23 +806,8 @@ export function closeTelegramIngress(bot: Bot): void {
   ingressByBot.get(bot)?.close();
 }
 
-export type TelegramAvailableModel = {
-  provider: string;
-  id: string;
-  name?: string;
-};
-
-export type TelegramSessionState = {
-  model?: { provider: string; id: string };
-  thinkingLevel: string;
-  sessionId: string;
-  sessionFile?: string;
-  messageCount: number;
-  autoCompactionEnabled: boolean;
-};
-
 export function formatModelList(
-  models: readonly TelegramAvailableModel[],
+  models: readonly AvailableModel[],
   current?: { provider: string; id: string },
 ): string {
   if (models.length === 0) return "No models available.";
@@ -850,7 +828,7 @@ export function formatThinkingLevels(levels: readonly string[], current?: string
     .join("\n");
 }
 
-export function formatStatus(state: TelegramSessionState): string {
+export function formatStatus(state: WorkerSessionState): string {
   const model = state.model ? `${state.model.provider}/${state.model.id}` : "unset";
   const session = state.sessionFile ?? state.sessionId;
   return `Model: ${model} | Thinking: ${state.thinkingLevel} | Session: ${session} | Messages: ${state.messageCount}`;
@@ -863,13 +841,10 @@ export function createTelegramBot(
 ): Bot {
   const bot = new Bot(config.token);
 
-  const queuedSend = (ctx: Context, send: () => Promise<unknown>): Promise<void> => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined) return Promise.resolve();
-    return deliveryQueue.enqueue(chatId, send).then(() => undefined);
-  };
-  const queuedReply = (ctx: Context, text: string): Promise<void> => queuedSend(ctx, () => ctx.reply(text));
-  const queuedReplyChunks = (ctx: Context, text: string): Promise<void> => queuedSend(ctx, () => replyChunks(ctx, text));
+  const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
+  const queuedReplyChunks = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, async () => {
+    for (const chunk of splitTelegramText(text)) await ctx.reply(chunk);
+  });
 
   const ingress = new TelegramIngressBuffer(async (chatId, events) => {
     const workspace = chatPaths(config.dataDir, chatId).workspace;
@@ -910,91 +885,88 @@ export function createTelegramBot(
       await queuedReply(ctx, "I could not start a new session. Please try again.");
       return;
     }
-    try {
-      await queuedReply(ctx, "Started a new session. Earlier session files remain searchable.");
-    } catch (error) {
-      console.error("Failed to start new session", error);
-      await queuedReply(ctx, "I could not start a new session. Please try again.");
-    }
+    await queuedReply(ctx, "Started a new session. Earlier session files remain searchable.");
   });
 
   bot.command("model", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const chatId = ctx.chat.id;
+    const query = ctx.match.trim();
+    const models = await agents.getAvailableModels(chatId);
+    const current = (await agents.status(chatId)).model;
+    if (!query) {
+      await queuedReplyChunks(ctx, formatModelList(models, current));
+      return;
+    }
+    const needle = query.toLowerCase();
+    const matches = models.filter((model) =>
+      `${model.id} ${model.name ?? ""}`.toLowerCase().includes(needle),
+    );
+    if (matches.length === 0) {
+      await queuedReply(ctx, `No model matches "${query}".`);
+      return;
+    }
+    if (matches.length > 1) {
+      await queuedReplyChunks(ctx, `Multiple models match "${query}":\n\n${formatModelList(matches, current)}`);
+      return;
+    }
+    const model = matches[0]!;
     try {
-      const query = (ctx.match ?? "").trim();
-      const models = await agents.getAvailableModels(chatId);
-      const current = (await agents.status(chatId)).model;
-      if (!query) {
-        await queuedReplyChunks(ctx, formatModelList(models, current));
-        return;
-      }
-      const needle = query.toLowerCase();
-      const matches = models.filter((model) =>
-        `${model.id} ${model.name ?? ""}`.toLowerCase().includes(needle),
-      );
-      if (matches.length === 0) {
-        await queuedReply(ctx, `No model matches "${query}".`);
-        return;
-      }
-      if (matches.length > 1) {
-        await queuedReplyChunks(ctx, `Multiple models match "${query}":\n\n${formatModelList(matches, current)}`);
-        return;
-      }
-      const model = matches[0]!;
       await agents.setModel(chatId, model.provider, model.id);
-      await queuedReply(ctx, `Model set to ${model.provider}/${model.id}.`);
     } catch (error) {
       console.error("Failed to set model", error);
       await queuedReply(ctx, "I could not set the model. Please try again.");
+      return;
     }
+    await queuedReply(ctx, `Model set to ${model.provider}/${model.id}.`);
   });
 
   bot.command("thinking", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const chatId = ctx.chat.id;
+    const level = ctx.match.trim();
+    const levels = await agents.getAvailableThinkingLevels(chatId);
+    const current = (await agents.status(chatId)).thinkingLevel;
+    if (!level) {
+      await queuedReply(ctx, formatThinkingLevels(levels, current));
+      return;
+    }
+    if (!levels.includes(level)) {
+      await queuedReply(ctx, `Unknown thinking level "${level}". Valid levels: ${levels.join(", ")}.`);
+      return;
+    }
     try {
-      const level = (ctx.match ?? "").trim();
-      const levels = await agents.getAvailableThinkingLevels(chatId);
-      const current = (await agents.status(chatId)).thinkingLevel;
-      if (!level) {
-        await queuedReply(ctx, formatThinkingLevels(levels, current));
-        return;
-      }
-      if (!levels.includes(level)) {
-        await queuedReply(ctx, `Unknown thinking level "${level}". Valid levels: ${levels.join(", ")}.`);
-        return;
-      }
       await agents.setThinkingLevel(chatId, level);
-      await queuedReply(ctx, `Thinking level set to ${level}.`);
     } catch (error) {
       console.error("Failed to set thinking level", error);
       await queuedReply(ctx, "I could not set the thinking level. Please try again.");
+      return;
     }
+    await queuedReply(ctx, `Thinking level set to ${level}.`);
   });
 
   bot.command("status", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const chatId = ctx.chat.id;
+    let state: WorkerSessionState;
     try {
-      await queuedReply(ctx, formatStatus(await agents.status(chatId)));
+      state = await agents.status(chatId);
     } catch (error) {
       console.error("Failed to get status", error);
       await queuedReply(ctx, "I could not get the status. Please try again.");
+      return;
     }
+    await queuedReply(ctx, formatStatus(state));
   });
 
   bot.command("restart", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const chatId = ctx.chat.id;
     await queuedReply(ctx, "Restarting agent…");
     try {
       await agents.restart(chatId);
-      await queuedReply(ctx, "Agent restarted.");
     } catch (error) {
       console.error("Failed to restart agent", error);
       await queuedReply(ctx, "I could not restart the agent. Please try again.");
+      return;
     }
+    await queuedReply(ctx, "Agent restarted.");
   });
 
   bot.on("message", (ctx) => {
@@ -1017,7 +989,7 @@ export function createTelegramBot(
   bot.on("callback_query", (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
-    if (chatId === undefined || query.message?.message_id === undefined) return;
+    if (chatId === undefined) return;
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
     ingress.add(chatId, {

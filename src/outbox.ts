@@ -4,8 +4,8 @@ import type { FSWatcher, Stats } from "node:fs";
 import { lstat, link, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { appendChatEvent } from "./events.js";
-import { SerialQueueRegistry } from "./queue.js";
-import { appendBoundedJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, OUTBOX_DIR, POLL_RESULTS_FILE, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { SerialQueue } from "./queue.js";
+import { appendBoundedJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 import { validateRequest, validateWorkspacePath, type WorkspaceOutboxDispatcher, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
@@ -36,6 +36,8 @@ const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
 const CLAIM_NAME = /^\.in-progress-(\d+)-[^/]+$/u;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
+const OUTBOX_DIR = "outbox";
+const POLL_RESULTS_FILE = "poll-results.jsonl";
 
 type ClaimLease = {
   stop: () => Promise<void>;
@@ -45,22 +47,9 @@ type ChatWatcher = {
   debounce: ReturnType<typeof setTimeout> | undefined;
 };
 
-
 type OutboxEntry = {
   name: string;
   path: string;
-  originalName?: string;
-};
-
-type ChatChain = {
-  chatDirectory: PinnedDirectory;
-  workspaceDirectory: PinnedDirectory;
-  metadata: PinnedDirectory;
-  outbox: PinnedDirectory;
-  processed: PinnedDirectory;
-  failed: PinnedDirectory;
-  /** Present only when the chain opener opened chatsRoot itself. */
-  chatsRoot?: PinnedDirectory;
 };
 
 function isMissing(error: unknown): boolean {
@@ -149,7 +138,7 @@ export class WorkspaceOutbox {
   private readonly cancelSchedule: typeof clearInterval;
   private readonly watchFs: typeof watch;
   private readonly logger: (error: unknown) => void;
-  private readonly registry = new SerialQueueRegistry();
+  private readonly queues = new Map<number, SerialQueue>();
   private readonly chatWatchers = new Map<number, ChatWatcher>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private pollInFlight: Promise<void> | undefined;
@@ -202,7 +191,16 @@ export class WorkspaceOutbox {
       const pending: Promise<void>[] = [];
       if (this.startInFlight) pending.push(this.startInFlight);
       if (this.pollInFlight) pending.push(this.pollInFlight);
-      if (this.registry.size > 0) pending.push(this.registry.idle());
+      let queued = 0;
+      for (const queue of this.queues.values()) queued += queue.size;
+      if (queued > 0) pending.push((async (): Promise<void> => {
+        for (;;) {
+          const live = [...this.queues.values()];
+          if (live.length === 0) return;
+          await Promise.all(live.map((queue) => queue.idle()));
+          await Promise.resolve();
+        }
+      })());
       if (pending.length === 0) return;
       await Promise.all(pending.map((operation) => operation.catch(() => {})));
     }
@@ -227,9 +225,17 @@ export class WorkspaceOutbox {
     await this.enqueueChatScan(chatId, workspace, chatsRoot);
   }
 
-  /** Enqueue a scan of one chat's outbox on its dedicated serial queue. */
   private enqueueChatScan(chatId: number, workspace: string, chatsRoot?: PinnedDirectory): Promise<void> {
-    return this.registry.run(chatId, () => this.processChatNow(chatId, workspace, chatsRoot));
+    let queue = this.queues.get(chatId);
+    if (!queue) {
+      queue = new SerialQueue();
+      this.queues.set(chatId, queue);
+    }
+    return queue.run(() => this.processChatNow(chatId, workspace, chatsRoot)).finally(() => {
+      if (queue.size === 0 && this.queues.get(chatId) === queue) {
+        this.queues.delete(chatId);
+      }
+    });
   }
 
   /** Watch one chat's outbox directory, scheduling a debounced scan on filesystem events. */
@@ -266,7 +272,6 @@ export class WorkspaceOutbox {
     watcher.on("close", disarm);
   }
 
-  /** Debounce a burst of watcher events into a single scan. */
   private debounceChatScan(chatId: number, workspace: string): void {
     const entry = this.chatWatchers.get(chatId);
     if (!entry) return;
@@ -280,7 +285,6 @@ export class WorkspaceOutbox {
     timer.unref();
   }
 
-  /** Close every watcher and clear every pending debounce. */
   private closeWatchers(): void {
     for (const entry of this.chatWatchers.values()) {
       clearTimeout(entry.debounce);
@@ -323,30 +327,6 @@ export class WorkspaceOutbox {
   }
 
   private async processChatNow(chatId: number, workspace: string, chatsRoot?: PinnedDirectory): Promise<void> {
-    let chain: ChatChain | undefined;
-    try {
-      chain = await this.openChatChain(chatId, chatsRoot);
-      const entries = await this.collectOutboxEntries(chain.outbox);
-      for (const entry of entries) {
-        await this.deliverOutboxEntry(entry, workspace, chain, chatId);
-      }
-    } catch (error) {
-      if (!isMissing(error)) this.report(error);
-    } finally {
-      if (chain) {
-        await this.closeDirectory(chain.failed);
-        await this.closeDirectory(chain.processed);
-        await this.closeDirectory(chain.outbox);
-        await this.closeDirectory(chain.metadata);
-        await this.closeDirectory(chain.workspaceDirectory);
-        await this.closeDirectory(chain.chatDirectory);
-        if (chain.chatsRoot) await this.closeDirectory(chain.chatsRoot);
-      }
-    }
-  }
-
-  /** Opens the pinned chats/chat/workspace/metadata/outbox chain, closing anything already opened if a later step fails. */
-  private async openChatChain(chatId: number, chatsRoot?: PinnedDirectory): Promise<ChatChain> {
     let openedChatsRoot: PinnedDirectory | undefined;
     let chatDirectory: PinnedDirectory | undefined;
     let workspaceDirectory: PinnedDirectory | undefined;
@@ -362,14 +342,97 @@ export class WorkspaceOutbox {
         throw new Error(`Workspace for chat ${chatId} is outside the chat directory`);
       }
       metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
-      const openedOutbox = await openPinnedDirectory(path.join(metadata.path, OUTBOX_DIR));
-      outbox = openedOutbox;
-      processed = await openChildDirectory(openedOutbox, "processed");
-      failed = await openChildDirectory(openedOutbox, "failed");
-      const chain: ChatChain = { chatDirectory, workspaceDirectory, metadata, outbox, processed, failed };
-      if (chatsRoot === undefined) chain.chatsRoot = openedChatsRoot;
-      return chain;
+      outbox = await openPinnedDirectory(path.join(metadata.path, OUTBOX_DIR));
+      const outboxPath = outbox.path;
+      processed = await openChildDirectory(outbox, "processed");
+      failed = await openChildDirectory(outbox, "failed");
+
+      const entries = (await readBoundedEntries(outbox.path, MAX_OUTBOX_ENTRIES_PER_CHAT))
+        .filter((entry) => JSON_REQUEST.test(entry.name) || CLAIM_NAME.test(entry.name))
+        .map((entry) => ({ name: entry.name, path: path.join(outboxPath, entry.name) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      for (const entry of entries) {
+        const claimMatch = CLAIM_NAME.exec(entry.name);
+        const stale = claimMatch !== null && this.isStaleClaim(claimMatch);
+        if (claimMatch !== null && !stale) continue;
+        if (stale && await this.claimWasAlreadyArchived(entry, processed, chatId)) continue;
+        const claim = await this.claimEntry(outbox, entry, chatId, stale);
+        if (!claim) continue;
+        const archiveName = entry.name;
+        let lease: ClaimLease | undefined;
+        let request: WorkspaceOutboxRequest | undefined;
+        try {
+          lease = this.startClaimLease(claim, chatId);
+          request = await readRequest(claim.path);
+          if (request.type === "send_file") validateWorkspacePath(workspace, request.path);
+          const result = await this.dispatch(chatId, request);
+          if (result !== undefined) {
+            try {
+              if (result.messageId !== undefined) {
+                appendChatEvent(workspace, {
+                  type: "send",
+                  kind: request.type,
+                  id: request.id,
+                  messageId: result.messageId,
+                  ...defined({ pollId: result.pollId }),
+                  ok: true,
+                });
+              }
+              if (result.data !== undefined) {
+                await appendBoundedJsonl(
+                  path.join(metadata.path, POLL_RESULTS_FILE),
+                  JSON.stringify({ id: request.id, result: result.data }),
+                  { maxLines: MAX_JSONL_LINES, maxBytes: MAX_JSONL_BYTES },
+                );
+              }
+            } catch (error) {
+              // Delivery succeeded; a lost ack or result must never resend the request.
+              this.reportRequestError(chatId, archiveName, error);
+            }
+          }
+        } catch (error) {
+          if (lease) {
+            await lease.stop();
+            lease = undefined;
+          }
+          try {
+            await this.archiveClaimed(claim.path, failed, archiveName);
+          } catch (moveError) {
+            this.report(moveError);
+          }
+          if (request !== undefined) {
+            appendChatEvent(workspace, {
+              type: "send",
+              kind: request.type,
+              id: request.id,
+              ok: false,
+              error: errorMessage(error),
+            });
+          }
+          this.reportRequestError(chatId, archiveName, error);
+          continue;
+        }
+
+        if (lease) {
+          await lease.stop();
+          lease = undefined;
+        }
+        try {
+          await this.archiveClaimed(claim.path, processed, archiveName);
+        } catch (error) {
+          // Sending succeeded. Never put this request in failed, where it would be resent.
+          this.reportRequestError(chatId, archiveName, error);
+          try {
+            await this.discardSentClaim(claim.path);
+          } catch (discardError) {
+            this.report(discardError);
+          }
+        }
+      }
     } catch (error) {
+      if (!isMissing(error)) this.report(error);
+    } finally {
       if (failed) await this.closeDirectory(failed);
       if (processed) await this.closeDirectory(processed);
       if (outbox) await this.closeDirectory(outbox);
@@ -377,96 +440,6 @@ export class WorkspaceOutbox {
       if (workspaceDirectory) await this.closeDirectory(workspaceDirectory);
       if (chatDirectory) await this.closeDirectory(chatDirectory);
       if (chatsRoot === undefined && openedChatsRoot) await this.closeDirectory(openedChatsRoot);
-      throw error;
-    }
-  }
-
-  /** Collects the request and claim entries of an outbox directory, sorted by name. */
-  private async collectOutboxEntries(outbox: PinnedDirectory): Promise<OutboxEntry[]> {
-    return (await readBoundedEntries(outbox.path, MAX_OUTBOX_ENTRIES_PER_CHAT))
-      .filter((entry) => JSON_REQUEST.test(entry.name) || CLAIM_NAME.test(entry.name))
-      .map((entry) => ({ name: entry.name, path: path.join(outbox.path, entry.name) }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }
-
-  /** Delivers one outbox entry: claim, lease, dispatch, result persistence, and archive; per-entry failures are contained. */
-  private async deliverOutboxEntry(entry: OutboxEntry, workspace: string, chain: ChatChain, chatId: number): Promise<void> {
-    const { outbox, metadata, processed, failed } = chain;
-    const isClaim = CLAIM_NAME.test(entry.name);
-    const stale = isClaim && this.isStaleClaim(entry.name);
-    if (isClaim && !stale) return;
-    if (stale && await this.claimWasAlreadyArchived(entry, processed, chatId)) return;
-    const claim = await this.claimEntry(outbox, entry, chatId, stale);
-    if (!claim) return;
-    const archiveName = claim.originalName ?? entry.name;
-    let lease: ClaimLease | undefined;
-    let request: WorkspaceOutboxRequest | undefined;
-    try {
-      lease = this.startClaimLease(claim, chatId);
-      request = await readRequest(claim.path);
-      if (request.type === "send_file") validateWorkspacePath(workspace, request.path);
-      const result = await this.dispatch(chatId, request);
-      if (result !== undefined) {
-        try {
-          if (result.messageId !== undefined) {
-            appendChatEvent(workspace, {
-              type: "send",
-              kind: request.type,
-              id: request.id,
-              messageId: result.messageId,
-              ...defined({ pollId: result.pollId }),
-              ok: true,
-            });
-          }
-          if (result.data !== undefined) {
-            await appendBoundedJsonl(
-              path.join(metadata.path, POLL_RESULTS_FILE),
-              JSON.stringify({ id: request.id, result: result.data }),
-              { maxLines: MAX_JSONL_LINES, maxBytes: MAX_JSONL_BYTES },
-            );
-          }
-        } catch (error) {
-          // Delivery succeeded; a lost ack or result must never resend the request.
-          this.reportRequestError(chatId, archiveName, error);
-        }
-      }
-    } catch (error) {
-      if (lease) {
-        await lease.stop();
-        lease = undefined;
-      }
-      try {
-        await this.archiveClaimed(claim.path, failed, archiveName);
-      } catch (moveError) {
-        this.report(moveError);
-      }
-      if (request !== undefined) {
-        appendChatEvent(workspace, {
-          type: "send",
-          kind: request.type,
-          id: request.id,
-          ok: false,
-          error: errorMessage(error),
-        });
-      }
-      this.reportRequestError(chatId, archiveName, error);
-      return;
-    }
-
-    if (lease) {
-      await lease.stop();
-      lease = undefined;
-    }
-    try {
-      await this.archiveClaimed(claim.path, processed, archiveName);
-    } catch (error) {
-      // Sending succeeded. Never put this request in failed, where it would be resent.
-      this.reportRequestError(chatId, archiveName, error);
-      try {
-        await this.discardSentClaim(claim.path);
-      } catch (discardError) {
-        this.report(discardError);
-      }
     }
   }
 
@@ -478,7 +451,7 @@ export class WorkspaceOutbox {
       const operation = this.refreshClaim(claim);
       heartbeatInFlight = operation;
       void operation
-        .catch((error) => this.reportRequestError(chatId, claim.originalName ?? claim.name, error))
+        .catch((error) => this.reportRequestError(chatId, claim.name, error))
         .finally(() => {
           if (heartbeatInFlight === operation) heartbeatInFlight = undefined;
         });
@@ -513,9 +486,7 @@ export class WorkspaceOutbox {
     throw new Error("Unable to refresh outbox request lease");
   }
 
-  private isStaleClaim(name: string): boolean {
-    const match = CLAIM_NAME.exec(name);
-    if (!match) return false;
+  private isStaleClaim(match: RegExpExecArray): boolean {
     const createdAt = Number(match[1]);
     if (!Number.isSafeInteger(createdAt)) return false;
     const current = this.now();
@@ -577,7 +548,7 @@ export class WorkspaceOutbox {
       const claimPath = path.join(outbox.path, claimName);
       try {
         await rename(entry.path, claimPath);
-        return { name: claimName, path: claimPath, originalName: entry.name };
+        return { name: claimName, path: claimPath };
       } catch (error) {
         if (isMissing(error)) return undefined;
         if (isExisting(error)) continue;

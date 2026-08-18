@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config.js";
-import { canonicalChatId, chatPaths } from "../src/util.js";
+import { chatPaths } from "../src/util.js";
 
 const base = { TG_BOT_TOKEN: "token", ALLOWED_USER_IDS: "123, 456", DATA_DIR: "/tmp/data" };
 
@@ -29,26 +29,10 @@ describe("configuration", () => {
     expect(Object.keys(config)).toEqual(["token", "allowedUserIds", "dataDir"]);
   });
 
-  it("does not expose obsolete environment runtime fields", () => {
-    const config = parseConfig({
-      ...base,
-      TOOL_TIMEOUT_MS: "not-a-number",
-      MAX_TOOL_OUTPUT_BYTES: "not-a-number",
-      SESSION_IDLE_TIMEOUT_MS: "not-a-number",
-      AGENT_MODEL: "",
-      AGENT_THINKING: "invalid",
-    });
-    expect(config).not.toHaveProperty("toolTimeoutMs");
-    expect(config).not.toHaveProperty("maxToolOutputBytes");
-    expect(config).not.toHaveProperty("sessionIdleTimeoutMs");
-    expect(config).not.toHaveProperty("model");
-    expect(config).not.toHaveProperty("thinking");
-  });
-
-  it("derives canonical paths from numeric chat IDs", () => {
-    expect(canonicalChatId(-42)).toBe("-42");
+  it("derives workspace paths from safe-integer chat IDs", () => {
     expect(chatPaths("/data", -42)).toEqual({ workspace: "/data/chats/-42/workspace" });
     expect(chatPaths("/data", 42)).toEqual({ workspace: "/data/chats/42/workspace" });
-    expect(() => canonicalChatId(Number.NaN)).toThrow();
+    expect(() => chatPaths("/data", Number.NaN)).toThrow();
   });
+
 });

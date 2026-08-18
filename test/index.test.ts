@@ -10,7 +10,6 @@ const state = vi.hoisted(() => {
       return Promise.resolve();
     }),
     disposeAll: vi.fn(async () => { order.push("agents.disposeAll"); }),
-    prompt: vi.fn(async () => ""),
   };
   const bot = {
     start: vi.fn(),
@@ -29,7 +28,6 @@ const state = vi.hoisted(() => {
     agentManager: vi.fn(class AgentManagerMock {
       beginShutdown = agents.beginShutdown;
       disposeAll = agents.disposeAll;
-      prompt = agents.prompt;
     }),
     scheduler: vi.fn(class WorkspaceSchedulerMock {
       start = vi.fn(async () => {});
@@ -62,7 +60,6 @@ const state = vi.hoisted(() => {
 
 vi.mock("../src/config.js", () => ({
   parseConfig: () => state.config,
-  chatPaths: (dataDir: string, chatId: number) => ({ workspace: `${dataDir}/chats/${chatId}/workspace` }),
 }));
 vi.mock("../src/sandbox.js", () => ({
   checkSandboxEnvironment: state.checkSandboxEnvironment,

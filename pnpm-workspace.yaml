@@ -3,14 +3,12 @@ allowBuilds:
   esbuild: true
   protobufjs: true
 minimumReleaseAgeExclude:
-  - '@earendil-works/pi-agent-core@0.84.1'
-  - '@earendil-works/pi-ai@0.84.1'
-  - '@earendil-works/pi-client@0.84.1'
-  - '@earendil-works/pi-coding-agent@0.84.1'
-  - '@earendil-works/pi-protocol@0.84.1'
-  - '@earendil-works/pi-telemetry@0.84.1'
-  - '@earendil-works/pi-tui@0.84.1'
+  - '@earendil-works/pi-agent-core@0.84.2'
+  - '@earendil-works/pi-ai@0.84.2'
+  - '@earendil-works/pi-client@0.84.2'
+  - '@earendil-works/pi-coding-agent@0.84.2'
+  - '@earendil-works/pi-protocol@0.84.2'
+  - '@earendil-works/pi-telemetry@0.84.2'
+  - '@earendil-works/pi-tui@0.84.2'
   - '@types/node@26.2.0'
   - tsx@4.23.11
-  - pi-multimodal-proxy@1.12.1
-  - pi-subagents@0.43.0

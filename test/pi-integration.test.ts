@@ -107,30 +107,6 @@ class PiHarness {
     const data = response.data;
     return data !== null && typeof data === "object" ? (data as JsonRecord) : {};
   }
-
-  async getAvailableThinkingLevels(): Promise<unknown> {
-    const response = await this.request({ type: "get_available_thinking_levels" });
-    const data = response.data;
-    return data !== null && typeof data === "object" ? (data as JsonRecord).levels : undefined;
-  }
-
-  async setThinkingLevel(level: string): Promise<void> {
-    await this.request({ type: "set_thinking_level", level });
-  }
-
-  async newSession(): Promise<void> {
-    await this.request({ type: "new_session" });
-  }
-
-  async prompt(message: string): Promise<void> {
-    await this.request({ type: "prompt", message });
-  }
-
-  async getLastAssistantText(): Promise<unknown> {
-    const response = await this.request({ type: "get_last_assistant_text" });
-    const data = response.data;
-    return data !== null && typeof data === "object" ? (data as JsonRecord).text : undefined;
-  }
 }
 
 async function startWorker() {
@@ -178,7 +154,9 @@ integration("Pi RPC integration (requires RUN_BWRAP_TESTS=1)", () => {
       // Offline (no credentials) the agent resolves to an unconfigured, non-reasoning
       // model, so it reports only "off". A credentialed reasoning model reports the
       // full canonical set; assert every reported level is canonical and "off" is present.
-      const levels = await harness.getAvailableThinkingLevels();
+      const levelsResponse = await harness.request({ type: "get_available_thinking_levels" });
+      const levelsData = levelsResponse.data;
+      const levels = levelsData !== null && typeof levelsData === "object" ? (levelsData as JsonRecord).levels : undefined;
       expect(Array.isArray(levels)).toBe(true);
       for (const level of levels as unknown[]) {
         expect(CANONICAL_THINKING_LEVELS).toContain(level);
@@ -187,33 +165,39 @@ integration("Pi RPC integration (requires RUN_BWRAP_TESTS=1)", () => {
 
       // 3. set_thinking_level succeeds and round-trips into get_state, clamped to the
       // model's available levels. Offline, "high" clamps to "off" (the only level).
-      await harness.setThinkingLevel("high");
+      await harness.request({ type: "set_thinking_level", level: "high" });
       const highState = await harness.getState();
       expect(typeof highState.thinkingLevel).toBe("string");
       expect(levels).toContain(highState.thinkingLevel);
 
       // 4. new_session yields a fresh session id.
       const beforeId = highState.sessionId;
-      await harness.newSession();
+      await harness.request({ type: "new_session" });
       const freshState = await harness.getState();
       expect(freshState.sessionId).not.toBe(beforeId);
-      // 5. A prompt without credentials must settle without crashing the worker:
-      // accept either a graceful error response or a textual reply, and never
-      // assert provider-specific behavior.
+      // 5. A prompt without credentials must settle without crashing the worker.
+      // Register the settlement waiter before awaiting acceptance so a fast
+      // agent_settled is not missed. Only the specific no-credentials rejection
+      // is tolerated (it produces no agent turn); a settlement timeout or any
+      // other RPC error must fail the test.
+      const promptSettled = harness.waitForEvent("agent_settled");
       try {
-        await harness.prompt("hi");
-        await harness.waitForEvent("agent_settled");
+        await harness.request({ type: "prompt", message: "hi" });
+        await promptSettled;
       } catch (error) {
-        // Graceful error response (no credentials configured): the worker must
-        // still be alive, not crashed.
-        expect(error).toBeInstanceOf(Error);
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/No API key found|No model selected|Authentication failed/.test(message)) {
+          throw error;
+        }
       }
       const afterPrompt = await harness.getState();
       expect(afterPrompt.isStreaming).toBe(false);
 
       // 6. get_last_assistant_text succeeds once the turn has settled. With no
       // assistant message (offline prompt failed), the text is null/undefined.
-      const text = await harness.getLastAssistantText();
+      const textResponse = await harness.request({ type: "get_last_assistant_text" });
+      const textData = textResponse.data;
+      const text = textData !== null && typeof textData === "object" ? (textData as JsonRecord).text : undefined;
       expect(text === null || text === undefined || typeof text === "string").toBe(true);
     } finally {
       await stopChild(child);

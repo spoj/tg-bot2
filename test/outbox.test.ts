@@ -757,7 +757,7 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["both-edit.json"]);
   });
 
-  it("dispatches edit_message without text using only reply_markup", async () => {
+  it("rejects edit_message without text using only reply_markup", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "reply-edit.json", {
       version: 1, id: "reply-edit", type: "edit_message", message_id: 9,
@@ -765,10 +765,22 @@ describe("WorkspaceOutbox", () => {
     });
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
-    expect(dispatch).toHaveBeenCalledWith(42, {
-      version: 1, id: "reply-edit", type: "edit_message", message_id: 9,
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["reply-edit.json"]);
+  });
+
+  it("rejects reply_markup over 8192 UTF-8 bytes even when under 8192 UTF-16 code units", async () => {
+    const { dataDir, workspace } = await fixture();
+    await writeRequest(workspace, "cjk-markup.json", {
+      version: 1,
+      id: "cjk-markup",
+      type: "send_message",
+      text: "x",
+      reply_markup: { inline_keyboard: [[{ text: "漢".repeat(3000), callback_data: "cjk" }]] },
     });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["reply-edit.json"]);
+    const dispatch = vi.fn(async () => undefined);
+    await pollOutbox(dataDir, dispatch);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["cjk-markup.json"]);
   });
 });

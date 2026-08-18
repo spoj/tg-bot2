@@ -1,8 +1,8 @@
-import { constants as fsConstants, type Dirent } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { link, lstat, open, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { SCHEDULES_FILE, TG_BOT_DIR, chatPaths, errorCode, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
+import { TG_BOT_DIR, chatPaths, errorCode, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRecord } from "./schedule-protocol.js";
 
 type StoredScheduleRecord = ScheduleRecord & Record<string, unknown>;
@@ -18,13 +18,12 @@ type ScheduleSnapshot = {
 };
 type DueRecord = {
   chatId: number;
-  chatName: string;
   metadataRealPath: string;
   record: StoredScheduleRecord;
 };
 
 type MaybePromise<T> = T | PromiseLike<T>;
-export type WorkspaceSchedulerOptions = {
+type WorkspaceSchedulerOptions = {
   dataDir: string;
   run: (chatId: number, prompt: string) => MaybePromise<string | undefined>;
   pollIntervalMs?: number;
@@ -42,6 +41,7 @@ const WEEK_MS = 7 * DAY_MS;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
 const WRITE_NEW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW;
+const SCHEDULES_FILE = "schedules.json";
 const MAX_SCHEDULE_FILE_BYTES = 64 * 1024;
 const MAX_SCHEDULE_RECORDS = 256;
 const MAX_SCHEDULE_ID_LENGTH = 256;
@@ -77,7 +77,7 @@ function validateRecord(value: unknown, index: number): StoredScheduleRecord {
   }
   if (typeof record.enabled !== "boolean") invalid(`record ${index} has an invalid enabled flag`);
   if (record.lastRunAt !== null && !isUtcIso(record.lastRunAt)) invalid(`record ${index} has an invalid lastRunAt`);
-  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0 || record.runCount > Number.MAX_SAFE_INTEGER) {
+  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0) {
     invalid(`record ${index} has an invalid runCount`);
   }
   return { ...record } as StoredScheduleRecord;
@@ -111,13 +111,11 @@ function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): s
   return new Date(due + periods * period).toISOString();
 }
 
-async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<boolean> {
+async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<void> {
   try {
     await handle.close();
-    return true;
   } catch {
     // Preserve the original read/write error.
-    return false;
   }
 }
 async function readBoundedFile(handle: Awaited<ReturnType<typeof open>>): Promise<string> {
@@ -231,7 +229,7 @@ export class WorkspaceScheduler {
           if (!scheduleSnapshot) continue;
           for (const record of scheduleSnapshot.file.schedules) {
             if (record.enabled && Date.parse(record.dueAt) <= now) {
-              due.push({ chatId, chatName: name, metadataRealPath: metadata.realPath, record });
+              due.push({ chatId, metadataRealPath: metadata.realPath, record });
             }
           }
         } catch (error) {
@@ -314,12 +312,18 @@ export class WorkspaceScheduler {
   }
 
   private async markRun(item: DueRecord, id: string, now: number): Promise<void> {
-    await this.writeSchedule(item, (snapshot) => {
+    const metadata = await this.openCurrentMetadata(item);
+    if (!metadata) return;
+    const filePath = path.join(metadata.path, SCHEDULES_FILE);
+    const temporaryPath = path.join(metadata.path, `schedules.json.${randomUUID()}.tmp`);
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      const snapshot = await this.readSchedule(metadata, item.chatId);
+      if (!snapshot) return;
       const { file } = snapshot;
       const index = file.schedules.findIndex((record) => record.id === id);
-      if (index < 0) return undefined;
-      const current = file.schedules[index];
-      if (!current) return undefined;
+      if (index < 0) return;
+      const current = file.schedules[index]!;
       const updated: StoredScheduleRecord = {
         ...current,
         lastRunAt: new Date(now).toISOString(),
@@ -331,24 +335,7 @@ export class WorkspaceScheduler {
         updated.dueAt = advanceRecurring(current.dueAt, current.recurrence, now);
       }
       file.schedules[index] = updated;
-      return file;
-    });
-  }
 
-  private async writeSchedule(
-    item: DueRecord,
-    update: (snapshot: ScheduleSnapshot) => ScheduleFile | undefined,
-  ): Promise<ScheduleSnapshot | undefined> {
-    const metadata = await this.openCurrentMetadata(item);
-    if (!metadata) return undefined;
-    const filePath = path.join(metadata.path, SCHEDULES_FILE);
-    const temporaryPath = path.join(metadata.path, `schedules.json.${randomUUID()}.tmp`);
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      const snapshot = await this.readSchedule(metadata, item.chatId);
-      if (!snapshot) return undefined;
-      const file = update(snapshot);
-      if (!file) return snapshot;
       const expectedRaw = snapshot.raw;
       handle = await open(temporaryPath, WRITE_NEW, 0o600);
       const encoded = `${JSON.stringify(file)}\n`;
@@ -410,7 +397,6 @@ export class WorkspaceScheduler {
           await rm(previousPath, { force: true }).catch(() => {});
         }
       }
-      return snapshot;
     } finally {
       if (handle) await closeQuietly(handle);
       await closeQuietly(metadata.handle);

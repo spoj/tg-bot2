@@ -6,12 +6,11 @@ import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { PiRpcWorker, StrictJsonlParser } from "../src/pi-worker.js";
 import { buildBwrapArgs, buildPiWorkerBwrapArgs } from "../src/sandbox.js";
-import type { PiWorkerSpawn } from "../src/sandbox.js";
+import type { PiWorkerChildProcess, PiWorkerSpawn } from "../src/sandbox.js";
 
 type Signal = NodeJS.Signals | null;
 
 class FakeChild extends EventEmitter {
-  readonly pid = 2_147_000_000;
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
   readonly commands: string[] = [];
@@ -60,20 +59,10 @@ async function fixture(): Promise<FixturePaths> {
   return { root, appRoot, workspace, cliPath };
 }
 
-function spawnCollecting(children: FakeChild[]): PiWorkerSpawn {
-  return (() => {
-    const child = new FakeChild();
-    children.push(child);
-    return child as unknown as ReturnType<PiWorkerSpawn>;
-  }) as PiWorkerSpawn;
-}
-
-interface WithWorkerOptions extends Omit<ConstructorParameters<typeof PiRpcWorker>[0], "spawn" | "workspace" | "appRoot" | "cliPath"> {
-  /** Test seam: builds the spawn closure over the harness's children array. */
+interface WithWorkerOptions extends Omit<ConstructorParameters<typeof PiRpcWorker>[0], "spawn" | "terminateProcessGroup" | "workspace" | "appRoot" | "cliPath"> {
   spawn?: (children: FakeChild[]) => PiWorkerSpawn;
-  /** Install fake timers around the worker lifecycle. */
+  terminateProcessGroup?: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   useFakeTimers?: boolean;
-  /** Skip the harness-owned start for bodies that drive start themselves. */
   start?: boolean;
 }
 
@@ -84,7 +73,13 @@ async function withWorker<T>(
 ): Promise<T> {
   const children: FakeChild[] = [];
   const { spawn: spawnSetup, terminateProcessGroup: terminateSetup, useFakeTimers = false, start = true, ...workerOptions } = options;
-  const spawn = spawnSetup ? spawnSetup(children) : spawnCollecting(children);
+  const spawn = spawnSetup
+    ? spawnSetup(children)
+    : ((() => {
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as ReturnType<PiWorkerSpawn>;
+      }) as PiWorkerSpawn);
   const terminateProcessGroup = terminateSetup ?? ((child: unknown, signal: NodeJS.Signals) => {
     (child as FakeChild).kill(signal);
   });
@@ -454,14 +449,12 @@ describe("PiRpcWorker", () => {
       await expect(settled).resolves.toBeUndefined();
       record(child, { type: "response", id: promptCommand.id, command: "prompt", success: true });
       await expect(prompt).resolves.toBeUndefined();
-      const state = worker as unknown as {
-        activeEpoch: number | undefined;
-        accepted: boolean;
-        settledBeforeAcceptance: boolean;
-      };
-      expect(state.activeEpoch).toBeUndefined();
-      expect(state.accepted).toBe(false);
-      expect(state.settledBeforeAcceptance).toBe(false);
+
+      const nextPrompt = worker.prompt("after abort");
+      const nextCommand = JSON.parse(child.commands[2] ?? "{}") as { id?: string; type?: string; message?: string };
+      expect(nextCommand).toMatchObject({ type: "prompt", message: "after abort" });
+      record(child, { type: "response", id: nextCommand.id, command: "prompt", success: true });
+      await expect(nextPrompt).resolves.toBeUndefined();
     });
   });
 
@@ -528,6 +521,20 @@ describe("PiRpcWorker", () => {
     });
   });
 
+  it("rejects a late waitForSettled after a provider failure", async () => {
+    await withWorker(await fixture(), {}, async ({ worker, child }) => {
+      const prompt = worker.prompt("erroring turn");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      child.stdout.write(
+        `${JSON.stringify({ type: "response", id: command.id, command: "prompt", success: true })}\n` +
+        `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "provider failed" } })}\n` +
+        `${JSON.stringify({ type: "agent_settled" })}\n`,
+      );
+      await prompt;
+      await expect(worker.waitForSettled()).rejects.toThrow("provider failed");
+    });
+  });
+
   it("allows slow prompt acceptance while keeping fast RPC deadlines", async () => {
     await withWorker(await fixture(), { useFakeTimers: true, rpcTimeoutMs: 20, promptTimeoutMs: 200 }, async ({ worker, child }) => {
       const prompt = worker.prompt("slow acceptance");
@@ -591,25 +598,39 @@ describe("PiRpcWorker", () => {
 
   it("rejects timer values above Node's maximum", async () => {
     const f = await fixture();
-    await withWorker(f, { start: false }, async () => {
+    try {
       for (const option of ["stopGraceMs", "rpcTimeoutMs", "promptTimeoutMs", "lifecycleTimeoutMs"] as const) {
         expect(() => new PiRpcWorker({
           workspace: f.workspace,
           appRoot: f.appRoot,
           cliPath: f.cliPath,
+          spawn: () => { throw new Error("unused"); },
+          terminateProcessGroup: () => {},
           [option]: 2_147_483_648,
         } as ConstructorParameters<typeof PiRpcWorker>[0])).toThrow("2147483647");
       }
-    });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
   });
 
   it("bounds retained stderr while preserving the newest diagnostics", async () => {
     await withWorker(await fixture(), {}, async ({ worker, child }) => {
+      const prompt = worker.prompt("crashing turn");
+      const command = JSON.parse(child.commands[0] ?? "{}") as { id?: string };
+      record(child, { type: "response", id: command.id, command: "prompt", success: true });
+      await prompt;
+      const settled = worker.waitForSettled();
+      const settlementError = settled.then(
+        () => { throw new Error("expected settlement to reject on exit"); },
+        (error: unknown): Error => error as Error,
+      );
       child.stderr.write(`${"x".repeat(100_000)}tail`);
       await Promise.resolve();
-      const state = worker as unknown as { stderr: string };
-      expect(state.stderr.length).toBeLessThanOrEqual(64 * 1024);
-      expect(state.stderr.endsWith("tail")).toBe(true);
+      child.emit("exit", 1, null);
+      const error = await settlementError;
+      expect(error.message).toMatch(/tail$/);
+      expect(error.message.length).toBeLessThanOrEqual(64 * 1024 + 64);
     });
   });
 

@@ -7,17 +7,15 @@ const sourceRoot = join(projectRoot, "src");
 
 function listSourceFiles(directory, relativeDirectory = "") {
   const files = [];
-  const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
-  for (const entry of entries) {
-    const relativePath = join(relativeDirectory, entry.name);
-    const absolutePath = join(directory, entry.name);
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const relativePath = relativeDirectory ? join(relativeDirectory, entry.name) : entry.name;
     if (entry.isDirectory()) {
-      files.push(...listSourceFiles(absolutePath, relativePath));
+      files.push(...listSourceFiles(join(directory, entry.name), relativePath));
     } else if (entry.isFile() && entry.name.endsWith(".ts")) {
       files.push(relativePath);
     }
   }
-  return files.sort();
+  return files;
 }
 
 const sourceFiles = listSourceFiles(sourceRoot);
@@ -70,207 +68,7 @@ function readQuoted(source, position) {
   return undefined;
 }
 
-/**
- * Collect static, dynamic, and CommonJS module specifiers without evaluating code.
- * The small scanner skips comments and strings, avoiding broad framework parsing.
- */
-function collectImports(source) {
-  const imports = [];
-  let cursor = 0;
-  let quote;
-
-  while (cursor < source.length) {
-    const character = source[cursor];
-    if (quote) {
-      if (character === "\\") {
-        cursor += 2;
-      } else if (character === quote) {
-        quote = undefined;
-        cursor += 1;
-      } else {
-        cursor += 1;
-      }
-      continue;
-    }
-    if (character === "`" || character === "\"" || character === "'") {
-      quote = character;
-      cursor += 1;
-      continue;
-    }
-    if (source.startsWith("//", cursor)) {
-      const newline = source.indexOf("\n", cursor + 2);
-      cursor = newline === -1 ? source.length : newline + 1;
-      continue;
-    }
-    if (source.startsWith("/*", cursor)) {
-      const end = source.indexOf("*/", cursor + 2);
-      cursor = end === -1 ? source.length : end + 2;
-      continue;
-    }
-
-    const isImport = source.startsWith("import", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6]);
-    const isExport = source.startsWith("export", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6]);
-    if (isImport || isExport) {
-      let next = skipTrivia(source, cursor + 6);
-      if (isImport && source[next] === ".") {
-        cursor += 6;
-        continue;
-      }
-      if (isImport && source[next] === "(") {
-        next = skipTrivia(source, next + 1);
-        const imported = readQuoted(source, next);
-        if (imported) imports.push({ specifier: imported.value, clause: "", index: cursor });
-        cursor = imported?.end ?? next + 1;
-        continue;
-      }
-
-      const declarationStart = next;
-      const sideEffect = isImport ? readQuoted(source, next) : undefined;
-      if (sideEffect) {
-        imports.push({ specifier: sideEffect.value, clause: "", index: cursor });
-        cursor = sideEffect.end;
-        continue;
-      }
-
-      let foundFrom;
-      while (next < source.length && next - declarationStart < 16_384) {
-        next = skipTrivia(source, next);
-        if (source[next] === ";") break;
-        if (isIdentifierStart(source[next])) {
-          const tokenStart = next;
-          next += 1;
-          while (isIdentifierPart(source[next])) next += 1;
-          if (source.slice(tokenStart, next) === "from") {
-            const moduleStart = skipTrivia(source, next);
-            const imported = readQuoted(source, moduleStart);
-            if (imported) {
-              foundFrom = {
-                specifier: imported.value,
-                clause: source.slice(declarationStart, tokenStart),
-                index: cursor,
-              };
-              next = imported.end;
-            }
-            break;
-          }
-          continue;
-        }
-        if (source[next] === "\"" || source[next] === "'") {
-          const string = readQuoted(source, next);
-          next = string?.end ?? source.length;
-          continue;
-        }
-        next += 1;
-      }
-      if (foundFrom) imports.push(foundFrom);
-      cursor = Math.max(next, cursor + 6);
-      continue;
-    }
-
-    if (source.startsWith("require", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 7])) {
-      let next = skipTrivia(source, cursor + 7);
-      if (source[next] === "(") {
-        next = skipTrivia(source, next + 1);
-        const required = readQuoted(source, next);
-        if (required) imports.push({ specifier: required.value, clause: "require", index: cursor });
-        cursor = required?.end ?? next + 1;
-        continue;
-      }
-    }
-
-    cursor += 1;
-  }
-  return imports;
-}
-
-function hasCall(source, name) {
-  let cursor = 0;
-  let quote;
-  while (cursor < source.length) {
-    const character = source[cursor];
-    if (quote) {
-      if (character === "\\") cursor += 2;
-      else if (character === quote) {
-        quote = undefined;
-        cursor += 1;
-      } else cursor += 1;
-      continue;
-    }
-    if (character === "\"" || character === "'" || character === "`") {
-      quote = character;
-      cursor += 1;
-      continue;
-    }
-    if (source.startsWith("//", cursor)) {
-      const newline = source.indexOf("\n", cursor + 2);
-      cursor = newline === -1 ? source.length : newline + 1;
-      continue;
-    }
-    if (source.startsWith("/*", cursor)) {
-      const end = source.indexOf("*/", cursor + 2);
-      cursor = end === -1 ? source.length : end + 2;
-      continue;
-    }
-    if (source.startsWith(name, cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + name.length])) {
-      const next = skipTrivia(source, cursor + name.length);
-      if (source[next] === "(") return true;
-      cursor += name.length;
-      continue;
-    }
-    cursor += 1;
-  }
-  return false;
-}
-
-function hasMemberCall(source, name, excludedObject) {
-  let cursor = 0;
-  let quote;
-  while (cursor < source.length) {
-    const character = source[cursor];
-    if (quote) {
-      if (character === "\\") cursor += 2;
-      else if (character === quote) {
-        quote = undefined;
-        cursor += 1;
-      } else cursor += 1;
-      continue;
-    }
-    if (character === "\"" || character === "'" || character === "`") {
-      quote = character;
-      cursor += 1;
-      continue;
-    }
-    if (source.startsWith("//", cursor)) {
-      const newline = source.indexOf("\n", cursor + 2);
-      cursor = newline === -1 ? source.length : newline + 1;
-      continue;
-    }
-    if (source.startsWith("/*", cursor)) {
-      const end = source.indexOf("*/", cursor + 2);
-      cursor = end === -1 ? source.length : end + 2;
-      continue;
-    }
-
-    const optional = source.startsWith("?.", cursor);
-    if (character === "." || optional) {
-      const memberStart = cursor + (optional ? 2 : 1);
-      if (source.startsWith(name, memberStart) && !isIdentifierPart(source[memberStart - 1]) && !isIdentifierPart(source[memberStart + name.length])) {
-        const next = skipTrivia(source, memberStart + name.length);
-        if (source[next] === "(") {
-          let objectEnd = cursor;
-          while (objectEnd > 0 && /\s/.test(source[objectEnd - 1])) objectEnd -= 1;
-          let objectStart = objectEnd;
-          while (objectStart > 0 && isIdentifierPart(source[objectStart - 1])) objectStart -= 1;
-          if (source.slice(objectStart, objectEnd) !== excludedObject) return true;
-        }
-      }
-    }
-    cursor += 1;
-  }
-  return false;
-}
-
-/** Extract local names (after `as`) from an import/export clause like `type { A as B, C }`. */
+/** Local names (after `as`) in an import/export clause like `type { A as B, C }`. */
 function clauseNames(clause) {
   const braceStart = clause.indexOf("{");
   const braceEnd = clause.lastIndexOf("}");
@@ -288,13 +86,47 @@ function clauseNames(clause) {
   return names;
 }
 
-/** Collect `export { ... }` / `export type { ... }` clauses with re-exported names and optional `from` specifier. */
-function collectExportBraceClauses(source) {
-  const clauses = [];
+/** Reads a trailing `from "<specifier>"`, stopping at a statement terminator. */
+function readFromClause(source, start) {
+  let next = start;
+  while (next < source.length && next - start < 16_384) {
+    next = skipTrivia(source, next);
+    if (source[next] === ";") break;
+    if (isIdentifierStart(source[next])) {
+      const tokenStart = next;
+      next += 1;
+      while (isIdentifierPart(source[next])) next += 1;
+      if (source.slice(tokenStart, next) === "from") {
+        const imported = readQuoted(source, skipTrivia(source, next));
+        if (imported) return { value: imported.value, tokenStart, end: imported.end };
+        break;
+      }
+      continue;
+    }
+    if (source[next] === "\"" || source[next] === "'") {
+      const string = readQuoted(source, next);
+      next = string?.end ?? source.length;
+      continue;
+    }
+    next += 1;
+  }
+  return undefined;
+}
+
+/** One lexical pass per file collecting every fact the boundary rules inspect. */
+function scanFile(source) {
+  const imports = [];
+  const exportClauses = [];
+  let spawnCall = false;
+  let processKillCall = false;
+  let memberKillCall = false;
+
   let cursor = 0;
   let quote;
+
   while (cursor < source.length) {
     const character = source[cursor];
+
     if (quote) {
       if (character === "\\") cursor += 2;
       else if (character === quote) {
@@ -318,54 +150,111 @@ function collectExportBraceClauses(source) {
       cursor = end === -1 ? source.length : end + 2;
       continue;
     }
-    if (source.startsWith("export", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6])) {
+
+    const importKeyword = source.startsWith("import", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6]);
+    if (importKeyword) {
+      let next = skipTrivia(source, cursor + 6);
+      if (source[next] === ".") {
+        cursor += 6;
+        continue;
+      }
+      if (source[next] === "(") {
+        next = skipTrivia(source, next + 1);
+        const imported = readQuoted(source, next);
+        if (imported) imports.push({ specifier: imported.value, clause: "", isImport: true });
+        cursor = imported?.end ?? next + 1;
+        continue;
+      }
+      const sideEffect = readQuoted(source, next);
+      if (sideEffect) {
+        imports.push({ specifier: sideEffect.value, clause: "", isImport: true });
+        cursor = sideEffect.end;
+        continue;
+      }
+      const declarationStart = next;
+      const from = readFromClause(source, next);
+      if (from) {
+        imports.push({ specifier: from.value, clause: source.slice(declarationStart, from.tokenStart), isImport: true });
+        cursor = from.end;
+      } else {
+        cursor += 6;
+      }
+      continue;
+    }
+
+    const exportKeyword = source.startsWith("export", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6]);
+    if (exportKeyword) {
       let next = skipTrivia(source, cursor + 6);
       if (source.startsWith("type", next) && !isIdentifierPart(source[next + 4])) {
         next = skipTrivia(source, next + 4);
       }
-      if (source[next] !== "{") {
-        cursor += 6;
+      if (source[next] === "{") {
+        let braceEnd = next + 1;
+        let depth = 1;
+        while (braceEnd < source.length && depth > 0) {
+          if (source[braceEnd] === "{") depth += 1;
+          else if (source[braceEnd] === "}") depth -= 1;
+          braceEnd += 1;
+        }
+        const names = clauseNames(source.slice(next + 1, braceEnd - 1));
+        const from = readFromClause(source, braceEnd);
+        if (from) {
+          imports.push({ specifier: from.value, clause: source.slice(skipTrivia(source, cursor + 6), from.tokenStart), isImport: false });
+          exportClauses.push({ names, fromSpecifier: from.value });
+          cursor = from.end;
+        } else {
+          exportClauses.push({ names, fromSpecifier: undefined });
+          cursor = braceEnd;
+        }
         continue;
       }
-      let braceEnd = next + 1;
-      let depth = 1;
-      while (braceEnd < source.length && depth > 0) {
-        if (source[braceEnd] === "{") depth += 1;
-        else if (source[braceEnd] === "}") depth -= 1;
-        braceEnd += 1;
-      }
-      const names = clauseNames(source.slice(next + 1, braceEnd - 1));
-      let fromSpecifier;
-      let look = braceEnd;
-      while (look < source.length && look - braceEnd < 4_096) {
-        look = skipTrivia(source, look);
-        if (source[look] === ";") break;
-        if (isIdentifierStart(source[look])) {
-          const tokenStart = look;
-          look += 1;
-          while (isIdentifierPart(source[look])) look += 1;
-          if (source.slice(tokenStart, look) === "from") {
-            const moduleStart = skipTrivia(source, look);
-            const imported = readQuoted(source, moduleStart);
-            if (imported) fromSpecifier = imported.value;
-            break;
-          }
-          continue;
+      if (source[next] === "*") {
+        const from = readFromClause(source, next + 1);
+        if (from) {
+          imports.push({ specifier: from.value, clause: source.slice(skipTrivia(source, cursor + 6), from.tokenStart), isImport: false });
+          cursor = from.end;
+        } else {
+          cursor = next + 1;
         }
-        if (source[look] === "\"" || source[look] === "'") {
-          const string = readQuoted(source, look);
-          look = string?.end ?? look + 1;
-          continue;
-        }
-        look += 1;
+        continue;
       }
-      clauses.push({ names, fromSpecifier });
-      cursor = braceEnd;
+      cursor += 6;
       continue;
     }
+
+    if (source.startsWith("require", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 7])) {
+      let next = skipTrivia(source, cursor + 7);
+      if (source[next] === "(") {
+        next = skipTrivia(source, next + 1);
+        const required = readQuoted(source, next);
+        if (required) imports.push({ specifier: required.value, clause: "require", isImport: false });
+        cursor = required?.end ?? next + 1;
+        continue;
+      }
+    }
+
+    if (source.startsWith("spawn", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 5])) {
+      if (source[skipTrivia(source, cursor + 5)] === "(") spawnCall = true;
+    } else if (source.startsWith("process.kill", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 12])) {
+      if (source[skipTrivia(source, cursor + 12)] === "(") processKillCall = true;
+    } else if (character === "." || source.startsWith("?.", cursor)) {
+      const optional = source.startsWith("?.", cursor);
+      const memberStart = cursor + (optional ? 2 : 1);
+      if (source.startsWith("kill", memberStart) && !isIdentifierPart(source[memberStart - 1]) && !isIdentifierPart(source[memberStart + 4])) {
+        if (source[skipTrivia(source, memberStart + 4)] === "(") {
+          let objectEnd = cursor;
+          while (objectEnd > 0 && /\s/.test(source[objectEnd - 1])) objectEnd -= 1;
+          let objectStart = objectEnd;
+          while (objectStart > 0 && isIdentifierPart(source[objectStart - 1])) objectStart -= 1;
+          if (source.slice(objectStart, objectEnd) !== "process") memberKillCall = true;
+        }
+      }
+    }
+
     cursor += 1;
   }
-  return clauses;
+
+  return { imports, exportClauses, spawnCall, processKillCall, memberKillCall };
 }
 
 function moduleBase(specifier) {
@@ -380,10 +269,6 @@ function isLocalModule(specifier, name) {
 
 function isPackage(specifier, name) {
   return specifier === name || specifier.startsWith(`${name}/`);
-}
-
-function isModelSpecifier(specifier) {
-  return /(?:^|[/_.-])model(?:[/_.-]|$)/i.test(specifier);
 }
 
 function compareText(left, right) {
@@ -401,7 +286,7 @@ const violations = [];
 for (const file of sourceFiles) {
   const source = readFileSync(join(sourceRoot, file), "utf8");
   const layer = basename(file, ".ts").toLowerCase();
-  const imports = collectImports(source);
+  const { imports, exportClauses, spawnCall, processKillCall, memberKillCall } = scanFile(source);
 
   for (const imported of imports) {
     const { specifier, clause } = imported;
@@ -411,10 +296,10 @@ for (const file of sourceFiles) {
     const sandbox = isLocalModule(specifier, "sandbox");
     const childProcess = specifier === "child_process" || specifier === "node:child_process" || specifier.endsWith("/child_process");
     const importedSpawn = /\bspawn\b/.test(clause);
-    const importedAgentSession = /\bAgentSession\b/.test(clause);
+    const importedAgentBoundary = /\bAgent(?:Manager|Worker)\b/.test(clause);
 
-    if (layer === "sandbox" && (telegram || agent || scheduler || isModelSpecifier(specifier) || isPackage(specifier, "@earendil-works/pi-coding-agent"))) {
-      addViolation(violations, file, specifier, "sandbox may not import Telegram, agent, scheduler, or model modules");
+    if (layer === "sandbox" && (telegram || agent || scheduler || isPackage(specifier, "@earendil-works/pi-coding-agent"))) {
+      addViolation(violations, file, specifier, "sandbox may not import Telegram, agent, scheduler, or pi-coding-agent modules");
     }
     if (layer === "agent" && (telegram || scheduler)) {
       addViolation(violations, file, specifier, "agent may not import grammY, Telegram, or scheduler modules");
@@ -422,10 +307,10 @@ for (const file of sourceFiles) {
     if (layer === "config" && (isLocalModule(specifier, "agent") || isLocalModule(specifier, "telegram") || isLocalModule(specifier, "sandbox") || isLocalModule(specifier, "scheduler") || isLocalModule(specifier, "queue") || isLocalModule(specifier, "index") || isPackage(specifier, "grammy") || isPackage(specifier, "@earendil-works/pi-coding-agent"))) {
       addViolation(violations, file, specifier, "config may not import runtime or transport modules");
     }
-    if (layer === "scheduler" && (telegram || importedAgentSession || sandbox)) {
-      addViolation(violations, file, specifier, "scheduler may not import grammY, AgentSession, sandbox, or tools");
+    if (layer === "scheduler" && (telegram || importedAgentBoundary || sandbox)) {
+      addViolation(violations, file, specifier, "scheduler may not import grammY, agent, or sandbox modules");
     }
-    if (layer !== "sandbox" && childProcess && layer !== "tools") {
+    if (layer !== "sandbox" && childProcess) {
       addViolation(violations, file, specifier, "child_process may only be imported by sandbox.ts");
     }
     if (layer !== "sandbox" && importedSpawn && !childProcess) {
@@ -436,11 +321,11 @@ for (const file of sourceFiles) {
   if (layer !== "sandbox") {
     const sandboxLocalNames = new Set();
     for (const imported of imports) {
-      if (isLocalModule(imported.specifier, "sandbox") && source.slice(imported.index, imported.index + 6) === "import") {
+      if (imported.isImport && isLocalModule(imported.specifier, "sandbox")) {
         for (const name of clauseNames(imported.clause)) sandboxLocalNames.add(name);
       }
     }
-    for (const exported of collectExportBraceClauses(source)) {
+    for (const exported of exportClauses) {
       if (exported.fromSpecifier !== undefined) {
         if (isLocalModule(exported.fromSpecifier, "sandbox")) {
           for (const name of exported.names) {
@@ -457,14 +342,13 @@ for (const file of sourceFiles) {
     }
   }
 
-  if (layer !== "sandbox" && hasCall(source, "spawn")) {
+  if (layer !== "sandbox" && spawnCall) {
     addViolation(violations, file, "spawn", "spawn may only be used by sandbox.ts");
   }
-
-  if (layer !== "sandbox" && hasCall(source, "process.kill")) {
+  if (layer !== "sandbox" && processKillCall) {
     addViolation(violations, file, "process.kill", "process-control calls may only be used by sandbox.ts");
   }
-  if (layer !== "sandbox" && hasMemberCall(source, "kill", "process")) {
+  if (layer !== "sandbox" && memberKillCall) {
     addViolation(violations, file, "ChildProcess.kill", "process-control calls may only be used by sandbox.ts");
   }
 }

@@ -10,7 +10,6 @@ export function defined<T extends object>(value: T): { [K in keyof T]-?: Exclude
   };
 }
 
-/** Reads the string `code` property off an unknown error, or undefined. */
 export function errorCode(error: unknown): string | undefined {
   if (error === null || typeof error !== "object") return undefined;
   const code = (error as { code?: unknown }).code;
@@ -23,7 +22,7 @@ export function errorCode(error: unknown): string | undefined {
  */
 export async function requireRealDirectory(candidate: string, label: string, expectedRealPath?: string): Promise<string> {
   const initial = await lstat(candidate);
-  if (!initial.isDirectory() || initial.isSymbolicLink()) {
+  if (!initial.isDirectory()) {
     throw new Error(`${label} must be a real directory: ${candidate}`);
   }
   const canonical = await realpath(candidate);
@@ -38,19 +37,10 @@ export async function requireRealDirectory(candidate: string, label: string, exp
 }
 
 export const TG_BOT_DIR = ".tg-bot";
-export const OUTBOX_DIR = "outbox";
-export const EVENTS_FILE = "events.jsonl";
-export const SCHEDULES_FILE = "schedules.json";
-export const POLL_RESULTS_FILE = "poll-results.jsonl";
-export const ATTACHMENTS_DIR = "attachments";
-
-export function canonicalChatId(chatId: number): string {
-  if (!Number.isSafeInteger(chatId)) throw new Error("Telegram chat ID must be a safe integer");
-  return String(chatId);
-}
 
 export function chatPaths(dataDir: string, chatId: number): { workspace: string } {
-  return { workspace: path.join(dataDir, "chats", canonicalChatId(chatId), "workspace") };
+  if (!Number.isSafeInteger(chatId)) throw new Error("Telegram chat ID must be a safe integer");
+  return { workspace: path.join(dataDir, "chats", String(chatId), "workspace") };
 }
 
 const CHAT_DIRECTORY = /^-?(?:0|[1-9]\d*)$/u;
@@ -70,35 +60,29 @@ export type PinnedDirectory = {
 };
 
 /**
- * Opens a real directory pinned by an O_NOFOLLOW file descriptor, verifying the
- * directory did not change (dev/ino) or get swapped (fd realpath) during opening.
+ * Opens a directory directly with O_NOFOLLOW, pinning the inode so later path
+ * swaps cannot redirect the handle. The fd realpath is the canonical path.
  */
 export async function openPinnedDirectory(directory: string, expectedRealPath?: string): Promise<PinnedDirectory> {
-  const canonical = await requireRealDirectory(directory, "Directory", expectedRealPath);
-  const canonicalStat = await lstat(canonical);
-  const handle = await open(canonical, fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW);
+  const handle = await open(directory, fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW);
   try {
     const openedStat = await handle.stat();
-    if (
-      !openedStat.isDirectory() ||
-      openedStat.isSymbolicLink() ||
-      openedStat.dev !== canonicalStat.dev ||
-      openedStat.ino !== canonicalStat.ino
-    ) {
-      throw new Error(`Directory changed while opening: ${directory}`);
+    if (!openedStat.isDirectory()) throw new Error(`Directory changed while opening: ${directory}`);
+    const fdPath = `/proc/self/fd/${handle.fd}`;
+    const realPath = await realpath(fdPath);
+    if (expectedRealPath !== undefined && realPath !== expectedRealPath) {
+      throw new Error(`Directory is not stable: ${directory}`);
     }
-    const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
-    if (openedPath !== canonical) throw new Error(`Directory is not stable: ${directory}`);
-    return { handle, path: `/proc/self/fd/${handle.fd}`, realPath: canonical };
+    return { handle, path: fdPath, realPath };
   } catch (error) {
     await handle.close().catch(() => {});
     throw error;
   }
 }
 
-const DIRECTORY = fsConstants.O_DIRECTORY ?? 0;
-const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
-const NON_BLOCKING = fsConstants.O_NONBLOCK ?? 0;
+const DIRECTORY = fsConstants.O_DIRECTORY;
+const NO_FOLLOW = fsConstants.O_NOFOLLOW;
+const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 /**
  * Appends one record to a bounded line store (filePath), rotating to the last
@@ -138,13 +122,12 @@ export async function readBoundedJsonl(
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
-    return await readJsonlLines(handle, stat.size, caps.maxBytes);
+    return (await readJsonlLines(handle, stat.size, caps.maxBytes)).slice(-caps.maxLines);
   } finally {
     await handle.close().catch(() => {});
   }
 }
 
-/** Resolves an awaited deferred operation that rejects when the timeout elapses. */
 export function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Error | void): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {

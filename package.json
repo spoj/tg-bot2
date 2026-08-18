@@ -13,7 +13,7 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --dir test",
-    "test:integration": "RUN_BWRAP_TESTS=1 vitest run --dir test sandbox.test.ts",
+    "test:integration": "RUN_BWRAP_TESTS=1 vitest run --dir test sandbox.test.ts pi-integration.test.ts",
     "check:layers": "node scripts/check-layer-boundaries.mjs"
   },
   "dependencies": {

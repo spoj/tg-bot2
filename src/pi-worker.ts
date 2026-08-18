@@ -69,10 +69,8 @@ export class StrictJsonlParser {
 
 export type PiRpcWorkerOptions = PiWorkerSandboxPaths & {
   bwrapPath?: string;
-  /** Test seam; production spawning is injected by the composition root. */
-  spawn?: PiWorkerSpawn;
-  /** Test seam; production teardown is injected by the composition root. */
-  terminateProcessGroup?: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
+  spawn: PiWorkerSpawn;
+  terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   /** Bound fast RPC control requests so a silent worker cannot strand operations. */
   rpcTimeoutMs?: number;
@@ -104,23 +102,6 @@ function asRecord(value: unknown): JsonRecord | undefined {
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
-
-export function assistantText(event: JsonRecord): string | undefined {
-  if (event.type !== "message_end") return undefined;
-  const message = asRecord(event.message);
-  if (!message || message.role !== "assistant") return undefined;
-  if (typeof message.content === "string") return message.content.trim() || undefined;
-  if (!Array.isArray(message.content)) return undefined;
-  const text = message.content
-    .map((block) => {
-      const record = asRecord(block);
-      return record?.type === "text" && typeof record.text === "string" ? record.text : "";
-    })
-    .join("")
-    .trim();
-  return text || undefined;
-}
-
 
 async function ensurePrivateDirectory(directory: string): Promise<void> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -312,8 +293,8 @@ export class PiRpcWorker {
   private readonly bwrapPath: string;
   private readonly cliPath: string | undefined;
   private readonly appendSystemPrompt: string | undefined;
-  private readonly spawnProcess: PiWorkerSpawn | undefined;
-  private readonly terminateProcessGroup: ((child: PiWorkerChildProcess, signal: NodeJS.Signals) => void) | undefined;
+  private readonly spawnProcess: PiWorkerSpawn;
+  private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number;
   private readonly rpcTimeoutMs: number;
   private readonly promptTimeoutMs: number;
@@ -440,11 +421,6 @@ export class PiRpcWorker {
     this.accepted = false;
     this.settledBeforeAcceptance = false;
     this.workError = undefined;
-    this.settledError = undefined;
-  }
-
-  private clearWorkSets(): void {
-    this.resetWorkFields();
   }
 
   private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
@@ -533,7 +509,7 @@ export class PiRpcWorker {
       return;
     }
     this.stopping = true;
-    this.terminateProcessGroup?.(child, "SIGTERM");
+    this.terminateProcessGroup(child, "SIGTERM");
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
       done,
@@ -544,7 +520,7 @@ export class PiRpcWorker {
     if (timer) clearTimeout(timer);
     if (this.process === child) {
       const forcedStopError = new Error("Pi worker did not exit after SIGKILL");
-      this.terminateProcessGroup?.(child, "SIGKILL");
+      this.terminateProcessGroup(child, "SIGKILL");
       await Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, this.stopGraceMs))]);
       if (this.process === child) {
         this.rejectPending(forcedStopError);
@@ -597,9 +573,6 @@ export class PiRpcWorker {
     if (epoch !== this.lifecycleEpoch) throw new Error("Pi worker start was superseded by stop");
     let child: PiWorkerChildProcess;
     try {
-      if (!this.spawnProcess) {
-        throw new Error("Pi worker spawn was not injected; the composition root must supply spawnProcess");
-      }
       child = this.spawnProcess(this.bwrapPath, built.args, {
         detached: true,
         env: {},
@@ -614,7 +587,8 @@ export class PiRpcWorker {
     this.lastAssistantText = undefined;
     this.assistantTextKnown = false;
     this.workEpoch = 0;
-    this.clearWorkSets();
+    this.resetWorkFields();
+    this.settledError = undefined;
     this.clearPromptSettlementTimers();
     this.process = child;
     this.stopping = false;
@@ -918,78 +892,68 @@ export class PiRpcWorker {
     const record = asRecord(value);
     if (!record) return;
     switch (record.type) {
-      case "response":
-        this.handleResponse(record);
+      case "response": {
+        const id = record.id;
+        if (typeof id !== "string") return;
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        clearTimeout(pending.timeout);
+        if (record.success === true) {
+          if (pending.workEpoch !== undefined && this.activeEpoch === pending.workEpoch) {
+            this.accepted = true;
+            if (this.settledBeforeAcceptance) this.settleWork(pending.workEpoch);
+          }
+          pending.resolve(record);
+        } else {
+          pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC command failed"));
+        }
         return;
-      case "message_end":
-        this.handleMessageEnd(record);
+      }
+      case "message_end": {
+        const message = asRecord(record.message);
+        if (message && message.role === "assistant") {
+          if (message.stopReason === "error") {
+            const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+              ? message.errorMessage
+              : "Pi assistant turn failed";
+            const failure = new Error(errorMessage);
+            this.settledError = failure;
+            if (this.activeEpoch !== undefined) this.workError = failure;
+            this.lastAssistantText = undefined;
+          } else if (typeof message.content === "string") {
+            this.lastAssistantText = message.content.trim() || undefined;
+          } else if (Array.isArray(message.content)) {
+            const text = message.content
+              .map((block) => {
+                const record = asRecord(block);
+                return record?.type === "text" && typeof record.text === "string" ? record.text : "";
+              })
+              .join("")
+              .trim();
+            this.lastAssistantText = text || undefined;
+          } else {
+            this.lastAssistantText = undefined;
+          }
+          this.assistantTextKnown = true;
+        }
         break;
+      }
       case "agent_settled":
-        this.handleAgentSettled();
+        if (this.workError !== undefined) this.settledError = this.workError;
+        if (this.activeEpoch !== undefined) {
+          if (this.accepted) this.settleWork(this.activeEpoch);
+          else this.settledBeforeAcceptance = true;
+        }
         break;
     }
     this.emitEvent(record);
-    if (record.type === "extension_ui_request") this.cancelExtensionUiRequest(record);
-  }
-
-  private handleResponse(record: JsonRecord): void {
-    const id = record.id;
-    if (typeof id !== "string") return;
-    const pending = this.pending.get(id);
-    if (!pending) return;
-    this.pending.delete(id);
-    if (pending.timeout) clearTimeout(pending.timeout);
-    if (record.success === true) {
-      if (pending.workEpoch !== undefined && this.activeEpoch === pending.workEpoch) {
-        this.accepted = true;
-        if (this.settledBeforeAcceptance) this.settleWork(pending.workEpoch);
+    if (record.type === "extension_ui_request") {
+      if (["select", "confirm", "input", "editor"].includes(String(record.method))) {
+        const id = record.id;
+        if (typeof id === "string") this.writeFireAndForget({ type: "extension_ui_response", id, cancelled: true });
       }
-      pending.resolve(record);
-    } else {
-      pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC command failed"));
     }
-  }
-
-  private handleMessageEnd(record: JsonRecord): void {
-    const message = asRecord(record.message);
-    if (!message || message.role !== "assistant") return;
-    if (message.stopReason === "error") {
-      const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
-        ? message.errorMessage
-        : "Pi assistant turn failed";
-      const failure = new Error(errorMessage);
-      this.settledError = failure;
-      if (this.activeEpoch !== undefined) this.workError = failure;
-      this.lastAssistantText = undefined;
-    } else if (typeof message.content === "string") {
-      this.lastAssistantText = message.content.trim() || undefined;
-    } else if (Array.isArray(message.content)) {
-      const text = message.content
-        .map((block) => {
-          const record = asRecord(block);
-          return record?.type === "text" && typeof record.text === "string" ? record.text : "";
-        })
-        .join("")
-        .trim();
-      this.lastAssistantText = text || undefined;
-    } else {
-      this.lastAssistantText = undefined;
-    }
-    this.assistantTextKnown = true;
-  }
-
-  private handleAgentSettled(): void {
-    if (this.workError !== undefined) this.settledError = this.workError;
-    if (this.activeEpoch !== undefined) {
-      if (this.accepted) this.settleWork(this.activeEpoch);
-      else this.settledBeforeAcceptance = true;
-    }
-  }
-
-  private cancelExtensionUiRequest(record: JsonRecord): void {
-    if (!["select", "confirm", "input", "editor"].includes(String(record.method))) return;
-    const id = record.id;
-    if (typeof id === "string") this.writeFireAndForget({ type: "extension_ui_response", id, cancelled: true });
   }
 
   private writeFireAndForget(value: JsonRecord): void {
@@ -1002,7 +966,7 @@ export class PiRpcWorker {
     this.clearPromptSettlementTimers();
     this.rejectPending(error);
     this.rejectSettledWaiters(error);
-    this.clearWorkSets();
+    this.resetWorkFields();
   }
 
   private failProcess(error: Error): void {
@@ -1010,7 +974,7 @@ export class PiRpcWorker {
     this.teardownWork(error);
     this.settleAllWork();
     const child = this.process;
-    if (child && !this.stopping) this.terminateProcessGroup?.(child, "SIGKILL");
+    if (child && !this.stopping) this.terminateProcessGroup(child, "SIGKILL");
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {

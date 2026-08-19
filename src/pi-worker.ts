@@ -26,7 +26,7 @@ export type PiRunWorkerOptions = PiRunSandboxPaths & {
 };
 
 const DEFAULT_STOP_GRACE_MS = 1_000;
-const MAX_CAPTURE_BYTES = 64 * 1024;
+const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
 
 function asError(error: unknown): Error {

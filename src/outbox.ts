@@ -25,7 +25,7 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
-const MAX_REQUEST_BYTES = 64 * 1024;
+const MAX_REQUEST_BYTES = 1024 * 1024;
 const JSON_REQUEST = /\.json$/;
 // Recover claims older than five minutes after crashes without racing active senders.
 const STALE_CLAIM_AGE_MS = 5 * 60_000;

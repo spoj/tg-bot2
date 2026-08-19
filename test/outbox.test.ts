@@ -220,7 +220,7 @@ describe("WorkspaceOutbox", () => {
   it("discards oversized requests without delivering them", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
-    await writeFile(path.join(outbox, "oversized.json"), `${JSON.stringify(valid())}${"x".repeat(64 * 1024)}`, "utf8");
+    await writeFile(path.join(outbox, "oversized.json"), `${JSON.stringify(valid())}${"x".repeat(1024 * 1024)}`, "utf8");
     const dispatch = vi.fn(async () => undefined);
 
     await pollOutbox(dataDir, dispatch);

@@ -1,7 +1,6 @@
-import { constants as fsConstants } from "node:fs";
-import { mkdir, open, rename, stat, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { TG_BOT_DIR, errorCode, openPinnedDirectory, type PinnedDirectory } from "./util.js";
+import { appendJsonl, TG_BOT_DIR, errorCode, openPinnedDirectory } from "./util.js";
 
 /**
  * One chat event, appended to `.tg-bot/chat.jsonl` — a faithful mirror of the
@@ -96,10 +95,6 @@ export type SystemEvent =
 
 const CHAT_FILE = "chat.jsonl";
 const SYSTEM_FILE = "system.jsonl";
-const LEGACY_EVENTS_FILE = "events.jsonl";
-const NO_FOLLOW = fsConstants.O_NOFOLLOW;
-const NON_BLOCKING = fsConstants.O_NONBLOCK;
-
 /**
  * Appends chat events to the workspace chat log. Opens the `.tg-bot` directory
  * pinned by an O_NOFOLLOW descriptor, then opens the log file once and writes one
@@ -138,56 +133,16 @@ async function appendLines(
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
     }
-    if (migrateLegacy) await migrateLegacyEventsFile(directory);
     const pinned = await openPinnedDirectory(directory);
     try {
-      const handle = await openLogFile(path.join(pinned.path, fileName));
-      try {
-        const logStat = await handle.stat();
-        if (!logStat.isFile()) throw new Error(`${label} file must be a regular file: ${fileName}`);
-        const payload = Buffer.from(
-          events.map((event) => `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...event })}\n`).join(""),
-          "utf8",
-        );
-        await handle.write(payload, 0, payload.length, null);
-      } finally {
-        await handle.close().catch(() => {});
-      }
+      const targetFile = path.join(pinned.path, fileName);
+      const records = events.map((event) => JSON.stringify({ v: 1, t: new Date().toISOString(), ...event }));
+      await appendJsonl(targetFile, records);
     } finally {
       await pinned.handle.close().catch(() => {});
     }
   } catch (error) {
     console.error(`Failed to append ${label}${events.length === 1 ? "" : "s"}`, error);
-  }
-}
-
-/** Renames the pre-split events.jsonl to chat.jsonl once; never overwrites an existing chat log. */
-async function migrateLegacyEventsFile(directory: string): Promise<void> {
-  try {
-    await stat(path.join(directory, CHAT_FILE));
-    return;
-  } catch (error) {
-    if (errorCode(error) !== "ENOENT") throw error;
-  }
-  try {
-    await rename(path.join(directory, LEGACY_EVENTS_FILE), path.join(directory, CHAT_FILE));
-  } catch (error) {
-    if (errorCode(error) !== "ENOENT") throw error;
-  }
-}
-
-/** Opens a log file, replacing a symlink the workspace may have planted at its path. */
-async function openLogFile(filePath: string): Promise<FileHandle> {
-  try {
-    return await open(filePath, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
-  } catch (error) {
-    if (errorCode(error) !== "ELOOP") throw error;
-    try {
-      await unlink(filePath);
-    } catch (unlinkError) {
-      if (errorCode(unlinkError) !== "ENOENT") throw unlinkError;
-    }
-    return open(filePath, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | NO_FOLLOW | NON_BLOCKING, 0o600);
   }
 }
 

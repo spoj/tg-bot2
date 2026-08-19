@@ -1164,6 +1164,15 @@ describe("Telegram command formatting", () => {
       messageCount: 0,
       autoCompactionEnabled: false,
     })).toBe("Model: unset | Thinking: low | Session: none | Messages: 0");
+    expect(formatStatus({
+      model: { provider: "anthropic", id: "claude" },
+      thinkingLevel: "high",
+      sessionFile: "42.jsonl",
+      messageCount: 3,
+      autoCompactionEnabled: true,
+      activeTasks: 2,
+      activeSchedules: 1,
+    })).toBe("Model: anthropic/claude | Thinking: high | Session: 42.jsonl | Messages: 3 | Tasks: 2 | Schedules: 1");
   });
 });
 

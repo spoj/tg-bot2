@@ -84,19 +84,21 @@ const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 /**
- * Appends one record to a JSONL store (filePath). A symlink planted at the path is
- * unlinked and the open retried (ELOOP defense).
+ * Appends one or more serialized records to a JSONL store (filePath). A symlink planted
+ * at the path is unlinked and the open retried (ELOOP defense).
  */
 export async function appendJsonl(
   filePath: string,
-  record: string,
+  recordOrRecords: string | string[],
 ): Promise<void> {
-  const line = `${record}\n`;
+  const records = Array.isArray(recordOrRecords) ? recordOrRecords : [recordOrRecords];
+  if (records.length === 0) return;
+  const payload = Buffer.from(records.map((r) => `${r}\n`).join(""), "utf8");
   const handle = await openJsonlAppend(filePath);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
-    await handle.write(line, null, "utf8");
+    await handle.write(payload, 0, payload.length, null);
   } finally {
     await handle.close().catch(() => {});
   }

@@ -70,6 +70,8 @@ export type AgentStatus = {
   sessionFile?: string;
   messageCount: number;
   autoCompactionEnabled: boolean;
+  activeTasks?: number;
+  activeSchedules?: number;
 };
 
 type ChatState = {
@@ -235,6 +237,33 @@ export class AgentManager {
     if (!result.model && settingsProvider && settingsModel) {
       result = { ...result, model: { provider: settingsProvider, id: settingsModel } };
     }
+    try {
+      const taskEntries = await readdir(path.join(workspace, ".pi", "tasks"), { withFileTypes: true });
+      let activeTasks = 0;
+      for (const entry of taskEntries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        try {
+          await stat(path.join(workspace, ".pi", "tasks", entry.name, "result.json"));
+        } catch {
+          activeTasks += 1;
+        }
+      }
+      result = { ...result, activeTasks };
+    } catch {
+      // .pi/tasks directory absent or unreadable
+    }
+
+    try {
+      const rawSchedules = await readFile(path.join(workspace, TG_BOT_DIR, "schedules.json"), "utf8");
+      const parsedSchedules = JSON.parse(rawSchedules) as { schedules?: Array<{ enabled?: boolean }> };
+      if (Array.isArray(parsedSchedules.schedules)) {
+        const activeSchedules = parsedSchedules.schedules.filter((s) => s.enabled !== false).length;
+        result = { ...result, activeSchedules };
+      }
+    } catch {
+      // schedules.json absent or invalid
+    }
+
     return result;
   }
 

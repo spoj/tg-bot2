@@ -649,7 +649,19 @@ export async function registerBotCommands(bot: Bot): Promise<void> {
 export function formatStatus(state: AgentStatus): string {
   const model = state.model ? `${state.model.provider}/${state.model.id}` : "unset";
   const session = state.sessionFile ?? "none";
-  return `Model: ${model} | Thinking: ${state.thinkingLevel} | Session: ${session} | Messages: ${state.messageCount}`;
+  const parts = [
+    `Model: ${model}`,
+    `Thinking: ${state.thinkingLevel}`,
+    `Session: ${session}`,
+    `Messages: ${state.messageCount}`,
+  ];
+  if (state.activeTasks !== undefined && state.activeTasks > 0) {
+    parts.push(`Tasks: ${state.activeTasks}`);
+  }
+  if (state.activeSchedules !== undefined && state.activeSchedules > 0) {
+    parts.push(`Schedules: ${state.activeSchedules}`);
+  }
+  return parts.join(" | ");
 }
 
 export function createTelegramBot(

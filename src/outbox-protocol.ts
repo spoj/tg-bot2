@@ -214,11 +214,11 @@ its id matches the poll_answer events' poll_id and the matching send event's pol
 {version:1,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from chat.jsonl.
 {version:1,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
 {version:1,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
-The request's filename (minus .json) is its correlation id: the host echoes it as the id
-field of the matching send event, records it in .tg-bot/sent.jsonl and
-.tg-bot/failed.jsonl, and names it in rejection reports. Filenames must be unique
-per send but their content never matters beyond that: no id field exists inside the
-request. Write each request to a temporary filename that does not end in .json, then
-atomically rename it to the final unique *.json request name.
-Every processed request is recorded in .tg-bot/sent.jsonl as {id,request,messageId?,pollId?,data?} ; rejected requests are recorded in .tg-bot/failed.jsonl as {id,request,error}. Both archives are append-only. Every request is also reported in .tg-bot/system.jsonl as outbox_claimed followed by one terminal outbox_sent or outbox_rejected event. Requests leave no other trace in the outbox directory.
+The request's filename is its name: the host assigns a unique UUID id upon claim,
+echoes both id and name in matching send and system events, and names it in rejection reports.
+Filenames must be unique per send but their content never matters beyond that: no id field
+exists inside the request. Write each request to a temporary filename that does not end in .json,
+then atomically rename it to the final unique *.json request name.
+Every request is reported in .tg-bot/system.jsonl as outbox_claimed followed by one terminal
+outbox_sent or outbox_rejected event. Requests leave no other trace in the outbox directory.
 `;

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
 import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
@@ -6,7 +6,7 @@ import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendChatEvent, appendSystemEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
-import { appendJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
@@ -35,8 +35,7 @@ const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 const OUTBOX_DIR = "outbox";
-const SENT_ARCHIVE_FILE = "sent.jsonl";
-const FAILED_ARCHIVE_FILE = "failed.jsonl";
+const SYSTEM_LOG_FILE = "system.jsonl";
 type ClaimLease = {
   stop: () => Promise<void>;
 };
@@ -117,26 +116,6 @@ async function claimFileText(filePath: string): Promise<string | undefined> {
   }
 }
 
-/** SHA-256 of a claim file's raw bytes; undefined when unreadable or oversized. */
-async function claimFileHash(filePath: string): Promise<string | undefined> {
-  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => undefined);
-  if (!handle) return undefined;
-  try {
-    const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(16 * 1024);
-    let total = 0;
-    for (;;) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-      if (total > MAX_REQUEST_BYTES + 1) return undefined;
-      hash.update(bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead));
-    }
-    return hash.digest("hex");
-  } finally {
-    await handle.close();
-  }
-}
 
 async function readEntries(directory: string) {
   const directoryHandle = await opendir(directory);
@@ -368,8 +347,7 @@ export class WorkspaceOutbox {
       metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
       outbox = await openPinnedDirectory(path.join(metadata.path, OUTBOX_DIR));
       const outboxPath = outbox.path;
-      const sentPath = path.join(metadata.path, SENT_ARCHIVE_FILE);
-      const failedPath = path.join(metadata.path, FAILED_ARCHIVE_FILE);
+      const systemLogPath = path.join(metadata.path, SYSTEM_LOG_FILE);
 
       const entries = (await readEntries(outbox.path))
         .filter((entry) => JSON_REQUEST.test(entry.name) || CLAIM_NAME.test(entry.name))
@@ -380,22 +358,23 @@ export class WorkspaceOutbox {
         const claimMatch = CLAIM_NAME.exec(entry.name);
         const stale = claimMatch !== null && this.isStaleClaim(claimMatch);
         if (claimMatch !== null && !stale) continue;
-        if (stale && await this.staleClaimResolved(entry, sentPath, failedPath, chatId)) continue;
+        if (stale && await this.staleClaimResolved(entry, systemLogPath, chatId)) continue;
         const claim = await this.claimEntry(outbox, entry, chatId, stale);
         if (!claim) continue;
-        const archiveName = entry.name;
-        const requestKey = entry.name.endsWith(".json") ? entry.name.slice(0, -5) : entry.name;
+        const originalName = entry.name;
+        const requestId = randomUUID();
         let lease: ClaimLease | undefined;
         let request: WorkspaceOutboxRequest | undefined;
         let result: WorkspaceOutboxDispatchResult | undefined;
         try {
           lease = this.startClaimLease(claim, chatId);
           request = await readRequest(claim.path);
-          await appendSystemEvent(workspace, { type: "outbox_claimed", id: requestKey, request });
+          await appendSystemEvent(workspace, { type: "outbox_claimed", id: requestId, name: originalName, request });
           result = await this.dispatch(chatId, request);
           await appendSystemEvent(workspace, {
             type: "outbox_sent",
-            id: requestKey,
+            id: requestId,
+            name: originalName,
             kind: request.type,
             request,
             ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
@@ -405,14 +384,15 @@ export class WorkspaceOutbox {
               appendChatEvent(workspace, {
                 type: "send",
                 kind: request.type,
-                id: requestKey,
+                id: requestId,
+                name: originalName,
                 ...defined({ messageId: result.messageId }),
                 ...defined({ pollId: result.pollId }),
                 ...defined({ data: result.data }),
               });
             } catch (error) {
               // Delivery succeeded; a lost ack or result must never resend the request.
-              this.reportRequestError(chatId, archiveName, error);
+              this.reportRequestError(chatId, originalName, error);
             }
           }
         } catch (error) {
@@ -420,20 +400,9 @@ export class WorkspaceOutbox {
             await lease.stop();
             lease = undefined;
           }
-          if (request !== undefined) {
-            try {
-              const hash = await claimFileHash(claim.path);
-              await appendJsonl(
-                failedPath,
-                JSON.stringify({ id: requestKey, ...(hash === undefined ? {} : { hash }), request, error: errorMessage(error) }),
-              );
-            } catch (archiveError) {
-              this.report(archiveError);
-            }
-          }
           const raw = request === undefined ? await claimFileText(claim.path) : undefined;
-          await this.recordRejection(chatId, workspace, requestKey, error, { ...defined({ request }), ...defined({ raw }) });
-          this.reportRequestError(chatId, archiveName, error);
+          await this.recordRejection(chatId, workspace, requestId, originalName, error, { ...defined({ request }), ...defined({ raw }) });
+          this.reportRequestError(chatId, originalName, error);
           await this.discardClaimFile(claim.path);
           continue;
         }
@@ -443,26 +412,10 @@ export class WorkspaceOutbox {
           lease = undefined;
         }
         if (request === undefined) {
-          this.reportRequestError(chatId, archiveName, new Error("Outbox request disappeared after dispatch"));
-          await this.recordRejection(chatId, workspace, requestKey, new Error("Outbox request file disappeared after claim"), {});
+          this.reportRequestError(chatId, originalName, new Error("Outbox request disappeared after dispatch"));
+          await this.recordRejection(chatId, workspace, requestId, originalName, new Error("Outbox request file disappeared after claim"), {});
           await this.discardClaimFile(claim.path);
           continue;
-        }
-        try {
-          const hash = await claimFileHash(claim.path);
-          await appendJsonl(
-            sentPath,
-            JSON.stringify({
-              id: requestKey,
-              ...(hash === undefined ? {} : { hash }),
-              request,
-              ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
-            }),
-          );
-        } catch (error) {
-          // Sending succeeded; a lost archive record must never resend, and the
-          // stale-claim oracle falls back to the failed archive only.
-          this.reportRequestError(chatId, archiveName, error);
         }
         await this.discardClaimFile(claim.path);
       }
@@ -526,25 +479,24 @@ export class WorkspaceOutbox {
     const current = this.now();
     return Number.isFinite(current) && current >= createdAt && current - createdAt >= STALE_CLAIM_AGE_MS;
   }
-  private async staleClaimResolved(entry: OutboxEntry, sentPath: string, failedPath: string, chatId: number): Promise<boolean> {
-    const hash = await claimFileHash(entry.path);
-    if (hash === undefined) return false;
-    for (const archivePath of [sentPath, failedPath]) {
-      let lines: string[];
+  private async staleClaimResolved(entry: OutboxEntry, systemLogPath: string, chatId: number): Promise<boolean> {
+    let lines: string[];
+    try {
+      lines = await readJsonl(systemLogPath);
+    } catch {
+      return false;
+    }
+    for (const line of lines) {
+      let record: unknown;
       try {
-        lines = await readJsonl(archivePath);
+        record = JSON.parse(line);
       } catch {
         continue;
       }
-      for (const line of lines) {
-        let record: unknown;
-        try {
-          record = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
-        if ((record as Record<string, unknown>).hash !== hash) continue;
+      if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+      const event = record as Record<string, unknown>;
+      if (event.name !== entry.name) continue;
+      if (event.type === "outbox_sent" || event.type === "outbox_rejected") {
         try {
           await unlink(entry.path);
         } catch (error) {
@@ -598,6 +550,7 @@ export class WorkspaceOutbox {
   private async recordRejection(
     chatId: number,
     workspace: string,
+    id: string,
     name: string,
     error: unknown,
     context: { request?: WorkspaceOutboxRequest; raw?: string },
@@ -605,6 +558,8 @@ export class WorkspaceOutbox {
     const message = `Outbox request ${name} rejected: ${errorMessage(error)}`;
     await appendSystemEvent(workspace, {
       type: "outbox_rejected",
+      id,
+      name,
       detail: message,
       ...defined({ request: context.request }),
       ...defined({ raw: context.raw }),

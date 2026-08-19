@@ -29,10 +29,11 @@ export type ChatEvent =
     poll_answer: unknown;
   }
   | {
-    /** Confirmation that one outbox request reached Telegram. `id` is the request's filename without ".json"; `data` carries the response payload where applicable. Host-side protocol fields, not a Telegram object. */
+    /** Confirmation that one outbox request reached Telegram. `id` is the host-assigned UUID; `name` is the original request filename; `data` carries the response payload where applicable. Host-side protocol fields, not a Telegram object. */
     type: "send";
     kind: string;
     id: string;
+    name: string;
     messageId?: number | undefined;
     pollId?: string | undefined;
     data?: unknown;
@@ -60,15 +61,17 @@ export type SystemEvent =
     stderr?: string | undefined;
   }
   | {
-    /** Host claimed one outbox request file; `id` is the filename without ".json"; `request` is the full validated request. */
+    /** Host claimed one outbox request file; `id` is the host-assigned UUID; `name` is the original request filename; `request` is the full validated request. */
     type: "outbox_claimed";
     id: string;
+    name: string;
     request: unknown;
   }
   | {
-    /** Telegram accepted one outbox request; `id` is the filename without ".json"; `request` is the full request and `data` the raw Telegram response payload. */
+    /** Telegram accepted one outbox request; `id` is the host-assigned UUID; `name` is the original request filename; `request` is the full request and `data` the raw Telegram response payload. */
     type: "outbox_sent";
     id: string;
+    name: string;
     kind: string;
     request: unknown;
     messageId?: number | undefined;
@@ -76,8 +79,10 @@ export type SystemEvent =
     data?: unknown;
   }
   | {
-    /** A rejected outbox request. `detail` describes the failure; `request` is the validated request when parsing succeeded, otherwise `raw` is the file's original text. */
+    /** A rejected outbox request. `id` is the host-assigned UUID; `name` is the original request filename; `detail` describes the failure; `request` is the validated request when parsing succeeded, otherwise `raw` is the file's original text. */
     type: "outbox_rejected";
+    id: string;
+    name: string;
     detail: string;
     request?: unknown;
     raw?: string | undefined;
@@ -204,8 +209,8 @@ chat.jsonl mirrors the Telegram chat window. Event types:
 - poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
   Telegram PollAnswer object (poll_id, user, option_ids).
 - send: a confirmation of one of your outbox requests that Telegram accepted:
-  {v:1,t,type:'send',kind,id,messageId?,pollId?,data?} where id is your request's
-  filename without ".json" and data carries the Telegram
+  {v:1,t,type:'send',kind,id,name,messageId?,pollId?,data?} where id is the host-assigned
+  UUID, name is your original request filename, and data carries the Telegram
   response object the request produced (for stop_poll it is the final closed Poll).
 system.jsonl records host activity that never appears in the chat window:
 - task_claimed: {v:1,t,type:'task_claimed',name,runId} when the host claims one of your
@@ -213,16 +218,16 @@ system.jsonl records host activity that never appears in the chat window:
 - task_settled: {v:1,t,type:'task_settled',name,runId,status,exitCode,stderr?} when a
   task finishes: status is done, failed, or aborted (aborted means the run was killed
   or the host restarted mid-run); stderr carries a bounded failure tail when failed.
-- outbox_claimed: {v:1,t,type:'outbox_claimed',id,request} when the host claims one of
-  your outbox request files; id is the filename without ".json" and request is the full
-  validated request.
-- outbox_sent: {v:1,t,type:'outbox_sent',id,kind,request,messageId?,pollId?,data?} when
-  Telegram accepts a request, whether or not it returned a message id; request is the
-  full request and data is the raw Telegram response payload.
-- outbox_rejected: {v:1,t,type:'outbox_rejected',detail,request?,raw?} reports a
-  rejected request; request is the validated request when parsing succeeded, otherwise
-  raw is the file's original text. The rejection is also recorded in
-  .tg-bot/failed.jsonl ({id,request,error}).
+- outbox_claimed: {v:1,t,type:'outbox_claimed',id,name,request} when the host claims one
+  of your outbox request files; id is the host-assigned UUID, name is your original
+  request filename, and request is the full validated request.
+- outbox_sent: {v:1,t,type:'outbox_sent',id,name,kind,request,messageId?,pollId?,data?}
+  when Telegram accepts a request, whether or not it returned a message id; request is
+  the full request and data is the raw Telegram response payload.
+- outbox_rejected: {v:1,t,type:'outbox_rejected',id,name,detail,request?,raw?} reports a
+  rejected request; id is the host-assigned UUID, name is your original request filename,
+  request is the validated request when parsing succeeded, otherwise raw is the file's
+  original text.
 - schedule_triggered: {v:1,t,type:'schedule_triggered',id,record} when a due schedule
   fires; record is the stored schedule record as-is.
 Every claimed task is followed by exactly one task_settled; every claimed outbox request

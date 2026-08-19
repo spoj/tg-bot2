@@ -1,5 +1,4 @@
 import type { watch } from "node:fs";
-import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -40,9 +39,9 @@ async function systemEvents(workspace: string): Promise<Array<Record<string, unk
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-async function archiveRecords(workspace: string, file: "sent.jsonl" | "failed.jsonl"): Promise<Array<Record<string, unknown>>> {
-  const contents = await readFile(path.join(workspace, ".tg-bot", file), "utf8").catch(() => "");
-  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+async function systemLogRecords(workspace: string, type: "outbox_sent" | "outbox_rejected"): Promise<Array<Record<string, unknown>>> {
+  const contents = await readFile(path.join(workspace, ".tg-bot", "system.jsonl"), "utf8").catch(() => "");
+  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((event) => event.type === type);
 }
 
 function setupOutbox(
@@ -121,14 +120,14 @@ describe("WorkspaceOutbox", () => {
       pollIntervalMs: 2_147_483_648,
     })).toThrow("positive timer-safe integer");
   });
-  it("delivers valid requests and archives them to sent.jsonl", async () => {
+  it("delivers valid requests and records them to system.jsonl", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "one.json", valid());
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "one" }]);
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "one.json" }]);
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toEqual([]);
   });
   it("retries a stale claim left by a crashed process", async () => {
     const { dataDir, workspace } = await fixture();
@@ -139,25 +138,24 @@ describe("WorkspaceOutbox", () => {
 
     await pollOutbox(dataDir, dispatch, { now: () => 5 * 60_000 });
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: ".in-progress-0-crashed" }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: ".in-progress-0-crashed" }]);
   });
-  it("skips and cleans a stale claim already recorded in the archives", async () => {
+  it("skips and cleans a stale claim already recorded in system.jsonl", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-archived";
     await writeRequest(workspace, claimName, valid());
-    const raw = JSON.stringify(valid());
-    const record = { id: "archived", hash: createHash("sha256").update(raw).digest("hex"), request: valid() };
-    await writeFile(path.join(workspace, ".tg-bot", "sent.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+    const record = { v: 1, t: "2026-08-19T00:00:00.000Z", type: "outbox_sent", id: "00000000-0000-0000-0000-000000000000", name: claimName, kind: "send_file", request: valid() };
+    await writeFile(path.join(workspace, ".tg-bot", "system.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
     const dispatch = vi.fn(async () => undefined);
 
     await pollOutbox(dataDir, dispatch, { now: () => 5 * 60_000 });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "archived" }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: claimName }]);
     expect(await names(outbox)).not.toContain(claimName);
   });
 
-  it("does not retry a sent request when archiving the claim fails", async () => {
+  it("does not retry a sent request when recording the claim in chat.jsonl fails", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const dispatch = vi.fn(async () => {
@@ -166,15 +164,12 @@ describe("WorkspaceOutbox", () => {
       return undefined;
     });
     await writeRequest(workspace, "sent.json", valid());
-    // A directory planted at sent.jsonl makes the archive append fail; the
-    // claim must still be discarded so the send is never retried.
-    await mkdir(path.join(workspace, ".tg-bot", "sent.jsonl"), { recursive: true });
     const instance = setupOutbox(dataDir, dispatch);
 
     await instance.poll();
     await instance.poll();
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toEqual([]);
     expect(await names(outbox)).toEqual([]);
   });
 
@@ -188,7 +183,7 @@ describe("WorkspaceOutbox", () => {
 
     await pollOutbox(dataDir, dispatch, { now: () => 300_000 });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "sent.jsonl")).toEqual([]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toEqual([]);
     expect(await names(outbox)).toContain(claimName);
   });
 
@@ -201,10 +196,9 @@ describe("WorkspaceOutbox", () => {
 
     await pollOutbox(dataDir, dispatch, { now: () => 5 * 60_000 });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toMatchObject([{ name: claimName, detail: expect.stringContaining("malformed JSON") }]);
     expect(await names(outbox)).toEqual([]);
   });
-
   it("discards malformed JSON and invalid schemas without delivery", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
@@ -213,10 +207,14 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    const rejected = await systemLogRecords(workspace, "outbox_rejected");
+    rejected.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(rejected).toMatchObject([
+      { name: "invalid.json", detail: expect.stringContaining("version must be 1") },
+      { name: "malformed.json", detail: expect.stringContaining("malformed JSON") },
+    ]);
     expect(await names(outbox)).toEqual([]);
   });
-
   it("discards oversized requests without delivering them", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
@@ -225,10 +223,9 @@ describe("WorkspaceOutbox", () => {
 
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toMatchObject([{ name: "oversized.json", detail: expect.stringContaining("exceeds 1048576 bytes") }]);
     expect(await names(outbox)).toEqual([]);
   });
-
 
   it("forwards send_file requests with unconfined paths to the dispatcher", async () => {
     const { dataDir, workspace } = await fixture();
@@ -237,7 +234,9 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "alias" }, { id: "escape" }]);
+    const records = await systemLogRecords(workspace, "outbox_sent");
+    records.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(records).toMatchObject([{ name: "alias.json" }, { name: "escape.json" }]);
   });
 
   it("rejects symlinked request files without following them", async () => {
@@ -249,12 +248,11 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toMatchObject([{ name: "link.json", detail: expect.stringContaining("ELOOP") }]);
     expect(await names(outbox)).toEqual([]);
     expect(JSON.parse(await readFile(target, "utf8"))).toEqual(valid());
   });
-
-  it("archives host failures to failed.jsonl and ignores temporary or non-JSON entries", async () => {
+  it("records host failures to system.jsonl and ignores temporary or non-JSON entries", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeRequest(workspace, "failed.json", valid());
@@ -262,7 +260,7 @@ describe("WorkspaceOutbox", () => {
     await writeFile(path.join(outbox, "notes.txt"), JSON.stringify(valid()), "utf8");
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
     await pollOutbox(dataDir, dispatch);
-    expect(await archiveRecords(workspace, "failed.jsonl")).toMatchObject([{ id: "failed", error: "upload failed" }]);
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toMatchObject([{ name: "failed.json", detail: expect.stringContaining("upload failed") }]);
     expect(await names(outbox)).toEqual(["notes.txt", "partial.json.tmp"]);
   });
 
@@ -288,12 +286,12 @@ describe("WorkspaceOutbox", () => {
       expect(await systemEvents(workspace)).toMatchObject([
         {
           type: "outbox_claimed",
-          id: "one",
+          name: "one.json",
           request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" },
         },
         {
           type: "outbox_sent",
-          id: "one",
+          name: "one.json",
           kind: "send_file",
           request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" },
           messageId: 7,
@@ -371,7 +369,7 @@ describe("WorkspaceOutbox", () => {
 
     finishSend();
     await firstPoll;
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "long" }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "long.json" }]);
   });
 
 
@@ -405,7 +403,7 @@ describe("WorkspaceOutbox", () => {
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
       reply_to_message_id: 42,
     });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "msg", messageId: 9001 }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "msg.json", messageId: 9001 }]);
   });
 
   it("records a send event for each sent message id", async () => {
@@ -416,10 +414,10 @@ describe("WorkspaceOutbox", () => {
     await pollOutbox(dataDir, dispatch);
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
-      recorded.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      recorded.sort((a, b) => String(a.name).localeCompare(String(b.name)));
       expect(recorded).toMatchObject([
-        { type: "send", kind: "send_file", id: "one", messageId: 100 },
-        { type: "send", kind: "send_file", id: "two", messageId: 200 },
+        { type: "send", kind: "send_file", name: "one.json", messageId: 100 },
+        { type: "send", kind: "send_file", name: "two.json", messageId: 200 },
       ]);
     });
   });
@@ -429,7 +427,7 @@ describe("WorkspaceOutbox", () => {
     await writeRequest(workspace, "one.json", valid());
     await pollOutbox(dataDir, vi.fn(async () => undefined));
     await expect(readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8")).rejects.toThrow();
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "one" }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "one.json" }]);
   });
 
   it("writes dispatcher data onto the send event in chat.jsonl", async () => {
@@ -438,9 +436,9 @@ describe("WorkspaceOutbox", () => {
     await pollOutbox(dataDir, vi.fn(async () => ({ data: 777 })));
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
-      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", data: 777 }]);
+      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", name: "stop.json", data: 777 }]);
     });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "stop", data: 777 }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "stop.json", data: 777 }]);
   });
 
   it("forwards send_message requests without host-side semantic validation", async () => {
@@ -452,8 +450,10 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(4);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
-      { id: "bad-markup" }, { id: "bad-mode" }, { id: "bad-reply" }, { id: "long-text" },
+    const records = await systemLogRecords(workspace, "outbox_sent");
+    records.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(records).toMatchObject([
+      { name: "bad-markup.json" }, { name: "bad-mode.json" }, { name: "bad-reply.json" }, { name: "long-text.json" },
     ]);
   });
 
@@ -495,13 +495,15 @@ describe("WorkspaceOutbox", () => {
     });
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
-      recorded.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      recorded.sort((a, b) => String(a.name).localeCompare(String(b.name)));
       expect(recorded).toMatchObject([
-        { type: "send", kind: "send_location", id: "loc", messageId: 301 },
-        { type: "send", kind: "send_poll", id: "poll", messageId: 302, pollId: "poll-abc" },
+        { type: "send", kind: "send_location", name: "loc.json", messageId: 301 },
+        { type: "send", kind: "send_poll", name: "poll.json", messageId: 302, pollId: "poll-abc" },
       ]);
     });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "loc", messageId: 301 }, { id: "poll", messageId: 302, pollId: "poll-abc" }, { id: "react" }]);
+    const sent = await systemLogRecords(workspace, "outbox_sent");
+    sent.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(sent).toMatchObject([{ name: "loc.json", messageId: 301 }, { name: "poll.json", messageId: 302, pollId: "poll-abc" }, { name: "react.json" }]);
   });
 
 
@@ -519,7 +521,7 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => ({ messageId: 7 }));
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledWith(42, group);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "album", messageId: 7 }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "album.json", messageId: 7 }]);
   });
 
   it("rejects send_media_group requests with fewer than two items or wrong item types", async () => {
@@ -531,11 +533,11 @@ describe("WorkspaceOutbox", () => {
     await pollOutbox(dataDir, dispatch, { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
-    expect(followup).toHaveBeenCalledWith(42, "Outbox request single rejected: Outbox request media must be an array of 2 to 10 items");
-    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request media item type must be photo or video");
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request single.json rejected: Outbox request media must be an array of 2 to 10 items");
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-kind.json rejected: Outbox request media item type must be photo or video");
     await vi.waitFor(async () => expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_rejected", detail: "Outbox request bad-kind rejected: Outbox request media item type must be photo or video" },
-      { type: "outbox_rejected", detail: "Outbox request single rejected: Outbox request media must be an array of 2 to 10 items" },
+      { type: "outbox_rejected", name: "bad-kind.json", detail: "Outbox request bad-kind.json rejected: Outbox request media item type must be photo or video" },
+      { type: "outbox_rejected", name: "single.json", detail: "Outbox request single.json rejected: Outbox request media must be an array of 2 to 10 items" },
     ]));
     expect(await names(path.join(workspace, ".tg-bot", "outbox"))).toEqual([]);
   });
@@ -548,9 +550,9 @@ describe("WorkspaceOutbox", () => {
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "stop_poll", message_id: 77 });
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
-      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", messageId: 77, data: poll }]);
+      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", name: "stop.json", messageId: 77, data: poll }]);
     });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "stop", messageId: 77, data: poll }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "stop.json", messageId: 77, data: poll }]);
   });
 
   it("forwards location, poll, and reaction requests without host-side semantic validation", async () => {
@@ -565,8 +567,10 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(7);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
-      { id: "bad-answer-index" }, { id: "bad-emoji" }, { id: "bad-lat" }, { id: "bad-stop" }, { id: "bad-venue" }, { id: "few-options" }, { id: "quiz-no-answer" },
+    const sent = await systemLogRecords(workspace, "outbox_sent");
+    sent.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(sent).toMatchObject([
+      { name: "bad-answer-index.json" }, { name: "bad-emoji.json" }, { name: "bad-lat.json" }, { name: "bad-stop.json" }, { name: "bad-venue.json" }, { name: "few-options.json" }, { name: "quiz-no-answer.json" },
     ]);
   });
 
@@ -579,11 +583,16 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch, { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    const rejected = await systemLogRecords(workspace, "outbox_rejected");
+    rejected.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(rejected).toMatchObject([
+      { name: "bad-kind.json", detail: expect.stringContaining("must be auto, photo") },
+      { name: "bad-path.json", detail: expect.stringContaining("must be a non-empty string") },
+    ]);
     expect(await names(outbox)).toEqual([]);
     await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
-    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
-    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-path rejected: Outbox request path must be a non-empty string");
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-kind.json rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-path.json rejected: Outbox request path must be a non-empty string");
   });
 
   it("dispatches an empty reaction array to remove a reaction", async () => {
@@ -592,7 +601,7 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_reaction", message_id: 12, reaction: [] });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "react" }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "react.json" }]);
   });
 
   it("forwards reaction requests with too many or invalid entries", async () => {
@@ -611,7 +620,9 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "bad-entry" }, { id: "too-many" }]);
+    const sent = await systemLogRecords(workspace, "outbox_sent");
+    sent.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(sent).toMatchObject([{ name: "bad-entry.json" }, { name: "too-many.json" }]);
   });
 
   it("notifies the agent when the dispatcher throws, without logging a chat event", async () => {
@@ -621,9 +632,8 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
     await pollOutbox(dataDir, dispatch, { agent: { followup } });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(followup).toHaveBeenCalledWith(42, "Outbox request one rejected: upload failed");
-    expect(await archiveRecords(workspace, "failed.jsonl")).toMatchObject([{ id: "one", error: "upload failed" }]);
-    await expect(readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8")).rejects.toThrow();
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request one.json rejected: upload failed");
+    expect(await systemLogRecords(workspace, "outbox_rejected")).toMatchObject([{ name: "one.json", detail: expect.stringContaining("upload failed") }]);
   });
 
 
@@ -742,7 +752,9 @@ describe("WorkspaceOutbox", () => {
       link_preview_options: { is_disabled: true },
     });
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "delete_message", message_id: 56 });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "del" }, { id: "edit" }]);
+    const sent = await systemLogRecords(workspace, "outbox_sent");
+    sent.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(sent).toMatchObject([{ name: "del.json" }, { name: "edit.json" }]);
   });
 
   it("forwards edit_message requests without host-side semantic validation", async () => {
@@ -762,8 +774,10 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(4);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
-      { id: "both-edit" }, { id: "empty-edit" }, { id: "long-edit" }, { id: "reply-edit" },
+    const sent = await systemLogRecords(workspace, "outbox_sent");
+    sent.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(sent).toMatchObject([
+      { name: "both-edit.json" }, { name: "empty-edit.json" }, { name: "long-edit.json" }, { name: "reply-edit.json" },
     ]);
   });
 
@@ -791,8 +805,10 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(5);
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
-      { id: "bad-entity" }, { id: "big-preview" }, { id: "both" }, { id: "cjk-markup" }, { id: "no-length" },
+    const sent = await systemLogRecords(workspace, "outbox_sent");
+    sent.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(sent).toMatchObject([
+      { name: "bad-entity.json" }, { name: "big-preview.json" }, { name: "both.json" }, { name: "cjk-markup.json" }, { name: "no-length.json" },
     ]);
   });
 
@@ -808,7 +824,7 @@ describe("WorkspaceOutbox", () => {
       version: 1, id: "react", type: "send_reaction", message_id: 12,
       reaction: [{ type: "emoji", emoji: "👍" }, { type: "custom_emoji", custom_emoji_id: "1234567890123456" }],
     });
-    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "react" }]);
+    expect(await systemLogRecords(workspace, "outbox_sent")).toMatchObject([{ name: "react.json" }]);
   });
 
 });

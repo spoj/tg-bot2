@@ -28,7 +28,7 @@ export type ChatEvent =
     poll_answer: unknown;
   }
   | {
-    /** Confirmation that one outbox request reached Telegram, with the request's response payload where applicable. Host-side protocol fields, not a Telegram object. */
+    /** Confirmation that one outbox request reached Telegram. `id` is the request's filename without ".json"; `data` carries the response payload where applicable. Host-side protocol fields, not a Telegram object. */
     type: "send";
     kind: string;
     id: string;
@@ -119,10 +119,11 @@ timestamp). Event types:
 - poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
   Telegram PollAnswer object (poll_id, user, option_ids).
 - send: a confirmation of one of your outbox requests that Telegram accepted:
-  {v:1,t,type:'send',kind,id,messageId?,pollId?,data?} where data carries the Telegram
+  {v:1,t,type:'send',kind,id,messageId?,pollId?,data?} where id is your request's
+  filename without ".json" and data carries the Telegram
   response object the request produced (for stop_poll it is the final closed Poll).
 - outbox_rejected: {v:1,t,type:'outbox_rejected',detail} reports a rejected request; the
-  rejected request body is kept at .tg-bot/outbox/failed/<name> so you can inspect it.
+  rejection is recorded in .tg-bot/failed.jsonl ({id,request,error}) so you can inspect it.
 Grep events.jsonl whenever you need recent chat history or sent message ids.
 When a user message, button press, or outbox rejection arrives, the host wakes you with a
 single "." prompt that carries no content. Read the newest events.jsonl lines and decide

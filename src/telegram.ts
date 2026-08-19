@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
-import type { Message, Poll } from "grammy/types";
+import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } from "grammy/types";
 import type { Config } from "./config.js";
 import type { AgentManager, AgentStatus } from "./agent.js";
 import { SerialQueue } from "./queue.js";
 import { appendChatEvent, appendChatEvents, type ChatEvent } from "./events.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
+  WorkspaceOutboxSendMediaGroupRequest,
   WorkspaceOutboxSendLocationRequest,
   WorkspaceOutboxSendPollRequest,
   WorkspaceOutboxEditMessageRequest,
@@ -18,7 +19,6 @@ import type {
   WorkspaceOutboxDispatchResult,
   WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-
 import { appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
@@ -52,7 +52,6 @@ type SavedAttachment = {
 
 type BufferEntry = {
   value: PromiseLike<ChatEvent>;
-  typing?: () => void | PromiseLike<void>;
 };
 
 type PendingBatch = {
@@ -197,26 +196,11 @@ export class TelegramIngressBuffer {
   }
 
   private async executeBatch(batch: PendingBatch): Promise<void> {
-    let typing: NodeJS.Timeout | undefined;
     try {
-      const typingCallback = batch.owner.typing;
-      if (typingCallback) {
-        void invokeCallback(typingCallback).catch((error) => {
-          console.error("Buffered Telegram initial typing notification failed", error);
-        });
-        typing = setInterval(() => {
-          void invokeCallback(typingCallback).catch((error) => {
-            console.error("Buffered Telegram typing notification failed", error);
-          });
-        }, 4_000);
-        typing.unref?.();
-      }
       const events = await Promise.all(batch.entries.map((entry) => entry.value));
       await invokeCallback(() => this.flushBatch(batch.chatId, events));
     } catch (error) {
       console.error("Buffered Telegram request failed", error);
-    } finally {
-      if (typing) clearInterval(typing);
     }
   }
 
@@ -372,6 +356,7 @@ export async function dispatchOutboxRequest(bot: Bot, dataDir: string, chatId: n
   switch (request.type) {
     case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: chatPaths(dataDir, chatId).workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
+    case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: chatPaths(dataDir, chatId).workspace, request }) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
     case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
     case "stop_poll": return { messageId: request.message_id, data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
@@ -428,17 +413,8 @@ function workspaceCandidate(workspace: string, sandboxPath: string): string {
   return path.resolve(workspace, sandboxPath);
 }
 
-export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest): Promise<number> {
-  let workspace: string;
-  try {
-    workspace = await realpath(request.workspace);
-    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace is not a directory.");
-  } catch (error) {
-    if (error instanceof Error && error.message === "Workspace is not a directory.") throw error;
-    throw new Error("Workspace is unavailable.");
-  }
-
-  const candidate = workspaceCandidate(workspace, request.sandboxPath);
+async function workspaceFileInput(workspace: string, sandboxPath: string): Promise<{ bytes: Buffer; resolved: string }> {
+  const candidate = workspaceCandidate(workspace, sandboxPath);
   if (!isWithinWorkspace(workspace, candidate)) throw new Error("File path escapes the workspace.");
 
   let resolved: string;
@@ -469,30 +445,95 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
       total += bytesRead;
     }
     if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
-    const bytes = Buffer.concat(chunks, total);
-    const kind = resolvedFileKind(resolved, bytes.length, request.kind);
-
-    const caption = request.caption === undefined
-      ? undefined
-      : Array.from(request.caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
-
-    const input = kind === "photo" ? new InputFile(bytes) : new InputFile(bytes, path.basename(resolved));
-    const options = {
-      ...(caption === undefined ? {} : { caption }),
-      ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
-      ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
-    };
-    let sent: { message_id: number };
-    if (kind === "photo") sent = await bot.api.sendPhoto(request.chatId, input, options);
-    else if (kind === "audio") sent = await bot.api.sendAudio(request.chatId, input, options);
-    else if (kind === "video") sent = await bot.api.sendVideo(request.chatId, input, options);
-    else if (kind === "voice") sent = await bot.api.sendVoice(request.chatId, input, options);
-    else sent = await bot.api.sendDocument(request.chatId, input, options);
-    return sent.message_id;
-
+    return { bytes: Buffer.concat(chunks, total), resolved };
   } finally {
     await handle.close();
   }
+}
+
+function boundedCaption(caption: string | undefined): string | undefined {
+  return caption === undefined
+    ? undefined
+    : Array.from(caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
+}
+export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest): Promise<number> {
+  let workspace: string;
+  try {
+    workspace = await realpath(request.workspace);
+    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace is not a directory.");
+  } catch (error) {
+    if (error instanceof Error && error.message === "Workspace is not a directory.") throw error;
+    throw new Error("Workspace is unavailable.");
+  }
+
+  const { bytes, resolved } = await workspaceFileInput(workspace, request.sandboxPath);
+  const kind = resolvedFileKind(resolved, bytes.length, request.kind);
+  const caption = boundedCaption(request.caption);
+  const input = kind === "photo" ? new InputFile(bytes) : new InputFile(bytes, path.basename(resolved));
+  const options = {
+    ...(caption === undefined ? {} : { caption }),
+    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
+  };
+  let sent: { message_id: number };
+  if (kind === "photo") sent = await bot.api.sendPhoto(request.chatId, input, options);
+  else if (kind === "audio") sent = await bot.api.sendAudio(request.chatId, input, options);
+  else if (kind === "video") sent = await bot.api.sendVideo(request.chatId, input, options);
+  else if (kind === "voice") sent = await bot.api.sendVoice(request.chatId, input, options);
+  else sent = await bot.api.sendDocument(request.chatId, input, options);
+  return sent.message_id;
+}
+export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number; workspace: string; request: WorkspaceOutboxSendMediaGroupRequest }): Promise<number> {
+  const { chatId } = request;
+  let workspace: string;
+  try {
+    workspace = await realpath(request.workspace);
+    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace is not a directory.");
+  } catch (error) {
+    if (error instanceof Error && error.message === "Workspace is not a directory.") throw error;
+    throw new Error("Workspace is unavailable.");
+  }
+  const group: Array<InputMediaPhoto | InputMediaVideo> = [];
+  for (const item of request.request.media) {
+    const { bytes, resolved } = await workspaceFileInput(workspace, item.media);
+    if (item.type === "photo") {
+      group.push({
+        type: "photo",
+        media: new InputFile(bytes),
+        ...defined({
+          caption: boundedCaption(item.caption),
+          parse_mode: item.parse_mode,
+          caption_entities: item.caption_entities as MessageEntity[] | undefined,
+          show_caption_above_media: item.show_caption_above_media,
+          has_spoiler: item.has_spoiler,
+        }),
+      });
+    } else {
+      group.push({
+        type: "video",
+        media: new InputFile(bytes, path.basename(resolved)),
+        ...defined({
+          caption: boundedCaption(item.caption),
+          parse_mode: item.parse_mode,
+          caption_entities: item.caption_entities as MessageEntity[] | undefined,
+          show_caption_above_media: item.show_caption_above_media,
+          has_spoiler: item.has_spoiler,
+          width: item.width,
+          height: item.height,
+          duration: item.duration,
+          supports_streaming: item.supports_streaming,
+        }),
+      });
+    }
+  }
+  const options = {
+    ...(request.request.reply_to_message_id === undefined ? {} : { reply_to_message_id: request.request.reply_to_message_id }),
+    ...(request.request.disable_notification === undefined ? {} : { disable_notification: request.request.disable_notification }),
+  };
+  const sent = await bot.api.sendMediaGroup(chatId, group, options);
+  const first = sent[0];
+  if (!first) throw new Error("Telegram returned an empty media group");
+  return first.message_id;
 }
 const POLL_OWNER_STORE_NAME = "poll-owners.jsonl";
 const MAX_POLL_OWNER_LINES = 256;
@@ -882,10 +923,7 @@ export function createTelegramBot(
         );
       };
     });
-    const admission = ingress.add(chatId, {
-      value: prepared,
-      typing: async () => { await ctx.replyWithChatAction("typing"); },
-    });
+    const admission = ingress.add(chatId, { value: prepared });
     if (admission) startPreparation();
   });
   bot.on("callback_query", (ctx) => {

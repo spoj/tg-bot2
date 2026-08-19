@@ -1,10 +1,11 @@
 import type { watch } from "node:fs";
-import { link, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceOutbox, type WorkspaceOutboxOptions } from "../src/outbox.js";
-import type { WorkspaceOutboxDispatcher } from "../src/outbox-protocol.js";
+import type { WorkspaceOutboxDispatcher, WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -34,6 +35,11 @@ async function chatEvents(workspace: string): Promise<Array<Record<string, unkno
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
+async function archiveRecords(workspace: string, file: "sent.jsonl" | "failed.jsonl"): Promise<Array<Record<string, unknown>>> {
+  const contents = await readFile(path.join(workspace, ".tg-bot", file), "utf8").catch(() => "");
+  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
 function setupOutbox(
   dataDir: string,
   dispatch: WorkspaceOutboxDispatcher,
@@ -50,9 +56,8 @@ async function pollOutbox(
   await setupOutbox(dataDir, dispatch, options).poll();
 }
 
-const valid = (id = "one", filePath = "/workspace/report.txt") => ({
+const valid = (filePath = "/workspace/report.txt") => ({
   version: 1,
-  id,
   type: "send_file",
   path: filePath,
   caption: "Report",
@@ -110,39 +115,39 @@ describe("WorkspaceOutbox", () => {
       pollIntervalMs: 2_147_483_648,
     })).toThrow("positive timer-safe integer");
   });
-  it("delivers valid requests and moves them to processed", async () => {
+  it("delivers valid requests and archives them to sent.jsonl", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "one.json", valid());
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "one", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["one.json"]);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual([]);
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "one" }]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
   });
   it("retries a stale claim left by a crashed process", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-crashed";
-    await writeRequest(workspace, claimName, valid("crashed"));
+    await writeRequest(workspace, claimName, valid());
     const dispatch = vi.fn(async () => undefined);
 
     await pollOutbox(dataDir, dispatch, { now: () => 5 * 60_000 });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "crashed", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
-    expect(await names(path.join(outbox, "processed"))).toEqual([claimName]);
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: ".in-progress-0-crashed" }]);
   });
-  it("skips and cleans a stale claim whose inode is already processed", async () => {
+  it("skips and cleans a stale claim already recorded in the archives", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-archived";
-    const claimPath = path.join(outbox, claimName);
-    await writeRequest(workspace, claimName, valid("archived"));
-    await mkdir(path.join(outbox, "processed"), { recursive: true });
-    await link(claimPath, path.join(outbox, "processed", "archived.json"));
+    await writeRequest(workspace, claimName, valid());
+    const raw = JSON.stringify(valid());
+    const record = { id: "archived", hash: createHash("sha256").update(raw).digest("hex"), request: valid() };
+    await writeFile(path.join(workspace, ".tg-bot", "sent.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
     const dispatch = vi.fn(async () => undefined);
 
     await pollOutbox(dataDir, dispatch, { now: () => 5 * 60_000 });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "processed"))).toEqual(["archived.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "archived" }]);
     expect(await names(outbox)).not.toContain(claimName);
   });
 
@@ -154,13 +159,17 @@ describe("WorkspaceOutbox", () => {
       if (claim) await rm(path.join(outbox, claim), { force: true });
       return undefined;
     });
-    await writeRequest(workspace, "sent.json", valid("sent"));
+    await writeRequest(workspace, "sent.json", valid());
+    // A directory planted at sent.jsonl makes the archive append fail; the
+    // claim must still be discarded so the send is never retried.
+    await mkdir(path.join(workspace, ".tg-bot", "sent.jsonl"), { recursive: true });
     const instance = setupOutbox(dataDir, dispatch);
 
     await instance.poll();
     await instance.poll();
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(await names(path.join(outbox, "failed"))).toEqual([]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await names(outbox)).toEqual([]);
   });
 
 
@@ -168,16 +177,16 @@ describe("WorkspaceOutbox", () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-299999-recent";
-    await writeRequest(workspace, claimName, valid("recent"));
+    await writeRequest(workspace, claimName, valid());
     const dispatch = vi.fn(async () => undefined);
 
     await pollOutbox(dataDir, dispatch, { now: () => 300_000 });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "processed"))).toEqual([]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toEqual([]);
     expect(await names(outbox)).toContain(claimName);
   });
 
-  it("quarantines malformed stale claims without delivery", async () => {
+  it("discards malformed stale claims without delivery", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-malformed";
@@ -186,10 +195,11 @@ describe("WorkspaceOutbox", () => {
 
     await pollOutbox(dataDir, dispatch, { now: () => 5 * 60_000 });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "failed"))).toEqual([claimName]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await names(outbox)).toEqual([]);
   });
 
-  it("quarantines malformed JSON and invalid schemas without delivery", async () => {
+  it("discards malformed JSON and invalid schemas without delivery", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeFile(path.join(outbox, "malformed.json"), "{not json", "utf8");
@@ -197,10 +207,11 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "failed"))).toEqual(["invalid.json", "malformed.json"]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await names(outbox)).toEqual([]);
   });
 
-  it("quarantines oversized requests without delivering them", async () => {
+  it("discards oversized requests without delivering them", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeFile(path.join(outbox, "oversized.json"), `${JSON.stringify(valid())}${"x".repeat(64 * 1024)}`, "utf8");
@@ -208,18 +219,19 @@ describe("WorkspaceOutbox", () => {
 
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "failed"))).toEqual(["oversized.json"]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await names(outbox)).toEqual([]);
   });
 
 
   it("forwards send_file requests with unconfined paths to the dispatcher", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "escape.json", valid("escape", "/workspace/../outside.txt"));
-    await writeRequest(workspace, "alias.json", valid("alias", "/workspace/"));
+    await writeRequest(workspace, "escape.json", valid("/workspace/../outside.txt"));
+    await writeRequest(workspace, "alias.json", valid("/workspace/"));
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["alias.json", "escape.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "alias" }, { id: "escape" }]);
   });
 
   it("rejects symlinked request files without following them", async () => {
@@ -231,11 +243,12 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "failed"))).toEqual(["link.json"]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await names(outbox)).toEqual([]);
     expect(JSON.parse(await readFile(target, "utf8"))).toEqual(valid());
   });
 
-  it("moves host failures to failed and ignores temporary or non-JSON entries", async () => {
+  it("archives host failures to failed.jsonl and ignores temporary or non-JSON entries", async () => {
     const { dataDir, workspace } = await fixture();
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeRequest(workspace, "failed.json", valid());
@@ -243,8 +256,8 @@ describe("WorkspaceOutbox", () => {
     await writeFile(path.join(outbox, "notes.txt"), JSON.stringify(valid()), "utf8");
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
     await pollOutbox(dataDir, dispatch);
-    expect(await names(path.join(outbox, "failed"))).toEqual(["failed.json"]);
-    expect(await names(outbox)).toEqual(["failed", "notes.txt", "partial.json.tmp", "processed"]);
+    expect(await archiveRecords(workspace, "failed.jsonl")).toMatchObject([{ id: "failed", error: "upload failed" }]);
+    expect(await names(outbox)).toEqual(["notes.txt", "partial.json.tmp"]);
   });
 
   it("filters chat directories to canonical numeric real directories", async () => {
@@ -252,22 +265,22 @@ describe("WorkspaceOutbox", () => {
     await writeRequest(workspace, "valid.json", valid());
     const aliasWorkspace = path.join(dataDir, "chats", "042", "workspace");
     await mkdir(path.join(aliasWorkspace, ".tg-bot", "outbox"), { recursive: true });
-    await writeRequest(aliasWorkspace, "alias.json", valid("alias"));
+    await writeRequest(aliasWorkspace, "alias.json", valid());
     await mkdir(path.join(dataDir, "chats", "not-a-chat", "workspace", ".tg-bot", "outbox"), { recursive: true });
     await writeRequest(path.join(dataDir, "chats", "not-a-chat", "workspace"), "ignored.json", valid());
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "one", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
   });
   it("bounds a flooded chat while still processing later chats", async () => {
     const { dataDir, workspace } = await fixture();
     const laterWorkspace = path.join(dataDir, "chats", "43", "workspace");
     await mkdir(path.join(laterWorkspace, ".tg-bot", "outbox"), { recursive: true });
-    await writeRequest(laterWorkspace, "later.json", valid("later", "/workspace/later.txt"));
+    await writeRequest(laterWorkspace, "later.json", valid("/workspace/later.txt"));
     for (let index = 0; index < 300; index += 1) {
       const id = String(index).padStart(4, "0");
-      await writeRequest(workspace, `${id}.json`, valid(id, `/workspace/${id}.txt`));
+      await writeRequest(workspace, `${id}.json`, valid(`/workspace/${id}.txt`));
     }
 
     const chats: number[] = [];
@@ -304,7 +317,7 @@ describe("WorkspaceOutbox", () => {
   });
   it("renews a live claim before stale recovery can reclaim a long send", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "long.json", valid("long"));
+    await writeRequest(workspace, "long.json", valid());
     const { callbacks, setInterval, clearInterval } = fakeInterval();
     let now = 0;
     let finishSend!: () => void;
@@ -330,7 +343,7 @@ describe("WorkspaceOutbox", () => {
 
     finishSend();
     await firstPoll;
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["long.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "long" }]);
   });
 
 
@@ -348,7 +361,6 @@ describe("WorkspaceOutbox", () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "msg.json", {
       version: 1,
-      id: "msg",
       type: "send_message",
       text: "hello <b>world</b>",
       parse_mode: "HTML",
@@ -359,21 +371,20 @@ describe("WorkspaceOutbox", () => {
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledWith(42, {
       version: 1,
-      id: "msg",
       type: "send_message",
       text: "hello <b>world</b>",
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
       reply_to_message_id: 42,
     });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["msg.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "msg", messageId: 9001 }]);
   });
 
   it("records a send event for each sent message id", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "one.json", valid());
-    await writeRequest(workspace, "two.json", valid("two"));
-    const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => ({ messageId: request.id === "one" ? 100 : 200 }));
+    await writeRequest(workspace, "two.json", valid("/workspace/report-two.txt"));
+    const dispatch = vi.fn(async (_chatId: number, request: WorkspaceOutboxRequest) => ({ messageId: (request as { path: string }).path === "/workspace/report.txt" ? 100 : 200 }));
     await pollOutbox(dataDir, dispatch);
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
@@ -390,31 +401,31 @@ describe("WorkspaceOutbox", () => {
     await writeRequest(workspace, "one.json", valid());
     await pollOutbox(dataDir, vi.fn(async () => undefined));
     await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["one.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "one" }]);
   });
 
   it("writes dispatcher data onto the send event in events.jsonl", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "stop.json", { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
+    await writeRequest(workspace, "stop.json", { version: 1, type: "stop_poll", message_id: 77 });
     await pollOutbox(dataDir, vi.fn(async () => ({ data: 777 })));
     await vi.waitFor(async () => {
       const recorded = await chatEvents(workspace);
       expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", data: 777 }]);
     });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["stop.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "stop", data: 777 }]);
   });
 
   it("forwards send_message requests without host-side semantic validation", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "bad-mode.json", { version: 1, id: "bad-mode", type: "send_message", text: "x", parse_mode: "Markdown" });
-    await writeRequest(workspace, "bad-markup.json", { version: 1, id: "bad-markup", type: "send_message", text: "x", reply_markup: [1] });
-    await writeRequest(workspace, "bad-reply.json", { version: 1, id: "bad-reply", type: "send_message", text: "x", reply_to_message_id: -3 });
-    await writeRequest(workspace, "long-text.json", { version: 1, id: "long-text", type: "send_message", text: "x".repeat(4_097) });
+    await writeRequest(workspace, "bad-mode.json", { version: 1, type: "send_message", text: "x", parse_mode: "Markdown" });
+    await writeRequest(workspace, "bad-markup.json", { version: 1, type: "send_message", text: "x", reply_markup: [1] });
+    await writeRequest(workspace, "bad-reply.json", { version: 1, type: "send_message", text: "x", reply_to_message_id: -3 });
+    await writeRequest(workspace, "long-text.json", { version: 1, type: "send_message", text: "x".repeat(4_097) });
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(4);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual([
-      "bad-markup.json", "bad-mode.json", "bad-reply.json", "long-text.json",
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
+      { id: "bad-markup" }, { id: "bad-mode" }, { id: "bad-reply" }, { id: "long-text" },
     ]);
   });
 
@@ -434,9 +445,9 @@ describe("WorkspaceOutbox", () => {
       version: 1, id: "react", type: "send_reaction", message_id: 12,
       reaction: [{ type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" }],
     });
-    const dispatch = vi.fn(async (_chatId: number, request: { id: string }) => {
-      if (request.id === "loc") return { messageId: 301 };
-      if (request.id === "poll") return { messageId: 302, pollId: "poll-abc" };
+    const dispatch = vi.fn(async (_chatId: number, request: WorkspaceOutboxRequest) => {
+      if ((request as { latitude: number }).latitude === 52.52) return { messageId: 301 };
+      if ((request as { question: string }).question === "Pick one") return { messageId: 302, pollId: "poll-abc" };
       return undefined;
     });
     await pollOutbox(dataDir, dispatch);
@@ -462,62 +473,94 @@ describe("WorkspaceOutbox", () => {
         { type: "send", kind: "send_poll", id: "poll", messageId: 302, pollId: "poll-abc" },
       ]);
     });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["loc.json", "poll.json", "react.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "loc", messageId: 301 }, { id: "poll", messageId: 302, pollId: "poll-abc" }, { id: "react" }]);
   });
 
-  it("records stopped poll results as data on the send event", async () => {
+
+  it("dispatches send_media_group requests with their media payload", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "stop.json", { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
-    const poll = { id: "poll-xyz", question: "Q", options: [{ text: "a", voter_count: 2 }], total_voter_count: 2, is_closed: true };
-    const dispatch = vi.fn(async () => ({ messageId: 77, data: poll }));
+    const group = {
+      version: 1,
+      type: "send_media_group",
+      media: [
+        { type: "photo", media: "/workspace/a.png", caption: "first" },
+        { type: "video", media: "b.mp4" },
+      ],
+    };
+    await writeRequest(workspace, "album.json", group);
+    const dispatch = vi.fn(async () => ({ messageId: 7 }));
     await pollOutbox(dataDir, dispatch);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
-    await vi.waitFor(async () => {
-      const recorded = await chatEvents(workspace);
-      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", messageId: 77, data: poll }]);
-    });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["stop.json"]);
+    expect(dispatch).toHaveBeenCalledWith(42, group);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "album", messageId: 7 }]);
   });
 
-  it("forwards location, poll, and reaction requests without host-side semantic validation", async () => {
+  it("rejects send_media_group requests with fewer than two items or wrong item types", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "bad-lat.json", { version: 1, id: "bad-lat", type: "send_location", latitude: 91, longitude: 0 });
-    await writeRequest(workspace, "bad-venue.json", { version: 1, id: "bad-venue", type: "send_location", latitude: 1, longitude: 2, venue: { title: "x" } });
-    await writeRequest(workspace, "few-options.json", { version: 1, id: "few-options", type: "send_poll", question: "q", options: ["only"] });
-    await writeRequest(workspace, "quiz-no-answer.json", { version: 1, id: "quiz-no-answer", type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz" });
-    await writeRequest(workspace, "bad-answer-index.json", { version: 1, id: "bad-answer-index", type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 });
-    await writeRequest(workspace, "bad-emoji.json", { version: 1, id: "bad-emoji", type: "send_reaction", message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
-    await writeRequest(workspace, "bad-stop.json", { version: 1, id: "bad-stop", type: "stop_poll", message_id: 0 });
-    const dispatch = vi.fn(async () => undefined);
-    await pollOutbox(dataDir, dispatch);
-    expect(dispatch).toHaveBeenCalledTimes(7);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual([
-      "bad-answer-index.json", "bad-emoji.json", "bad-lat.json", "bad-stop.json", "bad-venue.json", "few-options.json", "quiz-no-answer.json",
-    ]);
-  });
-
-  it("quarantines structurally invalid requests and notifies the agent", async () => {
-    const { dataDir, workspace } = await fixture();
-    const outbox = path.join(workspace, ".tg-bot", "outbox");
-    await writeRequest(workspace, "bad-kind.json", { version: 1, id: "bad-kind", type: "send_file", path: "x", kind: "weird" });
-    await writeRequest(workspace, "bad-path.json", { version: 1, id: "bad-path", type: "send_file", path: 7 });
+    await writeRequest(workspace, "single.json", { version: 1, type: "send_media_group", media: [{ type: "photo", media: "a.png" }] });
+    await writeRequest(workspace, "bad-kind.json", { version: 1, type: "send_media_group", media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] });
     const notifyAgent = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch, { notifyAgent });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(await names(path.join(outbox, "failed"))).toEqual(["bad-kind.json", "bad-path.json"]);
     await vi.waitFor(() => expect(notifyAgent).toHaveBeenCalledTimes(2));
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-kind.json rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-path.json rejected: Outbox request path must be a non-empty string");
+    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request single rejected: Outbox request media must be an array of 2 to 10 items");
+    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request media item type must be photo or video");
+    expect(await names(path.join(workspace, ".tg-bot", "outbox"))).toEqual([]);
+  });
+  it("records stopped poll results as data on the send event", async () => {
+    const { dataDir, workspace } = await fixture();
+    await writeRequest(workspace, "stop.json", { version: 1, type: "stop_poll", message_id: 77 });
+    const poll = { id: "poll-xyz", question: "Q", options: [{ text: "a", voter_count: 2 }], total_voter_count: 2, is_closed: true };
+    const dispatch = vi.fn(async () => ({ messageId: 77, data: poll }));
+    await pollOutbox(dataDir, dispatch);
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "stop_poll", message_id: 77 });
+    await vi.waitFor(async () => {
+      const recorded = await chatEvents(workspace);
+      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", messageId: 77, data: poll }]);
+    });
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "stop", messageId: 77, data: poll }]);
+  });
+
+  it("forwards location, poll, and reaction requests without host-side semantic validation", async () => {
+    const { dataDir, workspace } = await fixture();
+    await writeRequest(workspace, "bad-lat.json", { version: 1, type: "send_location", latitude: 91, longitude: 0 });
+    await writeRequest(workspace, "bad-venue.json", { version: 1, type: "send_location", latitude: 1, longitude: 2, venue: { title: "x" } });
+    await writeRequest(workspace, "few-options.json", { version: 1, type: "send_poll", question: "q", options: ["only"] });
+    await writeRequest(workspace, "quiz-no-answer.json", { version: 1, type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz" });
+    await writeRequest(workspace, "bad-answer-index.json", { version: 1, type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 });
+    await writeRequest(workspace, "bad-emoji.json", { version: 1, type: "send_reaction", message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
+    await writeRequest(workspace, "bad-stop.json", { version: 1, type: "stop_poll", message_id: 0 });
+    const dispatch = vi.fn(async () => undefined);
+    await pollOutbox(dataDir, dispatch);
+    expect(dispatch).toHaveBeenCalledTimes(7);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
+      { id: "bad-answer-index" }, { id: "bad-emoji" }, { id: "bad-lat" }, { id: "bad-stop" }, { id: "bad-venue" }, { id: "few-options" }, { id: "quiz-no-answer" },
+    ]);
+  });
+
+  it("discards structurally invalid requests and notifies the agent", async () => {
+    const { dataDir, workspace } = await fixture();
+    const outbox = path.join(workspace, ".tg-bot", "outbox");
+    await writeRequest(workspace, "bad-kind.json", { version: 1, type: "send_file", path: "x", kind: "weird" });
+    await writeRequest(workspace, "bad-path.json", { version: 1, type: "send_file", path: 7 });
+    const notifyAgent = vi.fn(async () => undefined);
+    const dispatch = vi.fn(async () => undefined);
+    await pollOutbox(dataDir, dispatch, { notifyAgent });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
+    expect(await names(outbox)).toEqual([]);
+    await vi.waitFor(() => expect(notifyAgent).toHaveBeenCalledTimes(2));
+    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
+    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-path rejected: Outbox request path must be a non-empty string");
   });
 
   it("dispatches an empty reaction array to remove a reaction", async () => {
     const { dataDir, workspace } = await fixture();
-    await writeRequest(workspace, "react.json", { version: 1, id: "react", type: "send_reaction", message_id: 12, reaction: [] });
+    await writeRequest(workspace, "react.json", { version: 1, type: "send_reaction", message_id: 12, reaction: [] });
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "react", type: "send_reaction", message_id: 12, reaction: [] });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["react.json"]);
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_reaction", message_id: 12, reaction: [] });
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "react" }]);
   });
 
   it("forwards reaction requests with too many or invalid entries", async () => {
@@ -536,7 +579,7 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["bad-entry.json", "too-many.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "bad-entry" }, { id: "too-many" }]);
   });
 
   it("notifies the agent when the dispatcher throws, without logging a chat event", async () => {
@@ -546,8 +589,8 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
     await pollOutbox(dataDir, dispatch, { notifyAgent });
     await vi.waitFor(() => expect(notifyAgent).toHaveBeenCalledOnce());
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request one.json rejected: upload failed");
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "failed"))).toEqual(["one.json"]);
+    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request one rejected: upload failed");
+    expect(await archiveRecords(workspace, "failed.jsonl")).toMatchObject([{ id: "one", error: "upload failed" }]);
     await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
   });
 
@@ -569,7 +612,7 @@ describe("WorkspaceOutbox", () => {
 
       await vi.advanceTimersByTimeAsync(50);
       await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
-      expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "one", type: "send_file", path: "/workspace/report.txt", caption: "Report" });
+      expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
       await outbox.stop();
     } finally {
       vi.useRealTimers();
@@ -657,7 +700,7 @@ describe("WorkspaceOutbox", () => {
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
       link_preview_options: { is_disabled: true },
     });
-    await writeRequest(workspace, "del.json", { version: 1, id: "del", type: "delete_message", message_id: 56 });
+    await writeRequest(workspace, "del.json", { version: 1, type: "delete_message", message_id: 56 });
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledWith(42, {
@@ -666,8 +709,8 @@ describe("WorkspaceOutbox", () => {
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
       link_preview_options: { is_disabled: true },
     });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "del", type: "delete_message", message_id: 56 });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["del.json", "edit.json"]);
+    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "delete_message", message_id: 56 });
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "del" }, { id: "edit" }]);
   });
 
   it("forwards edit_message requests without host-side semantic validation", async () => {
@@ -675,7 +718,7 @@ describe("WorkspaceOutbox", () => {
     await writeRequest(workspace, "long-edit.json", {
       version: 1, id: "long-edit", type: "edit_message", message_id: 7, text: "x".repeat(4_097),
     });
-    await writeRequest(workspace, "empty-edit.json", { version: 1, id: "empty-edit", type: "edit_message", message_id: 9 });
+    await writeRequest(workspace, "empty-edit.json", { version: 1, type: "edit_message", message_id: 9 });
     await writeRequest(workspace, "both-edit.json", {
       version: 1, id: "both-edit", type: "edit_message", message_id: 9,
       text: "x", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 1 }],
@@ -687,8 +730,8 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(4);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual([
-      "both-edit.json", "empty-edit.json", "long-edit.json", "reply-edit.json",
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
+      { id: "both-edit" }, { id: "empty-edit" }, { id: "long-edit" }, { id: "reply-edit" },
     ]);
   });
 
@@ -716,8 +759,8 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledTimes(5);
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual([
-      "bad-entity.json", "big-preview.json", "both.json", "cjk-markup.json", "no-length.json",
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([
+      { id: "bad-entity" }, { id: "big-preview" }, { id: "both" }, { id: "cjk-markup" }, { id: "no-length" },
     ]);
   });
 
@@ -733,7 +776,7 @@ describe("WorkspaceOutbox", () => {
       version: 1, id: "react", type: "send_reaction", message_id: 12,
       reaction: [{ type: "emoji", emoji: "👍" }, { type: "custom_emoji", custom_emoji_id: "1234567890123456" }],
     });
-    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["react.json"]);
+    expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "react" }]);
   });
 
 });

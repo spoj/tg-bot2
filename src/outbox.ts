@@ -1,12 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
-import { lstat, link, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { appendChatEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
-import { chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
-import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
+import { appendBoundedJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readBoundedJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
   dataDir: string;
@@ -29,7 +29,9 @@ const JSON_REQUEST = /\.json$/;
 // Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
 const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
 const MAX_OUTBOX_ENTRIES_PER_CHAT = 256;
-const MAX_PROCESSED_ENTRIES_TO_CHECK = 256;
+const MAX_ARCHIVE_LINES = 256;
+const MAX_ARCHIVE_BYTES = 64 * 1024;
+const ARCHIVE_CAPS = { maxLines: MAX_ARCHIVE_LINES, maxBytes: MAX_ARCHIVE_BYTES };
 // Recover claims older than five minutes after crashes without racing active senders.
 const STALE_CLAIM_AGE_MS = 5 * 60_000;
 const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
@@ -38,6 +40,8 @@ const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 const OUTBOX_DIR = "outbox";
+const SENT_ARCHIVE_FILE = "sent.jsonl";
+const FAILED_ARCHIVE_FILE = "failed.jsonl";
 type ClaimLease = {
   stop: () => Promise<void>;
 };
@@ -69,10 +73,6 @@ function errorMessage(error: unknown): string {
   return detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
 }
 
-function isNotLinkable(error: unknown): boolean {
-  const code = errorCode(error);
-  return code === "EISDIR" || code === "EINVAL" || code === "EPERM" || code === "EOPNOTSUPP" || code === "ENOTSUP" || code === "EXDEV";
-}
 
 async function readRequest(filePath: string): Promise<WorkspaceOutboxRequest> {
   const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
@@ -103,15 +103,27 @@ async function readRequest(filePath: string): Promise<WorkspaceOutboxRequest> {
   }
 }
 
-async function openChildDirectory(parent: PinnedDirectory, name: string): Promise<PinnedDirectory> {
-  const child = path.join(parent.path, name);
+/** SHA-256 of a claim file's raw bytes; undefined when unreadable or oversized. */
+async function claimFileHash(filePath: string): Promise<string | undefined> {
+  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => undefined);
+  if (!handle) return undefined;
   try {
-    await mkdir(child, { mode: 0o700 });
-  } catch (error) {
-    if (!isExisting(error)) throw error;
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(16 * 1024);
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > MAX_REQUEST_BYTES + 1) return undefined;
+      hash.update(bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead));
+    }
+    return hash.digest("hex");
+  } finally {
+    await handle.close();
   }
-  return openPinnedDirectory(child);
 }
+
 async function readBoundedEntries(directory: string, limit: number) {
   const directoryHandle = await opendir(directory);
   const entries = [];
@@ -333,8 +345,6 @@ export class WorkspaceOutbox {
     let workspaceDirectory: PinnedDirectory | undefined;
     let metadata: PinnedDirectory | undefined;
     let outbox: PinnedDirectory | undefined;
-    let processed: PinnedDirectory | undefined;
-    let failed: PinnedDirectory | undefined;
     try {
       openedChatsRoot = chatsRoot ?? await openPinnedDirectory(path.join(this.dataDir, "chats"));
       chatDirectory = await openPinnedDirectory(path.join(openedChatsRoot.path, String(chatId)));
@@ -345,8 +355,8 @@ export class WorkspaceOutbox {
       metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
       outbox = await openPinnedDirectory(path.join(metadata.path, OUTBOX_DIR));
       const outboxPath = outbox.path;
-      processed = await openChildDirectory(outbox, "processed");
-      failed = await openChildDirectory(outbox, "failed");
+      const sentPath = path.join(metadata.path, SENT_ARCHIVE_FILE);
+      const failedPath = path.join(metadata.path, FAILED_ARCHIVE_FILE);
 
       const entries = (await readBoundedEntries(outbox.path, MAX_OUTBOX_ENTRIES_PER_CHAT))
         .filter((entry) => JSON_REQUEST.test(entry.name) || CLAIM_NAME.test(entry.name))
@@ -357,22 +367,24 @@ export class WorkspaceOutbox {
         const claimMatch = CLAIM_NAME.exec(entry.name);
         const stale = claimMatch !== null && this.isStaleClaim(claimMatch);
         if (claimMatch !== null && !stale) continue;
-        if (stale && await this.claimWasAlreadyArchived(entry, processed, chatId)) continue;
+        if (stale && await this.staleClaimResolved(entry, sentPath, failedPath, chatId)) continue;
         const claim = await this.claimEntry(outbox, entry, chatId, stale);
         if (!claim) continue;
         const archiveName = entry.name;
+        const requestKey = entry.name.endsWith(".json") ? entry.name.slice(0, -5) : entry.name;
         let lease: ClaimLease | undefined;
         let request: WorkspaceOutboxRequest | undefined;
+        let result: WorkspaceOutboxDispatchResult | undefined;
         try {
           lease = this.startClaimLease(claim, chatId);
           request = await readRequest(claim.path);
-          const result = await this.dispatch(chatId, request);
+          result = await this.dispatch(chatId, request);
           if (result !== undefined && (result.messageId !== undefined || result.data !== undefined)) {
             try {
               appendChatEvent(workspace, {
                 type: "send",
                 kind: request.type,
-                id: request.id,
+                id: requestKey,
                 ...defined({ messageId: result.messageId }),
                 ...defined({ pollId: result.pollId }),
                 ...defined({ data: result.data }),
@@ -387,13 +399,21 @@ export class WorkspaceOutbox {
             await lease.stop();
             lease = undefined;
           }
-          try {
-            await this.archiveClaimed(claim.path, failed, archiveName);
-          } catch (moveError) {
-            this.report(moveError);
+          if (request !== undefined) {
+            try {
+              const hash = await claimFileHash(claim.path);
+              await appendBoundedJsonl(
+                failedPath,
+                JSON.stringify({ id: requestKey, ...(hash === undefined ? {} : { hash }), request, error: errorMessage(error) }),
+                ARCHIVE_CAPS,
+              );
+            } catch (archiveError) {
+              this.report(archiveError);
+            }
           }
-          this.notifyAgentFailure(chatId, archiveName, error);
+          this.notifyAgentFailure(chatId, requestKey, error);
           this.reportRequestError(chatId, archiveName, error);
+          await this.discardClaimFile(claim.path);
           continue;
         }
 
@@ -401,23 +421,33 @@ export class WorkspaceOutbox {
           await lease.stop();
           lease = undefined;
         }
-        try {
-          await this.archiveClaimed(claim.path, processed, archiveName);
-        } catch (error) {
-          // Sending succeeded. Never put this request in failed, where it would be resent.
-          this.reportRequestError(chatId, archiveName, error);
-          try {
-            await this.discardSentClaim(claim.path);
-          } catch (discardError) {
-            this.report(discardError);
-          }
+        if (request === undefined) {
+          this.reportRequestError(chatId, archiveName, new Error("Outbox request disappeared after dispatch"));
+          await this.discardClaimFile(claim.path);
+          continue;
         }
+        try {
+          const hash = await claimFileHash(claim.path);
+          await appendBoundedJsonl(
+            sentPath,
+            JSON.stringify({
+              id: requestKey,
+              ...(hash === undefined ? {} : { hash }),
+              request,
+              ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
+            }),
+            ARCHIVE_CAPS,
+          );
+        } catch (error) {
+          // Sending succeeded; a lost archive record must never resend, and the
+          // stale-claim oracle falls back to the failed archive only.
+          this.reportRequestError(chatId, archiveName, error);
+        }
+        await this.discardClaimFile(claim.path);
       }
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
-      if (failed) await this.closeDirectory(failed);
-      if (processed) await this.closeDirectory(processed);
       if (outbox) await this.closeDirectory(outbox);
       if (metadata) await this.closeDirectory(metadata);
       if (workspaceDirectory) await this.closeDirectory(workspaceDirectory);
@@ -475,38 +505,37 @@ export class WorkspaceOutbox {
     const current = this.now();
     return Number.isFinite(current) && current >= createdAt && current - createdAt >= STALE_CLAIM_AGE_MS;
   }
-  private async claimWasAlreadyArchived(entry: OutboxEntry, processed: PinnedDirectory, chatId: number): Promise<boolean> {
-    let claimStat: Awaited<ReturnType<typeof lstat>>;
-    try {
-      claimStat = await lstat(entry.path);
-    } catch (error) {
-      if (isMissing(error)) return false;
-      throw error;
-    }
-
-    const processedEntries = await readBoundedEntries(processed.path, MAX_PROCESSED_ENTRIES_TO_CHECK);
-    for (const processedEntry of processedEntries) {
-      if (!processedEntry.isFile() || processedEntry.isSymbolicLink()) continue;
-      const processedPath = path.join(processed.path, processedEntry.name);
-      let processedStat: Awaited<ReturnType<typeof lstat>>;
+  private async staleClaimResolved(entry: OutboxEntry, sentPath: string, failedPath: string, chatId: number): Promise<boolean> {
+    const hash = await claimFileHash(entry.path);
+    if (hash === undefined) return false;
+    for (const archivePath of [sentPath, failedPath]) {
+      let lines: string[];
       try {
-        processedStat = await lstat(processedPath);
-      } catch (error) {
-        if (isMissing(error)) continue;
-        throw error;
+        lines = await readBoundedJsonl(archivePath, ARCHIVE_CAPS);
+      } catch {
+        continue;
       }
-      if (processedStat.dev !== claimStat.dev || processedStat.ino !== claimStat.ino) continue;
-      try {
-        await unlink(entry.path);
-      } catch (error) {
-        if (!isMissing(error)) this.reportRequestError(chatId, entry.name, error);
+      for (const line of lines) {
+        let record: unknown;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+        if ((record as Record<string, unknown>).hash !== hash) continue;
+        try {
+          await unlink(entry.path);
+        } catch (error) {
+          if (!isMissing(error)) this.reportRequestError(chatId, entry.name, error);
+        }
+        return true;
       }
-      return true;
     }
     return false;
   }
 
-  private async discardSentClaim(claimedPath: string): Promise<void> {
+  private async discardClaimFile(claimedPath: string): Promise<void> {
     try {
       await unlink(claimedPath);
     } catch (error) {
@@ -543,43 +572,6 @@ export class WorkspaceOutbox {
     return undefined;
   }
 
-  private async archiveClaimed(claimedPath: string, destination: PinnedDirectory, originalName: string): Promise<void> {
-    const preferredPath = path.join(destination.path, originalName);
-    const preferred = await this.tryLinkArchive(claimedPath, preferredPath);
-    if (preferred.ok) return;
-    if (!preferred.retry) throw preferred.error;
-
-    for (let attempt = 0; attempt < 16; attempt += 1) {
-      const archiveName = `${originalName}.${this.now()}-${randomUUID()}`;
-      const archivePath = path.join(destination.path, archiveName);
-      const linked = await this.tryLinkArchive(claimedPath, archivePath);
-      if (linked.ok) return;
-      if (linked.error && isExisting(linked.error)) continue;
-      if (linked.error && !isNotLinkable(linked.error)) throw linked.error;
-      try {
-        await rename(claimedPath, archivePath);
-        return;
-      } catch (error) {
-        if (isExisting(error)) continue;
-        throw error;
-      }
-    }
-    throw new Error("Unable to archive outbox request without a name collision");
-  }
-
-  private async tryLinkArchive(claimedPath: string, archivePath: string): Promise<{ ok: true } | { ok: false; retry: boolean; error: unknown }> {
-    try {
-      await link(claimedPath, archivePath);
-    } catch (error) {
-      return { ok: false, retry: isExisting(error) || isNotLinkable(error), error };
-    }
-    try {
-      await unlink(claimedPath);
-    } catch (error) {
-      return { ok: false, retry: false, error };
-    }
-    return { ok: true };
-  }
 
   /** Reports a rejected request to the agent as a direct message; never blocks scanning. */
   private notifyAgentFailure(chatId: number, name: string, error: unknown): void {

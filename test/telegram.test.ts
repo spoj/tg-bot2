@@ -24,6 +24,7 @@ import {
   sendTelegramRichMessage,
   stopTelegramPoll,
   sendWorkspaceFile,
+  sendTelegramMediaGroup,
   splitTelegramText,
   TelegramDeliveryQueue,
   TelegramIngressBuffer,
@@ -40,6 +41,7 @@ function fakeBot() {
       sendAudio: vi.fn(async () => ({ message_id: 123 })),
       sendDocument: vi.fn(async () => ({ message_id: 123 })),
       sendLocation: vi.fn(async () => ({ message_id: 123 })),
+      sendMediaGroup: vi.fn(async () => [{ message_id: 11 }, { message_id: 12 }]),
       sendMessage: vi.fn(async () => ({ message_id: 123 })),
       sendPhoto: vi.fn(async () => ({ message_id: 123 })),
       sendPoll: vi.fn(async () => ({ message_id: 123, poll: { id: "poll-9" } })),
@@ -213,9 +215,8 @@ describe("splitTelegramText", () => {
 });
 
 describe("TelegramIngressBuffer", () => {
-  const entry = (typing?: () => void | Promise<void>) => ({
+  const entry = () => ({
     value: Promise.resolve<ChatEvent>({ type: "message", message: { message_id: 1, text: "m1" }, attachments: [] }),
-    ...(typing === undefined ? {} : { typing }),
   });
 
   it("batches a quiet window and wakes once", async () => {
@@ -395,24 +396,6 @@ describe("TelegramIngressBuffer", () => {
     expect(buffer.add(7, entry())).toBe(false);
   });
 
-  it("does not block batch processing on deferred initial typing", async () => {
-    let releaseTyping!: () => void;
-    const deferredTyping = new Promise<void>((resolve) => { releaseTyping = resolve; });
-    let typingStarted = false;
-    const wakes: number[] = [];
-    const buffer = new TelegramIngressBuffer(async (chatId) => {
-      wakes.push(chatId);
-    }, 60_000);
-    buffer.add(7, entry(() => {
-      typingStarted = true;
-      return deferredTyping;
-    }));
-
-    await buffer.flushAll();
-    expect(typingStarted).toBe(true);
-    expect(wakes).toEqual([7]);
-    releaseTyping();
-  });
 
   it("swallows a rejecting flush without retrying", async () => {
     let attempts = 0;
@@ -593,6 +576,51 @@ it("honors explicit kinds and voice overrides", async () => {
     await sendWorkspaceFile(forcedDocument, { chatId: 42, workspace, sandboxPath: "note.ogg", kind: "document" });
     expect(forcedDocument.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
     expect(forcedDocument.api.sendAudio as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+  });
+});
+
+it("sends a media group as an album with mapped items and options", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "a.png"), "a");
+    await writeFile(path.join(workspace, "b.mp4"), "b");
+    const bot = fakeBot();
+    const group = {
+      version: 1 as const,
+      id: "album",
+      type: "send_media_group" as const,
+      media: [
+        { type: "photo" as const, media: "a.png", caption: "first" },
+        { type: "video" as const, media: "/workspace/b.mp4", caption: "x".repeat(2_000) },
+      ],
+      disable_notification: true,
+    };
+
+    await expect(sendTelegramMediaGroup(bot, { chatId: 42, workspace, request: group })).resolves.toBe(11);
+    const api = bot.api.sendMediaGroup as unknown as ReturnType<typeof vi.fn>;
+    expect(api).toHaveBeenCalledTimes(1);
+    expect(api.mock.calls[0]?.[0]).toBe(42);
+    const [media, options] = [api.mock.calls[0]?.[1], api.mock.calls[0]?.[2]];
+    expect(media).toHaveLength(2);
+    expect(media[0]).toMatchObject({ type: "photo", caption: "first" });
+    expect(media[1]).toMatchObject({ type: "video", caption: "x".repeat(1_024) });
+    expect(options).toEqual({ disable_notification: true });
+  });
+});
+
+it("rejects media group items that escape the workspace", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "ok.png"), "a");
+    const bot = fakeBot();
+    const group = {
+      version: 1 as const,
+      id: "album",
+      type: "send_media_group" as const,
+      media: [
+        { type: "photo" as const, media: "ok.png" },
+        { type: "video" as const, media: "/workspace/../outside.mp4" },
+      ],
+    };
+    await expect(sendTelegramMediaGroup(bot, { chatId: 42, workspace, request: group })).rejects.toThrow("path escapes the workspace");
   });
 });
 
@@ -994,7 +1022,6 @@ describe("Telegram rich messages", () => {
     const bot = fakeBot();
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
-      id: "rich-1",
       type: "send_message",
       text: "<b>hi</b>",
       parse_mode: "HTML",
@@ -1020,7 +1047,6 @@ describe("Telegram rich messages", () => {
     ));
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
-      id: "rich-2",
       type: "send_message",
       text: "<b>hi</b>",
       parse_mode: "HTML",
@@ -1039,7 +1065,7 @@ describe("Telegram rich messages", () => {
       "sendMessage",
       { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
     ));
-    await expect(sendTelegramRichMessage(bot, 42, { version: 1, id: "rich-3", type: "send_message", text: "<b>hi</b>", parse_mode: "HTML" })).rejects.toThrow("chat not found");
+    await expect(sendTelegramRichMessage(bot, 42, { version: 1, type: "send_message", text: "<b>hi</b>", parse_mode: "HTML" })).rejects.toThrow("chat not found");
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -1047,7 +1073,6 @@ describe("Telegram rich messages", () => {
     const bot = fakeBot();
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
-      id: "rich-4",
       type: "send_message",
       text: "hi",
       entities: [{ type: "bold", offset: 0, length: 2 }],
@@ -1068,7 +1093,6 @@ describe("Telegram message editing and deletion", () => {
     const bot = fakeBot();
     await expect(sendTelegramEditMessage(bot, 42, {
       version: 1,
-      id: "edit-1",
       type: "edit_message",
       message_id: 7,
       text: "<b>updated</b>",
@@ -1095,7 +1119,6 @@ describe("Telegram message editing and deletion", () => {
     ));
     await expect(sendTelegramEditMessage(bot, 42, {
       version: 1,
-      id: "edit-2",
       type: "edit_message",
       message_id: 7,
       text: "<b>updated</b>",
@@ -1222,7 +1245,6 @@ describe("Telegram locations, polls, and reactions", () => {
     const bot = fakeBot();
     await expect(sendTelegramLocation(bot, 42, {
       version: 1,
-      id: "loc-1",
       type: "send_location",
       latitude: 52.52,
       longitude: 13.405,
@@ -1237,7 +1259,6 @@ describe("Telegram locations, polls, and reactions", () => {
     const bot = fakeBot();
     await expect(sendTelegramLocation(bot, 42, {
       version: 1,
-      id: "loc-2",
       type: "send_location",
       latitude: 52.5163,
       longitude: 13.3777,
@@ -1251,7 +1272,6 @@ describe("Telegram locations, polls, and reactions", () => {
     const bot = fakeBot();
     await expect(sendTelegramLocation(bot, 42, {
       version: 1,
-      id: "loc-3",
       type: "send_location",
       latitude: 52.5163,
       longitude: 13.3777,
@@ -1267,7 +1287,6 @@ describe("Telegram locations, polls, and reactions", () => {
     const bot = fakeBot();
     await expect(sendTelegramPoll(bot, 42, {
       version: 1,
-      id: "poll-1",
       type: "send_poll",
       question: "Pick one",
       options: ["a", "b"],

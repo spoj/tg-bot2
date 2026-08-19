@@ -13,6 +13,7 @@ import {
 import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
 import { EVENTS_PROMPT } from "../src/events.js";
 import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
+import { TASKS_PROMPT } from "../src/task-protocol.js";
 import type { Config } from "../src/config.js";
 import { deferred } from "./helpers.js";
 
@@ -50,6 +51,7 @@ function managerOptions(overrides: Record<string, unknown> = {}): ConstructorPar
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
     now: () => 1_000_000,
+    interruptCoalesceMs: 0,
     ...overrides,
   };
 }
@@ -85,7 +87,7 @@ Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep 
 `;
 
 it("composes the SYSTEM_PROMPT from the intro, protocol sections, and outro", () => {
-  expect(SYSTEM_PROMPT).toBe(`${INTRO}${OUTBOX_PROMPT}${EVENTS_PROMPT}${SCHEDULES_PROMPT}${OUTRO}`);
+  expect(SYSTEM_PROMPT).toBe(`${INTRO}${OUTBOX_PROMPT}${EVENTS_PROMPT}${SCHEDULES_PROMPT}${TASKS_PROMPT}${OUTRO}`);
   expect(SYSTEM_PROMPT).toContain("/status is a host command");
   expect(SYSTEM_PROMPT).toContain("new-session");
   expect(SYSTEM_PROMPT).not.toContain("/model, /thinking, /status, and /restart");
@@ -161,6 +163,58 @@ it("interrupt while idle starts a run immediately", async () => {
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     expect(factory.mock.calls[0]?.[0].message).toBe(".");
     runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("coalesces an interrupt burst into one worker stop", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, interruptCoalesceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "scheduled");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.interrupt(42, "first");
+    await manager.interrupt(42, "second");
+    await vi.waitFor(() => expect(runs[0]?.stop).toHaveBeenCalledOnce());
+    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.message).toBe("first");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(3));
+    expect(runs[2]?.worker.options.message).toBe("second");
+    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("a natural settle cancels the pending interrupt stop", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, interruptCoalesceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "scheduled");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.interrupt(42, ".");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[0]?.stop).not.toHaveBeenCalled();
+    expect(runs[1]?.worker.options.message).toBe(".");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("rejects a non-timer-safe interrupt coalesce window", () => {
+  expect(() => new AgentManager(config, managerOptions({ interruptCoalesceMs: -1 }))).toThrow("non-negative timer-safe integer");
+});
+
+it("beginShutdown cancels pending interrupt stops", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, interruptCoalesceMs: 10_000, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "scheduled");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.interrupt(42, ".");
+    await manager.beginShutdown();
+    expect(runs[0]?.stop).toHaveBeenCalledOnce();
+    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
+    expect(runs).toHaveLength(1);
   });
 });
 

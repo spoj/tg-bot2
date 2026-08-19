@@ -8,6 +8,7 @@ import { TG_BOT_DIR, chatPaths, defined } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
 import { EVENTS_PROMPT } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
+import { TASKS_PROMPT } from "./task-protocol.js";
 
 export const SYSTEM_PROMPT = [
 `You are a persistent personal agent reached through Telegram.
@@ -20,6 +21,7 @@ Install optional project-local extensions with pi install npm:<package> -l --app
   OUTBOX_PROMPT,
   EVENTS_PROMPT,
   SCHEDULES_PROMPT,
+  TASKS_PROMPT,
   `Keep Telegram-facing answers concise unless the user asks for detail.
 /status is a host command that reports your current model, thinking level, and session summary.
 Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
@@ -55,6 +57,10 @@ export type AgentManagerOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   now?: () => number;
+  /** Quiet window absorbing interrupt bursts into one worker stop; 0 disables it. */
+  interruptCoalesceMs?: number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 };
 
 export type AgentStatus = {
@@ -75,8 +81,11 @@ type ChatState = {
   lastActivityAt: number;
   activityLoaded: boolean;
   closing: boolean;
+  interruptTimer: NodeJS.Timeout | undefined;
 };
 
+const INTERRUPT_COALESCE_MS = 2_000;
+const MAX_TIMER_MS = 2_147_483_647;
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
 const NEW_SESSION_MARKER = path.join(TG_BOT_DIR, "new-session");
 const ACTIVITY_FILE = "activity.json";
@@ -104,6 +113,9 @@ export class AgentManager {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly now: () => number;
+  private readonly interruptCoalesceMs: number;
+  private readonly setTimeoutFn: typeof setTimeout;
+  private readonly clearTimeoutFn: typeof clearTimeout;
   private shuttingDown = false;
 
   constructor(private readonly config: Pick<Config, "dataDir">, options: AgentManagerOptions) {
@@ -113,6 +125,13 @@ export class AgentManager {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.now = options.now ?? Date.now;
+    const coalesceMs = options.interruptCoalesceMs ?? INTERRUPT_COALESCE_MS;
+    if (!Number.isSafeInteger(coalesceMs) || coalesceMs < 0 || coalesceMs > MAX_TIMER_MS) {
+      throw new Error("Interrupt coalesce window must be a non-negative timer-safe integer");
+    }
+    this.interruptCoalesceMs = coalesceMs;
+    this.setTimeoutFn = options.setTimeout ?? setTimeout;
+    this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRunWorker({
       ...workerOptions,
       spawnProcess: this.spawnProcess,
@@ -136,20 +155,26 @@ export class AgentManager {
     });
   }
 
-  /** Terminates the active run and starts one immediately with text; queued followups are preserved. */
+  /** Terminates the active run and starts one immediately with text; queued followups are preserved. Interrupts arriving within the coalesce window join one stop. */
   interrupt(chatId: number, text: string): Promise<void> {
     if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
     const state = this.state(chatId);
     return state.serial.run(async () => {
       await this.loadActivity(state);
       if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
-      if (state.running) {
-        state.interrupts.push(text);
-        const worker = state.worker;
-        if (worker) void worker.stop().catch((error) => console.error("Agent interrupt failed", error));
+      state.interrupts.push(text);
+      if (!state.running) {
+        this.launch(state, state.interrupts.shift()!);
         return;
       }
-      this.launch(state, text);
+      if (state.interruptTimer !== undefined) return;
+      const worker = state.worker;
+      if (!worker) return;
+      state.interruptTimer = this.setTimeoutFn(() => {
+        state.interruptTimer = undefined;
+        void worker.stop().catch((error) => console.error("Agent interrupt failed", error));
+      }, this.interruptCoalesceMs);
+      state.interruptTimer.unref?.();
     });
   }
 
@@ -216,6 +241,7 @@ export class AgentManager {
   beginShutdown(): Promise<void> {
     this.shuttingDown = true;
     const stops = [...this.states.values()].flatMap((state) => {
+      this.clearInterruptTimer(state);
       const worker = state.worker;
       if (!worker) return [];
       return [worker.stop().catch((error) => console.error("Agent shutdown stop failed", error))];
@@ -241,6 +267,7 @@ export class AgentManager {
       lastActivityAt: 0,
       activityLoaded: false,
       closing: false,
+      interruptTimer: undefined,
     };
     this.states.set(chatId, state);
     return state;
@@ -300,6 +327,7 @@ export class AgentManager {
   }
 
   private onRunSettled(state: ChatState): void {
+    this.clearInterruptTimer(state);
     state.running = false;
     state.worker = undefined;
     state.lastActivityAt = this.now();
@@ -307,6 +335,12 @@ export class AgentManager {
     const next = state.interrupts.shift() ?? state.followups.shift();
     if (next === undefined || state.closing || this.shuttingDown) return;
     this.launch(state, next);
+  }
+
+  private clearInterruptTimer(state: ChatState): void {
+    if (state.interruptTimer === undefined) return;
+    this.clearTimeoutFn(state.interruptTimer);
+    state.interruptTimer = undefined;
   }
 
   private async spawnWorker(state: ChatState, text: string): Promise<AgentRunWorker> {

@@ -8,11 +8,8 @@ import { tmpdir } from "node:os";
 
 import { GrammyError, type Bot } from "grammy";
 import {
-  addTelegramIngressEvent,
-  closeTelegramIngress,
   createTelegramBot,
   deleteTelegramMessage,
-  flushTelegramIngress,
   formatStatus,
   recordPollOwner,
   registerBotCommands,
@@ -27,7 +24,6 @@ import {
   sendTelegramMediaGroup,
   splitTelegramText,
   TelegramDeliveryQueue,
-  TelegramIngressBuffer,
 } from "../src/telegram.js";
 import type { AgentStatus } from "../src/agent.js";
 import { appendChatEvents, type ChatEvent } from "../src/events.js";
@@ -128,7 +124,7 @@ async function runAttachmentFixture(
     allowedUserIds: new Set([42]),
     dataDir,
   }, {
-    prompt,
+    interrupt: prompt,
   } as never);
   (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
   bot.api.getFile = vi.fn(getFileImplementation) as unknown as typeof bot.api.getFile;
@@ -145,7 +141,6 @@ async function runAttachmentFixture(
       document: { file_id: "file-id", file_name: fileName, mime_type: "text/plain" },
     },
   } as never);
-  await flushTelegramIngress(bot);
   return prompt;
 }
 
@@ -214,221 +209,7 @@ describe("splitTelegramText", () => {
   });
 });
 
-describe("TelegramIngressBuffer", () => {
-  const entry = () => ({
-    value: Promise.resolve<ChatEvent>({ type: "message", message: { message_id: 1, text: "m1" }, attachments: [] }),
-  });
 
-  it("batches a quiet window and wakes once", async () => {
-    vi.useFakeTimers();
-    try {
-      const wakes: number[] = [];
-      const buffer = new TelegramIngressBuffer(async (chatId) => {
-        wakes.push(chatId);
-      }, 2_000);
-
-      expect(buffer.add(7, entry())).toBe(true);
-      await vi.advanceTimersByTimeAsync(1_500);
-      expect(buffer.add(7, entry())).toBe(true);
-      await vi.advanceTimersByTimeAsync(2_000);
-
-      expect(wakes).toEqual([7]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("drains pre-barrier work before admitting post-barrier work", async () => {
-    const wakes: number[] = [];
-    const buffer = new TelegramIngressBuffer(async (chatId) => {
-      wakes.push(chatId);
-    }, 60_000);
-
-    buffer.add(7, entry());
-    const barrier = buffer.acquireBarrier(7);
-    buffer.add(7, entry());
-    await buffer.flush(7);
-    expect(wakes).toEqual([7]);
-
-    barrier.release();
-    await buffer.flush(7);
-    expect(wakes).toEqual([7, 7]);
-  });
-
-  it("defers post-barrier admission while an earlier batch is active", async () => {
-    const wakes: number[] = [];
-    let releaseFirst!: () => void;
-    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    let resolveFirstStarted!: () => void;
-    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
-    let batch = 0;
-    const buffer = new TelegramIngressBuffer(async () => {
-      batch += 1;
-      wakes.push(batch);
-      if (batch === 1) {
-        resolveFirstStarted();
-        await firstFinished;
-      }
-    }, 60_000);
-
-    buffer.add(7, entry());
-    const first = buffer.flush(7);
-    await firstStarted;
-    const barrier = buffer.acquireBarrier(7);
-    buffer.add(7, entry());
-    const beforeRelease = buffer.flush(7);
-    expect(wakes).toEqual([1]);
-
-    releaseFirst();
-    await Promise.all([first, beforeRelease]);
-    expect(wakes).toEqual([1]);
-    barrier.release();
-    await buffer.flush(7);
-    expect(wakes).toEqual([1, 2]);
-  });
-
-  it("releases the barrier when starting a new session fails", async () => {
-    const wakes: number[] = [];
-    const buffer = new TelegramIngressBuffer(async (chatId) => {
-      wakes.push(chatId);
-    }, 60_000);
-    const newSession = vi.fn(async () => {
-      throw new Error("session failed");
-    });
-
-    buffer.add(7, entry());
-    const barrier = buffer.acquireBarrier(7);
-    buffer.add(7, entry());
-    try {
-      await buffer.flush(7);
-      await newSession();
-    } catch {
-      // The command reports the failure after its barrier is resumed.
-    } finally {
-      barrier.release();
-    }
-
-    await buffer.flush(7);
-    expect(newSession).toHaveBeenCalledOnce();
-    expect(wakes).toEqual([7, 7]);
-  });
-
-  it("drains accepted barrier work after close and release", async () => {
-    const wakes: number[] = [];
-    const buffer = new TelegramIngressBuffer(async (chatId) => {
-      wakes.push(chatId);
-    }, 60_000);
-    const barrier = buffer.acquireBarrier(7);
-    buffer.add(7, entry());
-
-    buffer.close();
-    barrier.release();
-    await buffer.flushAll();
-    expect(wakes).toEqual([7]);
-  });
-
-  it("serializes overlapping batches in FIFO order even when later work completes first", async () => {
-    const completions: Array<() => void> = [];
-    const callbacks: number[] = [];
-    let resolveFirstStarted!: () => void;
-    let resolveSecondStarted!: () => void;
-    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
-    const secondStarted = new Promise<void>((resolve) => { resolveSecondStarted = resolve; });
-    let batch = 0;
-    const buffer = new TelegramIngressBuffer(() => new Promise<void>((resolve) => {
-      batch += 1;
-      const current = batch;
-      callbacks.push(current);
-      if (current === 1) resolveFirstStarted();
-      else resolveSecondStarted();
-      completions.push(resolve);
-    }), 60_000);
-
-    buffer.add(7, entry());
-    const first = buffer.flush(7);
-    await firstStarted;
-    buffer.add(7, entry());
-    const second = buffer.flush(7);
-    expect(callbacks).toEqual([1]);
-    completions[0]!();
-    await secondStarted;
-    expect(callbacks).toEqual([1, 2]);
-    completions[1]!();
-    await Promise.all([first, second]);
-  });
-
-  it("keeps accepted pending work deliverable after close", async () => {
-    const wakes: number[] = [];
-    const buffer = new TelegramIngressBuffer(async (chatId) => {
-      wakes.push(chatId);
-    }, 60_000);
-    buffer.add(7, entry());
-    buffer.close();
-    await buffer.flushAll();
-    expect(wakes).toEqual([7]);
-  });
-
-  it("does not suppress an in-flight flush when closing", async () => {
-    let responseStarted!: () => void;
-    const callbackStarted = new Promise<void>((resolve) => { responseStarted = resolve; });
-    let releaseResponse!: () => void;
-    const responseFinished = new Promise<void>((resolve) => { releaseResponse = resolve; });
-    let attempts = 0;
-    const buffer = new TelegramIngressBuffer(async () => {
-      attempts += 1;
-      responseStarted();
-      return responseFinished;
-    }, 60_000);
-    buffer.add(7, entry());
-    const draining = buffer.flush(7);
-    await callbackStarted;
-    expect(attempts).toBe(1);
-    buffer.close();
-    releaseResponse();
-    await draining;
-    await buffer.flushAll();
-    expect(attempts).toBe(1);
-  });
-
-  it("reports quiesced admission after close", () => {
-    const buffer = new TelegramIngressBuffer(async () => undefined);
-    buffer.close();
-    expect(buffer.add(7, entry())).toBe(false);
-  });
-
-
-  it("swallows a rejecting flush without retrying", async () => {
-    let attempts = 0;
-    const buffer = new TelegramIngressBuffer(async () => {
-      attempts += 1;
-      throw new Error("model failed");
-    });
-    buffer.add(7, entry());
-    await buffer.flushAll();
-    expect(attempts).toBe(1);
-  });
-
-  it("flushAll drains work admitted while an earlier batch is running", async () => {
-    let calls = 0;
-    const buffer = new TelegramIngressBuffer(async () => {
-      calls += 1;
-      if (calls === 1) {
-        buffer.add(7, entry());
-      }
-    }, 60_000);
-    buffer.add(7, entry());
-    await buffer.flushAll();
-    expect(calls).toBe(2);
-  });
-
-  it("catches synchronous callback throws without leaking a rejection", async () => {
-    const buffer = new TelegramIngressBuffer(() => {
-      throw new Error("synchronous handler failure");
-    });
-    buffer.add(7, entry());
-    await expect(buffer.flushAll()).resolves.toBeUndefined();
-  });
-});
 describe("TelegramDeliveryQueue", () => {
   it("delivers operations FIFO within one chat", async () => {
     const queue = new TelegramDeliveryQueue();
@@ -919,28 +700,7 @@ describe("Telegram attachment downloads", () => {
       vi.unstubAllGlobals();
     }
   });
-  it("does not prepare attachments after quiesced ingress admission", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        const getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/remote.bin" }));
-        const fetchMock = vi.fn(async () => {
-          throw new Error("fetch should not start after quiescing");
-        });
-        const prompt = await runAttachmentFixture(
-          dataDir,
-          fetchMock as unknown as typeof fetch,
-          "report.txt",
-          getFile,
-          closeTelegramIngress,
-        );
-        expect(getFile).not.toHaveBeenCalled();
-        expect(fetchMock).not.toHaveBeenCalled();
-        expect(prompt).not.toHaveBeenCalled();
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
+
 
   it("keeps Unicode attachment filenames within Linux filename limits", async () => {
     try {
@@ -991,7 +751,6 @@ describe("Telegram location and venue updates", () => {
         ...message,
       },
     } as never);
-    await flushTelegramIngress(bot);
     return prompt;
   }
 
@@ -1165,7 +924,6 @@ describe("Telegram callback queries", () => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
-      await flushTelegramIngress(bot);
       expect(prompt).toHaveBeenCalledWith(42, ".");
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
@@ -1178,7 +936,6 @@ describe("Telegram callback queries", () => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
-      await flushTelegramIngress(bot);
       expect(prompt).not.toHaveBeenCalled();
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(false);
       expect((await readChatEvents(dataDir)).some((event) => event.type === "callback")).toBe(false);
@@ -1190,7 +947,6 @@ describe("Telegram callback queries", () => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
-      await flushTelegramIngress(bot);
       expect(prompt).toHaveBeenCalledWith(42, ".");
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
       expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "x".repeat(100) } });
@@ -1217,7 +973,6 @@ describe("Telegram chat events", () => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate(textUpdate("hello") as never);
-      await flushTelegramIngress(bot);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
       expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", message: { message_id: 7, text: "hello" } });
       expect(prompt).toHaveBeenCalledWith(42, ".");
@@ -1338,7 +1093,6 @@ describe("Telegram poll answers", () => {
           option_ids: [1, 2],
         },
       } as never);
-      await flushTelegramIngress(bot);
       expect(prompt).not.toHaveBeenCalled();
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
@@ -1366,7 +1120,6 @@ describe("Telegram poll answers", () => {
           option_ids: [0],
         },
       } as never);
-      await flushTelegramIngress(bot);
       expect(prompt).not.toHaveBeenCalled();
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
@@ -1391,7 +1144,6 @@ describe("Telegram poll answers", () => {
           option_ids: [0],
         },
       } as never);
-      await flushTelegramIngress(bot);
       expect(prompt).not.toHaveBeenCalled();
       expect((await readChatEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
     });

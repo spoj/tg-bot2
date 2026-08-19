@@ -7,7 +7,7 @@ import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } f
 import type { Config } from "./config.js";
 import type { AgentManager, AgentStatus } from "./agent.js";
 import { SerialQueue } from "./queue.js";
-import { appendChatEvent, appendChatEvents, type ChatEvent } from "./events.js";
+import { appendChatEvent } from "./events.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
   WorkspaceOutboxSendMediaGroupRequest,
@@ -21,8 +21,7 @@ import type {
 } from "./outbox-protocol.js";
 import { appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
 
-const INGRESS_COOLDOWN_MS = 2_000;
-const WAKE_PROMPT = ".";
+export const WAKE_PROMPT = ".";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
@@ -49,203 +48,6 @@ type SavedAttachment = {
   failure?: string | undefined;
 };
 
-
-type BufferEntry = {
-  value: PromiseLike<ChatEvent>;
-};
-
-type PendingBatch = {
-  readonly chatId: number;
-  readonly entries: readonly BufferEntry[];
-  readonly owner: BufferEntry;
-};
-
-type IngressBarrierState = {
-  pending: number;
-  owners: number;
-  released: Promise<void>;
-  resolveReleased: () => void;
-};
-
-type BufferState = {
-  pending: BufferEntry[];
-  timer: NodeJS.Timeout | undefined;
-  generation: number;
-  tail: Promise<void>;
-  running: Set<Promise<void>>;
-  barrier: IngressBarrierState | undefined;
-};
-
-type TelegramIngressBarrier = {
-  release: () => void;
-};
-
-function invokeCallback<T>(callback: () => T | PromiseLike<T>): Promise<T> {
-  return Promise.resolve().then(callback);
-}
-
-export class TelegramIngressBuffer {
-  private closed = false;
-  private readonly states = new Map<number, BufferState>();
-  constructor(
-    private readonly flushBatch: (chatId: number, events: ChatEvent[]) => void | PromiseLike<void>,
-    private readonly cooldownMs = INGRESS_COOLDOWN_MS,
-  ) {}
-
-  add(chatId: number, entry: BufferEntry): boolean {
-    if (this.closed) return false;
-    const state = this.stateFor(chatId);
-    state.pending.push(entry);
-    if (!state.barrier) this.schedule(chatId, state);
-    return true;
-  }
-
-  private stateFor(chatId: number): BufferState {
-    let state = this.states.get(chatId);
-    if (!state) {
-      state = {
-        pending: [],
-        timer: undefined,
-        generation: 0,
-        tail: Promise.resolve(),
-        running: new Set(),
-        barrier: undefined,
-      };
-      this.states.set(chatId, state);
-    }
-    return state;
-  }
-
-  acquireBarrier(chatId: number): TelegramIngressBarrier {
-    const state = this.stateFor(chatId);
-    if (!state.barrier) {
-      this.cancelTimer(state);
-      let resolveReleased!: () => void;
-      const released = new Promise<void>((resolve) => { resolveReleased = resolve; });
-      state.barrier = {
-        pending: state.pending.length,
-        owners: 0,
-        released,
-        resolveReleased,
-      };
-    }
-    const barrier = state.barrier!;
-    barrier.owners += 1;
-    let released = false;
-    return {
-      release: () => {
-        if (released) return;
-        released = true;
-        this.releaseBarrier(chatId, state!, barrier);
-      },
-    };
-  }
-
-  private releaseBarrier(chatId: number, state: BufferState, barrier: IngressBarrierState): void {
-    if (state.barrier !== barrier) return;
-    barrier.owners -= 1;
-    if (barrier.owners > 0) return;
-    state.barrier = undefined;
-    barrier.resolveReleased();
-    if (state.pending.length > 0 && !this.closed) this.schedule(chatId, state);
-    this.maybeDelete(chatId, state);
-  }
-
-  private schedule(chatId: number, state: BufferState): void {
-    if (state.timer) clearTimeout(state.timer);
-    const generation = ++state.generation;
-    state.timer = setTimeout(() => {
-      if (this.states.get(chatId) !== state || state.generation !== generation) return;
-      state.timer = undefined;
-      void this.flush(chatId);
-    }, this.cooldownMs);
-    state.timer.unref?.();
-  }
-
-  private cancelTimer(state: BufferState): void {
-    ++state.generation;
-    if (state.timer) clearTimeout(state.timer);
-    state.timer = undefined;
-  }
-
-  private claim(chatId: number, state: BufferState, maxEntries = Number.POSITIVE_INFINITY): void {
-    if (state.pending.length === 0) return;
-    const count = Math.min(maxEntries, state.pending.length);
-    const entries = state.pending.splice(0, count);
-    const owner = entries.at(-1);
-    if (!owner) return;
-    if (state.barrier) state.barrier.pending -= entries.length;
-    this.cancelTimer(state);
-    const batch: PendingBatch = Object.freeze({
-      chatId,
-      entries,
-      owner,
-    });
-    const job = state.tail.then(() => this.executeBatch(batch));
-    state.tail = job;
-    state.running.add(job);
-    void job.then(() => {
-      state.running.delete(job);
-    });
-  }
-
-  private maybeDelete(chatId: number, state: BufferState): void {
-    if (state.pending.length === 0 && state.running.size === 0 && !state.timer && !state.barrier && this.states.get(chatId) === state) {
-      this.states.delete(chatId);
-    }
-  }
-
-  private async executeBatch(batch: PendingBatch): Promise<void> {
-    try {
-      const events = await Promise.all(batch.entries.map((entry) => entry.value));
-      await invokeCallback(() => this.flushBatch(batch.chatId, events));
-    } catch (error) {
-      console.error("Buffered Telegram request failed", error);
-    }
-  }
-
-  async flush(chatId: number): Promise<void> {
-    const state = this.states.get(chatId);
-    if (!state) return;
-    while (true) {
-      if (state.barrier) {
-        this.claim(chatId, state, state.barrier.pending);
-        await state.tail;
-        break;
-      }
-      this.claim(chatId, state);
-      await state.tail;
-      if (state.pending.length === 0 && state.running.size === 0 && !state.barrier) break;
-    }
-    this.maybeDelete(chatId, state);
-  }
-
-  close(): void {
-    this.closed = true;
-    for (const state of this.states.values()) this.cancelTimer(state);
-    for (const [chatId, state] of this.states) this.maybeDelete(chatId, state);
-  }
-
-  async flushAll(): Promise<void> {
-    while (true) {
-      const states = [...this.states.entries()];
-      if (states.length === 0) return;
-      const barriers = states
-        .map(([, state]) => state.barrier?.released)
-        .filter((released): released is Promise<void> => released !== undefined);
-      await Promise.all(states.map(([chatId, state]) => {
-        if (this.states.get(chatId) !== state) return Promise.resolve();
-        return this.flush(chatId);
-      }));
-      if (barriers.length > 0) {
-        await Promise.all(barriers);
-        continue;
-      }
-      const outstanding = [...this.states.values()].some((state) => state.pending.length > 0 || state.running.size > 0);
-      if (!outstanding) return;
-    }
-  }
-}
 
 export class TelegramDeliveryQueue {
   private readonly queues = new Map<number, SerialQueue>();
@@ -837,20 +639,7 @@ async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<S
     : [];
 }
 
-const ingressByBot = new WeakMap<Bot, TelegramIngressBuffer>();
 
-export async function flushTelegramIngress(bot: Bot): Promise<void> {
-  await ingressByBot.get(bot)?.flushAll();
-}
-
-export function closeTelegramIngress(bot: Bot): void {
-  ingressByBot.get(bot)?.close();
-}
-
-/** Queues a host-side event into the bot's ingress buffer for delivery with the next flush. */
-export function addTelegramIngressEvent(bot: Bot, chatId: number, event: ChatEvent): void {
-  ingressByBot.get(bot)?.add(chatId, { value: Promise.resolve(event) });
-}
 
 /** Publishes the reduced command set to Telegram's client UI. */
 export async function registerBotCommands(bot: Bot): Promise<void> {
@@ -876,14 +665,9 @@ export function createTelegramBot(
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
 
-  const ingress = new TelegramIngressBuffer(async (chatId, events) => {
-    const workspace = chatPaths(config.dataDir, chatId).workspace;
-    await Promise.all(events.map((event) => appendChatEvent(workspace, event)));
-    await agents.interrupt(chatId, WAKE_PROMPT).catch((error) => {
-      console.error("Telegram wake prompt failed", error);
-    });
+  const wake = (chatId: number): Promise<void> => agents.interrupt(chatId, WAKE_PROMPT).catch((error) => {
+    console.error("Telegram wake prompt failed", error);
   });
-  ingressByBot.set(bot, ingress);
 
   bot.use(async (ctx, next) => {
     // grammY's ctx.from omits poll_answer updates; voters arrive in pollAnswer.user.
@@ -912,29 +696,27 @@ export function createTelegramBot(
     await queuedReply(ctx, formatStatus(state));
   });
 
-  bot.on("message", (ctx) => {
+  bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
-    let startPreparation!: () => void;
-    const prepared = new Promise<ChatEvent>((resolve, reject) => {
-      startPreparation = () => {
-        void prepareMessage(bot, config, ctx).then(
-          (attachments) => resolve({ type: "message", message: ctx.message, attachments }),
-          reject,
-        );
-      };
+    const attachments = await prepareMessage(bot, config, ctx);
+    await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
+      type: "message",
+      message: ctx.message,
+      attachments,
     });
-    const admission = ingress.add(chatId, { value: prepared });
-    if (admission) startPreparation();
+    await wake(chatId);
   });
-  bot.on("callback_query", (ctx) => {
+  bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
-    ingress.add(chatId, {
-      value: Promise.resolve({ type: "callback", callback_query: query }),
+    await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
+      type: "callback",
+      callback_query: query,
     });
+    await wake(chatId);
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
@@ -945,6 +727,7 @@ export function createTelegramBot(
       poll_answer: answer,
     });
   });
+
 
   bot.catch((error) => {
     const cause = error.error;

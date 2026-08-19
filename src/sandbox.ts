@@ -131,6 +131,8 @@ export type PiRunSandboxPaths = {
   appendSystemPrompt?: string;
   /** Resumes the most recent session (passes --continue). */
   resume?: boolean;
+  /** In-sandbox directory for session files; defaults to /workspace/.pi/sessions. */
+  sessionDir?: string;
   /** "provider/modelId" pattern passed as --model; overrides session-restored models. */
   model?: string;
   /** Thinking level passed as --thinking. */
@@ -201,7 +203,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   );
   const piArgs = [
     "--print",
-    "--session-dir", "/workspace/.pi/sessions",
+    "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
     "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
     ...(paths.resume ? ["--continue"] : []),

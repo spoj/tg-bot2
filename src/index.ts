@@ -3,7 +3,10 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { addTelegramIngressEvent, createTelegramBot, closeTelegramIngress, dispatchOutboxRequest, flushTelegramIngress, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
+import { WorkspaceTasks } from "./task.js";
+import { appendChatEvent } from "./events.js";
+import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue, WAKE_PROMPT } from "./telegram.js";
+import { chatPaths } from "./util.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -17,13 +20,13 @@ export interface DisposableServices {
   agents: Pick<AgentManager, "disposeAll">;
   scheduler: Pick<WorkspaceScheduler, "stop">;
   outbox: Pick<WorkspaceOutbox, "stop">;
+  tasks: Pick<WorkspaceTasks, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
 }
 
-// Stops the scheduler and outbox, disposes agents, terminates sandboxes, and
-// drains the delivery queue. Each step is guarded so a failure in one never
-// skips the rest. Called by the graceful shutdown() path after it overlaps
-// beginShutdown with the ingress drain.
+// Stops the scheduler, outbox, and tasks, disposes agents, terminates
+// sandboxes, and drains the delivery queue. Each step is guarded so a failure
+// in one never skips the rest.
 export async function finishDisposal(services: DisposableServices): Promise<void> {
   try {
     await services.scheduler.stop();
@@ -34,6 +37,11 @@ export async function finishDisposal(services: DisposableServices): Promise<void
     await services.outbox.stop();
   } catch (error) {
     console.error("Outbox shutdown failed", error);
+  }
+  try {
+    await services.tasks.stop();
+  } catch (error) {
+    console.error("Task shutdown failed", error);
   }
   try {
     await services.agents.disposeAll();
@@ -65,12 +73,22 @@ export async function main(): Promise<void> {
     dataDir,
     run: (chatId, prompt) => agentManager.followup(chatId, prompt),
   });
+  const wakeAgent = (chatId: number): Promise<void> => agentManager.interrupt(chatId, WAKE_PROMPT);
   const outboxInstance = new WorkspaceOutbox({
     dataDir,
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
     notifyAgent: (chatId, message) => {
-      addTelegramIngressEvent(bot, chatId, { type: "outbox_rejected", detail: message });
+      appendChatEvent(chatPaths(dataDir, chatId).workspace, { type: "outbox_rejected", detail: message });
+      return wakeAgent(chatId);
     },
+  });
+  const tasksInstance = new WorkspaceTasks({
+    dataDir,
+    appRoot: process.cwd(),
+    bwrapPath,
+    spawnProcess,
+    terminateProcessGroup,
+    wakeAgent,
   });
 
   let shuttingDown = false;
@@ -85,17 +103,11 @@ export async function main(): Promise<void> {
       } catch (error) {
         console.error("Telegram stop failed", error);
       }
-      closeTelegramIngress(bot);
       const agentShutdown = agentManager.beginShutdown().catch((error) => {
         console.error("Agent abort failed", error);
       });
-      try {
-        await flushTelegramIngress(bot);
-      } catch (error) {
-        console.error("Telegram ingress drain failed", error);
-      }
       await agentShutdown;
-      await finishDisposal({ agents: agentManager, scheduler: schedulerInstance, outbox: outboxInstance, delivery: deliveryQueue });
+      await finishDisposal({ agents: agentManager, scheduler: schedulerInstance, outbox: outboxInstance, tasks: tasksInstance, delivery: deliveryQueue });
     })();
     return shutdownPromise;
   };
@@ -109,6 +121,11 @@ export async function main(): Promise<void> {
       return;
     }
     await outboxInstance.start();
+    if (shuttingDown) {
+      await shutdown("startup interrupted");
+      return;
+    }
+    await tasksInstance.start();
     if (shuttingDown) {
       await shutdown("startup interrupted");
       return;

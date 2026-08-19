@@ -3,7 +3,6 @@ import { deferred, type Deferred } from "./helpers.js";
 
 const state = vi.hoisted(() => {
   const order: string[] = [];
-  const flushState = { current: undefined as Deferred<void> | undefined };
   const agents = {
     beginShutdown: vi.fn(() => {
       order.push("agents.beginShutdown");
@@ -22,8 +21,6 @@ const state = vi.hoisted(() => {
     config: { token: "token", allowedUserIds: new Set([42]), dataDir: "/requested" },
     sandbox: { dataDir: "/canonical-data", bwrapPath: "/validated/bwrap" },
     signalHandlers: {} as Record<string, () => void>,
-    flush: undefined as Deferred<void> | undefined,
-    setFlush: (value: Deferred<void>) => { flushState.current = value; },
     checkSandboxEnvironment: vi.fn(),
     agentManager: vi.fn(class AgentManagerMock {
       beginShutdown = agents.beginShutdown;
@@ -41,13 +38,13 @@ const state = vi.hoisted(() => {
       start = vi.fn(async () => {});
       stop = vi.fn(async () => { order.push("outbox.stop"); });
     }),
+    tasks: vi.fn(class WorkspaceTasksMock {
+      constructor(_options: unknown) {}
+      start = vi.fn(async () => {});
+      stop = vi.fn(async () => { order.push("tasks.stop"); });
+    }),
     createTelegramBot: vi.fn(() => bot),
     dispatchOutboxRequest: vi.fn(),
-    closeTelegramIngress: vi.fn(() => { order.push("closeTelegramIngress"); }),
-    flushTelegramIngress: vi.fn(async () => {
-      order.push("flushTelegramIngress");
-      await flushState.current?.promise;
-    }),
     delivery: vi.fn(class TelegramDeliveryQueueMock {
       enqueue = vi.fn(async (_chatId: number, run: () => unknown) => run());
       drain = vi.fn(async () => { order.push("delivery.drain"); });
@@ -57,6 +54,7 @@ const state = vi.hoisted(() => {
     terminateProcessGroup: vi.fn(),
   };
 });
+
 
 vi.mock("../src/config.js", () => ({
   parseConfig: () => state.config,
@@ -70,27 +68,23 @@ vi.mock("../src/sandbox.js", () => ({
 vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
 vi.mock("../src/outbox.js", () => ({ WorkspaceOutbox: state.outbox }));
+vi.mock("../src/task.js", () => ({ WorkspaceTasks: state.tasks }));
 vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
-  closeTelegramIngress: state.closeTelegramIngress,
-  flushTelegramIngress: state.flushTelegramIngress,
   dispatchOutboxRequest: state.dispatchOutboxRequest,
   TelegramDeliveryQueue: state.delivery,
+  WAKE_PROMPT: ".",
 }));
 
 async function importIndex(configure?: () => void): Promise<typeof import("../src/index.js")> {
-  const flush = deferred<void>();
-  state.flush = flush;
-  state.setFlush(flush);
   state.order.length = 0;
   state.checkSandboxEnvironment.mockReset().mockResolvedValue(state.sandbox);
   state.agentManager.mockClear();
   state.scheduler.mockClear();
   state.outbox.mockClear();
+  state.tasks.mockClear();
   state.createTelegramBot.mockClear();
   state.dispatchOutboxRequest.mockClear();
-  state.closeTelegramIngress.mockClear();
-  state.flushTelegramIngress.mockClear();
   state.terminateActiveSandboxes.mockClear();
   state.agents.beginShutdown.mockClear();
   state.agents.disposeAll.mockClear();
@@ -120,6 +114,7 @@ describe("application startup and shutdown wiring", () => {
     );
     expect(state.scheduler).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
+    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data", bwrapPath: "/validated/bwrap", wakeAgent: expect.any(Function) }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: ["message", "callback_query", "poll_answer"],
     }));
@@ -139,20 +134,20 @@ describe("application startup and shutdown wiring", () => {
     expect(result).toEqual({ messageId: 7 });
   });
 
-  it("raises the shutdown gate before waiting for ingress and treats signal abort as graceful", async () => {
+  it("raises the shutdown gate, disposes every service, and treats signal abort as graceful", async () => {
     const start = deferred<void>();
     const index = await importIndex(() => state.bot.start.mockReturnValue(start.promise));
     void index.main();
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
 
     state.signalHandlers.SIGTERM?.();
-    await vi.waitFor(() => expect(state.order).toEqual(["bot.stop", "closeTelegramIngress", "agents.beginShutdown", "flushTelegramIngress"]));
+    await vi.waitFor(() => expect(state.order).toEqual([
+      "bot.stop", "agents.beginShutdown", "scheduler.stop", "outbox.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
+    ]));
     expect(process.exitCode).toBeUndefined();
 
     start.reject(Object.assign(new Error("telegram polling aborted"), { name: "AbortError" }));
-    state.flush?.resolve();
-    await vi.waitFor(() => expect(state.agents.disposeAll).toHaveBeenCalledOnce());
-    expect(process.exitCode).toBeUndefined();
+    await vi.waitFor(() => expect(process.exitCode).toBeUndefined());
   });
 
   it("does not classify an unrelated startup failure as a signal abort", async () => {
@@ -176,6 +171,7 @@ describe("finishDisposal", () => {
         agents: { disposeAll: step("disposeAll") },
         scheduler: { stop: step("scheduler.stop") },
         outbox: { stop: step("outbox.stop") },
+        tasks: { stop: step("tasks.stop") },
         delivery: { drain: step("delivery.drain") },
       },
     };
@@ -187,7 +183,7 @@ describe("finishDisposal", () => {
 
     await finishDisposal(services);
 
-    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
@@ -198,7 +194,7 @@ describe("finishDisposal", () => {
 
     await expect(finishDisposal(services)).resolves.toBeUndefined();
 
-    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });

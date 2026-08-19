@@ -37,6 +37,16 @@ export type ChatEvent =
     data?: unknown;
   }
   | {
+    /** A delegated subagent task settled. `id` is the task filename stem; paths are absolute under /workspace. */
+    type: "subagent";
+    id: string;
+    status: "done" | "failed";
+    outputFile?: string | undefined;
+    sessionFile?: string | undefined;
+    exitCode?: number | null | undefined;
+    stderr?: string | undefined;
+  }
+  | {
     /** A rejected outbox request. `detail` describes the failure; the request body stays in outbox/failed/. */
     type: "outbox_rejected";
     detail: string;
@@ -124,6 +134,11 @@ timestamp). Event types:
   response object the request produced (for stop_poll it is the final closed Poll).
 - outbox_rejected: {v:1,t,type:'outbox_rejected',detail} reports a rejected request; the
   rejection is recorded in .tg-bot/failed.jsonl ({id,request,error}) so you can inspect it.
+- subagent: a delegated task settled: {v:1,t,type:'subagent',id,status,outputFile?,sessionFile?,
+  exitCode?,stderr?} where id is the task's filename stem, status is done or failed,
+  outputFile is the final report (the subagent's last message), sessionFile is its session
+  transcript, and stderr carries a bounded failure tail when failed. Paths are absolute
+  under /workspace/.pi/subagents/<id>/...; read or grep them for the subagent's work.
 Grep events.jsonl whenever you need recent chat history or sent message ids.
 When a user message, button press, or outbox rejection arrives, the host wakes you with a
 single "." prompt that carries no content. Read the newest events.jsonl lines and decide

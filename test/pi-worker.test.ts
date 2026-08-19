@@ -56,10 +56,35 @@ describe("PiRunWorker", () => {
       });
       const done = worker.run();
       await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-      const [, args, options] = spawn.mock.calls[0] ?? [];
+      const [, , options] = spawn.mock.calls[0] ?? [];
+      const args = spawn.mock.calls[0]?.[1] ?? [];
       expect(options).toEqual({ detached: true, env: {}, stdio: ["pipe", "pipe", "pipe"] });
       expect(args).toContain("--print");
+      expect(args).toContain("--session-dir");
+      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/sessions");
       expect(child.stdin.end).toHaveBeenCalledWith("hello world", "utf8");
+      child.emit("exit", 0, null);
+      await expect(done).resolves.toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("passes a custom session directory to the CLI", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiRunWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        message: "delegated work",
+        sessionDir: "/workspace/.pi/subagents/alpha/sessions",
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      const done = worker.run();
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      const args = spawn.mock.calls[0]?.[1] ?? [];
+      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/subagents/alpha/sessions");
       child.emit("exit", 0, null);
       await expect(done).resolves.toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
     } finally {

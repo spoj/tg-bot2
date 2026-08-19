@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import {
   buildPiRunBwrapArgs,
@@ -61,6 +63,18 @@ async function ensureWebSearchConfig(workspace: string): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
+}
+async function ensurePromptFile(content: string): Promise<string> {
+  const hash = createHash("sha256").update(content, "utf8").digest("hex");
+  const promptDir = path.join(os.tmpdir(), "tg-bot2-prompts");
+  await ensurePrivateDirectory(promptDir);
+  const promptFile = path.join(promptDir, `prompt-${hash}.md`);
+  try {
+    await writeFile(promptFile, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  return promptFile;
 }
 
 async function prepareWorkspace(workspace: string): Promise<void> {
@@ -143,12 +157,15 @@ export class PiRunWorker {
 
   private async runInternal(): Promise<PiRunResult> {
     await prepareWorkspace(this.options.workspace);
+    const promptFile = this.options.appendSystemPrompt !== undefined
+      ? await ensurePromptFile(this.options.appendSystemPrompt)
+      : undefined;
     const built = await buildPiRunBwrapArgs({
       workspace: this.options.workspace,
       appRoot: this.options.appRoot,
       ...defined({
         cliPath: this.options.cliPath,
-        appendSystemPrompt: this.options.appendSystemPrompt,
+        appendSystemPrompt: promptFile,
         resume: this.options.resume,
         sessionDir: this.options.sessionDir,
         model: this.options.model,

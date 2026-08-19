@@ -149,6 +149,32 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     await rm(root, { recursive: true, force: true });
   }
 });
+it("binds appendSystemPrompt read-only to /app/append-system-prompt.md", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const hostPrompt = path.join(f.root, "system-prompt.md");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await writeFile(hostPrompt, "prompt text", { mode: 0o600 });
+    const workerArgs = await buildPiRunBwrapArgs({
+      workspace: f.workspace,
+      appRoot,
+      appendSystemPrompt: hostPrompt,
+    });
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--dir", "/app",
+      "--ro-bind", hostPrompt, "/app/append-system-prompt.md",
+    ]));
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--append-system-prompt", "/app/append-system-prompt.md",
+    ]));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
 
 it("does not follow or clobber a write-probe symlink", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-probe-test-"));

@@ -91,6 +91,30 @@ describe("PiRunWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+  it("writes appendSystemPrompt to a prompt file and mounts it read-only", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiRunWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        message: "hello",
+        appendSystemPrompt: "custom system prompt",
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      const done = worker.run();
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      const args = spawn.mock.calls[0]?.[1] ?? [];
+      expect(args).toContain("--append-system-prompt");
+      expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("/app/append-system-prompt.md");
+      expect(args).toContain("/app/append-system-prompt.md");
+      child.emit("exit", 0, null);
+      await expect(done).resolves.toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
 
   it("captures bounded stdout and stderr into the run result", async () => {
     const f = await fixture();

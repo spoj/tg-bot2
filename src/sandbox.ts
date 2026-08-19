@@ -188,7 +188,9 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   }
   args.push(
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    "--dir", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
+    ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
     "--bind", workspace, "/workspace",
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
@@ -205,7 +207,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--print",
     "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
     "--approve",
-    ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
+    ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),
     ...(paths.resume ? ["--continue"] : []),
     ...(paths.model === undefined ? [] : ["--model", paths.model]),
     ...(paths.thinkingLevel === undefined ? [] : ["--thinking", paths.thinkingLevel]),

@@ -114,7 +114,7 @@ describe("application startup and shutdown wiring", () => {
     );
     expect(state.scheduler).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
-    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data", bwrapPath: "/validated/bwrap", wakeAgent: expect.any(Function) }));
+    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data", bwrapPath: "/validated/bwrap", agent: state.agentManager.mock.instances[0] }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: ["message", "callback_query", "poll_answer"],
     }));

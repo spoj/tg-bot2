@@ -1,12 +1,14 @@
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
 import { lstat, mkdir, open, opendir, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { appendChatEvent } from "./events.js";
+import type { AgentManager } from "./agent.js";
+import { appendSystemEvent } from "./events.js";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import { SerialQueue } from "./queue.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
-import { SUBAGENT_PROMPT } from "./task-protocol.js";
+import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
 import { chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 
 export type WorkspaceTaskWorker = {
@@ -16,7 +18,8 @@ export type WorkspaceTaskWorker = {
 
 export type WorkspaceTaskWorkerOptions = {
   workspace: string;
-  taskId: string;
+  /** Host-generated uuid identifying this run's directory under .pi/tasks/. */
+  runId: string;
   /** The complete prompt read from the claimed task file. */
   prompt: string;
 };
@@ -32,8 +35,8 @@ export type WorkspaceTasksOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
-  /** Wakes the agent after each task settles; the completion is recorded in events.jsonl first. */
-  wakeAgent?: (chatId: number) => Promise<void> | void;
+  /** Receives a completion followup per settled task, naming the prompt and its run directory. */
+  agent: Pick<AgentManager, "followup">;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -50,12 +53,11 @@ const MAX_TASK_BYTES = 64 * 1024;
 // Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
 const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
 const MAX_TASK_ENTRIES_PER_CHAT = 256;
-const MAX_SUBAGENT_DIRS_PER_CHAT = 16;
-const MAX_SUBAGENT_DIRS_PER_SCAN = 2 * MAX_SUBAGENT_DIRS_PER_CHAT;
+const MAX_RUN_DIRS_PER_CHAT = 16;
+const MAX_RUN_DIRS_PER_SCAN = 2 * MAX_RUN_DIRS_PER_CHAT;
 const TASK_DIR = "task";
-const SUBAGENTS_DIR = path.join(".pi", "subagents");
+const TASKS_DIR = path.join(".pi", "tasks");
 const SESSIONS_DIR = "sessions";
-const TASK_FILE_NAME = "task.md";
 const OUTPUT_FILE = "output.md";
 const RESULT_FILE = "result.json";
 const TASK_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(txt|md)$/u;
@@ -68,7 +70,6 @@ type ChatWatcher = {
 };
 
 type InFlightTask = {
-  taskId: string;
   worker: WorkspaceTaskWorker;
 };
 
@@ -142,15 +143,21 @@ async function removeTree(directory: string, depth: number): Promise<void> {
   await rmdir(directory);
 }
 
-/** Ensures the subagents root is a real directory, replacing a planted symlink. */
-async function ensureSubagentsDirectory(workspace: string): Promise<string> {
-  const directory = path.join(workspace, SUBAGENTS_DIR);
+/** Ensures the tasks root is a real directory, replacing a planted symlink. */
+async function ensureTasksDirectory(workspace: string): Promise<string> {
+  const directory = path.join(workspace, TASKS_DIR);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const entry = await lstat(directory);
   if (!entry.isDirectory() || entry.isSymbolicLink()) {
-    throw new Error(`Subagents path must be a real directory: ${directory}`);
+    throw new Error(`Tasks path must be a real directory: ${directory}`);
   }
   return directory;
+}
+
+/** Finds the claimed prompt file inside a run directory, keeping the agent's original filename. */
+async function findTaskFile(runDirectory: string): Promise<string | undefined> {
+  const entries = await readBoundedEntries(runDirectory, MAX_RUN_DIRS_PER_SCAN);
+  return entries.find((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))?.name;
 }
 
 async function newestSessionFile(sessionsDirectory: string): Promise<string | undefined> {
@@ -169,12 +176,13 @@ async function newestSessionFile(sessionsDirectory: string): Promise<string | un
 }
 
 /**
- * Runs agent-submitted subagent tasks: watches .tg-bot/task/*.txt|md, claims each
- * file by moving it into a per-task run directory, executes one background Pi run
- * per chat at a time, and reports completions as events plus an agent wake.
+ * Runs agent-submitted background tasks: watches .tg-bot/task/*.txt|md, claims each
+ * file into a host-generated uuid run directory under .pi/tasks/, executes one
+ * background Pi run per chat at a time, records the settlement in system.jsonl, and
+ * sends the agent a completion followup naming the prompt and the run directory.
  */
 export class WorkspaceTasks {
-  private readonly wakeAgent: WorkspaceTasksOptions["wakeAgent"];
+  private readonly agent: WorkspaceTasksOptions["agent"];
   private readonly dataDir: string;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
@@ -191,7 +199,7 @@ export class WorkspaceTasks {
   private readonly queues = new Map<number, SerialQueue>();
   private readonly chatWatchers = new Map<number, ChatWatcher>();
   private readonly inFlight = new Map<number, InFlightTask>();
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private timer: NodeJS.Timeout | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
   private running = false;
@@ -207,7 +215,7 @@ export class WorkspaceTasks {
     this.spawnProcess = options.spawnProcess;
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
-    this.wakeAgent = options.wakeAgent;
+    this.agent = options.agent;
     this.pollIntervalMs = pollIntervalMs;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
@@ -218,10 +226,10 @@ export class WorkspaceTasks {
       workspace: workerOptions.workspace,
       appRoot: this.appRoot,
       ...defined({ bwrapPath: this.bwrapPath }),
-      appendSystemPrompt: SUBAGENT_PROMPT,
+      appendSystemPrompt: TASK_RUNNER_PROMPT,
       message: workerOptions.prompt,
       resume: false,
-      sessionDir: `/workspace/.pi/subagents/${workerOptions.taskId}/${SESSIONS_DIR}`,
+      sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,
       ...defined({ stopGraceMs: this.stopGraceMs }),
@@ -408,7 +416,7 @@ export class WorkspaceTasks {
       if (workspaceDirectory.realPath !== path.join(chatDirectory.realPath, "workspace")) {
         throw new Error(`Workspace for chat ${chatId} is outside the chat directory`);
       }
-      await this.recoverSubagentDirs(workspace);
+      await this.recoverRunDirs(workspace);
       metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
       taskDirectory = await openPinnedDirectory(path.join(metadata.path, TASK_DIR));
 
@@ -420,23 +428,20 @@ export class WorkspaceTasks {
       const name = entries[0];
       if (name === undefined) return;
 
-      const taskId = name.replace(/\.(txt|md)$/u, "");
-      const runDirectory = path.join(workspace, SUBAGENTS_DIR, taskId);
-      await removeTree(runDirectory, 2).catch((error) => {
-        if (!isMissing(error)) throw error;
-      });
+      const runId = randomUUID();
+      const runDirectory = path.join(workspace, TASKS_DIR, runId);
       await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
       try {
-        await rename(path.join(taskDirectory.path, name), path.join(runDirectory, TASK_FILE_NAME));
+        await rename(path.join(taskDirectory.path, name), path.join(runDirectory, name));
       } catch (error) {
         if (isMissing(error)) return; // The agent deleted the pending task.
         throw error;
       }
       let prompt: string;
       try {
-        prompt = await readTaskPrompt(path.join(runDirectory, TASK_FILE_NAME));
+        prompt = await readTaskPrompt(path.join(runDirectory, name));
       } catch (error) {
-        await this.settleTask(chatId, workspace, taskId, runDirectory, {
+        await this.settleTask(chatId, workspace, name, runId, runDirectory, {
           code: null,
           signal: null,
           stderr: errorMessage(error),
@@ -447,9 +452,9 @@ export class WorkspaceTasks {
 
       let worker: WorkspaceTaskWorker;
       try {
-        worker = await this.workerFactory({ workspace, taskId, prompt });
+        worker = await this.workerFactory({ workspace, runId, prompt });
       } catch (error) {
-        await this.settleTask(chatId, workspace, taskId, runDirectory, {
+        await this.settleTask(chatId, workspace, name, runId, runDirectory, {
           code: null,
           signal: null,
           stderr: errorMessage(error),
@@ -457,7 +462,7 @@ export class WorkspaceTasks {
         });
         return;
       }
-      this.inFlight.set(chatId, { taskId, worker });
+      this.inFlight.set(chatId, { worker });
       let result: PiRunResult;
       try {
         result = await worker.run();
@@ -466,7 +471,7 @@ export class WorkspaceTasks {
       } finally {
         if (this.inFlight.get(chatId)?.worker === worker) this.inFlight.delete(chatId);
       }
-      await this.settleTask(chatId, workspace, taskId, runDirectory, result);
+      await this.settleTask(chatId, workspace, name, runId, runDirectory, result);
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
@@ -479,55 +484,59 @@ export class WorkspaceTasks {
   }
 
   /** Re-queues run directories orphaned by a host crash and prunes the oldest beyond the cap. */
-  private async recoverSubagentDirs(workspace: string): Promise<void> {
-    let subagentsPath: string;
+  private async recoverRunDirs(workspace: string): Promise<void> {
+    let tasksPath: string;
     try {
-      subagentsPath = await ensureSubagentsDirectory(workspace);
+      tasksPath = await ensureTasksDirectory(workspace);
     } catch (error) {
       this.report(error);
       return;
     }
-    const entries = await readBoundedEntries(subagentsPath, MAX_SUBAGENT_DIRS_PER_SCAN);
+    const entries = await readBoundedEntries(tasksPath, MAX_RUN_DIRS_PER_SCAN);
     const directories = entries.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink());
     const withMtime = await Promise.all(directories.map(async (entry) => ({
       name: entry.name,
-      mtimeMs: (await lstat(path.join(subagentsPath, entry.name))).mtimeMs,
+      mtimeMs: (await lstat(path.join(tasksPath, entry.name))).mtimeMs,
     })));
     withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     for (const directory of withMtime) {
-      const runDirectory = path.join(subagentsPath, directory.name);
+      const runDirectory = path.join(tasksPath, directory.name);
       try {
         await lstat(path.join(runDirectory, RESULT_FILE));
       } catch (error) {
-        if (isMissing(error)) await this.requeueOrphan(workspace, runDirectory, directory.name).catch((requeueError) => this.report(requeueError));
+        if (isMissing(error)) await this.requeueOrphan(workspace, runDirectory).catch((requeueError) => this.report(requeueError));
         else this.report(error);
       }
     }
-    for (const stale of withMtime.slice(MAX_SUBAGENT_DIRS_PER_CHAT)) {
-      await removeTree(path.join(subagentsPath, stale.name), 2).catch((error) => {
+    for (const stale of withMtime.slice(MAX_RUN_DIRS_PER_CHAT)) {
+      await removeTree(path.join(tasksPath, stale.name), 2).catch((error) => {
         if (!isMissing(error)) this.report(error);
       });
     }
   }
 
-  /** Moves an orphaned task prompt back into the task queue and clears the run directory. */
-  private async requeueOrphan(workspace: string, runDirectory: string, taskId: string): Promise<void> {
-    const taskDirectory = path.join(workspace, TG_BOT_DIR, TASK_DIR);
-    await mkdir(taskDirectory, { recursive: true, mode: 0o700 });
-    try {
-      await rename(path.join(runDirectory, TASK_FILE_NAME), path.join(taskDirectory, `${taskId}.md`));
-    } catch (error) {
-      if (!isMissing(error)) throw error;
+  /** Moves an orphaned task prompt back into the task queue under its original name and clears the run directory. */
+  private async requeueOrphan(workspace: string, runDirectory: string): Promise<void> {
+    const name = await findTaskFile(runDirectory);
+    if (name !== undefined) {
+      const taskDirectory = path.join(workspace, TG_BOT_DIR, TASK_DIR);
+      await mkdir(taskDirectory, { recursive: true, mode: 0o700 });
+      try {
+        await rename(path.join(runDirectory, name), path.join(taskDirectory, name));
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
     }
     await removeTree(runDirectory, 2);
   }
 
-  /** Records the outcome, appends the subagent event, and wakes the agent. */
+  /** Records the outcome, appends the system event, and sends the agent a completion followup. */
   private async settleTask(
     chatId: number,
     workspace: string,
-    taskId: string,
+    name: string,
+    runId: string,
     runDirectory: string,
     result: PiRunResult,
   ): Promise<void> {
@@ -536,31 +545,27 @@ export class WorkspaceTasks {
     const failed = result.code !== 0;
     const status = failed ? "failed" : "done";
     const stderr = failed ? errorMessage(result.stderr) : undefined;
-    let outputFile: string | undefined;
     if (!failed && result.stdout.trim().length > 0) {
       await writeFile(path.join(runDirectory, OUTPUT_FILE), result.stdout, { encoding: "utf8", mode: 0o600 });
-      outputFile = `/workspace/.pi/subagents/${taskId}/${OUTPUT_FILE}`;
     }
-    const sessionName = await newestSessionFile(path.join(runDirectory, SESSIONS_DIR));
-    const sessionFile = sessionName === undefined ? undefined : `/workspace/.pi/subagents/${taskId}/${SESSIONS_DIR}/${sessionName}`;
     await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({
       status,
       exitCode: result.code,
       signal: result.signal,
       ...defined({ stderr }),
     }), { encoding: "utf8", mode: 0o600 });
-    await appendChatEvent(workspace, {
-      type: "subagent",
-      id: taskId,
+    await appendSystemEvent(workspace, {
+      type: "task",
+      name,
+      runId,
       status,
       exitCode: result.code,
-      ...defined({ outputFile }),
-      ...defined({ sessionFile }),
       ...defined({ stderr }),
     });
-    if (this.wakeAgent) {
-      void Promise.resolve(this.wakeAgent(chatId)).catch((error) => this.report(error));
-    }
+    const summary = failed
+      ? `Task ${name} failed (exit ${result.code ?? "unknown"}).`
+      : `Task ${name} finished.`;
+    void this.agent.followup(chatId, `${summary} Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`).catch((error) => this.report(error));
   }
 
   private report(error: unknown): void {

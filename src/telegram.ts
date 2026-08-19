@@ -21,7 +21,7 @@ import type {
 } from "./outbox-protocol.js";
 import { appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
 
-export const WAKE_PROMPT = ".";
+const WAKE_PROMPT = ".";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 

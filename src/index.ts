@@ -4,9 +4,7 @@ import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { WorkspaceTasks } from "./task.js";
-import { appendChatEvent } from "./events.js";
-import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue, WAKE_PROMPT } from "./telegram.js";
-import { chatPaths } from "./util.js";
+import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -73,14 +71,10 @@ export async function main(): Promise<void> {
     dataDir,
     run: (chatId, prompt) => agentManager.followup(chatId, prompt),
   });
-  const wakeAgent = (chatId: number): Promise<void> => agentManager.interrupt(chatId, WAKE_PROMPT);
   const outboxInstance = new WorkspaceOutbox({
     dataDir,
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
-    notifyAgent: (chatId, message) => {
-      appendChatEvent(chatPaths(dataDir, chatId).workspace, { type: "outbox_rejected", detail: message });
-      return wakeAgent(chatId);
-    },
+    agent: agentManager,
   });
   const tasksInstance = new WorkspaceTasks({
     dataDir,
@@ -88,7 +82,7 @@ export async function main(): Promise<void> {
     bwrapPath,
     spawnProcess,
     terminateProcessGroup,
-    wakeAgent,
+    agent: agentManager,
   });
 
   let shuttingDown = false;

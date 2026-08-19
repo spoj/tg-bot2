@@ -26,15 +26,15 @@ async function writeTask(workspace: string, name: string, prompt: string): Promi
   await writeFile(path.join(workspace, ".tg-bot", "task", name), prompt, "utf8");
 }
 
-async function subagentsDirectory(workspace: string): Promise<string[]> {
-  return (await readdir(path.join(workspace, ".pi", "subagents"), { withFileTypes: true }))
+async function tasksDirectory(workspace: string): Promise<string[]> {
+  return (await readdir(path.join(workspace, ".pi", "tasks"), { withFileTypes: true }))
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
 }
 
-async function chatEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
-  const contents = await readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8");
+async function systemEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
+  const contents = await readFile(path.join(workspace, ".tg-bot", "system.jsonl"), "utf8");
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
@@ -66,16 +66,15 @@ const success = (stdout = "final report"): PiRunResult => ({ code: 0, signal: nu
 function setupTasks(
   dataDir: string,
   factory: Mock,
-  wakeAgent: Mock | undefined,
   options: Partial<WorkspaceTasksOptions> = {},
 ): WorkspaceTasks {
   return new WorkspaceTasks({
     dataDir,
-    appRoot: "/tmp/tg-bot2-app",
+    appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
+    agent: { followup: async () => undefined },
     workerFactory: factory as never,
-    ...(wakeAgent === undefined ? {} : { wakeAgent }),
     ...options,
   });
 }
@@ -84,38 +83,35 @@ describe("WorkspaceTasks", () => {
   it("rejects poll intervals above the timer-safe limit", async () => {
     const { dataDir } = await fixture();
     const { factory } = fakeWorkerFactory();
-    expect(() => setupTasks(dataDir, factory, undefined, { pollIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
+    expect(() => setupTasks(dataDir, factory, { pollIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
   });
 
-  it("claims a task, runs one subagent, records output, and wakes the agent", async () => {
+  it("claims a task into a uuid run directory, records output, and sends the agent a completion followup", async () => {
     const { dataDir, workspace } = await fixture();
     await writeTask(workspace, "research.md", "Investigate the parser regression.");
     const { factory, tasks } = fakeWorkerFactory();
-    const wakeAgent = vi.fn(async () => {});
-    const service = setupTasks(dataDir, factory, wakeAgent);
+    const followup = vi.fn(async () => undefined);
+    const service = setupTasks(dataDir, factory, { agent: { followup } });
 
     const poll = service.poll();
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
-    expect(tasks[0]?.options).toMatchObject({ taskId: "research", prompt: "Investigate the parser regression." });
+    const runId = tasks[0]?.options.runId;
+    expect(runId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(tasks[0]?.options).toMatchObject({ prompt: "Investigate the parser regression." });
     expect(tasks[0]?.options.workspace).toBe(workspace);
 
-    const runDir = path.join(workspace, ".pi", "subagents", "research");
+    const runDir = path.join(workspace, ".pi", "tasks", runId ?? "");
+    expect(await readFile(path.join(runDir, "research.md"), "utf8")).toBe("Investigate the parser regression.");
     await writeFile(path.join(runDir, "sessions", "session-1.jsonl"), "{}\n", "utf8");
     tasks[0]?.resolveRun(success("the findings"));
     await poll;
 
     expect(await readFile(path.join(runDir, "output.md"), "utf8")).toBe("the findings");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "done", exitCode: 0 });
-    const events = await chatEvents(workspace);
-    expect(events.at(-1)).toMatchObject({
-      type: "subagent",
-      id: "research",
-      status: "done",
-      outputFile: "/workspace/.pi/subagents/research/output.md",
-      sessionFile: "/workspace/.pi/subagents/research/sessions/session-1.jsonl",
-      exitCode: 0,
-    });
-    expect(wakeAgent).toHaveBeenCalledWith(42);
+    expect(await systemEvents(workspace)).toMatchObject([
+      { type: "task", name: "research.md", runId, status: "done", exitCode: 0 },
+    ]);
+    expect(followup).toHaveBeenCalledWith(42, `Task research.md finished. Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`);
     expect((await readdir(path.join(workspace, ".tg-bot", "task"))).length).toBe(0);
   });
 
@@ -123,20 +119,22 @@ describe("WorkspaceTasks", () => {
     const { dataDir, workspace } = await fixture();
     await writeTask(workspace, "broken.txt", "do the thing");
     const { factory, tasks } = fakeWorkerFactory();
-    const wakeAgent = vi.fn(async () => {});
-    const service = setupTasks(dataDir, factory, wakeAgent);
+    const followup = vi.fn(async () => undefined);
+    const service = setupTasks(dataDir, factory, { agent: { followup } });
 
     const poll = service.poll();
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
+    const runId = tasks[0]?.options.runId ?? "";
     tasks[0]?.resolveRun({ code: 3, signal: null, stderr: "boom", stdout: "" });
     await poll;
 
-    const runDir = path.join(workspace, ".pi", "subagents", "broken");
+    const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "failed", exitCode: 3, stderr: "boom" });
     await expect(readFile(path.join(runDir, "output.md"), "utf8")).rejects.toThrow();
-    const events = await chatEvents(workspace);
-    expect(events.at(-1)).toMatchObject({ type: "subagent", id: "broken", status: "failed", exitCode: 3, stderr: "boom" });
-    expect(wakeAgent).toHaveBeenCalledWith(42);
+    expect(await systemEvents(workspace)).toMatchObject([
+      { type: "task", name: "broken.txt", runId, status: "failed", exitCode: 3, stderr: "boom" },
+    ]);
+    expect(followup).toHaveBeenCalledWith(42, `Task broken.txt failed (exit 3). Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`);
   });
 
   it("reports a worker that fails to spawn as a failed task", async () => {
@@ -145,13 +143,12 @@ describe("WorkspaceTasks", () => {
     const factory = vi.fn(async () => {
       throw new Error("bwrap missing");
     });
-    const wakeAgent = vi.fn(async () => {});
+    const followup = vi.fn(async () => undefined);
 
-    await setupTasks(dataDir, factory, wakeAgent).poll();
+    await setupTasks(dataDir, factory, { agent: { followup } }).poll();
 
-    const events = await chatEvents(workspace);
-    expect(events.at(-1)).toMatchObject({ type: "subagent", id: "unspawnable", status: "failed" });
-    expect(wakeAgent).toHaveBeenCalledWith(42);
+    expect(await systemEvents(workspace)).toMatchObject([{ type: "task", name: "unspawnable.md", status: "failed" }]);
+    expect(followup).toHaveBeenCalledOnce();
   });
 
   it("ignores files that do not match the task naming contract", async () => {
@@ -162,7 +159,7 @@ describe("WorkspaceTasks", () => {
     await writeTask(workspace, "request.json", "d");
     const { factory } = fakeWorkerFactory();
 
-    await setupTasks(dataDir, factory, undefined).poll();
+    await setupTasks(dataDir, factory).poll();
 
     expect(factory).not.toHaveBeenCalled();
     expect((await readdir(path.join(workspace, ".tg-bot", "task"))).sort()).toEqual([".hidden.md", "no-extension", "request.json", "space name.md"]);
@@ -172,13 +169,11 @@ describe("WorkspaceTasks", () => {
     const { dataDir, workspace } = await fixture();
     await writeTask(workspace, "empty.md", "   ");
     const { factory } = fakeWorkerFactory();
-    const wakeAgent = vi.fn(async () => {});
 
-    await setupTasks(dataDir, factory, wakeAgent).poll();
+    await setupTasks(dataDir, factory).poll();
 
     expect(factory).not.toHaveBeenCalled();
-    const events = await chatEvents(workspace);
-    expect(events.at(-1)).toMatchObject({ type: "subagent", id: "empty", status: "failed" });
+    expect(await systemEvents(workspace)).toMatchObject([{ type: "task", name: "empty.md", status: "failed" }]);
     expect((await readdir(path.join(workspace, ".tg-bot", "task"))).length).toBe(0);
   });
 
@@ -187,31 +182,32 @@ describe("WorkspaceTasks", () => {
     await writeTask(workspace, "a.md", "first prompt");
     await writeTask(workspace, "b.txt", "second prompt");
     const { factory, tasks } = fakeWorkerFactory();
-    const service = setupTasks(dataDir, factory, undefined);
+    const service = setupTasks(dataDir, factory);
 
     const first = service.poll();
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
-    expect(tasks[0]?.options.taskId).toBe("a");
+    expect(await readFile(path.join(workspace, ".pi", "tasks", tasks[0]?.options.runId ?? "", "a.md"), "utf8")).toBe("first prompt");
 
     tasks[0]?.resolveRun(success());
     await first;
     const second = service.poll();
     await vi.waitFor(() => expect(tasks).toHaveLength(2));
-    expect(tasks[1]?.options.taskId).toBe("b");
+    expect(await readFile(path.join(workspace, ".pi", "tasks", tasks[1]?.options.runId ?? "", "b.txt"), "utf8")).toBe("second prompt");
     tasks[1]?.resolveRun(success());
     await second;
   });
 
   it("re-queues an orphaned run directory from a crashed host", async () => {
     const { dataDir, workspace } = await fixture();
-    const orphan = path.join(workspace, ".pi", "subagents", "orphan");
+    const orphan = path.join(workspace, ".pi", "tasks", "11111111-1111-4111-8111-111111111111");
     await mkdir(path.join(orphan, "sessions"), { recursive: true });
-    await writeFile(path.join(orphan, "task.md"), "recovered prompt", "utf8");
+    await writeFile(path.join(orphan, "recover.md"), "recovered prompt", "utf8");
     const { factory, tasks } = fakeWorkerFactory();
 
-    const poll = setupTasks(dataDir, factory, undefined).poll();
+    const poll = setupTasks(dataDir, factory).poll();
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
-    expect(tasks[0]?.options).toMatchObject({ taskId: "orphan", prompt: "recovered prompt" });
+    expect(tasks[0]?.options).toMatchObject({ prompt: "recovered prompt" });
+    expect(await readFile(path.join(workspace, ".pi", "tasks", tasks[0]?.options.runId ?? "", "recover.md"), "utf8")).toBe("recovered prompt");
     tasks[0]?.resolveRun(success());
     await poll;
   });
@@ -219,7 +215,7 @@ describe("WorkspaceTasks", () => {
   it("keeps settled run directories and prunes beyond the cap", async () => {
     const { dataDir, workspace } = await fixture();
     for (let index = 0; index < 18; index += 1) {
-      const runDir = path.join(workspace, ".pi", "subagents", `task-${String(index).padStart(2, "0")}`);
+      const runDir = path.join(workspace, ".pi", "tasks", `run-${String(index).padStart(2, "0")}`);
       await mkdir(runDir, { recursive: true });
       await writeFile(path.join(runDir, "result.json"), '{"status":"done"}\n', "utf8");
       const at = new Date(1_700_000_000_000 + index * 1_000);
@@ -227,12 +223,12 @@ describe("WorkspaceTasks", () => {
     }
     const { factory } = fakeWorkerFactory();
 
-    await setupTasks(dataDir, factory, undefined).poll();
+    await setupTasks(dataDir, factory).poll();
 
-    const remaining = await subagentsDirectory(workspace);
+    const remaining = await tasksDirectory(workspace);
     expect(remaining).toHaveLength(16);
-    expect(remaining).not.toContain("task-00");
-    expect(remaining).toContain("task-17");
+    expect(remaining).not.toContain("run-00");
+    expect(remaining).toContain("run-17");
   });
 
   it("leaves a signal-interrupted run orphaned for boot recovery", async () => {
@@ -240,27 +236,29 @@ describe("WorkspaceTasks", () => {
     await writeTask(workspace, "interrupted.md", "prompt");
     const { factory, tasks } = fakeWorkerFactory();
 
-    const poll = setupTasks(dataDir, factory, undefined).poll();
+    const poll = setupTasks(dataDir, factory).poll();
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
+    const runId = tasks[0]?.options.runId ?? "";
     tasks[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
     await poll;
 
-    const runDir = path.join(workspace, ".pi", "subagents", "interrupted");
+    const runDir = path.join(workspace, ".pi", "tasks", runId);
     await expect(readFile(path.join(runDir, "result.json"), "utf8")).rejects.toThrow();
-    expect(await readFile(path.join(runDir, "task.md"), "utf8")).toBe("prompt");
+    expect(await readFile(path.join(runDir, "interrupted.md"), "utf8")).toBe("prompt");
   });
 
   it("stop() stops the in-flight worker and leaves the task for boot recovery", async () => {
     const { dataDir, workspace } = await fixture();
     await writeTask(workspace, "long.md", "prompt");
     const { factory, tasks } = fakeWorkerFactory();
-    const service = setupTasks(dataDir, factory, undefined);
+    const service = setupTasks(dataDir, factory);
     const started = service.start();
 
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
+    const runId = tasks[0]?.options.runId ?? "";
     await service.stop();
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
-    expect(await readFile(path.join(workspace, ".pi", "subagents", "long", "task.md"), "utf8")).toBe("prompt");
+    expect(await readFile(path.join(workspace, ".pi", "tasks", runId, "long.md"), "utf8")).toBe("prompt");
     await started;
   });
 });

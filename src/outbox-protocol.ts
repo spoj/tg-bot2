@@ -206,12 +206,12 @@ sends a location pin (venue {title,address} sends a named venue instead).
 {version:1,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
-poll_answer event in events.jsonl; the matching send line in events.jsonl
+poll_answer event in chat.jsonl; the matching send line in chat.jsonl
 records pollId.
 {version:1,type:"stop_poll",message_id,reply_markup?} closes a poll early. Telegram's
-final closed Poll arrives as the data field of the matching send event in events.jsonl;
+final closed Poll arrives as the data field of the matching send event in chat.jsonl;
 its id matches the poll_answer events' poll_id and the matching send event's pollId.
-{version:1,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
+{version:1,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from chat.jsonl.
 {version:1,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
 {version:1,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
 The request's filename (minus .json) is its correlation id: the host echoes it as the id
@@ -220,5 +220,5 @@ field of the matching send event, records it in .tg-bot/sent.jsonl and
 per send but their content never matters beyond that: no id field exists inside the
 request. Write each request to a temporary filename that does not end in .json, then
 atomically rename it to the final unique *.json request name.
-Every processed request is recorded in .tg-bot/sent.jsonl as {id,request,messageId?,pollId?,data?} (latest 256 records kept); rejected requests are recorded in .tg-bot/failed.jsonl as {id,request,error} and reported to you as outbox_rejected events in events.jsonl. Requests leave no other trace in the outbox directory.
+Every processed request is recorded in .tg-bot/sent.jsonl as {id,request,messageId?,pollId?,data?} (latest 256 records kept); rejected requests are recorded in .tg-bot/failed.jsonl as {id,request,error} and recorded as outbox_rejected events in system.jsonl. Requests leave no other trace in the outbox directory.
 `;

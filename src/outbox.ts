@@ -3,7 +3,8 @@ import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
 import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
-import { appendChatEvent } from "./events.js";
+import type { AgentManager } from "./agent.js";
+import { appendChatEvent, appendSystemEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
 import { appendBoundedJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readBoundedJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
@@ -11,8 +12,8 @@ import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDi
 export type WorkspaceOutboxOptions = {
   dataDir: string;
   dispatch: WorkspaceOutboxDispatcher;
-  /** Direct-message channel to the agent; receives one message per rejected request. */
-  notifyAgent?: (chatId: number, message: string) => Promise<void> | void;
+  /** Receives one followup per rejected or failed request. */
+  agent: Pick<AgentManager, "followup">;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -141,7 +142,7 @@ async function readBoundedEntries(directory: string, limit: number) {
 }
 
 export class WorkspaceOutbox {
-  private readonly notifyAgent: WorkspaceOutboxOptions["notifyAgent"];
+  private readonly agent: WorkspaceOutboxOptions["agent"];
   private readonly dataDir: string;
   private readonly dispatch: WorkspaceOutboxDispatcher;
   private readonly pollIntervalMs: number;
@@ -162,7 +163,7 @@ export class WorkspaceOutbox {
       throw new Error("Outbox poll interval must be a positive timer-safe integer");
     }
     this.dataDir = path.resolve(options.dataDir);
-    this.notifyAgent = options.notifyAgent;
+    this.agent = options.agent;
     this.dispatch = options.dispatch;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.now = options.now ?? Date.now;
@@ -411,7 +412,7 @@ export class WorkspaceOutbox {
               this.report(archiveError);
             }
           }
-          this.notifyAgentFailure(chatId, requestKey, error);
+          this.notifyAgentFailure(chatId, workspace, requestKey, error);
           this.reportRequestError(chatId, archiveName, error);
           await this.discardClaimFile(claim.path);
           continue;
@@ -573,11 +574,11 @@ export class WorkspaceOutbox {
   }
 
 
-  /** Reports a rejected request to the agent as a direct message; never blocks scanning. */
-  private notifyAgentFailure(chatId: number, name: string, error: unknown): void {
-    if (!this.notifyAgent) return;
+  /** Records the rejection in system.jsonl and sends the agent a followup; never blocks scanning. */
+  private notifyAgentFailure(chatId: number, workspace: string, name: string, error: unknown): void {
     const message = `Outbox request ${name} rejected: ${errorMessage(error)}`;
-    void Promise.resolve(this.notifyAgent(chatId, message)).catch((notifyError) => this.report(notifyError));
+    void appendSystemEvent(workspace, { type: "outbox_rejected", detail: message });
+    void this.agent.followup(chatId, message).catch((notifyError) => this.report(notifyError));
   }
   private reportRequestError(chatId: number, name: string, error: unknown): void {
     this.report(new Error(`Outbox request ${chatId}/${name} failed: ${errorMessage(error)}`));

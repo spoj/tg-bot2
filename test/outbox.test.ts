@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceOutbox, type WorkspaceOutboxOptions } from "../src/outbox.js";
+import type { AgentManager } from "../src/agent.js";
 import type { WorkspaceOutboxDispatcher, WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
 
 const temporaryDirectories: string[] = [];
@@ -29,9 +30,13 @@ async function writeRequest(workspace: string, name: string, value: unknown): Pr
 async function names(directory: string): Promise<string[]> {
   return (await readdir(directory)).sort();
 }
-
 async function chatEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
-  const contents = await readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8");
+  const contents = await readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8");
+  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+async function systemEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
+  const contents = await readFile(path.join(workspace, ".tg-bot", "system.jsonl"), "utf8");
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
@@ -43,15 +48,15 @@ async function archiveRecords(workspace: string, file: "sent.jsonl" | "failed.js
 function setupOutbox(
   dataDir: string,
   dispatch: WorkspaceOutboxDispatcher,
-  options: Omit<WorkspaceOutboxOptions, "dataDir" | "dispatch"> = {},
+  options: Omit<WorkspaceOutboxOptions, "dataDir" | "dispatch" | "agent"> & { agent?: Pick<AgentManager, "followup"> } = {},
 ): WorkspaceOutbox {
-  return new WorkspaceOutbox({ dataDir, dispatch, ...options });
+  return new WorkspaceOutbox({ dataDir, dispatch, agent: { followup: async () => undefined }, ...options });
 }
 
 async function pollOutbox(
   dataDir: string,
   dispatch: WorkspaceOutboxDispatcher,
-  options: Omit<WorkspaceOutboxOptions, "dataDir" | "dispatch"> = {},
+  options: Omit<WorkspaceOutboxOptions, "dataDir" | "dispatch" | "agent"> & { agent?: Pick<AgentManager, "followup"> } = {},
 ): Promise<void> {
   await setupOutbox(dataDir, dispatch, options).poll();
 }
@@ -112,6 +117,7 @@ describe("WorkspaceOutbox", () => {
     expect(() => new WorkspaceOutbox({
       dataDir,
       dispatch: async () => undefined,
+      agent: { followup: async () => undefined },
       pollIntervalMs: 2_147_483_648,
     })).toThrow("positive timer-safe integer");
   });
@@ -400,11 +406,11 @@ describe("WorkspaceOutbox", () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "one.json", valid());
     await pollOutbox(dataDir, vi.fn(async () => undefined));
-    await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8")).rejects.toThrow();
     expect(await archiveRecords(workspace, "sent.jsonl")).toMatchObject([{ id: "one" }]);
   });
 
-  it("writes dispatcher data onto the send event in events.jsonl", async () => {
+  it("writes dispatcher data onto the send event in chat.jsonl", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "stop.json", { version: 1, type: "stop_poll", message_id: 77 });
     await pollOutbox(dataDir, vi.fn(async () => ({ data: 777 })));
@@ -498,13 +504,17 @@ describe("WorkspaceOutbox", () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "single.json", { version: 1, type: "send_media_group", media: [{ type: "photo", media: "a.png" }] });
     await writeRequest(workspace, "bad-kind.json", { version: 1, type: "send_media_group", media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] });
-    const notifyAgent = vi.fn(async () => undefined);
+    const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await pollOutbox(dataDir, dispatch, { notifyAgent });
+    await pollOutbox(dataDir, dispatch, { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(notifyAgent).toHaveBeenCalledTimes(2));
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request single rejected: Outbox request media must be an array of 2 to 10 items");
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request media item type must be photo or video");
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request single rejected: Outbox request media must be an array of 2 to 10 items");
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request media item type must be photo or video");
+    await vi.waitFor(async () => expect(await systemEvents(workspace)).toMatchObject([
+      { type: "outbox_rejected", detail: "Outbox request bad-kind rejected: Outbox request media item type must be photo or video" },
+      { type: "outbox_rejected", detail: "Outbox request single rejected: Outbox request media must be an array of 2 to 10 items" },
+    ]));
     expect(await names(path.join(workspace, ".tg-bot", "outbox"))).toEqual([]);
   });
   it("records stopped poll results as data on the send event", async () => {
@@ -543,15 +553,15 @@ describe("WorkspaceOutbox", () => {
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     await writeRequest(workspace, "bad-kind.json", { version: 1, type: "send_file", path: "x", kind: "weird" });
     await writeRequest(workspace, "bad-path.json", { version: 1, type: "send_file", path: 7 });
-    const notifyAgent = vi.fn(async () => undefined);
+    const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await pollOutbox(dataDir, dispatch, { notifyAgent });
+    await pollOutbox(dataDir, dispatch, { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
     expect(await archiveRecords(workspace, "failed.jsonl")).toEqual([]);
     expect(await names(outbox)).toEqual([]);
-    await vi.waitFor(() => expect(notifyAgent).toHaveBeenCalledTimes(2));
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request bad-path rejected: Outbox request path must be a non-empty string");
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-kind rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request bad-path rejected: Outbox request path must be a non-empty string");
   });
 
   it("dispatches an empty reaction array to remove a reaction", async () => {
@@ -585,13 +595,13 @@ describe("WorkspaceOutbox", () => {
   it("notifies the agent when the dispatcher throws, without logging a chat event", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "one.json", valid());
-    const notifyAgent = vi.fn(async () => undefined);
+    const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
-    await pollOutbox(dataDir, dispatch, { notifyAgent });
-    await vi.waitFor(() => expect(notifyAgent).toHaveBeenCalledOnce());
-    expect(notifyAgent).toHaveBeenCalledWith(42, "Outbox request one rejected: upload failed");
+    await pollOutbox(dataDir, dispatch, { agent: { followup } });
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
+    expect(followup).toHaveBeenCalledWith(42, "Outbox request one rejected: upload failed");
     expect(await archiveRecords(workspace, "failed.jsonl")).toMatchObject([{ id: "one", error: "upload failed" }]);
-    await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8")).rejects.toThrow();
   });
 
 

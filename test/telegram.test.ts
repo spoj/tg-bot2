@@ -59,7 +59,7 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
   }
 }
 async function readChatEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
+  const content = await readFile(path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "chat.jsonl"), "utf8").catch(() => "");
   return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
@@ -983,7 +983,7 @@ describe("Telegram chat events", () => {
     await withWorkspace(async (workspace) => {
       const eventsDir = path.join(workspace, ".tg-bot");
       await mkdir(eventsDir, { recursive: true });
-      const fifoPath = path.join(eventsDir, "events.jsonl");
+      const fifoPath = path.join(eventsDir, "chat.jsonl");
       execFileSync("mkfifo", [fifoPath]);
       await expect(appendChatEvents(workspace, [{ type: "message", message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
       expect((await lstat(fifoPath)).isFIFO()).toBe(true);

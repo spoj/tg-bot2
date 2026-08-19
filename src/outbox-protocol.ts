@@ -178,13 +178,14 @@ sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
 poll_answer event in events.jsonl; the matching send line in events.jsonl
 records pollId.
-{version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
-appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
-(latest 256 lines kept); result.id matches the poll_answer events' poll_id and
-the matching send event's top-level pollId.
+{version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early. Telegram's
+final closed Poll arrives as the data field of the matching send event in events.jsonl;
+its id matches the poll_answer events' poll_id and the matching send event's pollId.
 {version:1,id,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
 {version:1,id,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
 {version:1,id,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
 id must be unique. Write each request to a temporary filename that does not
 end in .json, then atomically rename it to the final unique *.json request name.
+Every processed request is moved to outbox/processed/ on success; rejected requests move
+to outbox/failed/ and are reported to you as outbox_rejected events in events.jsonl.
 `;

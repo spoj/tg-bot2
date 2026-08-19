@@ -5,7 +5,7 @@ import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message, Poll } from "grammy/types";
 import type { Config } from "./config.js";
-import type { AgentManager } from "./agent.js";
+import type { AgentManager, AgentStatus } from "./agent.js";
 import { SerialQueue } from "./queue.js";
 import { appendChatEvent, appendChatEvents, type ChatEvent } from "./events.js";
 import type {
@@ -18,7 +18,7 @@ import type {
   WorkspaceOutboxDispatchResult,
   WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-import type { AvailableModel, WorkerSessionState } from "./pi-worker.js";
+
 import { appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
 
 const INGRESS_COOLDOWN_MS = 2_000;
@@ -374,7 +374,7 @@ export async function dispatchOutboxRequest(bot: Bot, dataDir: string, chatId: n
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
     case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
-    case "stop_poll": return { data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
+    case "stop_poll": return { messageId: request.message_id, data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
     case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return undefined;
     case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
     case "delete_message": await deleteTelegramMessage(bot, chatId, request.message_id); return undefined;
@@ -806,31 +806,23 @@ export function closeTelegramIngress(bot: Bot): void {
   ingressByBot.get(bot)?.close();
 }
 
-export function formatModelList(
-  models: readonly AvailableModel[],
-  current?: { provider: string; id: string },
-): string {
-  if (models.length === 0) return "No models available.";
-  return models
-    .map((model, index) => {
-      const identifier = `${model.provider}/${model.id}`;
-      const label = model.name ? `${identifier} — ${model.name}` : identifier;
-      const marker = current && current.provider === model.provider && current.id === model.id ? " (current)" : "";
-      return `${index + 1}. ${label}${marker}`;
-    })
-    .join("\n");
+/** Queues a host-side event into the bot's ingress buffer for delivery with the next flush. */
+export function addTelegramIngressEvent(bot: Bot, chatId: number, event: ChatEvent): void {
+  ingressByBot.get(bot)?.add(chatId, { value: Promise.resolve(event) });
 }
 
-export function formatThinkingLevels(levels: readonly string[], current?: string): string {
-  if (levels.length === 0) return "No thinking levels available.";
-  return levels
-    .map((level, index) => `${index + 1}. ${level}${level === current ? " (current)" : ""}`)
-    .join("\n");
+/** Publishes the reduced command set to Telegram's client UI. */
+export async function registerBotCommands(bot: Bot): Promise<void> {
+  await bot.api.setMyCommands([
+    { command: "status", description: "Show model, thinking level, and session summary" },
+    { command: "start", description: "Introduction" },
+  ]);
 }
 
-export function formatStatus(state: WorkerSessionState): string {
+
+export function formatStatus(state: AgentStatus): string {
   const model = state.model ? `${state.model.provider}/${state.model.id}` : "unset";
-  const session = state.sessionFile ?? state.sessionId;
+  const session = state.sessionFile ?? "none";
   return `Model: ${model} | Thinking: ${state.thinkingLevel} | Session: ${session} | Messages: ${state.messageCount}`;
 }
 
@@ -842,14 +834,11 @@ export function createTelegramBot(
   const bot = new Bot(config.token);
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
-  const queuedReplyChunks = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, async () => {
-    for (const chunk of splitTelegramText(text)) await ctx.reply(chunk);
-  });
 
   const ingress = new TelegramIngressBuffer(async (chatId, events) => {
     const workspace = chatPaths(config.dataDir, chatId).workspace;
     await Promise.all(events.map((event) => appendChatEvent(workspace, event)));
-    await agents.prompt(chatId, WAKE_PROMPT).catch((error) => {
+    await agents.interrupt(chatId, WAKE_PROMPT).catch((error) => {
       console.error("Telegram wake prompt failed", error);
     });
   });
@@ -866,86 +855,12 @@ export function createTelegramBot(
   });
 
   bot.command("start", async (ctx) => {
-    await queuedReply(ctx, "Personal agent. Send text, attachments, or a location pin to continue your persistent session, or /new to start a fresh one.");
-  });
-
-  bot.command("new", async (ctx) => {
-    const barrier = ingress.acquireBarrier(ctx.chat.id);
-    let started = false;
-    try {
-      await ingress.flush(ctx.chat.id);
-      await agents.newSession(ctx.chat.id);
-      started = true;
-    } catch (error) {
-      console.error("Failed to start new session", error);
-    } finally {
-      barrier.release();
-    }
-    if (!started) {
-      await queuedReply(ctx, "I could not start a new session. Please try again.");
-      return;
-    }
-    await queuedReply(ctx, "Started a new session. Earlier session files remain searchable.");
-  });
-
-  bot.command("model", async (ctx) => {
-    const chatId = ctx.chat.id;
-    const query = ctx.match.trim();
-    const models = await agents.getAvailableModels(chatId);
-    const current = (await agents.status(chatId)).model;
-    if (!query) {
-      await queuedReplyChunks(ctx, formatModelList(models, current));
-      return;
-    }
-    const needle = query.toLowerCase();
-    const matches = models.filter((model) =>
-      `${model.id} ${model.name ?? ""}`.toLowerCase().includes(needle),
-    );
-    if (matches.length === 0) {
-      await queuedReply(ctx, `No model matches "${query}".`);
-      return;
-    }
-    if (matches.length > 1) {
-      await queuedReplyChunks(ctx, `Multiple models match "${query}":\n\n${formatModelList(matches, current)}`);
-      return;
-    }
-    const model = matches[0]!;
-    try {
-      await agents.setModel(chatId, model.provider, model.id);
-    } catch (error) {
-      console.error("Failed to set model", error);
-      await queuedReply(ctx, "I could not set the model. Please try again.");
-      return;
-    }
-    await queuedReply(ctx, `Model set to ${model.provider}/${model.id}.`);
-  });
-
-  bot.command("thinking", async (ctx) => {
-    const chatId = ctx.chat.id;
-    const level = ctx.match.trim();
-    const levels = await agents.getAvailableThinkingLevels(chatId);
-    const current = (await agents.status(chatId)).thinkingLevel;
-    if (!level) {
-      await queuedReply(ctx, formatThinkingLevels(levels, current));
-      return;
-    }
-    if (!levels.includes(level)) {
-      await queuedReply(ctx, `Unknown thinking level "${level}". Valid levels: ${levels.join(", ")}.`);
-      return;
-    }
-    try {
-      await agents.setThinkingLevel(chatId, level);
-    } catch (error) {
-      console.error("Failed to set thinking level", error);
-      await queuedReply(ctx, "I could not set the thinking level. Please try again.");
-      return;
-    }
-    await queuedReply(ctx, `Thinking level set to ${level}.`);
+    await queuedReply(ctx, "Personal agent. Send text, attachments, or a location pin to continue your persistent session. /status shows the current model, thinking level, and session summary.");
   });
 
   bot.command("status", async (ctx) => {
     const chatId = ctx.chat.id;
-    let state: WorkerSessionState;
+    let state: AgentStatus;
     try {
       state = await agents.status(chatId);
     } catch (error) {
@@ -954,19 +869,6 @@ export function createTelegramBot(
       return;
     }
     await queuedReply(ctx, formatStatus(state));
-  });
-
-  bot.command("restart", async (ctx) => {
-    const chatId = ctx.chat.id;
-    await queuedReply(ctx, "Restarting agent…");
-    try {
-      await agents.restart(chatId);
-    } catch (error) {
-      console.error("Failed to restart agent", error);
-      await queuedReply(ctx, "I could not restart the agent. Please try again.");
-      return;
-    }
-    await queuedReply(ctx, "Agent restarted.");
   });
 
   bot.on("message", (ctx) => {

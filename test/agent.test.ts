@@ -1,52 +1,41 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { expect, it, vi, type Mock } from "vitest";
 import {
   AgentManager,
   loadUserSettings,
   SYSTEM_PROMPT,
-  WORKER_IDLE_STOP_MS,
-  writeUserSettings,
-  type AgentEvent,
-  type AgentWorker,
+  type AgentRunWorker,
+  type AgentWorkerOptions,
+  type AgentStatus,
 } from "../src/agent.js";
+import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
+import { EVENTS_PROMPT } from "../src/events.js";
+import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
 import type { Config } from "../src/config.js";
 import { deferred } from "./helpers.js";
 
-type FakeWorker = AgentWorker & {
-  emit(event: AgentEvent): void;
+type RunResult = { code: number | null; signal: NodeJS.Signals | null; stderr: string; stdout: string };
+
+type FakeRun = {
+  worker: AgentRunWorker & { options: AgentWorkerOptions };
+  resolveRun: (result: RunResult) => void;
+  stop: Mock<() => Promise<void>>;
+  run: Mock<() => Promise<RunResult>>;
 };
 
-function fakeWorker(): FakeWorker {
-  const listeners = new Set<(event: AgentEvent) => void>();
-  const worker = {
-    start: vi.fn(async () => {}),
-    stop: vi.fn(async () => {}),
-    abort: vi.fn(async () => {}),
-    newSession: vi.fn(async () => {}),
-    prompt: vi.fn(async (_text: string) => {}),
-    waitForSettled: vi.fn(async () => {}),
-    setModel: vi.fn(async (_provider: string, _modelId: string) => {}),
-    setThinkingLevel: vi.fn(async (_level: string) => {}),
-    getAvailableModels: vi.fn(async () => []),
-    getAvailableThinkingLevels: vi.fn(async () => []),
-    getSessionState: vi.fn(async () => ({
-      thinkingLevel: "low",
-      sessionId: "session-id",
-      messageCount: 0,
-      autoCompactionEnabled: false,
-    })),
-    restart: vi.fn(async () => {}),
-    onEvent: vi.fn((listener: (event: AgentEvent) => void) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    }),
-    emit(event: AgentEvent): void {
-      for (const listener of listeners) listener(event);
-    },
-  } as unknown as FakeWorker;
-  return worker;
+function fakeWorkerFactory(): { factory: Mock<(options: AgentWorkerOptions) => Promise<AgentRunWorker>>; runs: FakeRun[] } {
+  const runs: FakeRun[] = [];
+  const factory = vi.fn(async (options: AgentWorkerOptions): Promise<AgentRunWorker> => {
+    const gate = deferred<RunResult>();
+    const stop = vi.fn(async () => {});
+    const run = vi.fn(async () => await gate.promise);
+    const worker = { run, stop, options } as unknown as AgentRunWorker & { options: AgentWorkerOptions };
+    runs.push({ worker, resolveRun: gate.resolve, stop, run });
+    return worker;
+  });
+  return { factory, runs };
 }
 
 const config: Config = {
@@ -54,686 +43,298 @@ const config: Config = {
   allowedUserIds: new Set([1]),
   dataDir: "/tmp/tg-bot2-test",
 };
-const managerOptions = { appRoot: "/tmp/tg-bot2-app", spawnProcess: vi.fn(), terminateProcessGroup: vi.fn() };
 
-it("renders the SYSTEM_PROMPT protocol sections from the schemas", () => {
-  expect(SYSTEM_PROMPT).toBe(`You are a persistent personal agent reached through Telegram.
+function managerOptions(overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
+  return {
+    appRoot: "/tmp/tg-bot2-app",
+    spawnProcess: vi.fn(),
+    terminateProcessGroup: vi.fn(),
+    now: () => 1_000_000,
+    ...overrides,
+  };
+}
+
+async function withDataDir(run: (dataDir: string) => Promise<void>): Promise<void> {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-"));
+  try {
+    await run(dataDir);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+async function settingsFile(dataDir: string, chatId: number, content: Record<string, unknown>): Promise<void> {
+  const target = path.join(dataDir, "chats", String(chatId), "workspace", ".pi", "agent", "settings.json");
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, JSON.stringify(content), "utf8");
+}
+
+const INTRO = `You are a persistent personal agent reached through Telegram.
 Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
 Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available.
-Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Extension changes are debounced and automatically reloaded after the current turn.
-To send files or messages through Telegram, write one request per send under
-/workspace/.tg-bot/outbox/. Request types:
-{version:1,id,type:"send_file",path,caption?,kind?,reply_to_message_id?,disable_notification?}
-sends the file at path (relative to /workspace or an absolute /workspace/... path)
-with an optional caption; kind is "auto" (default: images are sent as photos,
-audio as audio, video as video, other files as documents, and images over 10 MB
-as documents) or an explicit "photo", "audio", "video", "voice", or "document".
-{version:1,id,type:"send_message",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
-sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
-plain text; malformed markup is resent as plain text; parse_mode and entities
-are mutually exclusive), entities is a list of {type,offset,length} message
-entities, link_preview_options is a Telegram LinkPreviewOptions object,
-reply_markup is Telegram reply-markup JSON such as an inline_keyboard button
-list, reply_to_message_id targets an earlier message, and
-disable_notification sends silently.
-{version:1,id,type:"send_location",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
-sends a location pin (venue {title,address} sends a named venue instead).
-{version:1,id,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
-sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
-requires correct_option_id). Set is_anonymous:false to receive each vote as a
-poll_answer event in events.jsonl; the matching send line in events.jsonl
-records pollId.
-{version:1,id,type:"stop_poll",message_id,reply_markup?} closes a poll early and
-appends {id,result} with the final Poll to /workspace/.tg-bot/poll-results.jsonl
-(latest 256 lines kept); result.id matches the poll_answer events' poll_id and
-the matching send event's top-level pollId.
-{version:1,id,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from events.jsonl.
-{version:1,id,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
-{version:1,id,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
-id must be unique. Write each request to a temporary filename that does not
-end in .json, then atomically rename it to the final unique *.json request name.
-Every chat event is appended by the host to /workspace/.tg-bot/events.jsonl (one JSON
-object per line, newest last; every line starts with {v:1,t,...} where t is an ISO-8601
-timestamp). Event types:
-- message: {v:1,t,type:'message',message,attachments} where message is the raw Telegram
-  Message object (message_id, date, from, chat, text, caption, location, venue, photo,
-  document, reply_to_message, and any other Bot API Message field) and attachments lists
-  files the host downloaded into /workspace/attachments/... for you
-  ({type,path,mimeType,originalName} or {type,failure}).
-- callback: {v:1,t,type:'callback',callback_query} where callback_query is the raw
-  Telegram CallbackQuery object (id, from, message, chat_instance). data is optional and
-  may instead be game_short_name; logged callbacks are message-backed.
-- poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
-  Telegram PollAnswer object (poll_id, user, option_ids).
-- send: a confirmation of one of your outbox requests that Telegram accepted:
-  {v:1,t,type:'send',kind,id,messageId?,pollId?}. Rejected requests never
-  appear here; the host reports each rejection to you directly.
-Grep events.jsonl whenever you need recent chat history or sent message ids.
-When a user message or button press arrives the host wakes you with a single "." prompt
-that carries no content. Read the newest events.jsonl lines and decide whether the user
-needs a response. Send ALL Telegram output through .tg-bot/outbox requests; never rely
-on the wake prompt for content.
-Schedules are stored in /workspace/.tg-bot/schedules.json. Its root object is
-{version:1,schedules:[...]}. Each schedule record requires id, prompt, dueAt,
-recurrence, enabled, lastRunAt, and runCount. dueAt must be a UTC timestamp ending
-in Z; recurrence must be hourly, daily, weekly, or null; enabled is a boolean;
-lastRunAt is nullable and, when present, must be a UTC timestamp ending in Z; and
-runCount must be a nonnegative integer.
-Keep Telegram-facing answers concise unless the user asks for detail.
-Host commands /model, /thinking, /status, and /restart manage configuration; do not edit .pi config files yourself.
-Every worker start begins a fresh session; previous conversations persist in /workspace/.pi/sessions/*.jsonl and the agent should read/grep them when the user references history.
-`);
+Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Settings and extension changes take effect on your next run.
+`;
+
+const OUTRO = `Keep Telegram-facing answers concise unless the user asks for detail.
+/status is a host command that reports your current model, thinking level, and session summary.
+Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
+Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, touch /workspace/.tg-bot/new-session (any empty file) and the next run starts fresh.
+Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
+`;
+
+it("composes the SYSTEM_PROMPT from the intro, protocol sections, and outro", () => {
+  expect(SYSTEM_PROMPT).toBe(`${INTRO}${OUTBOX_PROMPT}${EVENTS_PROMPT}${SCHEDULES_PROMPT}${OUTRO}`);
+  expect(SYSTEM_PROMPT).toContain("/status is a host command");
+  expect(SYSTEM_PROMPT).toContain("new-session");
+  expect(SYSTEM_PROMPT).not.toContain("/model, /thinking, /status, and /restart");
 });
 
-it("creates one worker lazily per numeric chat", async () => {
-  const worker = fakeWorker();
-  const factory = vi.fn(() => worker);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  expect(factory).not.toHaveBeenCalled();
-  await expect(manager.prompt(42, "hello")).resolves.toBeUndefined();
-  await expect(manager.prompt(42, "again")).resolves.toBeUndefined();
-
-  expect(factory).toHaveBeenCalledOnce();
-  expect(factory).toHaveBeenCalledWith({
-    workspace: path.join(config.dataDir, "chats", "42", "workspace"),
-    appRoot: path.resolve(managerOptions.appRoot),
-    appendSystemPrompt: SYSTEM_PROMPT,
+it("loadUserSettings tolerates missing, empty, and malformed files", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "chats", "42", "workspace");
+    await mkdir(path.join(workspace, ".pi", "agent"), { recursive: true });
+    await expect(loadUserSettings(workspace)).resolves.toEqual({});
+    await writeFile(path.join(workspace, ".pi", "agent", "settings.json"), "not json", "utf8");
+    await expect(loadUserSettings(workspace)).resolves.toEqual({});
+    await settingsFile(dataDir, 42, { defaultModel: "claude", custom: true });
+    await expect(loadUserSettings(workspace)).resolves.toEqual({ defaultModel: "claude", custom: true });
   });
-  expect(worker.start).toHaveBeenCalledOnce();
-  expect(worker.prompt).toHaveBeenCalledTimes(2);
 });
 
-it("aborts an active run for an interactive request and reprompts fresh", async () => {
-  const worker = fakeWorker();
-  const firstDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await firstDone.promise;
+it("followup starts a fresh run when the resume window has never opened", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, ".");
+    await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
+    expect(factory.mock.calls[0]?.[0]).toMatchObject({ message: ".", resume: false, appendSystemPrompt: SYSTEM_PROMPT });
+    expect(runs[0]?.run).toHaveBeenCalledOnce();
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
-  vi.mocked(worker.abort).mockImplementationOnce(async () => {
-    firstDone.resolve();
-  });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  const first = manager.prompt(1, "first");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  const second = manager.prompt(1, "second");
-  await expect(first).resolves.toBeUndefined();
-  expect(worker.abort).toHaveBeenCalledOnce();
-  await expect(second).resolves.toBeUndefined();
-  expect(worker.prompt).toHaveBeenLastCalledWith("second");
 });
 
-it("waits for active work when the current worker is invalidated", async () => {
-  const worker = fakeWorker();
-  const replacement = fakeWorker();
-  const firstDone = deferred<void>();
-  const stopDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await firstDone.promise;
+it("followup queues behind an active run and drains in order", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "first");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.followup(42, "second");
+    await manager.followup(42, "third");
+    expect(runs).toHaveLength(1);
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.message).toBe("second");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(3));
+    expect(runs[2]?.worker.options.message).toBe("third");
+    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
-  vi.mocked(worker.stop).mockImplementationOnce(async () => {
-    await stopDone.promise;
-  });
-  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  const first = manager.prompt(13, "first");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  worker.emit({ type: "worker_error", error: "reload failed" });
-  await vi.waitFor(() => expect(worker.stop).toHaveBeenCalledOnce());
-  const second = manager.prompt(13, "second");
-  await Promise.resolve();
-  expect(worker.abort).not.toHaveBeenCalled();
-  expect(replacement.prompt).not.toHaveBeenCalled();
-
-  firstDone.resolve();
-  stopDone.resolve();
-  await expect(first).resolves.toBeUndefined();
-  await expect(second).resolves.toBeUndefined();
-  expect(replacement.prompt).toHaveBeenCalledWith("second");
 });
 
-it("waits for active work before issuing an independent follow-up prompt", async () => {
-  const worker = fakeWorker();
-  const firstDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await firstDone.promise;
+it("interrupt kills the active run and runs next, preserving queued followups", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "scheduled");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.followup(42, "queued");
+    await manager.interrupt(42, ".");
+    await vi.waitFor(() => expect(runs[0]?.stop).toHaveBeenCalledOnce());
+    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.message).toBe(".");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(3));
+    expect(runs[2]?.worker.options.message).toBe("queued");
+    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
-  vi.mocked(worker.prompt).mockImplementationOnce(async (text: string) => {
-    expect(text).toBe("follow-up");
-  });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  const first = manager.prompt(2, "first");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  const followUp = manager.prompt(2, "follow-up", "follow-up");
-  await Promise.resolve();
-  expect(worker.prompt).toHaveBeenCalledOnce();
-
-  firstDone.resolve();
-  await expect(first).resolves.toBeUndefined();
-  await expect(followUp).resolves.toBeUndefined();
-  expect(worker.prompt).toHaveBeenCalledTimes(2);
-  expect(worker.prompt).toHaveBeenNthCalledWith(2, "follow-up");
 });
 
-it("waits behind active work for /new and keeps the existing workspace", async () => {
-  const worker = fakeWorker();
-  const firstDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await firstDone.promise;
+it("interrupt while idle starts a run immediately", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.interrupt(42, ".");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(factory.mock.calls[0]?.[0].message).toBe(".");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  const first = manager.prompt(5, "running");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  const reset = manager.newSession(5);
-  await Promise.resolve();
-  expect(worker.newSession).not.toHaveBeenCalled();
-
-  firstDone.resolve();
-  await expect(first).resolves.toBeUndefined();
-  await expect(reset).resolves.toBeUndefined();
-  expect(worker.newSession).toHaveBeenCalledOnce();
-  expect(worker.stop).not.toHaveBeenCalled();
 });
 
-it("stops a worker whose startup fails before assignment", async () => {
-  const failed = fakeWorker();
-  const replacement = fakeWorker();
-  vi.mocked(failed.start).mockRejectedValueOnce(new Error("startup failed"));
-  const factory = vi.fn().mockReturnValueOnce(failed).mockReturnValueOnce(replacement);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
+it("resumes within the window and starts fresh after it closes", async () => {
+  await withDataDir(async (dataDir) => {
+    const tenHours = 10 * 60 * 60 * 1000;
+    let now = tenHours;
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => now }));
+    await manager.followup(42, "one");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(runs[0]?.worker.options.resume).toBe(false);
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
 
+    now = tenHours + 60_000;
+    await manager.followup(42, "two");
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.resume).toBe(true);
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
 
-  await expect(manager.prompt(6, "not replayed")).rejects.toThrow("startup failed");
-  expect(failed.stop).toHaveBeenCalledOnce();
-  await expect(manager.prompt(6, "new request")).resolves.toBeUndefined();
-  expect(failed.prompt).not.toHaveBeenCalled();
-  expect(replacement.prompt).toHaveBeenCalledWith("new request");
-});
-it("preserves startup failure when cleanup also fails", async () => {
-  const worker = fakeWorker();
-  vi.mocked(worker.start).mockRejectedValueOnce(new Error("startup failed"));
-  vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+    // Wait for run two to fully settle before advancing the clock, so "three"
+    // starts after a real gap rather than draining from run two's queue.
+    await vi.waitFor(async () => {
+      const activity = JSON.parse(await readFile(path.join(dataDir, "chats", "42", "activity.json"), "utf8")) as { at: number };
+      expect(activity.at).toBe(tenHours + 60_000);
+    });
 
-  await expect(manager.prompt(10, "request")).rejects.toThrow("startup failed");
-  expect(worker.stop).toHaveBeenCalledOnce();
-});
-
-it("preserves prompt failure when cleanup also fails", async () => {
-  const worker = fakeWorker();
-  vi.mocked(worker.prompt).mockRejectedValueOnce(new Error("prompt failed"));
-  vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  await expect(manager.prompt(11, "request")).rejects.toThrow("prompt failed");
-  expect(worker.stop).toHaveBeenCalledOnce();
-});
-it("retries stopping a worker after a rejected cleanup", async () => {
-  const worker = fakeWorker();
-  const replacement = fakeWorker();
-  const promptFailure = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await promptFailure.promise;
-    throw new Error("prompt failed");
+    now = tenHours + 3 * 60 * 60 * 1000;
+    await manager.followup(42, "three");
+    await vi.waitFor(() => expect(runs).toHaveLength(3));
+    expect(runs[2]?.worker.options.resume).toBe(false);
+    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
-  vi.mocked(worker.stop).mockRejectedValueOnce(new Error("stop failed"));
-  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  const run = manager.prompt(14, "request");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-
-  // A worker_error event invalidates the worker; its stop rejects once.
-  worker.emit({ type: "worker_error", error: "reload failed" });
-  await vi.waitFor(() => expect(worker.stop).toHaveBeenCalledOnce());
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  // The active run then fails: the manager retries stopping the same worker.
-  promptFailure.resolve();
-  await expect(run).rejects.toThrow("prompt failed");
-  expect(worker.stop).toHaveBeenCalledTimes(2);
-
-  // Subsequent work runs on a replacement worker, not the failed one.
-  await expect(manager.prompt(14, "next")).resolves.toBeUndefined();
-  expect(replacement.prompt).toHaveBeenCalledWith("next");
-  expect(worker.prompt).toHaveBeenCalledTimes(1);
-});
-it("replaces an idle worker after a worker_error event", async () => {
-  const worker = fakeWorker();
-  const replacement = fakeWorker();
-  const stopDone = deferred<void>();
-  vi.mocked(worker.stop).mockImplementationOnce(async () => {
-    await stopDone.promise;
-  });
-  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  await expect(manager.prompt(15, "first")).resolves.toBeUndefined();
-  worker.emit({ type: "worker_error", error: "extension reload failed" });
-  const next = manager.prompt(15, "next request");
-  await Promise.resolve();
-  expect(factory).toHaveBeenCalledOnce();
-
-  stopDone.resolve();
-  await expect(next).resolves.toBeUndefined();
-  expect(worker.stop).toHaveBeenCalledOnce();
-  expect(replacement.start).toHaveBeenCalledOnce();
-  expect(replacement.prompt).toHaveBeenCalledWith("next request");
 });
 
-it("stops a failed worker before dispatching queued work without replaying it", async () => {
-  const failed = fakeWorker();
-  const replacement = fakeWorker();
-  const runFailure = deferred<void>();
-  const stopFinished = deferred<void>();
-  vi.mocked(failed.prompt).mockImplementationOnce(async () => {
-    await runFailure.promise;
-    throw new Error("worker failed");
-  });
-  vi.mocked(failed.stop).mockImplementationOnce(async () => {
-    await stopFinished.promise;
-  });
-  const factory = vi.fn().mockReturnValueOnce(failed).mockReturnValueOnce(replacement);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
+it("a new-session marker forces a fresh run and is consumed", async () => {
+  await withDataDir(async (dataDir) => {
+    const tenHours = 10 * 60 * 60 * 1000;
+    let now = tenHours;
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => now }));
+    await manager.followup(42, "one");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(async () => {
+      const activity = JSON.parse(await readFile(path.join(dataDir, "chats", "42", "activity.json"), "utf8")) as { at: number };
+      expect(activity.at).toBe(tenHours);
+    });
 
-  const first = manager.prompt(6, "accepted once");
-  await vi.waitFor(() => expect(failed.prompt).toHaveBeenCalledOnce());
-  const later = manager.prompt(6, "later request", "follow-up");
-  runFailure.resolve();
-  await vi.waitFor(() => expect(failed.stop).toHaveBeenCalledOnce());
-  expect(replacement.start).not.toHaveBeenCalled();
-
-  stopFinished.resolve();
-  await expect(first).rejects.toThrow("worker failed");
-  await expect(later).resolves.toBeUndefined();
-  expect(failed.prompt).toHaveBeenCalledTimes(1);
-  expect(replacement.prompt).toHaveBeenCalledWith("later request");
-  expect(factory).toHaveBeenCalledTimes(2);
+    const marker = path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "new-session");
+    await mkdir(path.dirname(marker), { recursive: true });
+    await writeFile(marker, "", "utf8");
+    now = tenHours + 60_000;
+    await manager.followup(42, "two");
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.resume).toBe(false);
+    await expect(readFile(marker, "utf8")).rejects.toThrow();
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
 });
 
-it("aborts active work and drains queued disposal work without replacement", async () => {
-  const worker = fakeWorker();
-  const activeDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await activeDone.promise;
-  });
-  vi.mocked(worker.abort).mockImplementationOnce(async () => {
-    activeDone.resolve();
-  });
-  const factory = vi.fn().mockReturnValue(worker);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  const active = manager.prompt(8, "active");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  const queued = manager.prompt(8, "queued", "follow-up");
-  const queuedResult = expect(queued).rejects.toThrow("shutting down");
-
-  await manager.disposeAll();
-  await expect(active).resolves.toBeUndefined();
-  await queuedResult;
-  expect(worker.prompt).toHaveBeenCalledOnce();
-  expect(factory).toHaveBeenCalledOnce();
-  expect(worker.abort).toHaveBeenCalledOnce();
-  expect(worker.stop).toHaveBeenCalledOnce();
-});
-
-it("aborts, drains, stops all workers, and clears manager state", async () => {
-  const worker = fakeWorker();
-  const replacement = fakeWorker();
-  const activeDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await activeDone.promise;
-  });
-  vi.mocked(worker.abort).mockImplementationOnce(async () => {
-    activeDone.resolve();
-  });
-  const factory = vi.fn().mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-  const active = manager.prompt(7, "active");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-
-  await manager.disposeAll();
-  await expect(active).resolves.toBeUndefined();
-  expect(worker.abort).toHaveBeenCalledOnce();
-  expect(worker.stop).toHaveBeenCalledOnce();
-
-  await expect(manager.prompt(7, "after dispose")).resolves.toBeUndefined();
-  expect(factory).toHaveBeenCalledTimes(2);
-  await manager.disposeAll();
-  expect(replacement.stop).toHaveBeenCalledOnce();
-});
-
-it("gates new work and aborts each known worker only once", async () => {
-  const worker = fakeWorker();
-  const activeDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await activeDone.promise;
-  });
-  vi.mocked(worker.abort).mockImplementationOnce(async () => {
-    activeDone.resolve();
-  });
-  const factory = vi.fn().mockReturnValue(worker);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  const active = manager.prompt(9, "scheduled work", "follow-up");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-
-  const firstShutdown = manager.beginShutdown();
-  const secondShutdown = manager.beginShutdown();
-  await expect(firstShutdown).resolves.toBeUndefined();
-  await expect(secondShutdown).resolves.toBeUndefined();
-  await expect(active).resolves.toBeUndefined();
-  expect(worker.abort).toHaveBeenCalledOnce();
-  await expect(manager.prompt(9, "replacement", "follow-up")).rejects.toThrow("shutting down");
-  expect(factory).toHaveBeenCalledOnce();
-
-  await manager.disposeAll();
-  expect(worker.stop).toHaveBeenCalledOnce();
-});
-it("disposes an idle worker normally and clears its state", async () => {
-  const worker = fakeWorker();
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  await expect(manager.prompt(10, "first")).resolves.toBeUndefined();
-  await expect(manager.disposeAll()).resolves.toBeUndefined();
-  expect(worker.stop).toHaveBeenCalledOnce();
-
-  await expect(manager.prompt(10, "after dispose")).resolves.toBeUndefined();
-  await manager.disposeAll();
-  expect(worker.stop).toHaveBeenCalledTimes(2);
-});
-it("also disposes workers created while another worker is stopping", async () => {
-  const first = fakeWorker();
-  const second = fakeWorker();
-  const stopDone = deferred<void>();
-  vi.mocked(first.stop).mockImplementationOnce(async () => {
-    await stopDone.promise;
-  });
-  const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: factory });
-
-  await expect(manager.prompt(12, "first request")).resolves.toBeUndefined();
-  const disposal = manager.disposeAll();
-  await vi.waitFor(() => expect(first.stop).toHaveBeenCalledOnce());
-
-  await expect(manager.prompt(13, "during disposal")).resolves.toBeUndefined();
-  stopDone.resolve();
-  await expect(disposal).resolves.toBeUndefined();
-  expect(second.stop).toHaveBeenCalledOnce();
-});
-
-
-it("bounds abort disposal and rejects active and queued work", async () => {
-  const worker = fakeWorker();
-  const activeDone = deferred<void>();
-  const abortDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await activeDone.promise;
-  });
-  vi.mocked(worker.abort).mockImplementationOnce(async () => {
-    await abortDone.promise;
-  });
-  const manager = new AgentManager(config, {
-    ...managerOptions,
-    shutdownTimeoutMs: 10,
-    workerFactory: () => worker,
-  });
-
-  const active = manager.prompt(11, "active");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  const queued = manager.newSession(11);
-  await Promise.resolve();
-  const disposal = manager.disposeAll();
-
-  await expect(disposal).resolves.toBeUndefined();
-  await expect(active).rejects.toThrow("timed out");
-  await expect(queued).rejects.toThrow("shutting down");
-  expect(worker.stop).toHaveBeenCalledOnce();
-  activeDone.resolve();
-  abortDone.resolve();
-  await manager.disposeAll();
-  expect(worker.stop).toHaveBeenCalledOnce();
-});
-
-it("cleans up a worker that appears after an aborted hanging startup", async () => {
-  const startup = deferred<FakeWorker>();
-  const manager = new AgentManager(config, {
-    ...managerOptions,
-    shutdownTimeoutMs: 10,
-    workerFactory: () => startup.promise,
-  });
-
-  const pendingPrompt = manager.prompt(12, "during startup");
-  await Promise.resolve();
-  await expect(manager.disposeAll()).resolves.toBeUndefined();
-  await expect(pendingPrompt).rejects.toThrow();
-  const lateWorker = fakeWorker();
-  startup.resolve(lateWorker);
-  await vi.waitFor(() => expect(lateWorker.stop).toHaveBeenCalledOnce());
-});
-
-it("loadUserSettings tolerates missing and corrupt settings files", async () => {
-  const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-settings-"));
-  try {
-    expect(await loadUserSettings(workspace)).toEqual({});
-    const directory = path.join(workspace, ".pi", "agent");
-    await mkdir(directory, { recursive: true });
-    await writeFile(path.join(directory, "settings.json"), "{not valid json", "utf8");
-    expect(await loadUserSettings(workspace)).toEqual({});
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-it("writeUserSettings merges patches and preserves untouched keys", async () => {
-  const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-settings-"));
-  try {
-    const directory = path.join(workspace, ".pi", "agent");
-    await mkdir(directory, { recursive: true });
-    await writeFile(
-      path.join(directory, "settings.json"),
-      JSON.stringify({ custom: true, defaultProvider: "old" }),
-      "utf8",
-    );
-
-    await writeUserSettings(workspace, { defaultProvider: "new", defaultModel: "claude" });
-    await writeUserSettings(workspace, { defaultThinkingLevel: "high" });
-
-    expect(await loadUserSettings(workspace)).toEqual({
-      custom: true,
-      defaultProvider: "new",
-      defaultModel: "claude",
+it("passes settings defaults as model and thinking CLI args", async () => {
+  await withDataDir(async (dataDir) => {
+    await settingsFile(dataDir, 42, {
+      defaultProvider: "openrouter",
+      defaultModel: "deepseek/deepseek-chat",
       defaultThinkingLevel: "high",
     });
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-it("setModel and setThinkingLevel persist defaults while preserving existing settings", async () => {
-  const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-data-"));
-  const worker = fakeWorker();
-  const manager = new AgentManager({ ...config, dataDir }, { ...managerOptions, workerFactory: () => worker });
-  try {
-    const directory = path.join(dataDir, "chats", "42", "workspace", ".pi", "agent");
-    await mkdir(directory, { recursive: true });
-    await writeFile(path.join(directory, "settings.json"), JSON.stringify({ custom: true }), "utf8");
-
-    await manager.setModel(42, "anthropic", "claude");
-    await manager.setThinkingLevel(42, "high");
-
-    expect(worker.setModel).toHaveBeenCalledWith("anthropic", "claude");
-    expect(worker.setThinkingLevel).toHaveBeenCalledWith("high");
-    const settings = JSON.parse(await readFile(path.join(directory, "settings.json"), "utf8"));
-    expect(settings).toEqual({
-      custom: true,
-      defaultProvider: "anthropic",
-      defaultModel: "claude",
-      defaultThinkingLevel: "high",
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, ".");
+    await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
+    expect(factory.mock.calls[0]?.[0]).toMatchObject({
+      model: "openrouter/deepseek/deepseek-chat",
+      thinkingLevel: "high",
     });
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-it("status reports the worker session state through the per-chat queue", async () => {
-  const worker = fakeWorker();
-  vi.mocked(worker.getSessionState).mockResolvedValueOnce({
-    model: { provider: "anthropic", id: "claude" },
-    thinkingLevel: "high",
-    sessionId: "s1",
-    sessionFile: "/workspace/.pi/session.json",
-    messageCount: 3,
-    autoCompactionEnabled: true,
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  await expect(manager.status(4)).resolves.toEqual({
-    model: { provider: "anthropic", id: "claude" },
-    thinkingLevel: "high",
-    sessionId: "s1",
-    sessionFile: "/workspace/.pi/session.json",
-    messageCount: 3,
-    autoCompactionEnabled: true,
-  });
-  expect(worker.getSessionState).toHaveBeenCalledOnce();
 });
 
-it("getAvailableModels and getAvailableThinkingLevels route to the worker", async () => {
-  const worker = fakeWorker();
-  vi.mocked(worker.getAvailableModels).mockResolvedValueOnce([{ provider: "anthropic", id: "claude", name: "Claude" }]);
-  vi.mocked(worker.getAvailableThinkingLevels).mockResolvedValueOnce(["low", "high"]);
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  await expect(manager.getAvailableModels(5)).resolves.toEqual([{ provider: "anthropic", id: "claude", name: "Claude" }]);
-  await expect(manager.getAvailableThinkingLevels(5)).resolves.toEqual(["low", "high"]);
-});
-
-it("restart drains the active run before restarting the worker", async () => {
-  const worker = fakeWorker();
-  const activeDone = deferred<void>();
-  vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-    await activeDone.promise;
-  });
-  const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-  const active = manager.prompt(9, "running");
-  await vi.waitFor(() => expect(worker.prompt).toHaveBeenCalledOnce());
-  const restart = manager.restart(9);
-  await Promise.resolve();
-  expect(worker.restart).not.toHaveBeenCalled();
-
-  activeDone.resolve();
-  await expect(active).resolves.toBeUndefined();
-  await expect(restart).resolves.toBeUndefined();
-  expect(worker.restart).toHaveBeenCalledOnce();
-});
-
-it("serializes configuration commands through the per-chat queue", async () => {
-  const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-data-"));
-  const worker = fakeWorker();
-  const firstDone = deferred<void>();
-  vi.mocked(worker.setModel).mockImplementationOnce(async () => {
-    await firstDone.promise;
-  });
-  const manager = new AgentManager({ ...config, dataDir }, { ...managerOptions, workerFactory: () => worker });
-  try {
-    const first = manager.setModel(3, "anthropic", "claude");
-    await vi.waitFor(() => expect(worker.setModel).toHaveBeenCalledOnce());
-    const second = manager.setThinkingLevel(3, "high");
-    await Promise.resolve();
-    expect(worker.setThinkingLevel).not.toHaveBeenCalled();
-
-    firstDone.resolve();
-    await expect(first).resolves.toBeUndefined();
-    await expect(second).resolves.toBeUndefined();
-    expect(worker.setThinkingLevel).toHaveBeenCalledWith("high");
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-it("stops an idle worker after two hours without activity", async () => {
-  vi.useFakeTimers();
-  try {
-    const worker = fakeWorker();
-    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-    await manager.prompt(1, "hello");
-    expect(worker.stop).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS);
-    expect(worker.stop).toHaveBeenCalledOnce();
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-it("re-arms the idle timer when a prompt arrives before expiry", async () => {
-  vi.useFakeTimers();
-  try {
-    const worker = fakeWorker();
-    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
-
-    await manager.prompt(1, "first");
-    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS / 2);
-    await manager.prompt(1, "second");
-    // The original deadline has passed, but the second prompt re-armed the timer.
-    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS / 2);
-
-    expect(worker.stop).not.toHaveBeenCalled();
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-it("re-arms instead of stopping while a run is active at expiry", async () => {
-  vi.useFakeTimers();
-  try {
-    const worker = fakeWorker();
-    const promptStarted = deferred<void>();
-    const activeDone = deferred<void>();
-    vi.mocked(worker.prompt).mockImplementationOnce(async () => {
-      promptStarted.resolve();
-      await activeDone.promise;
+it("persists last activity host-side and reloads it for a new manager", async () => {
+  await withDataDir(async (dataDir) => {
+    const tenHours = 10 * 60 * 60 * 1000;
+    let now = tenHours;
+    const first = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: first.factory, now: () => now }));
+    await manager.followup(42, "one");
+    await vi.waitFor(() => expect(first.runs).toHaveLength(1));
+    first.runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(async () => {
+      const activity = JSON.parse(await readFile(path.join(dataDir, "chats", "42", "activity.json"), "utf8")) as { at: number };
+      expect(activity.at).toBe(tenHours);
     });
-    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
 
-    const active = manager.prompt(1, "long running");
-    await promptStarted.promise;
-    expect(worker.prompt).toHaveBeenCalledOnce();
-
-    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS);
-    expect(worker.stop).not.toHaveBeenCalled();
-
-    activeDone.resolve();
-    await expect(active).resolves.toBeUndefined();
-  } finally {
-    vi.useRealTimers();
-  }
+    const second = fakeWorkerFactory();
+    const secondManager = new AgentManager({ dataDir }, managerOptions({ workerFactory: second.factory, now: () => tenHours + 5_000 }));
+    await secondManager.followup(42, "two");
+    await vi.waitFor(() => expect(second.runs).toHaveLength(1));
+    expect(second.factory.mock.calls[0]?.[0].resume).toBe(true);
+    second.runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
 });
 
-it("disposeAll clears the idle timer and stops the worker", async () => {
-  vi.useFakeTimers();
-  try {
-    const worker = fakeWorker();
-    const manager = new AgentManager(config, { ...managerOptions, workerFactory: () => worker });
+it("status reads the newest session file and settings defaults without spawning", async () => {
+  await withDataDir(async (dataDir) => {
+    await settingsFile(dataDir, 42, { defaultModel: "fallback", defaultProvider: "openrouter", defaultThinkingLevel: "low" });
+    const sessions = path.join(dataDir, "chats", "42", "workspace", ".pi", "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(path.join(sessions, "old.jsonl"), [
+      JSON.stringify({ type: "session", version: 3, id: "old", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/workspace" }),
+      JSON.stringify({ type: "message", id: "m1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: [] } }),
+    ].join("\n"), "utf8");
+    await writeFile(path.join(sessions, "new.jsonl"), [
+      JSON.stringify({ type: "session", version: 3, id: "new", timestamp: "2026-02-01T00:00:00.000Z", cwd: "/workspace" }),
+      JSON.stringify({ type: "model_change", id: "c1", parentId: null, timestamp: "2026-02-01T00:00:01.000Z", provider: "anthropic", modelId: "claude" }),
+      JSON.stringify({ type: "thinking_level_change", id: "t1", parentId: "c1", timestamp: "2026-02-01T00:00:02.000Z", thinkingLevel: "medium" }),
+      JSON.stringify({ type: "message", id: "m1", parentId: "t1", timestamp: "2026-02-01T00:00:03.000Z", message: { role: "user", content: [] } }),
+      JSON.stringify({ type: "message", id: "m2", parentId: "m1", timestamp: "2026-02-01T00:00:04.000Z", message: { role: "assistant", content: [] } }),
+    ].join("\n"), "utf8");
 
-    await manager.prompt(1, "hello");
-    expect(worker.stop).not.toHaveBeenCalled();
+    const manager = new AgentManager({ dataDir }, managerOptions());
+    const status: AgentStatus = await manager.status(42);
+    expect(status).toEqual({
+      model: { provider: "anthropic", id: "claude" },
+      thinkingLevel: "medium",
+      sessionFile: "new.jsonl",
+      messageCount: 2,
+      autoCompactionEnabled: true,
+    });
+  });
+});
 
-    await manager.disposeAll();
-    expect(worker.stop).toHaveBeenCalledOnce();
+it("status reports settings defaults when no session file exists", async () => {
+  await withDataDir(async (dataDir) => {
+    await settingsFile(dataDir, 42, { defaultModel: "claude", defaultProvider: "anthropic" });
+    const manager = new AgentManager({ dataDir }, managerOptions());
+    await expect(manager.status(42)).resolves.toEqual({
+      model: { provider: "anthropic", id: "claude" },
+      thinkingLevel: "off",
+      messageCount: 0,
+      autoCompactionEnabled: true,
+    });
+  });
+});
 
-    await vi.advanceTimersByTimeAsync(WORKER_IDLE_STOP_MS * 2);
-    expect(worker.stop).toHaveBeenCalledOnce();
-  } finally {
-    vi.useRealTimers();
-  }
+it("beginShutdown stops active runs and rejects later work", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "one");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.beginShutdown();
+    expect(runs[0]?.stop).toHaveBeenCalledOnce();
+    await expect(manager.followup(42, "two")).rejects.toThrow("Agent manager is shutting down");
+    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
+  });
+});
+
+it("a failed run logs and continues draining queued followups", async () => {
+  await withDataDir(async (dataDir) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { factory, runs } = fakeWorkerFactory();
+      const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+      await manager.followup(42, "one");
+      await vi.waitFor(() => expect(runs).toHaveLength(1));
+      await manager.followup(42, "two");
+      runs[0]?.resolveRun({ code: 1, signal: null, stderr: "boom", stdout: "" });
+      await vi.waitFor(() => expect(runs).toHaveLength(2));
+      expect(runs[1]?.worker.options.message).toBe("two");
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("boom"));
+      runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });

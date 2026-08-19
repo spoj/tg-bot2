@@ -8,14 +8,14 @@ import { tmpdir } from "node:os";
 
 import { GrammyError, type Bot } from "grammy";
 import {
+  addTelegramIngressEvent,
   closeTelegramIngress,
   createTelegramBot,
   deleteTelegramMessage,
   flushTelegramIngress,
-  formatModelList,
   formatStatus,
-  formatThinkingLevels,
   recordPollOwner,
+  registerBotCommands,
   attachmentSource,
   sendTelegramEditMessage,
   sendTelegramLocation,
@@ -28,6 +28,7 @@ import {
   TelegramDeliveryQueue,
   TelegramIngressBuffer,
 } from "../src/telegram.js";
+import type { AgentStatus } from "../src/agent.js";
 import { appendChatEvents, type ChatEvent } from "../src/events.js";
 
 const execFile = promisify(execFileCallback);
@@ -87,7 +88,7 @@ let sentRequests: Array<{ url: string; body: string }> = [];
 
 async function makeTestBot(
   dataDir: string,
-  agents: { prompt: ReturnType<typeof vi.fn> },
+  agents: { interrupt: Mock<(chatId: number, text: string) => Promise<void>> },
   { fetchResult, recordRequests = false }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean } = {},
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
@@ -951,7 +952,7 @@ describe("Telegram attachment downloads", () => {
 describe("Telegram location and venue updates", () => {
   async function sendLocationUpdate(dataDir: string, message: Record<string, unknown>): Promise<Mock> {
     const prompt = vi.fn(async () => undefined);
-    const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
+    const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
     await bot.handleUpdate({
       update_id: 1,
       message: {
@@ -1139,7 +1140,7 @@ describe("Telegram callback queries", () => {
   it("records an authorized button press as a callback event and wakes the agent", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
       await flushTelegramIngress(bot);
       expect(prompt).toHaveBeenCalledWith(42, ".");
@@ -1152,7 +1153,7 @@ describe("Telegram callback queries", () => {
   it("rejects unauthorized button presses without a callback event", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
       await flushTelegramIngress(bot);
       expect(prompt).not.toHaveBeenCalled();
@@ -1164,7 +1165,7 @@ describe("Telegram callback queries", () => {
   it("embeds the raw callback query in the callback event", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
       await flushTelegramIngress(bot);
       expect(prompt).toHaveBeenCalledWith(42, ".");
@@ -1191,7 +1192,7 @@ describe("Telegram chat events", () => {
   it("logs a text message event and wakes the agent with the wake prompt", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate(textUpdate("hello") as never);
       await flushTelegramIngress(bot);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
@@ -1309,7 +1310,7 @@ describe("Telegram poll answers", () => {
     await withWorkspace(async (dataDir) => {
       await recordPollOwner(dataDir, 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1337,7 +1338,7 @@ describe("Telegram poll answers", () => {
       await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
       await recordPollOwner(dataDir, 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1362,7 +1363,7 @@ describe("Telegram poll answers", () => {
   it("drops poll answers from unknown polls", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { prompt }, { fetchResult: { message_id: 555 } });
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1379,72 +1380,40 @@ describe("Telegram poll answers", () => {
 });
 
 describe("Telegram command formatting", () => {
-  it("numbers models, marks the current one, and handles empty lists", () => {
-    expect(formatModelList([], undefined)).toBe("No models available.");
-    expect(formatModelList([
-      { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
-      { provider: "anthropic", id: "claude-3-5-sonnet" },
-    ], { provider: "anthropic", id: "claude-3-5-sonnet" })).toBe(
-      "1. openrouter/deepseek/deepseek-chat — DeepSeek Chat\n2. anthropic/claude-3-5-sonnet (current)",
-    );
-  });
-
-  it("numbers thinking levels, marks the current one, and handles empty lists", () => {
-    expect(formatThinkingLevels([], undefined)).toBe("No thinking levels available.");
-    expect(formatThinkingLevels(["low", "medium", "high"], "medium")).toBe(
-      "1. low\n2. medium (current)\n3. high",
-    );
-  });
-
   it("formats session state on one line", () => {
     expect(formatStatus({
       model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
       thinkingLevel: "medium",
-      sessionId: "42",
       sessionFile: "42.jsonl",
       messageCount: 7,
       autoCompactionEnabled: true,
     })).toBe("Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7");
     expect(formatStatus({
       thinkingLevel: "low",
-      sessionId: "42",
       messageCount: 0,
       autoCompactionEnabled: false,
-    })).toBe("Model: unset | Thinking: low | Session: 42 | Messages: 0");
+    })).toBe("Model: unset | Thinking: low | Session: none | Messages: 0");
   });
 });
 
 describe("Telegram commands", () => {
-  const defaultStatus = {
-    model: undefined,
+  const defaultStatus: AgentStatus = {
     thinkingLevel: "medium",
-    sessionId: "42",
-    sessionFile: undefined,
     messageCount: 0,
     autoCompactionEnabled: true,
   };
 
   type FakeAgents = {
-    prompt: ReturnType<typeof vi.fn>;
-    newSession: ReturnType<typeof vi.fn>;
-    getAvailableModels: ReturnType<typeof vi.fn>;
-    getAvailableThinkingLevels: ReturnType<typeof vi.fn>;
-    status: ReturnType<typeof vi.fn>;
-    setModel: ReturnType<typeof vi.fn>;
-    setThinkingLevel: ReturnType<typeof vi.fn>;
-    restart: ReturnType<typeof vi.fn>;
+    followup: Mock<(chatId: number, text: string) => Promise<void>>;
+    interrupt: Mock<(chatId: number, text: string) => Promise<void>>;
+    status: Mock<(chatId: number) => Promise<AgentStatus>>;
   };
 
   function makeAgents(overrides: Partial<FakeAgents> = {}): FakeAgents {
     return {
-      prompt: vi.fn(async () => undefined),
-      newSession: vi.fn(async () => {}),
-      getAvailableModels: vi.fn(async () => []),
-      getAvailableThinkingLevels: vi.fn(async () => []),
+      followup: vi.fn(async () => undefined),
+      interrupt: vi.fn(async () => undefined),
       status: vi.fn(async () => defaultStatus),
-      setModel: vi.fn(async () => {}),
-      setThinkingLevel: vi.fn(async () => {}),
-      restart: vi.fn(async () => {}),
       ...overrides,
     };
   }
@@ -1487,141 +1456,8 @@ describe("Telegram commands", () => {
     const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
     await sendCommand(bot, "/start");
     expect(replies(bot)).toEqual([
-      "Personal agent. Send text, attachments, or a location pin to continue your persistent session, or /new to start a fresh one.",
+      "Personal agent. Send text, attachments, or a location pin to continue your persistent session. /status shows the current model, thinking level, and session summary.",
     ]);
-  });
-
-  it("rejects unauthorized /start and /new before running handlers", async () => {
-    const agents = makeAgents();
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/start", 999);
-    await sendCommand(bot, "/new", 999);
-    expect(replies(bot)).toEqual(["Unauthorized.", "Unauthorized."]);
-    expect(agents.newSession).not.toHaveBeenCalled();
-  });
-
-  it("/new starts a new session and confirms", async () => {
-    const newSession = vi.fn(async () => {});
-    const agents = makeAgents({ newSession });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/new");
-    expect(newSession).toHaveBeenCalledWith(42);
-    expect(replies(bot)).toEqual([
-      "Started a new session. Earlier session files remain searchable.",
-    ]);
-  });
-
-  it("/new reports a friendly failure when newSession rejects", async () => {
-    const newSession = vi.fn(async () => { throw new Error("boom"); });
-    const agents = makeAgents({ newSession });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/new");
-    expect(replies(bot)).toEqual([
-      "I could not start a new session. Please try again.",
-    ]);
-  });
-
-  it("delivers /new and /status replies in command order", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const agents = makeAgents({ newSession: vi.fn(() => gate) });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-
-    const newDone = sendCommand(bot, "/new");
-    const statusDone = sendCommand(bot, "/status");
-    release();
-    await Promise.all([newDone, statusDone]);
-
-    expect(replies(bot)).toEqual([
-      "Started a new session. Earlier session files remain searchable.",
-      "Model: unset | Thinking: medium | Session: 42 | Messages: 0",
-    ]);
-  });
-
-  it("/model lists available models with the current one marked", async () => {
-    const agents = makeAgents({
-      getAvailableModels: vi.fn(async () => [
-        { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
-        { provider: "anthropic", id: "claude-3-5-sonnet" },
-      ]),
-      status: vi.fn(async () => ({ ...defaultStatus, model: { provider: "anthropic", id: "claude-3-5-sonnet" } })),
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/model");
-    expect(replies(bot)).toEqual([
-      "1. openrouter/deepseek/deepseek-chat — DeepSeek Chat\n2. anthropic/claude-3-5-sonnet (current)",
-    ]);
-  });
-
-  it("/model sets a uniquely matched model", async () => {
-    const setModel = vi.fn(async () => {});
-    const agents = makeAgents({
-      getAvailableModels: vi.fn(async () => [
-        { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
-        { provider: "anthropic", id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet" },
-      ]),
-      setModel,
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/model claude");
-    expect(setModel).toHaveBeenCalledWith(42, "anthropic", "claude-3-5-sonnet");
-    expect(replies(bot)).toEqual(["Model set to anthropic/claude-3-5-sonnet."]);
-  });
-
-  it("/model lists matches when the query is ambiguous", async () => {
-    const agents = makeAgents({
-      getAvailableModels: vi.fn(async () => [
-        { provider: "openrouter", id: "deepseek/deepseek-chat", name: "DeepSeek Chat" },
-        { provider: "openrouter", id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner" },
-      ]),
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/model deepseek");
-    expect(agents.setModel).not.toHaveBeenCalled();
-    expect(replies(bot)[0]).toContain('Multiple models match "deepseek":');
-  });
-
-  it("/model reports when nothing matches", async () => {
-    const agents = makeAgents({
-      getAvailableModels: vi.fn(async () => [
-        { provider: "openrouter", id: "deepseek/deepseek-chat" },
-      ]),
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/model nonexistent");
-    expect(replies(bot)).toEqual(['No model matches "nonexistent".']);
-  });
-
-  it("/thinking lists levels with the current one marked", async () => {
-    const agents = makeAgents({
-      getAvailableThinkingLevels: vi.fn(async () => ["low", "medium", "high"]),
-      status: vi.fn(async () => ({ ...defaultStatus, thinkingLevel: "medium" })),
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/thinking");
-    expect(replies(bot)).toEqual(["1. low\n2. medium (current)\n3. high"]);
-  });
-
-  it("/thinking sets a valid level", async () => {
-    const setThinkingLevel = vi.fn(async () => {});
-    const agents = makeAgents({
-      getAvailableThinkingLevels: vi.fn(async () => ["low", "high"]),
-      setThinkingLevel,
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/thinking high");
-    expect(setThinkingLevel).toHaveBeenCalledWith(42, "high");
-    expect(replies(bot)).toEqual(["Thinking level set to high."]);
-  });
-
-  it("/thinking rejects an invalid level and lists valid ones", async () => {
-    const agents = makeAgents({
-      getAvailableThinkingLevels: vi.fn(async () => ["low", "high"]),
-    });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/thinking extreme");
-    expect(agents.setThinkingLevel).not.toHaveBeenCalled();
-    expect(replies(bot)).toEqual(['Unknown thinking level "extreme". Valid levels: low, high.']);
   });
 
   it("/status reports the session state", async () => {
@@ -1629,7 +1465,6 @@ describe("Telegram commands", () => {
       status: vi.fn(async () => ({
         model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
         thinkingLevel: "medium",
-        sessionId: "42",
         sessionFile: "42.jsonl",
         messageCount: 7,
         autoCompactionEnabled: true,
@@ -1642,20 +1477,10 @@ describe("Telegram commands", () => {
     ]);
   });
 
-  it("/restart restarts the agent and confirms", async () => {
-    const restart = vi.fn(async () => {});
-    const agents = makeAgents({ restart });
+  it("/status reports a friendly failure", async () => {
+    const agents = makeAgents({ status: vi.fn(async () => { throw new Error("boom"); }) });
     const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/restart");
-    expect(restart).toHaveBeenCalledWith(42);
-    expect(replies(bot)).toEqual(["Restarting agent…", "Agent restarted."]);
-  });
-
-  it("/restart reports a friendly failure", async () => {
-    const restart = vi.fn(async () => { throw new Error("Pi worker is busy"); });
-    const agents = makeAgents({ restart });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/restart");
-    expect(replies(bot)).toEqual(["Restarting agent…", "I could not restart the agent. Please try again."]);
+    await sendCommand(bot, "/status");
+    expect(replies(bot)).toEqual(["I could not get the status. Please try again."]);
   });
 });

@@ -5,7 +5,7 @@ import { lstat, link, mkdir, open, opendir, rename, unlink } from "node:fs/promi
 import path from "node:path";
 import { appendChatEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
-import { appendBoundedJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
@@ -25,8 +25,6 @@ const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_REQUEST_BYTES = 64 * 1024;
-const MAX_JSONL_LINES = 256;
-const MAX_JSONL_BYTES = 64 * 1024;
 const JSON_REQUEST = /\.json$/;
 // Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
 const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
@@ -38,9 +36,8 @@ const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
 const CLAIM_NAME = /^\.in-progress-(\d+)-[^/]+$/u;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
-const OUTBOX_DIR = "outbox";
-const POLL_RESULTS_FILE = "poll-results.jsonl";
 
+const OUTBOX_DIR = "outbox";
 type ClaimLease = {
   stop: () => Promise<void>;
 };
@@ -370,24 +367,16 @@ export class WorkspaceOutbox {
           lease = this.startClaimLease(claim, chatId);
           request = await readRequest(claim.path);
           const result = await this.dispatch(chatId, request);
-          if (result !== undefined) {
+          if (result !== undefined && (result.messageId !== undefined || result.data !== undefined)) {
             try {
-              if (result.messageId !== undefined) {
-                appendChatEvent(workspace, {
-                  type: "send",
-                  kind: request.type,
-                  id: request.id,
-                  messageId: result.messageId,
-                  ...defined({ pollId: result.pollId }),
-                });
-              }
-              if (result.data !== undefined) {
-                await appendBoundedJsonl(
-                  path.join(metadata.path, POLL_RESULTS_FILE),
-                  JSON.stringify({ id: request.id, result: result.data }),
-                  { maxLines: MAX_JSONL_LINES, maxBytes: MAX_JSONL_BYTES },
-                );
-              }
+              appendChatEvent(workspace, {
+                type: "send",
+                kind: request.type,
+                id: request.id,
+                ...defined({ messageId: result.messageId }),
+                ...defined({ pollId: result.pollId }),
+                ...defined({ data: result.data }),
+              });
             } catch (error) {
               // Delivery succeeded; a lost ack or result must never resend the request.
               this.reportRequestError(chatId, archiveName, error);

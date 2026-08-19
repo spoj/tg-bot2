@@ -3,7 +3,7 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { createTelegramBot, closeTelegramIngress, dispatchOutboxRequest, flushTelegramIngress, TelegramDeliveryQueue } from "./telegram.js";
+import { addTelegramIngressEvent, createTelegramBot, closeTelegramIngress, dispatchOutboxRequest, flushTelegramIngress, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -63,13 +63,13 @@ export async function main(): Promise<void> {
   const bot = createTelegramBot(runtimeConfig, agentManager, deliveryQueue);
   const schedulerInstance = new WorkspaceScheduler({
     dataDir,
-    run: (chatId, prompt) => agentManager.prompt(chatId, prompt, "follow-up"),
+    run: (chatId, prompt) => agentManager.followup(chatId, prompt),
   });
   const outboxInstance = new WorkspaceOutbox({
     dataDir,
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
-    notifyAgent: async (chatId, message) => {
-      await agentManager.prompt(chatId, message, "follow-up");
+    notifyAgent: (chatId, message) => {
+      addTelegramIngressEvent(bot, chatId, { type: "outbox_rejected", detail: message });
     },
   });
 
@@ -116,7 +116,10 @@ export async function main(): Promise<void> {
     console.log("Starting Telegram long polling");
     await bot.start({
       allowed_updates: ["message", "callback_query", "poll_answer"],
-      onStart: (info) => console.log(`Telegram bot @${info.username} started`),
+      onStart: (info) => {
+        console.log(`Telegram bot @${info.username} started`);
+        void registerBotCommands(bot).catch((error) => console.error("Telegram command registration failed", error));
+      },
     });
   } catch (error) {
     await shutdown("startup or polling failure");

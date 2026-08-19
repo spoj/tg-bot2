@@ -393,17 +393,15 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["one.json"]);
   });
 
-  it("bounds the poll results file to the latest lines", async () => {
+  it("writes dispatcher data onto the send event in events.jsonl", async () => {
     const { dataDir, workspace } = await fixture();
-    const resultsPath = path.join(workspace, ".tg-bot", "poll-results.jsonl");
-    const oldLines = Array.from({ length: 300 }, (_unused, index) => JSON.stringify({ id: `old-${index}`, result: index }));
-    await writeFile(resultsPath, `${oldLines.join("\n")}\n`, "utf8");
     await writeRequest(workspace, "stop.json", { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
     await pollOutbox(dataDir, vi.fn(async () => ({ data: 777 })));
-    const lines = (await readFile(resultsPath, "utf8")).trim().split("\n");
-    expect(lines).toHaveLength(256);
-    expect(lines.at(-1)).toBe('{"id":"stop","result":777}');
-    expect(lines.at(-2)).toBe('{"id":"old-299","result":299}');
+    await vi.waitFor(async () => {
+      const recorded = await chatEvents(workspace);
+      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", data: 777 }]);
+    });
+    expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["stop.json"]);
   });
 
   it("forwards send_message requests without host-side semantic validation", async () => {
@@ -467,17 +465,18 @@ describe("WorkspaceOutbox", () => {
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["loc.json", "poll.json", "react.json"]);
   });
 
-  it("records stopped poll results in poll-results.jsonl", async () => {
+  it("records stopped poll results as data on the send event", async () => {
     const { dataDir, workspace } = await fixture();
     await writeRequest(workspace, "stop.json", { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
     const poll = { id: "poll-xyz", question: "Q", options: [{ text: "a", voter_count: 2 }], total_voter_count: 2, is_closed: true };
-    const dispatch = vi.fn(async () => ({ data: poll }));
+    const dispatch = vi.fn(async () => ({ messageId: 77, data: poll }));
     await pollOutbox(dataDir, dispatch);
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, id: "stop", type: "stop_poll", message_id: 77 });
-    const results = (await readFile(path.join(workspace, ".tg-bot", "poll-results.jsonl"), "utf8")).trim();
-    expect(JSON.parse(results)).toEqual({ id: "stop", result: poll });
+    await vi.waitFor(async () => {
+      const recorded = await chatEvents(workspace);
+      expect(recorded).toMatchObject([{ type: "send", kind: "stop_poll", id: "stop", messageId: 77, data: poll }]);
+    });
     expect(await names(path.join(workspace, ".tg-bot", "outbox", "processed"))).toEqual(["stop.json"]);
-    await expect(readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8")).rejects.toThrow();
   });
 
   it("forwards location, poll, and reaction requests without host-side semantic validation", async () => {

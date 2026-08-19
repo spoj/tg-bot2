@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildBwrapArgs, buildPiWorkerBwrapArgs, checkSandboxEnvironment, runSandbox, spawnProcess, terminateProcessGroup } from "../src/sandbox.js";
+import { buildBwrapArgs, buildPiRunBwrapArgs, checkSandboxEnvironment, runSandbox, spawnProcess, terminateProcessGroup } from "../src/sandbox.js";
 import { openPinnedDirectory } from "../src/util.js";
 
 async function fixture() {
@@ -96,7 +96,7 @@ it("rejects a symlinked appRoot node_modules tree", async () => {
     await mkdir(appRoot);
     await mkdir(dependencyTarget);
     await symlink(dependencyTarget, path.join(appRoot, "node_modules"), "dir");
-    await expect(buildPiWorkerBwrapArgs({ workspace: f.workspace, appRoot }))
+    await expect(buildPiRunBwrapArgs({ workspace: f.workspace, appRoot }))
       .rejects.toThrow("node_modules must be a real directory");
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
@@ -130,13 +130,14 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
-    const workerArgs = await buildPiWorkerBwrapArgs({ workspace: target, appRoot });
+    const workerArgs = await buildPiRunBwrapArgs({ workspace: target, appRoot, resume: true, model: "anthropic/claude", thinkingLevel: "high" });
     expect(workerArgs.args).toContain(await realpath(node));
     expect(workerArgs.args).not.toContain("/usr/bin/node");
     expect(workerArgs.args.slice(workerArgs.args.indexOf("--") + 1)).toEqual([
       await realpath(node),
       "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-      "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
+      "--print", "--session-dir", "/workspace/.pi/sessions", "--approve",
+      "--continue", "--model", "anthropic/claude", "--thinking", "high",
     ]);
     const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });
     expect(result).toEqual({ dataDir: target, bwrapPath: await realpath(bwrap) });

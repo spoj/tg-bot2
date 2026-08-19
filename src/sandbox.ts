@@ -124,13 +124,19 @@ export async function buildBwrapArgs(
   return { args };
 }
 
-export type PiWorkerSandboxPaths = {
+export type PiRunSandboxPaths = {
   workspace: string;
   appRoot: string;
   cliPath?: string;
   appendSystemPrompt?: string;
+  /** Resumes the most recent session (passes --continue). */
+  resume?: boolean;
+  /** "provider/modelId" pattern passed as --model; overrides session-restored models. */
+  model?: string;
+  /** Thinking level passed as --thinking. */
+  thinkingLevel?: string;
 };
-export type PiWorkerBwrapResult = { args: string[] };
+export type PiRunBwrapResult = { args: string[] };
 
 function relativeMountPath(root: string, candidate: string, mountPoint: string, label: string): string {
   const relative = path.relative(root, candidate);
@@ -140,8 +146,8 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
   return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
 }
 
-/** Build the Pi worker profile; appRoot, source, and .env stay out while dependencies remain read-only. */
-export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promise<PiWorkerBwrapResult> {
+/** Build the Pi one-shot run profile; appRoot, source, and .env stay out while dependencies remain read-only. */
+export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiRunBwrapResult> {
   const workspace = await requireRealDirectory(paths.workspace, "Pi worker workspace", path.resolve(paths.workspace));
   const appRoot = await requireRealDirectory(paths.appRoot, "Pi worker appRoot", path.resolve(paths.appRoot));
 
@@ -193,11 +199,16 @@ export async function buildPiWorkerBwrapArgs(paths: PiWorkerSandboxPaths): Promi
     "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
   );
-  args.push(
-    "--chdir", "/workspace", "--", nodePath, cliMountPath,
-    "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
+  const piArgs = [
+    "--print",
+    "--session-dir", "/workspace/.pi/sessions",
+    "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", paths.appendSystemPrompt]),
-  );
+    ...(paths.resume ? ["--continue"] : []),
+    ...(paths.model === undefined ? [] : ["--model", paths.model]),
+    ...(paths.thinkingLevel === undefined ? [] : ["--thinking", paths.thinkingLevel]),
+  ];
+  args.push("--chdir", "/workspace", "--", nodePath, cliMountPath, ...piArgs);
   return { args };
 }
 

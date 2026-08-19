@@ -1,113 +1,51 @@
-import { watch, type FSWatcher } from "node:fs";
-import { chmod, lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import {
-  buildPiWorkerBwrapArgs,
+  buildPiRunBwrapArgs,
+  type PiRunSandboxPaths,
   type PiWorkerChildProcess,
-  type PiWorkerSandboxPaths,
   type PiWorkerSpawn,
 } from "./sandbox.js";
 import { defined } from "./util.js";
 
-export type PiRpcEvent = Record<string, unknown>;
-export type PiRpcEventListener = (event: PiRpcEvent) => void;
-export type AvailableModel = { provider: string; id: string; name?: string };
-
-export type WorkerSessionState = {
-  model?: { provider: string; id: string };
-  thinkingLevel: string;
-  sessionId: string;
-  sessionFile?: string;
-  messageCount: number;
-  autoCompactionEnabled: boolean;
+export type PiRunResult = {
+  /** Exit code when the process ran to completion; null when signal-killed. */
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  stdout: string;
 };
 
-/** Parse strict LF-delimited JSONL; U+2028/U+2029 are data. */
-export class StrictJsonlParser {
-  private readonly decoder = new StringDecoder("utf8");
-  private buffer = "";
-  private lineNumber = 0;
-
-  push(chunk: string | Buffer): unknown[] {
-    this.buffer += this.decoder.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-    return this.drain(false);
-  }
-
-  end(): unknown[] {
-    this.buffer += this.decoder.end();
-    return this.drain(true);
-  }
-
-  private drain(final: boolean): unknown[] {
-    const records: unknown[] = [];
-    while (true) {
-      const newline = this.buffer.indexOf("\n");
-      if (newline < 0) break;
-      const line = this.buffer.slice(0, newline);
-      this.buffer = this.buffer.slice(newline + 1);
-      records.push(this.parse(line));
-    }
-    if (final && this.buffer.length > 0) {
-      records.push(this.parse(this.buffer));
-      this.buffer = "";
-    }
-    return records;
-  }
-
-  private parse(line: string): unknown {
-    this.lineNumber += 1;
-    const json = line.endsWith("\r") ? line.slice(0, -1) : line;
-    try {
-      return JSON.parse(json) as unknown;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Invalid Pi RPC JSON on line ${this.lineNumber}: ${message}`);
-    }
-  }
-}
-
-export type PiRpcWorkerOptions = PiWorkerSandboxPaths & {
+export type PiRunWorkerOptions = PiRunSandboxPaths & {
+  /** The single message processed by the one-shot --print run. */
+  message: string;
   bwrapPath?: string;
-  spawn: PiWorkerSpawn;
+  spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
-  /** Bound fast RPC control requests so a silent worker cannot strand operations. */
-  rpcTimeoutMs?: number;
-  /** Prompt acceptance can include extension/resource expansion work. */
-  promptTimeoutMs?: number;
-  /** Session lifecycle commands may perform asynchronous cleanup. */
-  lifecycleTimeoutMs?: number;
 };
 
-type PendingRequest = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  workEpoch?: number;
-  timeout?: ReturnType<typeof setTimeout>;
-};
-type SettledWaiter = {
-  resolve: () => void;
-  reject: (error: Error) => void;
-};
-
-type JsonRecord = Record<string, unknown>;
-
-function asRecord(value: unknown): JsonRecord | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as JsonRecord
-    : undefined;
-}
+const DEFAULT_STOP_GRACE_MS = 1_000;
+const MAX_CAPTURE_BYTES = 64 * 1024;
+const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function boundedCapture(previous: string, chunk: string | Buffer): string {
+  const incoming = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  const available = MAX_CAPTURE_BYTES - 1 - incoming.length;
+  if (available <= 0) return `…${incoming.slice(-(MAX_CAPTURE_BYTES - 1))}`;
+  if (previous.length > available) return `…${previous.slice(-available)}${incoming}`;
+  return previous + incoming;
 }
 
 async function ensurePrivateDirectory(directory: string): Promise<void> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const entry = await lstat(directory);
   if (!entry.isDirectory() || entry.isSymbolicLink()) {
-    throw new Error(`Pi worker runtime path must be a real directory: ${directory}`);
+    throw new Error(`Pi run runtime path must be a real directory: ${directory}`);
   }
   await chmod(directory, 0o700);
 }
@@ -123,114 +61,6 @@ async function ensureWebSearchConfig(workspace: string): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
-}
-
-const EXTENSION_RELOAD_DEBOUNCE_MS = 500;
-const EXTENSION_RELOAD_RETRY_MS = 100;
-
-function extensionWatchKind(filename: string | Buffer | null): "settings" | "resource" | undefined {
-  if (filename === null) return undefined;
-  const relative = filename.toString().replaceAll(path.sep, "/");
-  if (relative === "settings.json" || relative === "agent/settings.json") return "settings";
-  if (
-    relative === "extensions" || relative.startsWith("extensions/") ||
-    relative === "npm" || relative.startsWith("npm/") ||
-    relative === "git" || relative.startsWith("git/") ||
-    relative === "agent/extensions" || relative.startsWith("agent/extensions/") ||
-    relative === "agent/npm" || relative.startsWith("agent/npm/") ||
-    relative === "agent/git" || relative.startsWith("agent/git/")
-  ) return "resource";
-  return undefined;
-}
-
-const RESOURCE_DISCOVERY_SETTINGS = ["packages", "extensions", "skills", "prompts", "themes"] as const;
-
-function localExtensionSource(source: string): boolean {
-  const trimmed = source.trim();
-  return trimmed.length > 0 && !/^(?:npm:|git:|git\+|github:|https?:|ssh:)/i.test(trimmed);
-}
-
-function settingSources(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const sources: string[] = [];
-  for (const entry of value) {
-    if (typeof entry === "string") sources.push(entry);
-    else {
-      const source = asRecord(entry)?.source;
-      if (typeof source === "string") sources.push(source);
-    }
-  }
-  return sources;
-}
-
-async function localExtensionWatchPaths(workspace: string): Promise<string[]> {
-  const configRoots = [
-    { directory: path.join(workspace, ".pi"), file: path.join(workspace, ".pi", "settings.json") },
-    { directory: path.join(workspace, ".pi", "agent"), file: path.join(workspace, ".pi", "agent", "settings.json") },
-  ];
-  const piRoot = path.join(workspace, ".pi");
-  const watchPaths = new Set<string>();
-  for (const config of configRoots) {
-    let settings: JsonRecord;
-    try {
-      settings = asRecord(JSON.parse(await readFile(config.file, "utf8"))) ?? {};
-    } catch {
-      continue;
-    }
-    const sources = [
-      ...settingSources(settings.packages),
-      ...settingSources(settings.extensions),
-    ];
-    for (const source of sources) {
-      if (!localExtensionSource(source)) continue;
-      const resolved = path.resolve(config.directory, source.trim());
-      const relativeToPi = path.relative(piRoot, resolved);
-      if (relativeToPi === "" || (!relativeToPi.startsWith(`..${path.sep}`) && relativeToPi !== "..")) continue;
-      if (resolved === workspace) continue;
-      try {
-        const real = await realpath(resolved);
-        watchPaths.add(real);
-      } catch {
-        let parent = path.dirname(resolved);
-        while (true) {
-          try {
-            watchPaths.add(await realpath(parent));
-            break;
-          } catch {
-            const next = path.dirname(parent);
-            if (next === parent) break;
-            parent = next;
-          }
-        }
-      }
-    }
-  }
-  return [...watchPaths];
-}
-
-async function extensionSettingsFingerprint(workspace: string): Promise<string | undefined> {
-  const settingsPaths = [
-    path.join(workspace, ".pi", "settings.json"),
-    path.join(workspace, ".pi", "agent", "settings.json"),
-  ];
-  const snapshots: unknown[] = [];
-  for (const settingsPath of settingsPaths) {
-    try {
-      const parsed = asRecord(JSON.parse(await readFile(settingsPath, "utf8")));
-      const snapshot: JsonRecord = {};
-      for (const key of RESOURCE_DISCOVERY_SETTINGS) snapshot[key] = parsed?.[key] ?? null;
-      snapshots.push(snapshot);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        const snapshot: JsonRecord = {};
-        for (const key of RESOURCE_DISCOVERY_SETTINGS) snapshot[key] = null;
-        snapshots.push(snapshot);
-        continue;
-      }
-      return undefined;
-    }
-  }
-  return JSON.stringify(snapshots);
 }
 
 async function prepareWorkspace(workspace: string): Promise<void> {
@@ -254,721 +84,109 @@ async function prepareWorkspace(workspace: string): Promise<void> {
   await ensureWebSearchConfig(workspace);
 }
 
-const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
-const MAX_WORKER_STDERR_LENGTH = 64 * 1024;
-const MAX_WORKER_ERROR_LENGTH = 2_048;
-
-function validateTimer(name: string, value: number): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`${name} must be a non-negative integer`);
-  }
-  if (value > MAX_NODE_TIMEOUT_MS) {
-    throw new Error(`${name} must not exceed ${MAX_NODE_TIMEOUT_MS}`);
-  }
-}
-
-function boundedStderr(previous: string, chunk: string | Buffer): string {
-  const incoming = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-  const availablePrevious = MAX_WORKER_STDERR_LENGTH - 1 - incoming.length;
-  if (availablePrevious <= 0) return `…${incoming.slice(-(MAX_WORKER_STDERR_LENGTH - 1))}`;
-  if (previous.length > availablePrevious) return `…${previous.slice(-availablePrevious)}${incoming}`;
-  return previous + incoming;
-}
-
-function boundedErrorMessage(error: unknown): string {
-  const message = asError(error).message;
-  return message.length <= MAX_WORKER_ERROR_LENGTH
-    ? message
-    : `${message.slice(0, MAX_WORKER_ERROR_LENGTH - 1)}…`;
-}
-
-const PROMPT_SETTLEMENT_PROBE_DELAY_MS = 50;
-const DEFAULT_RPC_TIMEOUT_MS = 1_000;
-const DEFAULT_PROMPT_TIMEOUT_MS = 30_000;
-const DEFAULT_LIFECYCLE_TIMEOUT_MS = 30_000;
-
-export class PiRpcWorker {
-  private readonly workspace: string;
-  private readonly appRoot: string;
+/**
+ * One-shot Pi run: executes a single --print turn in a fresh bwrap process and
+ * resolves when the process exits. A live worker therefore always means an
+ * active run; termination is the only out-of-band signal.
+ */
+export class PiRunWorker {
+  private readonly options: PiRunWorkerOptions;
   private readonly bwrapPath: string;
-  private readonly cliPath: string | undefined;
-  private readonly appendSystemPrompt: string | undefined;
-  private readonly spawnProcess: PiWorkerSpawn;
-  private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number;
-  private readonly rpcTimeoutMs: number;
-  private readonly promptTimeoutMs: number;
-  private readonly lifecycleTimeoutMs: number;
-  private workError: Error | undefined;
-  private promptSettlementTimer: ReturnType<typeof setTimeout> | undefined;
-  private parser: StrictJsonlParser | undefined;
-  private settledError: Error | undefined;
   private process: PiWorkerChildProcess | undefined;
-  private processDone: Promise<void> | undefined;
-  private resolveProcessDone: (() => void) | undefined;
-  private readonly pending = new Map<string, PendingRequest>();
-  private readonly listeners = new Set<PiRpcEventListener>();
-  private readonly settledWaiters = new Set<SettledWaiter>();
-  private requestId = 0;
-  private workEpoch = 0;
-  private activeEpoch: number | undefined;
-  private accepted = false;
-  private settledBeforeAcceptance = false;
-  private terminalError: Error | undefined;
-  private reportedWorkerError: Error | undefined;
+  private stdout = "";
   private stderr = "";
-  private stopping = false;
-  private lifecycleEpoch = 0;
-  private extensionWatcher: FSWatcher | undefined;
-  private readonly localExtensionWatchers = new Map<string, FSWatcher>();
-  private extensionReloadTimer: ReturnType<typeof setTimeout> | undefined;
-  private extensionReloadPromise: Promise<void> | undefined;
-  private stopPromise: Promise<void> | undefined;
-  private stopBarrierPromise: Promise<void> | undefined;
-  private startPromise: Promise<void> | undefined;
-  private extensionSettingsFingerprint = "";
-  private extensionResourceDirty = false;
-  private extensionSettingsDirty = false;
-  private extensionChangeVersion = 0;
 
-  constructor(options: PiRpcWorkerOptions) {
-    this.workspace = options.workspace;
-    this.appRoot = options.appRoot;
+  constructor(options: PiRunWorkerOptions) {
+    this.options = options;
     this.bwrapPath = options.bwrapPath ?? "bwrap";
-    this.cliPath = options.cliPath;
-    this.appendSystemPrompt = options.appendSystemPrompt;
-    this.spawnProcess = options.spawn;
-    this.terminateProcessGroup = options.terminateProcessGroup;
-    this.stopGraceMs = options.stopGraceMs ?? 1_000;
-    this.rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
-    this.promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
-    this.lifecycleTimeoutMs = options.lifecycleTimeoutMs ?? DEFAULT_LIFECYCLE_TIMEOUT_MS;
-    validateTimer("stopGraceMs", this.stopGraceMs);
-    validateTimer("rpcTimeoutMs", this.rpcTimeoutMs);
-    validateTimer("promptTimeoutMs", this.promptTimeoutMs);
-    validateTimer("lifecycleTimeoutMs", this.lifecycleTimeoutMs);
-  }
-  private markExtensionChange(kind: "settings" | "resource"): void {
-    if (kind === "settings") this.extensionSettingsDirty = true;
-    else this.extensionResourceDirty = true;
-    this.extensionChangeVersion += 1;
-    this.scheduleExtensionReload();
-  }
-
-  private attachExtensionWatcher(watcher: FSWatcher, kind: "settings" | "resource"): void {
-    watcher.on("error", () => {
-      if (this.stopping) return;
-      this.markExtensionChange(kind);
-    });
-  }
-
-  private async refreshLocalExtensionWatchers(): Promise<void> {
-    const desired = new Set(await localExtensionWatchPaths(this.workspace));
-    for (const [source, watcher] of this.localExtensionWatchers) {
-      if (desired.has(source)) continue;
-      watcher.close();
-      this.localExtensionWatchers.delete(source);
+    const stopGraceMs = options.stopGraceMs ?? DEFAULT_STOP_GRACE_MS;
+    if (!Number.isSafeInteger(stopGraceMs) || stopGraceMs < 0) {
+      throw new Error("stopGraceMs must be a non-negative integer");
     }
-    for (const source of desired) {
-      if (this.localExtensionWatchers.has(source)) continue;
-      try {
-        const entry = await lstat(source);
-        const watcher = watch(source, { recursive: entry.isDirectory() }, () => {
-          this.markExtensionChange("resource");
-        });
-        this.attachExtensionWatcher(watcher, "resource");
-        this.localExtensionWatchers.set(source, watcher);
-      } catch {
-        // Missing or inaccessible local sources must not prevent worker startup.
-      }
+    if (stopGraceMs > MAX_SIGNAL_TIMEOUT_MS) {
+      throw new Error(`stopGraceMs must not exceed ${MAX_SIGNAL_TIMEOUT_MS}`);
     }
+    this.stopGraceMs = stopGraceMs;
   }
 
-  private async startExtensionWatcher(): Promise<void> {
-    if (!this.extensionWatcher) {
-      const root = path.join(this.workspace, ".pi");
-      const watcher = watch(root, { recursive: true }, (_event, filename) => {
-        const kind = extensionWatchKind(filename);
-        if (kind) this.markExtensionChange(kind);
-      });
-      this.attachExtensionWatcher(watcher, "resource");
-      this.extensionWatcher = watcher;
-    }
-    await this.refreshLocalExtensionWatchers();
-  }
-
-  private closeExtensionWatcher(): void {
-    if (this.extensionReloadTimer) clearTimeout(this.extensionReloadTimer);
-    this.extensionReloadTimer = undefined;
-    const watcher = this.extensionWatcher;
-    this.extensionWatcher = undefined;
-    watcher?.close();
-    for (const localWatcher of this.localExtensionWatchers.values()) localWatcher.close();
-    this.localExtensionWatchers.clear();
-  }
-
-  private clearExtensionChangeState(): void {
-    this.extensionResourceDirty = false;
-    this.extensionSettingsDirty = false;
-    this.extensionChangeVersion = 0;
-  }
-
-  private resetWorkFields(): void {
-    this.activeEpoch = undefined;
-    this.accepted = false;
-    this.settledBeforeAcceptance = false;
-    this.workError = undefined;
-  }
-
-  private scheduleExtensionReload(delayMs = EXTENSION_RELOAD_DEBOUNCE_MS): void {
-    if (this.stopping || !this.process) return;
-    if (this.extensionReloadTimer) clearTimeout(this.extensionReloadTimer);
-    this.extensionReloadTimer = setTimeout(() => {
-      this.extensionReloadTimer = undefined;
-      void this.processExtensionReload();
-    }, delayMs);
-    this.extensionReloadTimer.unref?.();
-  }
-
-  private async processExtensionReload(): Promise<void> {
-    if (this.extensionReloadPromise || this.stopping || !this.process) return;
-    if (!this.extensionResourceDirty && !this.extensionSettingsDirty) return;
-    const epoch = this.lifecycleEpoch;
-    if (this.activeEpoch !== undefined || this.pending.size > 0) {
-      this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
-      return;
-    }
+  /** Runs one turn to completion; resolves with the exit result. */
+  async run(): Promise<PiRunResult> {
+    if (this.process) throw new Error("Pi run worker is already running");
+    this.stdout = "";
+    this.stderr = "";
     try {
-      const fingerprint = await extensionSettingsFingerprint(this.workspace);
-      if (fingerprint === undefined) {
-        this.scheduleExtensionReload(EXTENSION_RELOAD_RETRY_MS);
+      return await this.runInternal();
+    } finally {
+      this.process = undefined;
+    }
+  }
+
+  /** Terminates the run; the run() promise settles with the signal. */
+  stop(): Promise<void> {
+    const child = this.process;
+    if (!child) return Promise.resolve();
+    const done = new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve();
         return;
       }
-      if (epoch !== this.lifecycleEpoch || this.stopping || !this.process || this.terminalError) return;
-      const changed = this.extensionResourceDirty ||
-        (this.extensionSettingsDirty && fingerprint !== this.extensionSettingsFingerprint);
-      const changeVersion = this.extensionChangeVersion;
-      this.extensionResourceDirty = false;
-      this.extensionSettingsDirty = false;
-      if (!changed) return;
-      const reload = this.reloadForExtensionChanges(epoch);
-      this.extensionReloadPromise = reload;
-      try {
-        await reload;
-        if (this.extensionChangeVersion === changeVersion) {
-          const refreshedFingerprint = await extensionSettingsFingerprint(this.workspace);
-          if (this.extensionChangeVersion === changeVersion) {
-            this.extensionSettingsFingerprint = refreshedFingerprint ?? this.extensionSettingsFingerprint;
-          } else {
-            this.scheduleExtensionReload();
-          }
-        } else {
-          this.scheduleExtensionReload();
-        }
-      } finally {
-        if (this.extensionReloadPromise === reload) this.extensionReloadPromise = undefined;
-      }
-    } catch (error) {
-      const failure = asError(error);
-      this.terminalError ??= failure;
-      this.emitWorkerError(failure);
-    }
-  }
-
-  private async reloadForExtensionChanges(epoch: number): Promise<void> {
-    await this.stopProcess(true);
-    if (epoch !== this.lifecycleEpoch || this.terminalError) return;
-    await this.start();
-  }
-
-  private stopProcess(keepExtensionWatcher = false): Promise<void> {
-    const existing = this.stopPromise;
-    if (existing) {
-      if (!keepExtensionWatcher) this.closeExtensionWatcher();
-      return existing;
-    }
-    let completion!: Promise<void>;
-    completion = this.stopProcessInternal(keepExtensionWatcher).finally(() => {
-      if (this.stopPromise === completion) this.stopPromise = undefined;
+      child.once("exit", () => resolve());
     });
-    this.stopPromise = completion;
-    return completion;
+    this.options.terminateProcessGroup(child, "SIGTERM");
+    const timer = setTimeout(() => {
+      this.options.terminateProcessGroup(child, "SIGKILL");
+    }, this.stopGraceMs);
+    return done.finally(() => clearTimeout(timer));
   }
 
-  private async stopProcessInternal(keepExtensionWatcher: boolean): Promise<void> {
-    if (!keepExtensionWatcher) this.closeExtensionWatcher();
-    const child = this.process;
-    const done = this.processDone;
-    if (!child || !done) {
-      const stopped = this.terminalError ?? new Error("Pi worker stopped");
-      this.teardownWork(stopped);
-      if (!keepExtensionWatcher) this.clearExtensionChangeState();
-      return;
-    }
-    this.stopping = true;
-    this.terminateProcessGroup(child, "SIGTERM");
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      done,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, this.stopGraceMs);
+  private async runInternal(): Promise<PiRunResult> {
+    await prepareWorkspace(this.options.workspace);
+    const built = await buildPiRunBwrapArgs({
+      workspace: this.options.workspace,
+      appRoot: this.options.appRoot,
+      ...defined({
+        cliPath: this.options.cliPath,
+        appendSystemPrompt: this.options.appendSystemPrompt,
+        resume: this.options.resume,
+        model: this.options.model,
+        thinkingLevel: this.options.thinkingLevel,
       }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (this.process === child) {
-      const forcedStopError = new Error("Pi worker did not exit after SIGKILL");
-      this.terminateProcessGroup(child, "SIGKILL");
-      await Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, this.stopGraceMs))]);
-      if (this.process === child) {
-        this.rejectPending(forcedStopError);
-        this.rejectSettledWaiters(forcedStopError);
-        this.finishProcess();
-      }
-    }
-    this.teardownWork(this.terminalError ?? new Error("Pi worker stopped"));
-    this.process = undefined;
-    this.processDone = undefined;
-    this.resolveProcessDone = undefined;
-    if (!keepExtensionWatcher) this.clearExtensionChangeState();
-  }
-
-  async start(): Promise<void> {
-    const stopping = this.stopBarrierPromise;
-    if (stopping) await stopping;
-    const stoppingProcess = this.stopPromise;
-    if (stoppingProcess) await stoppingProcess;
-    const existing = this.startPromise;
-    if (existing) return existing;
-    let completion!: Promise<void>;
-    completion = this.startInternal().catch((error) => {
-      this.emitWorkerError(error);
-      throw error;
-    }).finally(() => {
-      if (this.startPromise === completion) this.startPromise = undefined;
     });
-    this.startPromise = completion;
-    return completion;
-  }
-  private async startInternal(): Promise<void> {
-    if (this.process) throw new Error("Pi worker is already started");
-    if (this.terminalError) throw this.terminalError;
-    const reloading = this.extensionReloadPromise !== undefined;
-    this.lifecycleEpoch += 1;
-    const epoch = this.lifecycleEpoch;
-    await prepareWorkspace(this.workspace);
-    const fingerprint = await extensionSettingsFingerprint(this.workspace);
-    if (!reloading) {
-      this.extensionSettingsFingerprint = fingerprint ?? "";
-      this.clearExtensionChangeState();
-    }
-    const built = await buildPiWorkerBwrapArgs({
-      workspace: this.workspace,
-      appRoot: this.appRoot,
-      ...defined({ cliPath: this.cliPath, appendSystemPrompt: this.appendSystemPrompt }),
-    });
-    if (epoch !== this.lifecycleEpoch) throw new Error("Pi worker start was superseded by stop");
     let child: PiWorkerChildProcess;
     try {
-      child = this.spawnProcess(this.bwrapPath, built.args, {
+      child = this.options.spawnProcess(this.bwrapPath, built.args, {
         detached: true,
         env: {},
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
-      const failure = asError(error);
-      this.terminalError = failure;
-      throw failure;
+      throw new Error(`Pi run spawn failed: ${asError(error).message}`);
     }
-    this.stderr = "";
-    this.workEpoch = 0;
-    this.resetWorkFields();
-    this.settledError = undefined;
-    this.clearPromptSettlementTimers();
     this.process = child;
-    this.stopping = false;
-    this.parser = new StrictJsonlParser();
-    this.processDone = new Promise<void>((resolve) => { this.resolveProcessDone = resolve; });
+
+    const exited = new Promise<PiRunResult>((resolve) => {
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        this.stdout = boundedCapture(this.stdout, chunk);
+      });
+      child.stderr?.on("data", (chunk: Buffer | string) => {
+        this.stderr = boundedCapture(this.stderr, chunk);
+      });
+      child.once("exit", (code, signal) => {
+        resolve({ code, signal, stderr: this.stderr, stdout: this.stdout });
+      });
+    });
+
     const stdin = child.stdin;
     if (!stdin) {
-      const failure = new Error(`Pi worker stdin is unavailable. Stderr: ${this.stderr}`);
-      this.failProcess(failure);
-      throw failure;
-    }
-    child.stdout?.on("data", (chunk: Buffer | string) => {
-      if (this.process !== child) return;
-      try {
-        for (const record of this.parser?.push(chunk) ?? []) this.handleRecord(record);
-      } catch (error) {
-        this.failProcess(asError(error));
-      }
-    });
-    child.stdout?.on("end", () => {
-      if (this.process !== child) return;
-      try {
-        for (const record of this.parser?.end() ?? []) this.handleRecord(record);
-      } catch (error) {
-        this.failProcess(asError(error));
-      }
-    });
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      if (this.process !== child) return;
-      this.stderr = boundedStderr(this.stderr, chunk);
-    });
-    child.once("error", (error) => {
-      if (this.process !== child) return;
-      this.failProcess(new Error(`Pi worker process error: ${error.message}. Stderr: ${this.stderr}`));
-    });
-    child.once("exit", (code, signal) => {
-      if (this.process !== child) return;
-      this.handleExit(code, signal);
-    });
-    stdin.once("error", (error) => {
-      if (this.process !== child) return;
-      this.failProcess(new Error(`Pi worker stdin error: ${error.message}. Stderr: ${this.stderr}`));
-    });
-    if (child.exitCode !== null) {
-      this.handleExit(child.exitCode, child.signalCode);
-      throw this.terminalError ?? new Error("Pi worker exited during startup");
+      this.options.terminateProcessGroup(child, "SIGKILL");
+      throw new Error("Pi run stdin is unavailable");
     }
     try {
-      await this.startExtensionWatcher();
-      if (epoch !== this.lifecycleEpoch) throw new Error("Pi worker start was superseded by stop");
-      if (this.process !== child || child.exitCode !== null || child.signalCode !== null) {
-        const failure = this.terminalError ?? new Error("Pi worker exited during startup");
-        this.failProcess(failure);
-        throw failure;
-      }
-    } catch (error) {
-      const failure = asError(error);
-      this.closeExtensionWatcher();
-      this.failProcess(failure);
-      throw failure;
+      stdin.end(this.options.message, "utf8");
+    } catch {
+      this.options.terminateProcessGroup(child, "SIGKILL");
     }
-  }
-  async stop(): Promise<void> {
-    this.lifecycleEpoch += 1;
-    const existing = this.stopBarrierPromise;
-    if (existing) {
-      await existing;
-      return;
-    }
-    const starting = this.startPromise;
-    let completion!: Promise<void>;
-    completion = (async () => {
-      if (starting) await starting.catch(() => {});
-      await this.stopProcess();
-    })().finally(() => {
-      if (this.stopBarrierPromise === completion) this.stopBarrierPromise = undefined;
-    });
-    this.stopBarrierPromise = completion;
-    await completion;
-  }
-  async abort(): Promise<void> {
-    try {
-      await this.request({ type: "abort" }, undefined, this.lifecycleTimeoutMs);
-      this.settleAllWork();
-    } catch (error) {
-      const failure = asError(error);
-      this.failProcess(failure);
-      throw failure;
-    }
-  }
-
-  async newSession(): Promise<void> {
-    const reload = this.awaitPendingReload();
-    if (reload) await reload;
-    const response = await this.request({ type: "new_session" }, undefined, this.lifecycleTimeoutMs);
-    const data = this.responseData(response);
-    if (data?.cancelled === true) throw new Error("Pi worker new session was cancelled");
-    this.settledError = undefined;
-  }
-
-  async prompt(message: string): Promise<void> {
-    const reload = this.awaitPendingReload();
-    if (reload) await reload;
-    this.settledError = undefined;
-    await this.queueWork({ type: "prompt", message });
-  }
-
-  async waitForSettled(): Promise<void> {
-    if (this.terminalError) throw this.terminalError;
-    if (this.activeEpoch === undefined) {
-      if (this.settledError) throw this.settledError;
-      return;
-    }
-    return await new Promise<void>((resolve, reject) => {
-      this.settledWaiters.add({ resolve, reject });
-    });
-  }
-
-  async setModel(provider: string, modelId: string): Promise<void> {
-    await this.request({ type: "set_model", provider, modelId });
-  }
-
-  async setThinkingLevel(level: string): Promise<void> {
-    await this.request({ type: "set_thinking_level", level });
-  }
-
-  async getAvailableModels(): Promise<AvailableModel[]> {
-    const data = this.responseData(await this.request({ type: "get_available_models" }));
-    const models = Array.isArray(data?.models) ? data.models : [];
-    return models.map((model) => {
-      const m = asRecord(model);
-      const name = typeof m?.name === "string" ? m.name : undefined;
-      return {
-        provider: typeof m?.provider === "string" ? m.provider : "",
-        id: typeof m?.id === "string" ? m.id : "",
-        ...defined({ name }),
-      };
-    });
-  }
-
-  async getAvailableThinkingLevels(): Promise<string[]> {
-    const data = this.responseData(await this.request({ type: "get_available_thinking_levels" }));
-    const levels = Array.isArray(data?.levels) ? data.levels : [];
-    return levels.filter((level): level is string => typeof level === "string");
-  }
-
-  async getSessionState(): Promise<WorkerSessionState> {
-    const data = this.responseData(await this.request({ type: "get_state" }));
-    const model = asRecord(data?.model);
-    return {
-      ...(model && typeof model.provider === "string" && typeof model.id === "string"
-        ? { model: { provider: model.provider, id: model.id } }
-        : {}),
-      thinkingLevel: typeof data?.thinkingLevel === "string" ? data.thinkingLevel : "",
-      sessionId: typeof data?.sessionId === "string" ? data.sessionId : "",
-      ...(typeof data?.sessionFile === "string" ? { sessionFile: data.sessionFile } : {}),
-      messageCount: typeof data?.messageCount === "number" ? data.messageCount : 0,
-      autoCompactionEnabled: data?.autoCompactionEnabled === true,
-    };
-  }
-
-  async restart(): Promise<void> {
-    const reload = this.awaitPendingReload();
-    if (reload) await reload;
-    if (this.activeEpoch !== undefined || this.pending.size > 0) {
-      throw new Error("Pi worker is busy");
-    }
-    await this.stopProcess(true);
-    await this.start();
-  }
-
-  onEvent(listener: PiRpcEventListener): () => void {
-    this.listeners.add(listener);
-    return () => { this.listeners.delete(listener); };
-  }
-
-  private async queueWork(command: JsonRecord): Promise<void> {
-    if (this.activeEpoch !== undefined) {
-      throw new Error("Pi worker is already processing a prompt");
-    }
-    const epoch = ++this.workEpoch;
-    this.activeEpoch = epoch;
-    try {
-      await this.request(command, epoch, command.type === "prompt" ? this.promptTimeoutMs : this.rpcTimeoutMs);
-      if (command.type === "prompt") this.schedulePromptSettlementProbe(epoch);
-    } catch (error) {
-      this.settleWork(epoch);
-      throw error;
-    }
-  }
-
-  private request(command: JsonRecord, workEpoch?: number, timeoutMs?: number): Promise<unknown> {
-    const child = this.process;
-    if (!child || !child.stdin) {
-      return Promise.reject(this.terminalError ?? new Error("Pi worker is not started"));
-    }
-    const stdin = child.stdin;
-    const id = `pi-rpc-${++this.requestId}`;
-    const line = `${JSON.stringify({ id, ...command })}\n`;
-    const effectiveTimeout = timeoutMs ?? this.rpcTimeoutMs;
-    return new Promise<unknown>((resolve, reject) => {
-      const pending: PendingRequest = {
-        resolve,
-        reject,
-        ...(workEpoch === undefined ? {} : { workEpoch }),
-      };
-      this.pending.set(id, pending);
-      pending.timeout = setTimeout(() => {
-        if (this.pending.get(id) !== pending) return;
-        this.pending.delete(id);
-        const failure = new Error(`Pi RPC ${String(command.type)} request timed out`);
-        pending.reject(failure);
-        if (pending.workEpoch !== undefined) this.failProcess(failure);
-      }, effectiveTimeout);
-      pending.timeout.unref?.();
-      try {
-        stdin.write(line);
-      } catch (error) {
-        this.failProcess(asError(error));
-      }
-    });
-  }
-  private schedulePromptSettlementProbe(epoch: number): void {
-    if (this.activeEpoch !== epoch) return;
-    const timer = setTimeout(() => {
-      this.promptSettlementTimer = undefined;
-      void this.request({ type: "get_state" }).then((response) => {
-        if (this.activeEpoch !== epoch) return;
-        const data = this.responseData(response);
-        if (data?.isStreaming === false && data.pendingMessageCount === 0) this.settleWork(epoch);
-      }).catch((error) => {
-        if (this.activeEpoch === epoch) this.failProcess(asError(error));
-      });
-    }, PROMPT_SETTLEMENT_PROBE_DELAY_MS);
-    timer.unref?.();
-    this.promptSettlementTimer = timer;
-  }
-
-  private settleAllWork(): void {
-    if (this.activeEpoch !== undefined) this.settleWork(this.activeEpoch);
-  }
-
-  private settleWork(epoch: number): void {
-    if (this.activeEpoch !== epoch) return;
-    this.clearPromptSettlementTimers();
-    const error = this.settledError;
-    this.resetWorkFields();
-    this.finishSettledWaiters(error);
-  }
-
-  private finishSettledWaiters(error: Error | undefined): void {
-    if (error) this.rejectSettledWaiters(error);
-    else this.resolveSettledWaiters();
-  }
-
-  private clearPromptSettlementTimers(): void {
-    if (this.promptSettlementTimer) clearTimeout(this.promptSettlementTimer);
-    this.promptSettlementTimer = undefined;
-  }
-
-  private awaitPendingReload(): Promise<void> | undefined {
-    return this.extensionReloadPromise;
-  }
-
-  private responseData(response: unknown): JsonRecord | undefined {
-    return asRecord(asRecord(response)?.data);
-  }
-
-  private emitEvent(event: PiRpcEvent): void {
-    for (const listener of this.listeners) {
-      try { listener(event); } catch { /* listeners cannot break the RPC pump */ }
-    }
-  }
-
-  private emitWorkerError(error: unknown): void {
-    const failure = asError(error);
-    if (this.reportedWorkerError === failure) return;
-    this.reportedWorkerError = failure;
-    this.emitEvent({ type: "worker_error", error: boundedErrorMessage(failure) });
-  }
-
-  private handleRecord(value: unknown): void {
-    const record = asRecord(value);
-    if (!record) return;
-    switch (record.type) {
-      case "response": {
-        const id = record.id;
-        if (typeof id !== "string") return;
-        const pending = this.pending.get(id);
-        if (!pending) return;
-        this.pending.delete(id);
-        clearTimeout(pending.timeout);
-        if (record.success === true) {
-          if (pending.workEpoch !== undefined && this.activeEpoch === pending.workEpoch) {
-            this.accepted = true;
-            if (this.settledBeforeAcceptance) this.settleWork(pending.workEpoch);
-          }
-          pending.resolve(record);
-        } else {
-          pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC command failed"));
-        }
-        return;
-      }
-      case "message_end": {
-        const message = asRecord(record.message);
-        if (message && message.role === "assistant" && message.stopReason === "error") {
-          const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
-            ? message.errorMessage
-            : "Pi assistant turn failed";
-          const failure = new Error(errorMessage);
-          this.settledError = failure;
-          if (this.activeEpoch !== undefined) this.workError = failure;
-        }
-        break;
-      }
-      case "agent_settled":
-        if (this.workError !== undefined) this.settledError = this.workError;
-        if (this.activeEpoch !== undefined) {
-          if (this.accepted) this.settleWork(this.activeEpoch);
-          else this.settledBeforeAcceptance = true;
-        }
-        break;
-    }
-    this.emitEvent(record);
-    if (record.type === "extension_ui_request") {
-      if (["select", "confirm", "input", "editor"].includes(String(record.method))) {
-        const id = record.id;
-        if (typeof id === "string") this.writeFireAndForget({ type: "extension_ui_response", id, cancelled: true });
-      }
-    }
-  }
-
-  private writeFireAndForget(value: JsonRecord): void {
-    const stdin = this.process?.stdin;
-    if (!stdin) return;
-    try { stdin.write(`${JSON.stringify(value)}\n`); } catch { /* process exit handles write failure */ }
-  }
-
-  private teardownWork(error: Error): void {
-    this.clearPromptSettlementTimers();
-    this.rejectPending(error);
-    this.rejectSettledWaiters(error);
-    this.resetWorkFields();
-  }
-
-  private failProcess(error: Error): void {
-    if (!this.terminalError && !this.stopping) this.terminalError = error;
-    this.teardownWork(error);
-    this.settleAllWork();
-    const child = this.process;
-    if (child && !this.stopping) this.terminateProcessGroup(child, "SIGKILL");
-  }
-
-  private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
-    const unexpectedIdleExit = !this.stopping && !this.terminalError && this.activeEpoch === undefined;
-    const error = this.terminalError ?? new Error(
-      `Pi worker exited (${signal ?? (code === null ? "unknown" : code)}).${this.stderr ? ` Stderr: ${this.stderr}` : ""}`,
-    );
-    this.teardownWork(error);
-    this.settleAllWork();
-    if (!this.stopping && !this.terminalError) this.terminalError = error;
-    this.process = undefined;
-    this.finishProcess();
-    if (unexpectedIdleExit) this.emitWorkerError(error);
-  }
-
-  private finishProcess(): void {
-    this.resolveProcessDone?.();
-    this.resolveProcessDone = undefined;
-  }
-
-  private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) {
-      if (pending.timeout) clearTimeout(pending.timeout);
-      pending.reject(error);
-    }
-    this.pending.clear();
-  }
-
-  private resolveSettledWaiters(): void {
-    for (const waiter of this.settledWaiters) waiter.resolve();
-    this.settledWaiters.clear();
-  }
-
-  private rejectSettledWaiters(error: Error): void {
-    for (const waiter of this.settledWaiters) waiter.reject(error);
-    this.settledWaiters.clear();
+    return await exited;
   }
 }

@@ -115,11 +115,7 @@ export function appendChatEvent(workspace: string, event: ChatEvent): Promise<vo
   return appendChatEvents(workspace, [event]);
 }
 
-/**
- * Appends host-system events to the workspace system log, in the same
- * best-effort pinned-descriptor manner as {@link appendChatEvents}.
- */
-export async function appendSystemEvents(workspace: string, events: SystemEvent[]): Promise<void> {
+async function appendSystemEvents(workspace: string, events: SystemEvent[]): Promise<void> {
   await appendLines(workspace, SYSTEM_FILE, "system event", events, false);
 }
 
@@ -149,10 +145,11 @@ async function appendLines(
       try {
         const logStat = await handle.stat();
         if (!logStat.isFile()) throw new Error(`${label} file must be a regular file: ${fileName}`);
-        for (const event of events) {
-          const line = `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...event })}\n`;
-          await handle.write(line, null, "utf8");
-        }
+        const payload = Buffer.from(
+          events.map((event) => `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...event })}\n`).join(""),
+          "utf8",
+        );
+        await handle.write(payload, 0, payload.length, null);
       } finally {
         await handle.close().catch(() => {});
       }

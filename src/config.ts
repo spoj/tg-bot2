@@ -12,7 +12,7 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
-export function parseAllowedUserIds(value: string): ReadonlySet<number> {
+function parseAllowedUserIds(value: string): ReadonlySet<number> {
   if (!value.trim()) throw new Error("ALLOWED_USER_IDS must not be empty");
   const ids = new Set<number>();
   for (const raw of value.split(",")) {

@@ -1,4 +1,5 @@
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
@@ -292,16 +293,17 @@ export class AgentManager {
     return path.join(this.config.dataDir, "chats", String(chatId), ACTIVITY_FILE);
   }
 
-  private persistActivity(state: ChatState): void {
+  private async persistActivity(state: ChatState): Promise<void> {
     const file = this.activityPath(state.chatId);
-    void (async () => {
-      try {
-        await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-        await writeFile(file, JSON.stringify({ at: state.lastActivityAt }), { encoding: "utf8", mode: 0o600 });
-      } catch (error) {
-        console.error("Agent activity persistence failed", error);
-      }
-    })();
+    const temp = `${file}.${randomUUID()}.tmp`;
+    try {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeFile(temp, JSON.stringify({ at: state.lastActivityAt }), { encoding: "utf8", mode: 0o600 });
+      await rename(temp, file);
+    } catch (error) {
+      console.error("Agent activity persistence failed", error);
+      await rm(temp, { force: true }).catch(() => {});
+    }
   }
 
   /** Starts a run for text; must be called with the state's serial queue held. */
@@ -326,12 +328,12 @@ export class AgentManager {
     }
   }
 
-  private onRunSettled(state: ChatState): void {
+  private async onRunSettled(state: ChatState): Promise<void> {
     this.clearInterruptTimer(state);
     state.running = false;
     state.worker = undefined;
     state.lastActivityAt = this.now();
-    this.persistActivity(state);
+    await this.persistActivity(state);
     const next = state.interrupts.shift() ?? state.followups.shift();
     if (next === undefined || state.closing || this.shuttingDown) return;
     this.launch(state, next);

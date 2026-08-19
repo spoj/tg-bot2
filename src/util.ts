@@ -119,31 +119,6 @@ export async function readJsonl(
   }
 }
 
-export function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Error | void): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      let failure: unknown;
-      try {
-        failure = onTimeout();
-      } catch (error) {
-        failure = error;
-      }
-      reject(failure instanceof Error ? failure : new Error("Operation timed out"));
-    }, ms);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
 /** Opens a store file for appending, replacing a symlink planted at its path. */
 async function openJsonlAppend(filePath: string): Promise<FileHandle> {
   try {

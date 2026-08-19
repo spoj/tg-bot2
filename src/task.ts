@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, readdir, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendSystemEvent } from "./events.js";
@@ -543,17 +543,19 @@ export class WorkspaceTasks {
           this.report(error);
           continue;
         }
-        await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
         const name = await findTaskFile(runDirectory);
-        if (name !== undefined) {
-          await appendSystemEvent(workspace, {
-            type: "task_settled",
-            name,
-            runId: entry.name,
-            status: "aborted",
-            exitCode: null,
-          });
+        if (name === undefined) {
+          await rm(runDirectory, { recursive: true, force: true }).catch(() => {});
+          continue;
         }
+        await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
+        await appendSystemEvent(workspace, {
+          type: "task_settled",
+          name,
+          runId: entry.name,
+          status: "aborted",
+          exitCode: null,
+        });
       }
     }
   }

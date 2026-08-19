@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { requireRealDirectory } from "./util.js";
 export type PiWorkerChildProcess = ChildProcess;
-export type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
+type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
 export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
 export { spawnProcess };
 

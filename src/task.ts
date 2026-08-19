@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendSystemEvent } from "./events.js";
@@ -53,8 +53,8 @@ const MAX_TASK_BYTES = 64 * 1024;
 // Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
 const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
 const MAX_TASK_ENTRIES_PER_CHAT = 256;
-const MAX_RUN_DIRS_PER_CHAT = 16;
-const MAX_RUN_DIRS_PER_SCAN = 2 * MAX_RUN_DIRS_PER_CHAT;
+const MAX_CONCURRENT_TASKS_PER_CHAT = 8;
+const MAX_RUN_DIRS_PER_SWEEP = 4_096;
 const TASK_DIR = "task";
 const TASKS_DIR = path.join(".pi", "tasks");
 const SESSIONS_DIR = "sessions";
@@ -125,24 +125,6 @@ async function readTaskPrompt(filePath: string): Promise<string> {
   }
 }
 
-/** Removes a host-owned run directory without following symlinks planted inside it. */
-async function removeTree(directory: string, depth: number): Promise<void> {
-  if (depth < 0) return;
-  let entries;
-  try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch (error) {
-    if (isMissing(error)) return;
-    throw error;
-  }
-  for (const entry of entries) {
-    const child = path.join(directory, entry.name);
-    if (entry.isDirectory()) await removeTree(child, depth - 1);
-    else await unlink(child);
-  }
-  await rmdir(directory);
-}
-
 /** Ensures the tasks root is a real directory, replacing a planted symlink. */
 async function ensureTasksDirectory(workspace: string): Promise<string> {
   const directory = path.join(workspace, TASKS_DIR);
@@ -156,7 +138,7 @@ async function ensureTasksDirectory(workspace: string): Promise<string> {
 
 /** Finds the claimed prompt file inside a run directory, keeping the agent's original filename. */
 async function findTaskFile(runDirectory: string): Promise<string | undefined> {
-  const entries = await readBoundedEntries(runDirectory, MAX_RUN_DIRS_PER_SCAN);
+  const entries = await readBoundedEntries(runDirectory, MAX_TASK_ENTRIES_PER_CHAT);
   return entries.find((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))?.name;
 }
 
@@ -176,10 +158,12 @@ async function newestSessionFile(sessionsDirectory: string): Promise<string | un
 }
 
 /**
- * Runs agent-submitted background tasks: watches .tg-bot/task/*.txt|md, claims each
- * file into a host-generated uuid run directory under .pi/tasks/, executes one
- * background Pi run per chat at a time, records the settlement in system.jsonl, and
- * sends the agent a completion followup naming the prompt and the run directory.
+ * Runs agent-submitted background tasks: watches .tg-bot/task/*.txt|md, claims files into
+ * host-generated uuid run directories under .pi/tasks/ (up to 8 concurrent per chat),
+ * records every settlement in system.jsonl, and sends the agent a completion followup
+ * naming the prompt and the run directory. Every started task settles exactly once —
+ * immediately on exit (any signal included), or at the next boot via an aborted stamp
+ * when the host itself died mid-run.
  */
 export class WorkspaceTasks {
   private readonly agent: WorkspaceTasksOptions["agent"];
@@ -198,7 +182,8 @@ export class WorkspaceTasks {
   private readonly logger: (error: unknown) => void;
   private readonly queues = new Map<number, SerialQueue>();
   private readonly chatWatchers = new Map<number, ChatWatcher>();
-  private readonly inFlight = new Map<number, InFlightTask>();
+  private readonly inFlight = new Map<number, InFlightTask[]>();
+  private readonly pendingSettles = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -242,7 +227,7 @@ export class WorkspaceTasks {
       return;
     }
     this.running = true;
-    const initialPoll = this.poll();
+    const initialPoll = this.stampAbortedRuns().then(() => this.poll());
     this.startInFlight = initialPoll;
     try {
       await initialPoll;
@@ -263,12 +248,13 @@ export class WorkspaceTasks {
       this.cancelSchedule(this.timer);
       this.timer = undefined;
     }
-    const stops = [...this.inFlight.values()].map(({ worker }) => worker.stop().catch((error) => this.report(error)));
+    const stops = [...this.inFlight.values()].flat().map(({ worker }) => worker.stop().catch((error) => this.report(error)));
     await Promise.all(stops);
     for (;;) {
       const pending: Promise<void>[] = [];
       if (this.startInFlight) pending.push(this.startInFlight);
       if (this.pollInFlight) pending.push(this.pollInFlight);
+      for (const settle of [...this.pendingSettles]) pending.push(settle.catch(() => {}));
       let queued = 0;
       for (const queue of this.queues.values()) queued += queue.size;
       if (queued > 0) pending.push((async (): Promise<void> => {
@@ -280,7 +266,7 @@ export class WorkspaceTasks {
         }
       })());
       if (pending.length === 0) return;
-      await Promise.all(pending.map((operation) => operation.catch(() => {})));
+      await Promise.all(pending);
     }
   }
 
@@ -403,7 +389,6 @@ export class WorkspaceTasks {
   }
 
   private async processChatNow(chatId: number, workspace: string, chatsRoot?: PinnedDirectory): Promise<void> {
-    if (this.inFlight.has(chatId)) return;
     let openedChatsRoot: PinnedDirectory | undefined;
     let chatDirectory: PinnedDirectory | undefined;
     let workspaceDirectory: PinnedDirectory | undefined;
@@ -416,7 +401,6 @@ export class WorkspaceTasks {
       if (workspaceDirectory.realPath !== path.join(chatDirectory.realPath, "workspace")) {
         throw new Error(`Workspace for chat ${chatId} is outside the chat directory`);
       }
-      await this.recoverRunDirs(workspace);
       metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
       taskDirectory = await openPinnedDirectory(path.join(metadata.path, TASK_DIR));
 
@@ -425,53 +409,12 @@ export class WorkspaceTasks {
         .map((entry) => entry.name)
         .sort((a, b) => a.localeCompare(b));
       if (entries.length === 0) return;
-      const name = entries[0];
-      if (name === undefined) return;
-
-      const runId = randomUUID();
-      const runDirectory = path.join(workspace, TASKS_DIR, runId);
-      await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
-      try {
-        await rename(path.join(taskDirectory.path, name), path.join(runDirectory, name));
-      } catch (error) {
-        if (isMissing(error)) return; // The agent deleted the pending task.
-        throw error;
+      const available = MAX_CONCURRENT_TASKS_PER_CHAT - (this.inFlight.get(chatId)?.length ?? 0);
+      if (available <= 0) return;
+      await ensureTasksDirectory(workspace);
+      for (const name of entries.slice(0, available)) {
+        await this.claimAndLaunch(chatId, workspace, name, taskDirectory).catch((error) => this.report(error));
       }
-      let prompt: string;
-      try {
-        prompt = await readTaskPrompt(path.join(runDirectory, name));
-      } catch (error) {
-        await this.settleTask(chatId, workspace, name, runId, runDirectory, {
-          code: null,
-          signal: null,
-          stderr: errorMessage(error),
-          stdout: "",
-        });
-        return;
-      }
-
-      let worker: WorkspaceTaskWorker;
-      try {
-        worker = await this.workerFactory({ workspace, runId, prompt });
-      } catch (error) {
-        await this.settleTask(chatId, workspace, name, runId, runDirectory, {
-          code: null,
-          signal: null,
-          stderr: errorMessage(error),
-          stdout: "",
-        });
-        return;
-      }
-      this.inFlight.set(chatId, { worker });
-      let result: PiRunResult;
-      try {
-        result = await worker.run();
-      } catch (error) {
-        result = { code: null, signal: null, stderr: errorMessage(error), stdout: "" };
-      } finally {
-        if (this.inFlight.get(chatId)?.worker === worker) this.inFlight.delete(chatId);
-      }
-      await this.settleTask(chatId, workspace, name, runId, runDirectory, result);
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
@@ -483,8 +426,109 @@ export class WorkspaceTasks {
     }
   }
 
-  /** Re-queues run directories orphaned by a host crash and prunes the oldest beyond the cap. */
-  private async recoverRunDirs(workspace: string): Promise<void> {
+  /** Claims one pending task file into a fresh uuid run directory and launches its background run. */
+  private async claimAndLaunch(chatId: number, workspace: string, name: string, taskDirectory: PinnedDirectory): Promise<void> {
+    const runId = randomUUID();
+    const runDirectory = path.join(workspace, TASKS_DIR, runId);
+    await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
+    try {
+      await rename(path.join(taskDirectory.path, name), path.join(runDirectory, name));
+    } catch (error) {
+      if (isMissing(error)) return; // The agent deleted the pending task.
+      throw error;
+    }
+    let prompt: string;
+    try {
+      prompt = await readTaskPrompt(path.join(runDirectory, name));
+    } catch (error) {
+      await this.settleTask(chatId, workspace, name, runId, runDirectory, {
+        code: null,
+        signal: null,
+        stderr: errorMessage(error),
+        stdout: "",
+      });
+      return;
+    }
+    let worker: WorkspaceTaskWorker;
+    try {
+      worker = await this.workerFactory({ workspace, runId, prompt });
+    } catch (error) {
+      await this.settleTask(chatId, workspace, name, runId, runDirectory, {
+        code: null,
+        signal: null,
+        stderr: errorMessage(error),
+        stdout: "",
+      });
+      return;
+    }
+    this.launchTask(chatId, workspace, name, runId, runDirectory, worker);
+  }
+
+  private launchTask(chatId: number, workspace: string, name: string, runId: string, runDirectory: string, worker: WorkspaceTaskWorker): void {
+    const running = this.inFlight.get(chatId) ?? [];
+    running.push({ worker });
+    this.inFlight.set(chatId, running);
+    const settle = this.runAndSettle(chatId, workspace, name, runId, runDirectory, worker);
+    this.pendingSettles.add(settle);
+    void settle
+      .catch((error) => this.report(error))
+      .finally(() => this.pendingSettles.delete(settle));
+  }
+
+  private async runAndSettle(
+    chatId: number,
+    workspace: string,
+    name: string,
+    runId: string,
+    runDirectory: string,
+    worker: WorkspaceTaskWorker,
+  ): Promise<void> {
+    let result: PiRunResult;
+    try {
+      result = await worker.run();
+    } catch (error) {
+      result = { code: null, signal: null, stderr: errorMessage(error), stdout: "" };
+    } finally {
+      const running = this.inFlight.get(chatId);
+      if (running) {
+        const next = running.filter((entry) => entry.worker !== worker);
+        if (next.length === 0) this.inFlight.delete(chatId);
+        else this.inFlight.set(chatId, next);
+      }
+    }
+    await this.settleTask(chatId, workspace, name, runId, runDirectory, result);
+  }
+
+  /**
+   * Stamps aborted settles for runs the host left in flight when it died: the only way a
+   * run dir can lack result.json at boot is an unsettled host crash. Idempotent — a
+   * stamped dir never matches again.
+   */
+  private async stampAbortedRuns(): Promise<void> {
+    let chatsRoot: PinnedDirectory | undefined;
+    try {
+      chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
+      const entries = await readBoundedEntries(chatsRoot.path, MAX_CHAT_DIRECTORIES_PER_POLL);
+      const chats = entries
+        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+        .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
+        .filter((entry): entry is { chatId: number; name: string } => entry.chatId !== undefined);
+      for (const { chatId } of chats) {
+        const workspace = chatPaths(this.dataDir, chatId).workspace;
+        try {
+          await this.stampAbortedChatRuns(workspace);
+        } catch (error) {
+          this.report(error);
+        }
+      }
+    } catch (error) {
+      if (!isMissing(error)) this.report(error);
+    } finally {
+      if (chatsRoot) await this.closeDirectory(chatsRoot);
+    }
+  }
+
+  private async stampAbortedChatRuns(workspace: string): Promise<void> {
     let tasksPath: string;
     try {
       tasksPath = await ensureTasksDirectory(workspace);
@@ -492,43 +536,30 @@ export class WorkspaceTasks {
       this.report(error);
       return;
     }
-    const entries = await readBoundedEntries(tasksPath, MAX_RUN_DIRS_PER_SCAN);
-    const directories = entries.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink());
-    const withMtime = await Promise.all(directories.map(async (entry) => ({
-      name: entry.name,
-      mtimeMs: (await lstat(path.join(tasksPath, entry.name))).mtimeMs,
-    })));
-    withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    for (const directory of withMtime) {
-      const runDirectory = path.join(tasksPath, directory.name);
+    const entries = await readBoundedEntries(tasksPath, MAX_RUN_DIRS_PER_SWEEP);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const runDirectory = path.join(tasksPath, entry.name);
       try {
         await lstat(path.join(runDirectory, RESULT_FILE));
       } catch (error) {
-        if (isMissing(error)) await this.requeueOrphan(workspace, runDirectory).catch((requeueError) => this.report(requeueError));
-        else this.report(error);
+        if (!isMissing(error)) {
+          this.report(error);
+          continue;
+        }
+        await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
+        const name = await findTaskFile(runDirectory);
+        if (name !== undefined) {
+          await appendSystemEvent(workspace, {
+            type: "task",
+            name,
+            runId: entry.name,
+            status: "aborted",
+            exitCode: null,
+          });
+        }
       }
     }
-    for (const stale of withMtime.slice(MAX_RUN_DIRS_PER_CHAT)) {
-      await removeTree(path.join(tasksPath, stale.name), 2).catch((error) => {
-        if (!isMissing(error)) this.report(error);
-      });
-    }
-  }
-
-  /** Moves an orphaned task prompt back into the task queue under its original name and clears the run directory. */
-  private async requeueOrphan(workspace: string, runDirectory: string): Promise<void> {
-    const name = await findTaskFile(runDirectory);
-    if (name !== undefined) {
-      const taskDirectory = path.join(workspace, TG_BOT_DIR, TASK_DIR);
-      await mkdir(taskDirectory, { recursive: true, mode: 0o700 });
-      try {
-        await rename(path.join(runDirectory, name), path.join(taskDirectory, name));
-      } catch (error) {
-        if (!isMissing(error)) throw error;
-      }
-    }
-    await removeTree(runDirectory, 2);
   }
 
   /** Records the outcome, appends the system event, and sends the agent a completion followup. */
@@ -540,12 +571,9 @@ export class WorkspaceTasks {
     runDirectory: string,
     result: PiRunResult,
   ): Promise<void> {
-    // A signal-interrupted run (shutdown stop) stays orphaned so the next boot re-queues it.
-    if (result.signal !== null) return;
-    const failed = result.code !== 0;
-    const status = failed ? "failed" : "done";
-    const stderr = failed ? errorMessage(result.stderr) : undefined;
-    if (!failed && result.stdout.trim().length > 0) {
+    const status: "done" | "failed" | "aborted" = result.signal !== null ? "aborted" : result.code === 0 ? "done" : "failed";
+    const stderr = status === "failed" ? errorMessage(result.stderr) : undefined;
+    if (status === "done" && result.stdout.trim().length > 0) {
       await writeFile(path.join(runDirectory, OUTPUT_FILE), result.stdout, { encoding: "utf8", mode: 0o600 });
     }
     await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({
@@ -562,10 +590,13 @@ export class WorkspaceTasks {
       exitCode: result.code,
       ...defined({ stderr }),
     });
-    const summary = failed
-      ? `Task ${name} failed (exit ${result.code ?? "unknown"}).`
-      : `Task ${name} finished.`;
-    void this.agent.followup(chatId, `${summary} Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`).catch((error) => this.report(error));
+    const outcome = status === "done"
+      ? "finished"
+      : status === "failed"
+        ? `failed (exit ${result.code ?? "unknown"})`
+        : `aborted (${result.signal ?? "stopped"})`;
+    const message = `Task ${name} ${outcome}. Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`;
+    void this.agent.followup(chatId, message).catch((error) => this.report(error));
   }
 
   private report(error: unknown): void {

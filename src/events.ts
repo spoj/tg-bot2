@@ -49,7 +49,7 @@ export type SystemEvent =
     type: "task";
     name: string;
     runId: string;
-    status: "done" | "failed";
+    status: "done" | "failed" | "aborted";
     exitCode: number | null;
     stderr?: string | undefined;
   }
@@ -180,7 +180,8 @@ chat.jsonl mirrors the Telegram chat window. Event types:
 system.jsonl records host activity that never appears in the chat window:
 - task: a background task settled: {v:1,t,type:'task',name,runId,status,exitCode,stderr?}
   where name is the prompt filename you wrote, runId identifies the run directory
-  /workspace/.pi/tasks/<runId>/, status is done or failed, and stderr carries a bounded
+  /workspace/.pi/tasks/<runId>/, status is done, failed, or aborted (aborted means the
+  run was killed or the host restarted mid-run), and stderr carries a bounded
   failure tail when failed.
 - outbox_rejected: {v:1,t,type:'outbox_rejected',detail} reports a rejected request; the
   rejection is recorded in .tg-bot/failed.jsonl ({id,request,error}) so you can inspect it.

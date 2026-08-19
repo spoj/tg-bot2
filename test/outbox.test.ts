@@ -279,7 +279,30 @@ describe("WorkspaceOutbox", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
   });
-  it("bounds a flooded chat while still processing later chats", async () => {
+  it("records claimed and sent lifecycle events with the full request and raw response", async () => {
+    const { dataDir, workspace } = await fixture();
+    await writeRequest(workspace, "one.json", valid());
+    const dispatch = vi.fn(async () => ({ messageId: 7, data: { message_id: 7 } }));
+    await pollOutbox(dataDir, dispatch);
+    await vi.waitFor(async () => {
+      expect(await systemEvents(workspace)).toMatchObject([
+        {
+          type: "outbox_claimed",
+          id: "one",
+          request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" },
+        },
+        {
+          type: "outbox_sent",
+          id: "one",
+          kind: "send_file",
+          request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" },
+          messageId: 7,
+          data: { message_id: 7 },
+        },
+      ]);
+    });
+  });
+  it("processes every request in a flooded chat without skipping later chats", async () => {
     const { dataDir, workspace } = await fixture();
     const laterWorkspace = path.join(dataDir, "chats", "43", "workspace");
     await mkdir(path.join(laterWorkspace, ".tg-bot", "outbox"), { recursive: true });
@@ -297,8 +320,7 @@ describe("WorkspaceOutbox", () => {
     await pollOutbox(dataDir, dispatch);
 
     const floodedChatSends = chats.filter((chatId) => chatId === 42).length;
-    expect(floodedChatSends).toBeLessThanOrEqual(256);
-    expect(floodedChatSends).toBeLessThan(300);
+    expect(floodedChatSends).toBe(300);
     expect(chats).toContain(43);
   });
 

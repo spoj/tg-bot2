@@ -91,22 +91,26 @@ describe("WorkspaceScheduler discovery and validation", () => {
     expect(runs).toEqual([[-2, "chat negative"], [12, "chat twelve"]]);
     expect(errors.length).toBeGreaterThanOrEqual(3);
   }));
-  it("rejects schedule files larger than the bounded read limit", async () => withDirectory(async (dataDir) => {
-    const filePath = await writeSchedules(dataDir, 13, []);
-    await writeFile(filePath, "x".repeat(64 * 1024 + 1), "utf8");
-    const runs: string[] = [];
-    const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); } });
-    await scheduler.poll(NOW);
-    expect(runs).toEqual([]);
-  }));
-
-  it("rejects schedule files with too many records", async () => withDirectory(async (dataDir) => {
-    const schedules = Array.from({ length: 257 }, (_value, index) => record({ id: `schedule-${index}` }));
+  it("processes schedule files beyond the former record and byte bounds", async () => withDirectory(async (dataDir) => {
+    const schedules = Array.from({ length: 300 }, (_value, index) => record({ id: `schedule-${index}` }));
     await writeSchedules(dataDir, 13, schedules);
     const runs: string[] = [];
     const scheduler = new WorkspaceScheduler({ dataDir, run: async (_chatId, prompt) => { runs.push(prompt); } });
     await scheduler.poll(NOW);
-    expect(runs).toEqual([]);
+    expect(runs).toHaveLength(300);
+  }));
+  it("records schedule triggers in system.jsonl with the record as-is", async () => withDirectory(async (dataDir) => {
+    await writeSchedules(dataDir, 13, [record({ id: "due", prompt: "fire" })]);
+    const scheduler = new WorkspaceScheduler({ dataDir, run: async () => undefined });
+    await scheduler.poll(NOW);
+    const systemPath = path.join(dataDir, "chats", "13", "workspace", ".tg-bot", "system.jsonl");
+    const lines = (await readFile(systemPath, "utf8")).trim().split("\n");
+    const events = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(events).toMatchObject([{
+      type: "schedule_triggered",
+      id: "due",
+      record: expect.objectContaining({ id: "due", prompt: "fire" }),
+    }]);
   }));
 
   it.each([

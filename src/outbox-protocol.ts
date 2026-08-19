@@ -220,5 +220,5 @@ field of the matching send event, records it in .tg-bot/sent.jsonl and
 per send but their content never matters beyond that: no id field exists inside the
 request. Write each request to a temporary filename that does not end in .json, then
 atomically rename it to the final unique *.json request name.
-Every processed request is recorded in .tg-bot/sent.jsonl as {id,request,messageId?,pollId?,data?} (latest 256 records kept); rejected requests are recorded in .tg-bot/failed.jsonl as {id,request,error} and recorded as outbox_rejected events in system.jsonl. Requests leave no other trace in the outbox directory.
+Every processed request is recorded in .tg-bot/sent.jsonl as {id,request,messageId?,pollId?,data?} ; rejected requests are recorded in .tg-bot/failed.jsonl as {id,request,error}. Both archives are append-only. Every request is also reported in .tg-bot/system.jsonl as outbox_claimed followed by one terminal outbox_sent or outbox_rejected event. Requests leave no other trace in the outbox directory.
 `;

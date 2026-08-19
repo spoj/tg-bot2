@@ -2,6 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { link, lstat, open, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { appendSystemEvent } from "./events.js";
 import { TG_BOT_DIR, chatPaths, errorCode, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRecord } from "./schedule-protocol.js";
 
@@ -42,8 +43,6 @@ const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
 const WRITE_NEW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW;
 const SCHEDULES_FILE = "schedules.json";
-const MAX_SCHEDULE_FILE_BYTES = 64 * 1024;
-const MAX_SCHEDULE_RECORDS = 256;
 const MAX_SCHEDULE_ID_LENGTH = 256;
 const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
 const UTC_ISO = /Z$/u;
@@ -88,7 +87,6 @@ function validateScheduleFile(value: unknown): ScheduleFile {
   const file = value as Record<string, unknown>;
   if (file.version !== 1) invalid("version must be 1");
   if (!Array.isArray(file.schedules)) invalid("schedules must be an array");
-  if (file.schedules.length > MAX_SCHEDULE_RECORDS) invalid(`schedules exceed ${MAX_SCHEDULE_RECORDS} records`);
   const ids = new Set<string>();
   const schedules = file.schedules.map((record, index) => {
     const validated = validateRecord(record, index);
@@ -118,16 +116,14 @@ async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<v
     // Preserve the original read/write error.
   }
 }
-async function readBoundedFile(handle: Awaited<ReturnType<typeof open>>): Promise<string> {
-  const buffer = Buffer.allocUnsafe(MAX_SCHEDULE_FILE_BYTES + 1);
+async function readSchedulesFile(handle: Awaited<ReturnType<typeof open>>): Promise<string> {
+  const stat = await handle.stat();
+  const buffer = Buffer.allocUnsafe(stat.size);
   let bytesRead = 0;
-  while (bytesRead < buffer.length) {
-    const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, null);
+  while (bytesRead < stat.size) {
+    const result = await handle.read(buffer, bytesRead, stat.size - bytesRead, null);
     if (result.bytesRead === 0) break;
     bytesRead += result.bytesRead;
-  }
-  if (bytesRead > MAX_SCHEDULE_FILE_BYTES) {
-    throw new Error(`schedules.json exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
   }
   return buffer.subarray(0, bytesRead).toString("utf8");
 }
@@ -274,6 +270,11 @@ export class WorkspaceScheduler {
 
     try {
       await this.run(item.chatId, current.prompt);
+      await appendSystemEvent(chatPaths(this.dataDir, item.chatId).workspace, {
+        type: "schedule_triggered",
+        id: current.id,
+        record: current,
+      });
     } catch (error) {
       this.report(new Error(`Schedule ${current.id} for chat ${item.chatId} was not completed`, { cause: error }));
       return;
@@ -294,8 +295,7 @@ export class WorkspaceScheduler {
       handle = await open(filePath, READ_FILE);
       const stat = await handle.stat();
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
-      if (stat.size > MAX_SCHEDULE_FILE_BYTES) throw new Error(`schedules.json exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
-      raw = await readBoundedFile(handle);
+      raw = await readSchedulesFile(handle);
     } catch (error) {
       if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
       return undefined;
@@ -339,9 +339,6 @@ export class WorkspaceScheduler {
       const expectedRaw = snapshot.raw;
       handle = await open(temporaryPath, WRITE_NEW, 0o600);
       const encoded = `${JSON.stringify(file)}\n`;
-      if (Buffer.byteLength(encoded, "utf8") > MAX_SCHEDULE_FILE_BYTES) {
-        throw new Error(`schedules.json exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
-      }
       await handle.writeFile(encoded, "utf8");
       await handle.sync();
       await handle.close();
@@ -354,7 +351,7 @@ export class WorkspaceScheduler {
         latest = await open(filePath, READ_FILE);
         const latestStat = await latest.stat();
         if (!latestStat.isFile() || latestStat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
-        const latestRaw = await readBoundedFile(latest);
+        const latestRaw = await readSchedulesFile(latest);
         if (latestRaw !== expectedRaw) throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
         const liveStat = await lstat(filePath);
         if (!liveStat.isFile() || liveStat.dev !== latestStat.dev || liveStat.ino !== latestStat.ino) {
@@ -371,7 +368,7 @@ export class WorkspaceScheduler {
         try {
           previous = await open(previousPath, READ_FILE);
           const previousStat = await previous.stat();
-          const previousRaw = await readBoundedFile(previous);
+          const previousRaw = await readSchedulesFile(previous);
           if (!previousStat.isFile() || previousStat.dev !== latestStat.dev || previousStat.ino !== latestStat.ino || previousRaw !== expectedRaw) {
             throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
           }

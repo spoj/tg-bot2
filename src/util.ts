@@ -1,6 +1,5 @@
-import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { FileHandle, lstat, open, realpath, rename, unlink } from "node:fs/promises";
+import { lstat, open, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 /** Strips keys whose value is undefined at runtime AND at the type level; preserves the presence/absence contract under exactOptionalPropertyTypes. */
@@ -85,14 +84,12 @@ const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
 /**
- * Appends one record to a bounded line store (filePath), rotating to the last
- * `maxLines` lines when the line or byte caps are exceeded. A symlink planted at
- * the path is unlinked and the open retried (ELOOP defense).
+ * Appends one record to a JSONL store (filePath). A symlink planted at the path is
+ * unlinked and the open retried (ELOOP defense).
  */
-export async function appendBoundedJsonl(
+export async function appendJsonl(
   filePath: string,
   record: string,
-  caps: { maxLines: number; maxBytes: number },
 ): Promise<void> {
   const line = `${record}\n`;
   const handle = await openJsonlAppend(filePath);
@@ -100,29 +97,23 @@ export async function appendBoundedJsonl(
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
     await handle.write(line, null, "utf8");
-    const total = stat.size + Buffer.byteLength(line, "utf8");
-    const lines = await readJsonlLines(handle, total, caps.maxBytes);
-    if (lines.length > caps.maxLines || total > caps.maxBytes) {
-      await replaceJsonl(filePath, `${lines.slice(-caps.maxLines).join("\n")}\n`);
-    }
   } finally {
     await handle.close().catch(() => {});
   }
 }
 
 /**
- * Reads the tail of a bounded line store (filePath), dropping a possible partial
- * first line, without following symlinks.
+ * Reads every line of a JSONL store (filePath), dropping a possible partial first
+ * line, without following symlinks.
  */
-export async function readBoundedJsonl(
+export async function readJsonl(
   filePath: string,
-  caps: { maxLines: number; maxBytes: number },
 ): Promise<string[]> {
   const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
-    return (await readJsonlLines(handle, stat.size, caps.maxBytes)).slice(-caps.maxLines);
+    return await readJsonlLines(handle, stat.size);
   } finally {
     await handle.close().catch(() => {});
   }
@@ -168,39 +159,14 @@ async function openJsonlAppend(filePath: string): Promise<FileHandle> {
   }
 }
 
-/** Reads the tail of a store, dropping a possible partial first line. */
-async function readJsonlLines(handle: FileHandle, size: number, maxBytes: number): Promise<string[]> {
-  const readLength = Math.min(size, maxBytes);
-  const position = size - readLength;
-  const buffer = Buffer.allocUnsafe(readLength);
+/** Reads every line of a store, dropping a possible partial final line. */
+async function readJsonlLines(handle: FileHandle, size: number): Promise<string[]> {
+  const buffer = Buffer.allocUnsafe(size);
   let bytesRead = 0;
-  while (bytesRead < readLength) {
-    const result = await handle.read(buffer, bytesRead, readLength - bytesRead, position + bytesRead);
+  while (bytesRead < size) {
+    const result = await handle.read(buffer, bytesRead, size - bytesRead, bytesRead);
     if (result.bytesRead === 0) break;
     bytesRead += result.bytesRead;
   }
-  const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
-  const complete = position === 0 ? lines : lines.slice(1);
-  return complete.filter(Boolean);
-}
-
-/** Atomically rewrites a store via a unique temporary file, retrying the temp name on collision. */
-async function replaceJsonl(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const tempPath = path.join(directory, `.jsonl-${randomUUID()}.tmp`);
-    let handle: FileHandle | undefined;
-    try {
-      handle = await open(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
-      await handle.write(content, null, "utf8");
-    } catch (error) {
-      if (errorCode(error) === "EEXIST") continue;
-      throw error;
-    } finally {
-      if (handle) await handle.close().catch(() => {});
-    }
-    await rename(tempPath, filePath);
-    return;
-  }
-  throw new Error("Unable to rewrite JSONL store");
+  return buffer.subarray(0, bytesRead).toString("utf8").split("\n").filter(Boolean);
 }

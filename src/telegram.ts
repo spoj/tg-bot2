@@ -19,7 +19,7 @@ import type {
   WorkspaceOutboxDispatchResult,
   WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-import { appendBoundedJsonl, chatPaths, defined, readBoundedJsonl } from "./util.js";
+import { appendJsonl, chatPaths, defined, readJsonl } from "./util.js";
 
 const WAKE_PROMPT = ".";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
@@ -338,16 +338,12 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
   return first.message_id;
 }
 const POLL_OWNER_STORE_NAME = "poll-owners.jsonl";
-const MAX_POLL_OWNER_LINES = 256;
-const MAX_POLL_OWNER_BYTES = 64 * 1024;
-const POLL_OWNER_CAPS = { maxLines: MAX_POLL_OWNER_LINES, maxBytes: MAX_POLL_OWNER_BYTES };
 
 /** Records poll ownership in a host-side store the sandbox cannot reach (only /workspace is mounted). */
 export async function recordPollOwner(dataDir: string, chatId: number, pollId: string): Promise<void> {
-  await appendBoundedJsonl(
+  await appendJsonl(
     path.join(dataDir, POLL_OWNER_STORE_NAME),
     JSON.stringify({ chatId, pollId }),
-    POLL_OWNER_CAPS,
   );
 }
 
@@ -355,7 +351,7 @@ export async function recordPollOwner(dataDir: string, chatId: number, pollId: s
 async function findPollOwnerChat(dataDir: string, pollId: string): Promise<number | undefined> {
   let lines: string[];
   try {
-    lines = await readBoundedJsonl(path.join(dataDir, POLL_OWNER_STORE_NAME), POLL_OWNER_CAPS);
+    lines = await readJsonl(path.join(dataDir, POLL_OWNER_STORE_NAME));
   } catch {
     return undefined;
   }

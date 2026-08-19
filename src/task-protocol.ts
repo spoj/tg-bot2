@@ -11,10 +11,11 @@ prompt file (kept under its original name), output.md (the final report on succe
 sessions/, and result.json. To check a task's state, find the run directory containing
 your prompt file: no result.json means it is still running; result.json means settled with
 status done, failed, or aborted (aborted = the run was killed or the host restarted
-mid-run; rewrite the task file to retry). Settlements are also recorded in
-.tg-bot/system.jsonl, and each settle arrives as a followup naming the prompt and its run
-directory. Run directories accumulate until you delete them; system.jsonl is the durable
-index. Task agents cannot reach Telegram; relay anything user-facing yourself.
+mid-run; rewrite the task file to retry). Every transition — task_claimed then one
+task_settled — is recorded in .tg-bot/system.jsonl, and each task_settled arrives as a
+followup naming the prompt and its run directory. Run directories accumulate until you
+delete them; system.jsonl is the durable index. Task agents cannot reach Telegram;
+relay anything user-facing yourself.
 `;
 
 export const TASK_RUNNER_PROMPT = `You are a background task agent spawned by a persistent Telegram personal agent. You work

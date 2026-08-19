@@ -6,7 +6,7 @@ import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendChatEvent, appendSystemEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
-import { appendBoundedJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readBoundedJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { appendJsonl, chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
@@ -27,12 +27,6 @@ const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const JSON_REQUEST = /\.json$/;
-// Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
-const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
-const MAX_OUTBOX_ENTRIES_PER_CHAT = 256;
-const MAX_ARCHIVE_LINES = 256;
-const MAX_ARCHIVE_BYTES = 64 * 1024;
-const ARCHIVE_CAPS = { maxLines: MAX_ARCHIVE_LINES, maxBytes: MAX_ARCHIVE_BYTES };
 // Recover claims older than five minutes after crashes without racing active senders.
 const STALE_CLAIM_AGE_MS = 5 * 60_000;
 const CLAIM_HEARTBEAT_INTERVAL_MS = Math.floor(STALE_CLAIM_AGE_MS / 3);
@@ -104,6 +98,25 @@ async function readRequest(filePath: string): Promise<WorkspaceOutboxRequest> {
   }
 }
 
+/** Raw text of a claim file; undefined when unreadable or oversized. */
+async function claimFileText(filePath: string): Promise<string | undefined> {
+  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => undefined);
+  if (!handle) return undefined;
+  try {
+    const buffer = Buffer.allocUnsafe(MAX_REQUEST_BYTES + 1);
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > MAX_REQUEST_BYTES) return undefined;
+    }
+    return buffer.subarray(0, total).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 /** SHA-256 of a claim file's raw bytes; undefined when unreadable or oversized. */
 async function claimFileHash(filePath: string): Promise<string | undefined> {
   const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => undefined);
@@ -125,7 +138,7 @@ async function claimFileHash(filePath: string): Promise<string | undefined> {
   }
 }
 
-async function readBoundedEntries(directory: string, limit: number) {
+async function readEntries(directory: string) {
   const directoryHandle = await opendir(directory);
   const entries = [];
   try {
@@ -133,7 +146,6 @@ async function readBoundedEntries(directory: string, limit: number) {
       const entry = await directoryHandle.read();
       if (entry === null) break;
       entries.push(entry);
-      if (entries.length >= limit) break;
     }
   } finally {
     await directoryHandle.close().catch(() => {});
@@ -317,7 +329,7 @@ export class WorkspaceOutbox {
     let chatsRoot: PinnedDirectory | undefined;
     try {
       chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readBoundedEntries(chatsRoot.path, MAX_CHAT_DIRECTORIES_PER_POLL);
+      const entries = await readEntries(chatsRoot.path);
       const chats = entries
         .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
         .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
@@ -359,7 +371,7 @@ export class WorkspaceOutbox {
       const sentPath = path.join(metadata.path, SENT_ARCHIVE_FILE);
       const failedPath = path.join(metadata.path, FAILED_ARCHIVE_FILE);
 
-      const entries = (await readBoundedEntries(outbox.path, MAX_OUTBOX_ENTRIES_PER_CHAT))
+      const entries = (await readEntries(outbox.path))
         .filter((entry) => JSON_REQUEST.test(entry.name) || CLAIM_NAME.test(entry.name))
         .map((entry) => ({ name: entry.name, path: path.join(outboxPath, entry.name) }))
         .sort((a, b) => a.name.localeCompare(b.name));
@@ -379,7 +391,15 @@ export class WorkspaceOutbox {
         try {
           lease = this.startClaimLease(claim, chatId);
           request = await readRequest(claim.path);
+          await appendSystemEvent(workspace, { type: "outbox_claimed", id: requestKey, request });
           result = await this.dispatch(chatId, request);
+          await appendSystemEvent(workspace, {
+            type: "outbox_sent",
+            id: requestKey,
+            kind: request.type,
+            request,
+            ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
+          });
           if (result !== undefined && (result.messageId !== undefined || result.data !== undefined)) {
             try {
               appendChatEvent(workspace, {
@@ -403,16 +423,16 @@ export class WorkspaceOutbox {
           if (request !== undefined) {
             try {
               const hash = await claimFileHash(claim.path);
-              await appendBoundedJsonl(
+              await appendJsonl(
                 failedPath,
                 JSON.stringify({ id: requestKey, ...(hash === undefined ? {} : { hash }), request, error: errorMessage(error) }),
-                ARCHIVE_CAPS,
               );
             } catch (archiveError) {
               this.report(archiveError);
             }
           }
-          this.notifyAgentFailure(chatId, workspace, requestKey, error);
+          const raw = request === undefined ? await claimFileText(claim.path) : undefined;
+          await this.recordRejection(chatId, workspace, requestKey, error, { ...defined({ request }), ...defined({ raw }) });
           this.reportRequestError(chatId, archiveName, error);
           await this.discardClaimFile(claim.path);
           continue;
@@ -424,12 +444,13 @@ export class WorkspaceOutbox {
         }
         if (request === undefined) {
           this.reportRequestError(chatId, archiveName, new Error("Outbox request disappeared after dispatch"));
+          await this.recordRejection(chatId, workspace, requestKey, new Error("Outbox request file disappeared after claim"), {});
           await this.discardClaimFile(claim.path);
           continue;
         }
         try {
           const hash = await claimFileHash(claim.path);
-          await appendBoundedJsonl(
+          await appendJsonl(
             sentPath,
             JSON.stringify({
               id: requestKey,
@@ -437,7 +458,6 @@ export class WorkspaceOutbox {
               request,
               ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
             }),
-            ARCHIVE_CAPS,
           );
         } catch (error) {
           // Sending succeeded; a lost archive record must never resend, and the
@@ -512,7 +532,7 @@ export class WorkspaceOutbox {
     for (const archivePath of [sentPath, failedPath]) {
       let lines: string[];
       try {
-        lines = await readBoundedJsonl(archivePath, ARCHIVE_CAPS);
+        lines = await readJsonl(archivePath);
       } catch {
         continue;
       }
@@ -575,9 +595,20 @@ export class WorkspaceOutbox {
 
 
   /** Records the rejection in system.jsonl and sends the agent a followup; never blocks scanning. */
-  private notifyAgentFailure(chatId: number, workspace: string, name: string, error: unknown): void {
+  private async recordRejection(
+    chatId: number,
+    workspace: string,
+    name: string,
+    error: unknown,
+    context: { request?: WorkspaceOutboxRequest; raw?: string },
+  ): Promise<void> {
     const message = `Outbox request ${name} rejected: ${errorMessage(error)}`;
-    void appendSystemEvent(workspace, { type: "outbox_rejected", detail: message });
+    await appendSystemEvent(workspace, {
+      type: "outbox_rejected",
+      detail: message,
+      ...defined({ request: context.request }),
+      ...defined({ raw: context.raw }),
+    });
     void this.agent.followup(chatId, message).catch((notifyError) => this.report(notifyError));
   }
   private reportRequestError(chatId: number, name: string, error: unknown): void {

@@ -103,7 +103,8 @@ describe("WorkspaceTasks", () => {
     expect(await readFile(path.join(runDir, "output.md"), "utf8")).toBe("the findings");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "done", exitCode: 0 });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task", name: "research.md", runId, status: "done", exitCode: 0 },
+      { type: "task_claimed", name: "research.md", runId },
+      { type: "task_settled", name: "research.md", runId, status: "done", exitCode: 0 },
     ]);
     expect(followup).toHaveBeenCalledWith(42, `Task research.md finished. Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`);
     expect((await readFile(path.join(workspace, ".tg-bot", "task", "research.md"), "utf8").catch(() => null))).toBeNull();
@@ -127,7 +128,8 @@ describe("WorkspaceTasks", () => {
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "failed", exitCode: 3, stderr: "boom" });
     await expect(readFile(path.join(runDir, "output.md"), "utf8")).rejects.toThrow();
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task", name: "broken.txt", runId, status: "failed", exitCode: 3, stderr: "boom" },
+      { type: "task_claimed", name: "broken.txt", runId },
+      { type: "task_settled", name: "broken.txt", runId, status: "failed", exitCode: 3, stderr: "boom" },
     ]);
     expect(followup).toHaveBeenCalledWith(42, `Task broken.txt failed (exit 3). Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`);
   });
@@ -142,7 +144,10 @@ describe("WorkspaceTasks", () => {
 
     await setupTasks(dataDir, factory, { agent: { followup } }).poll();
 
-    expect(await systemEvents(workspace)).toMatchObject([{ type: "task", name: "unspawnable.md", status: "failed" }]);
+    expect(await systemEvents(workspace)).toMatchObject([
+      { type: "task_claimed", name: "unspawnable.md", runId: expect.any(String) },
+      { type: "task_settled", name: "unspawnable.md", status: "failed" },
+    ]);
     expect(followup).toHaveBeenCalledOnce();
   });
 
@@ -168,7 +173,10 @@ describe("WorkspaceTasks", () => {
     await setupTasks(dataDir, factory).poll();
 
     expect(factory).not.toHaveBeenCalled();
-    expect(await systemEvents(workspace)).toMatchObject([{ type: "task", name: "empty.md", status: "failed" }]);
+    expect(await systemEvents(workspace)).toMatchObject([
+      { type: "task_claimed", name: "empty.md", runId: expect.any(String) },
+      { type: "task_settled", name: "empty.md", status: "failed" },
+    ]);
   });
 
   it("runs up to eight tasks concurrently and claims the rest as slots free", async () => {
@@ -217,7 +225,8 @@ describe("WorkspaceTasks", () => {
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted", signal: "SIGTERM" });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task", name: "interrupted.md", runId, status: "aborted" },
+      { type: "task_claimed", name: "interrupted.md", runId },
+      { type: "task_settled", name: "interrupted.md", runId, status: "aborted" },
     ]);
     expect(followup).toHaveBeenCalledWith(42, `Task interrupted.md aborted (SIGTERM). Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`);
   });
@@ -239,7 +248,7 @@ describe("WorkspaceTasks", () => {
     expect(tasks).toHaveLength(0);
     expect(await readJson(path.join(deadRun, "result.json"))).toEqual({ status: "aborted" });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task", name: "crashed.md", runId: "22222222-2222-4222-8222-222222222222", status: "aborted", exitCode: null },
+      { type: "task_settled", name: "crashed.md", runId: "22222222-2222-4222-8222-222222222222", status: "aborted", exitCode: null },
     ]);
     expect(await readJson(path.join(settledRun, "result.json"))).toEqual({ status: "done" });
   });

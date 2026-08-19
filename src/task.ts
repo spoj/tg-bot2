@@ -50,11 +50,7 @@ const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_TASK_BYTES = 64 * 1024;
-// Bound attacker-controlled directory work while preserving lexical ordering of the captured entries.
-const MAX_CHAT_DIRECTORIES_PER_POLL = 256;
-const MAX_TASK_ENTRIES_PER_CHAT = 256;
 const MAX_CONCURRENT_TASKS_PER_CHAT = 8;
-const MAX_RUN_DIRS_PER_SWEEP = 4_096;
 const TASK_DIR = "task";
 const TASKS_DIR = path.join(".pi", "tasks");
 const SESSIONS_DIR = "sessions";
@@ -87,7 +83,7 @@ function errorMessage(error: unknown): string {
   return detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
 }
 
-async function readBoundedEntries(directory: string, limit: number) {
+async function readEntries(directory: string) {
   const directoryHandle = await opendir(directory);
   const entries = [];
   try {
@@ -95,7 +91,6 @@ async function readBoundedEntries(directory: string, limit: number) {
       const entry = await directoryHandle.read();
       if (entry === null) break;
       entries.push(entry);
-      if (entries.length >= limit) break;
     }
   } finally {
     await directoryHandle.close().catch(() => {});
@@ -138,7 +133,7 @@ async function ensureTasksDirectory(workspace: string): Promise<string> {
 
 /** Finds the claimed prompt file inside a run directory, keeping the agent's original filename. */
 async function findTaskFile(runDirectory: string): Promise<string | undefined> {
-  const entries = await readBoundedEntries(runDirectory, MAX_TASK_ENTRIES_PER_CHAT);
+  const entries = await readEntries(runDirectory);
   return entries.find((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))?.name;
 }
 
@@ -365,7 +360,7 @@ export class WorkspaceTasks {
     let chatsRoot: PinnedDirectory | undefined;
     try {
       chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readBoundedEntries(chatsRoot.path, MAX_CHAT_DIRECTORIES_PER_POLL);
+      const entries = await readEntries(chatsRoot.path);
       const chats = entries
         .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
         .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
@@ -404,7 +399,7 @@ export class WorkspaceTasks {
       metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
       taskDirectory = await openPinnedDirectory(path.join(metadata.path, TASK_DIR));
 
-      const entries = (await readBoundedEntries(taskDirectory.path, MAX_TASK_ENTRIES_PER_CHAT))
+      const entries = (await readEntries(taskDirectory.path))
         .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))
         .map((entry) => entry.name)
         .sort((a, b) => a.localeCompare(b));
@@ -437,6 +432,7 @@ export class WorkspaceTasks {
       if (isMissing(error)) return; // The agent deleted the pending task.
       throw error;
     }
+    await appendSystemEvent(workspace, { type: "task_claimed", name, runId });
     let prompt: string;
     try {
       prompt = await readTaskPrompt(path.join(runDirectory, name));
@@ -508,7 +504,7 @@ export class WorkspaceTasks {
     let chatsRoot: PinnedDirectory | undefined;
     try {
       chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readBoundedEntries(chatsRoot.path, MAX_CHAT_DIRECTORIES_PER_POLL);
+      const entries = await readEntries(chatsRoot.path);
       const chats = entries
         .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
         .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
@@ -536,7 +532,7 @@ export class WorkspaceTasks {
       this.report(error);
       return;
     }
-    const entries = await readBoundedEntries(tasksPath, MAX_RUN_DIRS_PER_SWEEP);
+    const entries = await readEntries(tasksPath);
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const runDirectory = path.join(tasksPath, entry.name);
@@ -551,7 +547,7 @@ export class WorkspaceTasks {
         const name = await findTaskFile(runDirectory);
         if (name !== undefined) {
           await appendSystemEvent(workspace, {
-            type: "task",
+            type: "task_settled",
             name,
             runId: entry.name,
             status: "aborted",
@@ -583,7 +579,7 @@ export class WorkspaceTasks {
       ...defined({ stderr }),
     }), { encoding: "utf8", mode: 0o600 });
     await appendSystemEvent(workspace, {
-      type: "task",
+      type: "task_settled",
       name,
       runId,
       status,

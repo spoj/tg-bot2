@@ -102,7 +102,7 @@ const SYSTEM_FILE = "system.jsonl";
  * follows a symbolic link planted at the log directory or file.
  */
 export async function appendChatEvents(workspace: string, events: ChatEvent[]): Promise<void> {
-  await appendLines(workspace, CHAT_FILE, "chat event", events, true);
+  await appendLines(workspace, CHAT_FILE, "chat event", events);
 }
 
 /** Appends one chat event; see {@link appendChatEvents}. */
@@ -111,7 +111,7 @@ export function appendChatEvent(workspace: string, event: ChatEvent): Promise<vo
 }
 
 async function appendSystemEvents(workspace: string, events: SystemEvent[]): Promise<void> {
-  await appendLines(workspace, SYSTEM_FILE, "system event", events, false);
+  await appendLines(workspace, SYSTEM_FILE, "system event", events);
 }
 
 /** Appends one system event; see {@link appendSystemEvents}. */
@@ -124,7 +124,6 @@ async function appendLines(
   fileName: string,
   label: string,
   events: Array<ChatEvent | SystemEvent>,
-  migrateLegacy: boolean,
 ): Promise<void> {
   try {
     const directory = path.join(workspace, TG_BOT_DIR);

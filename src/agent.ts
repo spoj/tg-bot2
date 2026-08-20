@@ -182,6 +182,7 @@ export class AgentManager {
   }
 
   /** File-based session summary; never spawns a worker. */
+  // eslint-disable-next-line complexity -- assembles a multi-section diagnostic report; refactor once stable
   async status(chatId: number): Promise<AgentStatus> {
     const workspace = chatPaths(this.config.dataDir, chatId).workspace;
     const settings = await loadUserSettings(workspace);

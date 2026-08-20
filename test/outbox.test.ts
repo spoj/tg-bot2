@@ -131,7 +131,6 @@ describe("WorkspaceOutbox", () => {
   });
   it("retries a stale claim left by a crashed process", async () => {
     const { dataDir, workspace } = await fixture();
-    const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-crashed";
     await writeRequest(workspace, claimName, valid());
     const dispatch = vi.fn(async () => undefined);

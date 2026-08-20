@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendSystemEvent } from "./events.js";
@@ -137,20 +137,6 @@ async function findTaskFile(runDirectory: string): Promise<string | undefined> {
   return entries.find((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))?.name;
 }
 
-async function newestSessionFile(sessionsDirectory: string): Promise<string | undefined> {
-  let newest: { name: string; mtimeMs: number } | undefined;
-  try {
-    const entries = await readdir(sessionsDirectory, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".jsonl")) continue;
-      const stat = await lstat(path.join(sessionsDirectory, entry.name));
-      if (!newest || stat.mtimeMs > newest.mtimeMs) newest = { name: entry.name, mtimeMs: stat.mtimeMs };
-    }
-  } catch {
-    return undefined;
-  }
-  return newest?.name;
-}
 
 /**
  * Runs agent-submitted background tasks: watches .tg-bot/task/*.txt|md, claims files into

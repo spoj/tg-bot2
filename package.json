@@ -14,7 +14,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --dir test",
     "test:integration": "RUN_BWRAP_TESTS=1 vitest run --dir test sandbox.test.ts pi-integration.test.ts",
-    "check:layers": "node scripts/check-layer-boundaries.mjs"
+    "lint": "eslint .",
+    "check": "node scripts/ci.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
@@ -22,8 +23,10 @@
   },
   "devDependencies": {
     "@types/node": "26.2.0",
+    "eslint": "^10.8.1",
     "tsx": "4.23.11",
-    "typescript": "7.0.2",
+    "typescript": "6.0.3",
+    "typescript-eslint": "^8.67.0",
     "vitest": "4.1.10"
   }
 }

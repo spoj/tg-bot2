@@ -139,6 +139,7 @@ const FILE_KINDS: Record<string, true> = {
 // Host-side checks are limited to what dispatch itself needs (routing,
 // bookkeeping, file safety). Telegram validates everything else and its
 // rejection message is relayed to the agent directly.
+// eslint-disable-next-line complexity -- one branch per send type; the validator shape is inherent
 export function validateRequest(value: unknown): WorkspaceOutboxRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Outbox request must be a JSON object");

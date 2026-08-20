@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, open, realpath, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 /** Strips keys whose value is undefined at runtime AND at the type level; preserves the presence/absence contract under exactOptionalPropertyTypes. */

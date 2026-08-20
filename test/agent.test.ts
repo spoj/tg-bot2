@@ -298,7 +298,7 @@ it("passes settings defaults as model and thinking CLI args", async () => {
 it("persists last activity host-side and reloads it for a new manager", async () => {
   await withDataDir(async (dataDir) => {
     const tenHours = 10 * 60 * 60 * 1000;
-    let now = tenHours;
+    const now = tenHours;
     const first = fakeWorkerFactory();
     const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: first.factory, now: () => now }));
     await manager.followup(42, "one");

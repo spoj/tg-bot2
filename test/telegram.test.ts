@@ -12,7 +12,6 @@ import {
   deleteTelegramMessage,
   formatStatus,
   recordPollOwner,
-  registerBotCommands,
   attachmentSource,
   sendTelegramEditMessage,
   sendTelegramLocation,
@@ -26,7 +25,7 @@ import {
   TelegramDeliveryQueue,
 } from "../src/telegram.js";
 import type { AgentStatus } from "../src/agent.js";
-import { appendChatEvents, type ChatEvent } from "../src/events.js";
+import { appendChatEvents } from "../src/events.js";
 
 const execFile = promisify(execFileCallback);
 function fakeBot() {

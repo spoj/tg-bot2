@@ -59,6 +59,7 @@ function invalid(message: string): never {
   throw new Error(`Invalid schedules file: ${message}`);
 }
 
+// eslint-disable-next-line complexity -- one branch per record field; the validator shape is inherent
 function validateRecord(value: unknown, index: number): StoredScheduleRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     invalid(`record ${index} must be an object`);
@@ -311,6 +312,7 @@ export class WorkspaceScheduler {
     }
   }
 
+  // eslint-disable-next-line complexity -- read-verify-swap state machine; one branch per failure mode
   private async markRun(item: DueRecord, id: string, now: number): Promise<void> {
     const metadata = await this.openCurrentMetadata(item);
     if (!metadata) return;

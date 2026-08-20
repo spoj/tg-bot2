@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { deferred, type Deferred } from "./helpers.js";
+import { deferred } from "./helpers.js";
 
 const state = vi.hoisted(() => {
   const order: string[] = [];

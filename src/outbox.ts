@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
+import { lstat, open, opendir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendChatEvent, appendSystemEvent } from "./events.js";
@@ -331,6 +331,7 @@ export class WorkspaceOutbox {
     }
   }
 
+  // eslint-disable-next-line complexity -- poll/settle state machine; one branch per failure mode
   private async processChatNow(chatId: number, workspace: string, chatsRoot?: PinnedDirectory): Promise<void> {
     let openedChatsRoot: PinnedDirectory | undefined;
     let chatDirectory: PinnedDirectory | undefined;

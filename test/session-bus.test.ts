@@ -186,9 +186,36 @@ describe("WorkspaceSessionBus", () => {
     expect(onSend).toHaveBeenCalledTimes(2);
     await bus.flushTaskRun(42, workspace, "run-1");
     expect(onSend).toHaveBeenCalledTimes(2);
-
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(2);
+  });
+  it("re-reads a rewritten session file and routes only new records", async () => {
+    const { dataDir, workspace } = await fixture();
+    const padding = `${JSON.stringify({
+      type: "message",
+      id: "pad00001",
+      parentId: "p",
+      timestamp: "t",
+      message: { role: "assistant", content: [{ type: "text", text: "x".repeat(2_000) }] },
+    })}\n`;
+    await writeSession(workspace, [
+      record([{ type: "toolCall", name: "send", arguments: { type: "send_message", text: "first" } }]),
+      padding,
+    ]);
+    const onSend = vi.fn<SendHandler>(async () => undefined);
+    const bus = setupBus(dataDir, { onSend });
+
+    await bus.poll();
+    expect(onSend).toHaveBeenCalledTimes(1);
+
+    // Rewrite the file shorter (compaction/migration); the consumed call must stay
+    // deduped while the new record is routed.
+    await writeSession(workspace, [
+      record([{ type: "toolCall", name: "send", arguments: { type: "send_message", text: "second" } }]).replace(RECORD_ID, "b2c3d4e5"),
+    ]);
+    await bus.poll();
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect((onSend.mock.calls[1]?.[0] as SessionToolCall).args).toEqual({ type: "send_message", text: "second" });
   });
 
   it("retries pending spawns until a slot frees", async () => {

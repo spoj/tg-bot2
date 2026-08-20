@@ -142,16 +142,21 @@ async function readSessionTail(filePath: string, offset: number): Promise<{ text
   const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size <= offset) return { text: "", nextOffset: offset };
-    const length = stat.size - offset;
+    if (!stat.isFile()) return { text: "", nextOffset: offset };
+    // The harness occasionally rewrites session files wholesale (version migration,
+    // compaction). A size below the stored offset means the file was rewritten:
+    // rescan from the top; the claim-check keeps already-consumed calls deduped.
+    const start = stat.size < offset ? 0 : offset;
+    if (stat.size <= start) return { text: "", nextOffset: start };
+    const length = stat.size - start;
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const result = await handle.read(buffer, read, length - read, offset + read);
+      const result = await handle.read(buffer, read, length - read, start + read);
       read += result.bytesRead;
       if (result.bytesRead === 0) break;
     }
-    return { text: buffer.subarray(0, read).toString("utf8"), nextOffset: offset + read };
+    return { text: buffer.subarray(0, read).toString("utf8"), nextOffset: start + read };
   } finally {
     await handle.close();
   }
@@ -434,13 +439,15 @@ export class WorkspaceSessionBus {
   }
 
   private async scanFile(chatId: number, workspace: string, state: ChatScanState, file: string): Promise<void> {
+    const previous = state.offsets.get(file) ?? 0;
     let tail: { text: string; nextOffset: number };
     try {
-      tail = await readSessionTail(file, state.offsets.get(file) ?? 0);
+      tail = await readSessionTail(file, previous);
     } catch (error) {
       if (!isMissing(error)) this.report(error);
       return;
     }
+    if (tail.nextOffset < previous) state.partials.delete(file);
     state.offsets.set(file, tail.nextOffset);
     const combined = (state.partials.get(file) ?? "") + tail.text;
     const { lines, partial } = splitRecords(combined);

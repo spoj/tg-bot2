@@ -1,0 +1,422 @@
+import { constants as fsConstants } from "node:fs";
+import { open, opendir } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import path from "node:path";
+import { chatPaths, isMissing, numericChatId, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
+
+/** One send_request command: the agent's tool minted requestId and the raw request object. */
+export type SendRequest = {
+  requestId: string;
+  request: unknown;
+};
+
+/** One spawn_request command: the agent's tool minted runId and the complete prompt. */
+export type SpawnRequest = {
+  runId: string;
+  prompt: string;
+};
+
+/** One cancel_request command: the runId of a previously spawned task. */
+export type CancelRequest = {
+  runId: string;
+};
+
+/** Consumes one send_request; `resume` means the command was claimed but its dispatch never reached a terminal event. */
+export type SendRequestHandler = (
+  record: SendRequest,
+  chatId: number,
+  workspace: string,
+  resume: boolean,
+) => Promise<void>;
+
+/** Consumes one spawn_request; "pending" means the chat is at capacity and the command must be retried. */
+export type SpawnRequestHandler = (
+  record: SpawnRequest,
+  chatId: number,
+  workspace: string,
+) => Promise<"claimed" | "pending">;
+
+/** Consumes one cancel_request; a command naming an unknown or settled run is a no-op. */
+export type CancelRequestHandler = (record: CancelRequest, chatId: number, workspace: string) => Promise<void>;
+
+export type WorkspaceRequestBusOptions = {
+  dataDir: string;
+  onSend: SendRequestHandler;
+  onSpawn: SpawnRequestHandler;
+  onCancel: CancelRequestHandler;
+  pollIntervalMs?: number;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+  logger?: (error: unknown) => void;
+};
+
+const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const MAX_TIMER_MS = 2_147_483_647;
+const SYSTEM_LOG = path.join(".tg-bot", "system.jsonl");
+const MAX_RECORD_BYTES = 8 * 1024 * 1024;
+const NO_FOLLOW = fsConstants.O_NOFOLLOW;
+const NON_BLOCKING = fsConstants.O_NONBLOCK;
+
+type ChatScanState = {
+  /** Byte offset into system.jsonl; the log is append-only, so offsets are stable for a process lifetime. */
+  offset: number;
+  /** Trailing fragment of a record still being written. */
+  partial: string;
+  /** Commands routed this lifetime, by UUID. */
+  consumed: Set<string>;
+  /** UUIDs already claimed or terminated in system.jsonl; never re-routed. */
+  bootConsumed: Set<string>;
+  /** requestIds claimed without a terminal event; re-dispatched at boot. */
+  sendResume: Set<string>;
+  /** Spawn commands awaiting a free slot. */
+  pending: SpawnRequest[];
+  booted: boolean;
+};
+
+function commandId(type: string, record: Record<string, unknown>): string | undefined {
+  const id = record[type === "send_request" ? "requestId" : "runId"];
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/** Parses one system.jsonl line into a command record; undefined for outcomes, junk, or malformed commands. */
+export function parseCommand(line: string): SendRequest | SpawnRequest | CancelRequest | undefined {
+  if (line.length > MAX_RECORD_BYTES) return undefined;
+  let record: unknown;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return undefined;
+  const typed = record as Record<string, unknown>;
+  const id = commandId(typed.type as string, typed);
+  if (id === undefined) return undefined;
+  if (typed.type === "send_request") return { requestId: id, request: typed.request };
+  if (typed.type === "spawn_request") {
+    const prompt = typed.prompt;
+    return typeof prompt === "string" ? { runId: id, prompt } : undefined;
+  }
+  if (typed.type === "cancel_request") return { runId: id };
+  return undefined;
+}
+
+async function readDirEntries(directory: string): Promise<Dirent[]> {
+  const handle = await opendir(directory);
+  const entries: Dirent[] = [];
+  try {
+    for (;;) {
+      const entry = await handle.read();
+      if (entry === null) break;
+      entries.push(entry);
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  return entries;
+}
+
+/** Reads bytes after offset without following symlinks; a planted symlink throws ELOOP and the file is skipped. */
+async function readTail(filePath: string, offset: number): Promise<{ text: string; nextOffset: number }> {
+  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) return { text: "", nextOffset: offset };
+    // The agent can truncate anything in its workspace, including system.jsonl.
+    // A size below the stored offset means the file was truncated: rescan from the
+    // top; the claim fold keeps already-consumed commands deduped.
+    const start = stat.size < offset ? 0 : offset;
+    if (stat.size <= start) return { text: "", nextOffset: start };
+    const length = stat.size - start;
+    const buffer = Buffer.allocUnsafe(length);
+    let read = 0;
+    while (read < length) {
+      const result = await handle.read(buffer, read, length - read, start + read);
+      read += result.bytesRead;
+      if (result.bytesRead === 0) break;
+    }
+    return { text: buffer.subarray(0, read).toString("utf8"), nextOffset: start + read };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Splits newly read text into complete records and one deferred trailing fragment.
+ * A fragment without a newline is emitted only when it already parses as complete JSON;
+ * otherwise it is held until the next read completes it.
+ */
+export function splitRecords(text: string): { lines: string[]; partial: string } {
+  const index = text.lastIndexOf("\n");
+  const parseComplete = (fragment: string): boolean => {
+    if (fragment.length === 0) return false;
+    try {
+      JSON.parse(fragment);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (index === -1) {
+    return parseComplete(text) ? { lines: [text], partial: "" } : { lines: [], partial: text };
+  }
+  const lines = text.slice(0, index).split("\n");
+  const tail = text.slice(index + 1);
+  if (tail === "") return { lines, partial: "" };
+  return parseComplete(tail) ? { lines: [...lines, tail], partial: "" } : { lines, partial: tail };
+}
+
+/**
+ * Consumes agent commands from the shared system.jsonl: tails the append-only log,
+ * extracts send_request/spawn_request/cancel_request records, dedupes against the
+ * claim events in the same log, and routes each command to its handler exactly once.
+ * Boot replay re-dispatches open outbox claims (claimed without a terminal event);
+ * spawn commands over a chat's concurrency limit are retried each poll. The agent's
+ * tools append commands with O_APPEND; the host's outcome appends interleave safely.
+ */
+export class WorkspaceRequestBus {
+  private readonly options: Required<Pick<WorkspaceRequestBusOptions, "onSend" | "onSpawn" | "onCancel">> & WorkspaceRequestBusOptions;
+  private readonly dataDir: string;
+  private readonly pollIntervalMs: number;
+  private readonly schedule: typeof setInterval;
+  private readonly cancelSchedule: typeof clearInterval;
+  private readonly logger: (error: unknown) => void;
+  private readonly states = new Map<number, ChatScanState>();
+  private timer: NodeJS.Timeout | undefined;
+  private pollInFlight: Promise<void> | undefined;
+  private startInFlight: Promise<void> | undefined;
+  private running = false;
+
+  constructor(options: WorkspaceRequestBusOptions) {
+    const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > MAX_TIMER_MS) {
+      throw new Error("Request poll interval must be a positive timer-safe integer");
+    }
+    this.options = options;
+    this.dataDir = path.resolve(options.dataDir);
+    this.pollIntervalMs = pollIntervalMs;
+    this.schedule = options.setInterval ?? setInterval;
+    this.cancelSchedule = options.clearInterval ?? clearInterval;
+    this.logger = options.logger ?? ((error) => console.error("Request bus error", error));
+  }
+
+  async start(): Promise<void> {
+    if (this.running) {
+      if (this.startInFlight) await this.startInFlight;
+      return;
+    }
+    this.running = true;
+    const initialPoll = this.poll();
+    this.startInFlight = initialPoll;
+    try {
+      await initialPoll;
+    } finally {
+      if (this.startInFlight === initialPoll) this.startInFlight = undefined;
+    }
+    if (!this.running) return;
+    this.timer = this.schedule(() => {
+      void this.poll().catch((error) => this.report(error));
+    }, this.pollIntervalMs);
+    (this.timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    if (this.timer !== undefined) {
+      this.cancelSchedule(this.timer);
+      this.timer = undefined;
+    }
+    const pending: Promise<void>[] = [];
+    if (this.startInFlight) pending.push(this.startInFlight);
+    if (this.pollInFlight) pending.push(this.pollInFlight);
+    if (pending.length > 0) await Promise.all(pending.map((operation) => operation.catch(() => {})));
+  }
+
+  /** Polls every chat workspace; concurrent calls share one operation. */
+  async poll(): Promise<void> {
+    if (this.pollInFlight) return this.pollInFlight;
+    const operation = this.runPoll();
+    this.pollInFlight = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.pollInFlight === operation) this.pollInFlight = undefined;
+    }
+  }
+
+  /** Consumes any commands written since the last scan, so settle followups order after a task's sends. */
+  async flush(chatId: number, workspace: string): Promise<void> {
+    if (!Number.isSafeInteger(chatId)) return;
+    const state = await this.ensureState(chatId, workspace);
+    await this.scanChat(chatId, workspace, state, false);
+  }
+
+  private async ensureState(chatId: number, workspace: string): Promise<ChatScanState> {
+    const existing = this.states.get(chatId);
+    if (existing) return existing;
+    const state: ChatScanState = {
+      offset: 0,
+      partial: "",
+      consumed: new Set(),
+      bootConsumed: new Set(),
+      sendResume: new Set(),
+      pending: [],
+      booted: false,
+    };
+    this.states.set(chatId, state);
+    await this.loadBootState(workspace, state);
+    state.booted = true;
+    return state;
+  }
+
+  /** Rebuilds claim state from system.jsonl so boot replay neither re-dispatches settled commands nor drops open ones. */
+  private async loadBootState(workspace: string, state: ChatScanState): Promise<void> {
+    let lines: string[];
+    try {
+      lines = await readJsonl(path.join(workspace, SYSTEM_LOG));
+    } catch (error) {
+      if (!isMissing(error)) this.report(error);
+      return;
+    }
+    const openSends = new Set<string>();
+    for (const line of lines) {
+      let record: unknown;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+      const typed = record as Record<string, unknown>;
+      const id = typeof typed.requestId === "string" && typed.requestId.length > 0 ? typed.requestId
+        : typeof typed.runId === "string" && typed.runId.length > 0 ? typed.runId
+          : undefined;
+      if (id === undefined) continue;
+      switch (typed.type) {
+        case "outbox_claimed":
+          openSends.add(id);
+          break;
+        case "outbox_sent":
+        case "outbox_rejected":
+          openSends.delete(id);
+          state.bootConsumed.add(id);
+          break;
+        case "task_claimed":
+        case "task_settled":
+        case "task_cancelled":
+          state.bootConsumed.add(id);
+          break;
+        default:
+          break;
+      }
+    }
+    for (const requestId of openSends) state.sendResume.add(requestId);
+  }
+
+  private async runPoll(): Promise<void> {
+    let chatsRoot: PinnedDirectory | undefined;
+    try {
+      chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
+      const entries = await readDirEntries(chatsRoot.path);
+      const chats = entries
+        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+        .map((entry) => numericChatId(entry.name))
+        .filter((chatId): chatId is number => chatId !== undefined)
+        .sort((a, b) => a - b);
+      for (const chatId of chats) {
+        const workspace = chatPaths(this.dataDir, chatId).workspace;
+        try {
+          const state = await this.ensureState(chatId, workspace);
+          await this.scanChat(chatId, workspace, state, true);
+        } catch (error) {
+          if (!isMissing(error)) this.report(error);
+        }
+      }
+    } catch (error) {
+      if (!isMissing(error)) this.report(error);
+    } finally {
+      if (chatsRoot) await chatsRoot.handle.close().catch((error) => this.report(error));
+    }
+  }
+
+  private async scanChat(chatId: number, workspace: string, state: ChatScanState, retryPending: boolean): Promise<void> {
+    // Retry spawns left pending by the previous poll before scanning new commands.
+    if (retryPending) {
+      const pending = state.pending;
+      state.pending = [];
+      for (const record of pending) {
+        const result = await this.invokeSpawn(chatId, workspace, record);
+        if (result === "claimed") state.consumed.add(record.runId);
+        else state.pending.push(record);
+      }
+    }
+    const file = path.join(workspace, SYSTEM_LOG);
+    const previous = state.offset;
+    let tail: { text: string; nextOffset: number };
+    try {
+      tail = await readTail(file, previous);
+    } catch (error) {
+      if (!isMissing(error)) this.report(error);
+      return;
+    }
+    if (tail.nextOffset < previous) state.partial = "";
+    state.offset = tail.nextOffset;
+    const { lines, partial } = splitRecords(state.partial + tail.text);
+    state.partial = partial;
+    for (const line of lines) {
+      const record = parseCommand(line);
+      if (record === undefined) continue;
+      await this.route(chatId, workspace, state, record);
+    }
+  }
+
+  private async route(chatId: number, workspace: string, state: ChatScanState, record: SendRequest | SpawnRequest | CancelRequest): Promise<void> {
+    const id = "requestId" in record ? record.requestId : record.runId;
+    if (state.consumed.has(id)) return;
+    if (state.bootConsumed.has(id)) {
+      state.consumed.add(id);
+      return;
+    }
+    if ("prompt" in record) {
+      // spawn_request
+      const result = await this.invokeSpawn(chatId, workspace, record);
+      if (result === "claimed") state.consumed.add(record.runId);
+      else state.pending.push(record);
+      return;
+    }
+    if ("request" in record) {
+      // send_request
+      state.consumed.add(id);
+      const resume = state.sendResume.has(record.requestId);
+      await this.invoke(() => this.options.onSend(record, chatId, workspace, resume));
+      return;
+    }
+    // cancel_request
+    state.consumed.add(id);
+    await this.invoke(() => this.options.onCancel(record, chatId, workspace));
+  }
+
+  private async invoke(operation: () => Promise<void>): Promise<void> {
+    try {
+      await operation();
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  private async invokeSpawn(chatId: number, workspace: string, record: SpawnRequest): Promise<"claimed" | "pending"> {
+    try {
+      return await this.options.onSpawn(record, chatId, workspace);
+    } catch (error) {
+      this.report(error);
+      return "claimed";
+    }
+  }
+
+  private report(error: unknown): void {
+    try {
+      this.logger(error);
+    } catch {
+      // Diagnostics must never interrupt request processing.
+    }
+  }
+}

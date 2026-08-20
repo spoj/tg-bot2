@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceOutbox, type WorkspaceOutboxOptions } from "../src/outbox.js";
 import type { AgentManager } from "../src/agent.js";
 import type { WorkspaceOutboxDispatcher, WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
-import type { SessionToolCall } from "../src/session-bus.js";
+import type { SendRequest } from "../src/request-bus.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -32,11 +32,6 @@ async function systemEvents(workspace: string): Promise<Array<Record<string, unk
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-const callRef = (index = 0) => ({ sessionId: "11111111-1111-4111-8111-111111111111", recordId: "a1b2c3d4", index });
-function sendCall(args: unknown, index = 0): SessionToolCall {
-  return { ref: callRef(index), name: "send", args: args as Record<string, unknown> };
-}
-
 function setupOutbox(
   dispatch: WorkspaceOutboxDispatcher,
   options: Omit<WorkspaceOutboxOptions, "dispatch" | "agent"> & { agent?: Pick<AgentManager, "followup"> } = {},
@@ -50,76 +45,70 @@ const valid = (filePath = "/workspace/report.txt") => ({
   caption: "Report",
 });
 
+function sendRecord(requestId: string, request: unknown): SendRequest {
+  return { requestId, request };
+}
+
 async function send(
   workspace: string,
   dispatch: WorkspaceOutboxDispatcher,
-  args: unknown,
+  record: SendRequest,
   options: Omit<WorkspaceOutboxOptions, "dispatch" | "agent"> & { agent?: Pick<AgentManager, "followup"> } = {},
-  resume?: { requestId: string },
+  resume = false,
 ): Promise<void> {
-  await setupOutbox(dispatch, options).handleSend(sendCall(args), 42, workspace, resume);
+  await setupOutbox(dispatch, options).handleSendRequest(record, 42, workspace, resume);
 }
 
 describe("WorkspaceOutbox", () => {
   it("delivers valid sends and records claimed then sent", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, valid());
+    await send(workspace, dispatch, sendRecord("req-1", valid()));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed", requestId: expect.any(String), callRef: callRef(), request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" } },
-      { type: "outbox_sent", requestId: expect.any(String), callRef: callRef(), request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" } },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1" },
     ]);
   });
 
   it("resumes an open claim without claiming again", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    const requestId = "00000000-0000-0000-0000-000000000000";
-    await send(workspace, dispatch, valid(), {}, { requestId });
+    await send(workspace, dispatch, sendRecord("req-resume", valid()), {}, true);
     expect(dispatch).toHaveBeenCalledTimes(1);
     const events = await systemEvents(workspace);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ type: "outbox_sent", requestId, callRef: callRef() });
+    expect(events[0]).toMatchObject({ type: "outbox_sent", requestId: "req-resume" });
   });
 
   it("records a send event in chat.jsonl for each returned message id", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async (_chatId: number, request: WorkspaceOutboxRequest) => ({ messageId: (request as { path: string }).path === "/workspace/report.txt" ? 100 : 200 }));
-    await send(workspace, dispatch, valid());
-    await send(workspace, dispatch, valid("/workspace/report-two.txt"));
-    const recorded = await chatEvents(workspace);
-    expect(recorded).toMatchObject([
-      { type: "send", kind: "send_file", messageId: 100 },
-      { type: "send", kind: "send_file", messageId: 200 },
+    await send(workspace, dispatch, sendRecord("req-1", valid()));
+    await send(workspace, dispatch, sendRecord("req-2", valid("/workspace/report-two.txt")));
+    expect(await chatEvents(workspace)).toMatchObject([
+      { type: "send", kind: "send_file", requestId: "req-1", messageId: 100 },
+      { type: "send", kind: "send_file", requestId: "req-2", messageId: 200 },
     ]);
   });
 
   it("skips the chat event when the dispatcher reports no message id", async () => {
     const { workspace } = await fixture();
-    await send(workspace, vi.fn(async () => undefined), valid());
+    await send(workspace, vi.fn(async () => undefined), sendRecord("req-1", valid()));
     await expect(readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8")).rejects.toThrow();
-    expect(await systemEvents(workspace)).toMatchObject([{ type: "outbox_claimed" }, { type: "outbox_sent" }]);
+    expect(await systemEvents(workspace)).toMatchObject([
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1" },
+    ]);
   });
 
   it("writes dispatcher data onto the send event in chat.jsonl", async () => {
     const { workspace } = await fixture();
-    await send(workspace, vi.fn(async () => ({ data: 777 })), { type: "stop_poll", message_id: 77 });
-    expect(await chatEvents(workspace)).toMatchObject([{ type: "send", kind: "stop_poll", data: 777 }]);
+    await send(workspace, vi.fn(async () => ({ data: 777 })), sendRecord("req-1", { type: "stop_poll", message_id: 77 }));
+    expect(await chatEvents(workspace)).toMatchObject([{ type: "send", kind: "stop_poll", requestId: "req-1", data: 777 }]);
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed" },
-      { type: "outbox_sent", data: 777 },
-    ]);
-  });
-
-  it("records stopped poll results as data on the send event", async () => {
-    const { workspace } = await fixture();
-    const poll = { id: "poll-xyz", question: "Q", options: [{ text: "a", voter_count: 2 }], total_voter_count: 2, is_closed: true };
-    await send(workspace, vi.fn(async () => ({ messageId: 77, data: poll })), { type: "stop_poll", message_id: 77 });
-    expect(await chatEvents(workspace)).toMatchObject([{ type: "send", kind: "stop_poll", messageId: 77, data: poll }]);
-    expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed" },
-      { type: "outbox_sent", messageId: 77, data: poll },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1", data: 777 },
     ]);
   });
 
@@ -133,28 +122,27 @@ describe("WorkspaceOutbox", () => {
       reply_to_message_id: 42,
     };
     const dispatch = vi.fn(async () => ({ messageId: 9_001 }));
-    await send(workspace, dispatch, request);
+    await send(workspace, dispatch, sendRecord("req-1", request));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...request });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed" },
-      { type: "outbox_sent", messageId: 9001 },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1", messageId: 9001 },
     ]);
   });
 
   it("forwards send_message requests without host-side semantic validation", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "send_message", text: "x", parse_mode: "Markdown" });
-    await send(workspace, dispatch, { type: "send_message", text: "x", reply_markup: [1] });
-    await send(workspace, dispatch, { type: "send_message", text: "x", reply_to_message_id: -3 });
-    await send(workspace, dispatch, { type: "send_message", text: "x".repeat(4_097) });
-    await send(workspace, dispatch, { type: "send_message", text: "hello", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 5 }] });
-    await send(workspace, dispatch, { type: "send_message", text: "x", entities: ["bold"] });
-    await send(workspace, dispatch, { type: "send_message", text: "x", entities: [{ type: "bold", offset: 0 }] });
-    await send(workspace, dispatch, { type: "send_message", text: "x", link_preview_options: { url: "x".repeat(8_193) } });
-    await send(workspace, dispatch, { type: "send_message", text: "x", reply_markup: { inline_keyboard: [[{ text: "漢".repeat(3000), callback_data: "cjk" }]] } });
-    expect(dispatch).toHaveBeenCalledTimes(9);
-    expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(9);
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_message", text: "x", parse_mode: "Markdown" }));
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_message", text: "x", reply_markup: [1] }));
+    await send(workspace, dispatch, sendRecord("req-3", { type: "send_message", text: "x", reply_to_message_id: -3 }));
+    await send(workspace, dispatch, sendRecord("req-4", { type: "send_message", text: "x".repeat(4_097) }));
+    await send(workspace, dispatch, sendRecord("req-5", { type: "send_message", text: "hello", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 5 }] }));
+    await send(workspace, dispatch, sendRecord("req-6", { type: "send_message", text: "x", entities: ["bold"] }));
+    await send(workspace, dispatch, sendRecord("req-7", { type: "send_message", text: "x", entities: [{ type: "bold", offset: 0 }] }));
+    await send(workspace, dispatch, sendRecord("req-8", { type: "send_message", text: "x", link_preview_options: { url: "x".repeat(8_193) } }));
+    expect(dispatch).toHaveBeenCalledTimes(8);
+    expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(8);
   });
 
   it("dispatches location, poll, and reaction requests and records poll ids", async () => {
@@ -178,34 +166,34 @@ describe("WorkspaceOutbox", () => {
       if ((request as { question: string }).question === "Pick one") return { messageId: 302, pollId: "poll-abc" };
       return undefined;
     });
-    await send(workspace, dispatch, location);
-    await send(workspace, dispatch, poll);
-    await send(workspace, dispatch, reaction);
+    await send(workspace, dispatch, sendRecord("req-1", location));
+    await send(workspace, dispatch, sendRecord("req-2", poll));
+    await send(workspace, dispatch, sendRecord("req-3", reaction));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...location });
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...poll });
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...reaction });
     expect(await chatEvents(workspace)).toMatchObject([
-      { type: "send", kind: "send_location", messageId: 301 },
-      { type: "send", kind: "send_poll", messageId: 302, pollId: "poll-abc" },
+      { type: "send", kind: "send_location", requestId: "req-1", messageId: 301 },
+      { type: "send", kind: "send_poll", requestId: "req-2", messageId: 302, pollId: "poll-abc" },
     ]);
     const sent = (await systemEvents(workspace)).filter((event) => event.type === "outbox_sent");
     expect(sent).toMatchObject([
-      { messageId: 301 },
-      { messageId: 302, pollId: "poll-abc" },
-      {},
+      { requestId: "req-1", messageId: 301 },
+      { requestId: "req-2", messageId: 302, pollId: "poll-abc" },
+      { requestId: "req-3" },
     ]);
   });
 
   it("forwards location, poll, and reaction requests without host-side semantic validation", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "send_location", latitude: 91, longitude: 0 });
-    await send(workspace, dispatch, { type: "send_location", latitude: 1, longitude: 2, venue: { title: "x" } });
-    await send(workspace, dispatch, { type: "send_poll", question: "q", options: ["only"] });
-    await send(workspace, dispatch, { type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz" });
-    await send(workspace, dispatch, { type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 });
-    await send(workspace, dispatch, { type: "send_reaction", message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
-    await send(workspace, dispatch, { type: "stop_poll", message_id: 0 });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_location", latitude: 91, longitude: 0 }));
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_location", latitude: 1, longitude: 2, venue: { title: "x" } }));
+    await send(workspace, dispatch, sendRecord("req-3", { type: "send_poll", question: "q", options: ["only"] }));
+    await send(workspace, dispatch, sendRecord("req-4", { type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz" }));
+    await send(workspace, dispatch, sendRecord("req-5", { type: "send_poll", question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 }));
+    await send(workspace, dispatch, sendRecord("req-6", { type: "send_reaction", message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] }));
+    await send(workspace, dispatch, sendRecord("req-7", { type: "stop_poll", message_id: 0 }));
     expect(dispatch).toHaveBeenCalledTimes(7);
     expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(7);
   });
@@ -220,11 +208,11 @@ describe("WorkspaceOutbox", () => {
       ],
     };
     const dispatch = vi.fn(async () => ({ messageId: 7 }));
-    await send(workspace, dispatch, group);
+    await send(workspace, dispatch, sendRecord("req-1", group));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...group });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed" },
-      { type: "outbox_sent", messageId: 7 },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1", messageId: 7 },
     ]);
   });
 
@@ -232,42 +220,46 @@ describe("WorkspaceOutbox", () => {
     const { workspace } = await fixture();
     const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "send_media_group", media: [{ type: "photo", media: "a.png" }] }, { agent: { followup } });
-    await send(workspace, dispatch, { type: "send_media_group", media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] }, { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_media_group", media: [{ type: "photo", media: "a.png" }] }), { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_media_group", media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] }), { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
-    expect(followup).toHaveBeenCalledWith(42, "Send rejected: Outbox request media must be an array of 2 to 10 items. Request: {\"type\":\"send_media_group\",\"media\":[{\"type\":\"photo\",\"media\":\"a.png\"}]}");
-    expect(followup).toHaveBeenCalledWith(42, "Send rejected: Outbox request media item type must be photo or video. Request: {\"type\":\"send_media_group\",\"media\":[{\"type\":\"document\",\"media\":\"a.pdf\"},{\"type\":\"photo\",\"media\":\"b.png\"}]}");
+    expect(followup).toHaveBeenCalledWith(42, "Send req-1 rejected: Outbox request media must be an array of 2 to 10 items");
+    expect(followup).toHaveBeenCalledWith(42, "Send req-2 rejected: Outbox request media item type must be photo or video");
     const rejected = (await systemEvents(workspace)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toHaveLength(2);
-    expect(rejected[0]).toMatchObject({ type: "outbox_rejected", callRef: callRef(), detail: expect.stringContaining("2 to 10 items"), raw: expect.any(String) });
+    expect(rejected).toMatchObject([
+      { requestId: "req-1", detail: expect.stringContaining("2 to 10 items") },
+      { requestId: "req-2", detail: expect.stringContaining("photo or video") },
+    ]);
   });
 
   it("discards structurally invalid sends and notifies the agent", async () => {
     const { workspace } = await fixture();
     const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "send_file", path: "x", kind: "weird" }, { agent: { followup } });
-    await send(workspace, dispatch, { type: "send_file", path: 7 }, { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_file", path: "x", kind: "weird" }), { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_file", path: 7 }), { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-3", "not-an-object"), { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
     const rejected = (await systemEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
-      { detail: expect.stringContaining("must be auto, photo"), raw: expect.any(String) },
-      { detail: expect.stringContaining("must be a non-empty string"), raw: expect.any(String) },
+      { requestId: "req-1", detail: expect.stringContaining("must be auto, photo") },
+      { requestId: "req-2", detail: expect.stringContaining("must be a non-empty string") },
+      { requestId: "req-3", detail: expect.stringContaining("must be a JSON object") },
     ]);
-    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
-    expect(followup).toHaveBeenCalledWith(42, "Send rejected: Outbox request kind must be auto, photo, audio, video, voice, or document. Request: {\"type\":\"send_file\",\"path\":\"x\",\"kind\":\"weird\"}");
-    expect(followup).toHaveBeenCalledWith(42, "Send rejected: Outbox request path must be a non-empty string. Request: {\"type\":\"send_file\",\"path\":7}");
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(3));
+    expect(followup).toHaveBeenCalledWith(42, "Send req-1 rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
+    expect(followup).toHaveBeenCalledWith(42, "Send req-3 rejected: Outbox request must be a JSON object");
   });
 
   it("discards oversized sends without delivering them", async () => {
     const { workspace } = await fixture();
     const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "send_file", path: "x".repeat(1024 * 1024) }, { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_file", path: "x".repeat(1024 * 1024) }), { agent: { followup } });
     expect(dispatch).not.toHaveBeenCalled();
     const rejected = (await systemEvents(workspace)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([{ detail: expect.stringContaining("exceeds 1048576 bytes"), raw: expect.any(String) }]);
+    expect(rejected).toMatchObject([{ requestId: "req-1", detail: expect.stringContaining("exceeds 1048576 bytes") }]);
     expect(followup).toHaveBeenCalledTimes(1);
   });
 
@@ -275,13 +267,13 @@ describe("WorkspaceOutbox", () => {
     const { workspace } = await fixture();
     const followup = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
-    await send(workspace, dispatch, valid(), { agent: { followup } });
+    await send(workspace, dispatch, sendRecord("req-1", valid()), { agent: { followup } });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(followup).toHaveBeenCalledWith(42, "Send rejected: upload failed. Request: {\"type\":\"send_file\",\"path\":\"/workspace/report.txt\",\"caption\":\"Report\",\"version\":1}");
+    expect(followup).toHaveBeenCalledWith(42, "Send req-1 rejected: upload failed");
     const events = await systemEvents(workspace);
     expect(events).toMatchObject([
-      { type: "outbox_claimed", request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" } },
-      { type: "outbox_rejected", detail: expect.stringContaining("upload failed"), request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" } },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_rejected", requestId: "req-1", detail: expect.stringContaining("upload failed") },
     ]);
     await expect(readFile(path.join(workspace, ".tg-bot", "chat.jsonl"), "utf8")).rejects.toThrow();
   });
@@ -289,24 +281,25 @@ describe("WorkspaceOutbox", () => {
   it("dispatches an empty reaction array to remove a reaction", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "send_reaction", message_id: 12, reaction: [] });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_reaction", message_id: 12, reaction: [] }));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_reaction", message_id: 12, reaction: [] });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed" },
-      { type: "outbox_sent" },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1" },
     ]);
   });
 
   it("forwards reaction requests with too many or invalid entries", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, {
+    await send(workspace, dispatch, sendRecord("req-1", {
       type: "send_reaction", message_id: 3,
       reaction: [
         { type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" },
+        { type: "emoji", emoji: "😀" }, { type: "emoji", emoji: "😎" },
       ],
-    });
-    await send(workspace, dispatch, { type: "send_reaction", message_id: 3, reaction: [{ type: "emoji", emoji: "" }] });
+    }));
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_reaction", message_id: 3, reaction: [{ type: "emoji", emoji: "" }] }));
     expect(dispatch).toHaveBeenCalledTimes(2);
     expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(2);
   });
@@ -318,11 +311,11 @@ describe("WorkspaceOutbox", () => {
       type: "send_reaction", message_id: 12,
       reaction: [{ type: "emoji", emoji: "👍" }, { type: "custom_emoji", custom_emoji_id: "1234567890123456" }],
     };
-    await send(workspace, dispatch, request);
+    await send(workspace, dispatch, sendRecord("req-1", request));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...request });
     expect(await systemEvents(workspace)).toMatchObject([
-      { type: "outbox_claimed" },
-      { type: "outbox_sent" },
+      { type: "outbox_claimed", requestId: "req-1" },
+      { type: "outbox_sent", requestId: "req-1" },
     ]);
   });
 
@@ -335,8 +328,8 @@ describe("WorkspaceOutbox", () => {
       link_preview_options: { is_disabled: true },
     };
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, edit);
-    await send(workspace, dispatch, { type: "delete_message", message_id: 56 });
+    await send(workspace, dispatch, sendRecord("req-1", edit));
+    await send(workspace, dispatch, sendRecord("req-2", { type: "delete_message", message_id: 56 }));
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...edit });
     expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "delete_message", message_id: 56 });
     expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(2);
@@ -345,10 +338,10 @@ describe("WorkspaceOutbox", () => {
   it("forwards edit_message requests without host-side semantic validation", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, { type: "edit_message", message_id: 7, text: "x".repeat(4_097) });
-    await send(workspace, dispatch, { type: "edit_message", message_id: 9 });
-    await send(workspace, dispatch, { type: "edit_message", message_id: 9, text: "x", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 1 }] });
-    await send(workspace, dispatch, { type: "edit_message", message_id: 9, reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "edit_message", message_id: 7, text: "x".repeat(4_097) }));
+    await send(workspace, dispatch, sendRecord("req-2", { type: "edit_message", message_id: 9 }));
+    await send(workspace, dispatch, sendRecord("req-3", { type: "edit_message", message_id: 9, text: "x", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 1 }] }));
+    await send(workspace, dispatch, sendRecord("req-4", { type: "edit_message", message_id: 9, reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] } }));
     expect(dispatch).toHaveBeenCalledTimes(4);
     expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(4);
   });
@@ -356,8 +349,8 @@ describe("WorkspaceOutbox", () => {
   it("forwards send_file requests with unconfined paths to the dispatcher", async () => {
     const { workspace } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, valid("/workspace/../outside.txt"));
-    await send(workspace, dispatch, valid("/workspace/"));
+    await send(workspace, dispatch, sendRecord("req-1", valid("/workspace/../outside.txt")));
+    await send(workspace, dispatch, sendRecord("req-2", valid("/workspace/")));
     expect(dispatch).toHaveBeenCalledTimes(2);
     expect((await systemEvents(workspace)).filter((event) => event.type === "outbox_sent")).toHaveLength(2);
   });

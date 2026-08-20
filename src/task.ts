@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { lstat, mkdir, opendir, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
@@ -6,7 +5,7 @@ import type { AgentManager } from "./agent.js";
 import { appendSystemEvent } from "./events.js";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
-import type { SessionToolCall } from "./session-bus.js";
+import type { CancelRequest, SpawnRequest } from "./request-bus.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
 import { chatPaths, defined, errorMessage, isMissing, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
 
@@ -38,8 +37,8 @@ export type WorkspaceTasksOptions = {
   workerFactory?: WorkspaceTaskWorkerFactory;
   /** Receives a completion followup per settled task, quoting the prompt and naming the run directory. */
   agent: Pick<AgentManager, "followup">;
-  /** Consumes one task run's session calls before its settle followup, so task sends order before the completion message. */
-  flush?: { flushTaskRun(chatId: number, workspace: string, runId: string): Promise<void> };
+  /** Consumes pending commands from system.jsonl before each settle followup, so task sends order before the completion message. */
+  flush?: { flush(chatId: number, workspace: string): Promise<void> };
   heartbeatIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -201,42 +200,38 @@ export class WorkspaceTasks {
   }
 
   /** Claims one spawn call; "pending" when the chat is at its concurrency limit. */
-  async handleSpawn(call: SessionToolCall, chatId: number, workspace: string): Promise<"claimed" | "pending"> {
-    const prompt = call.args.prompt;
-    if (typeof prompt !== "string" || prompt.trim().length === 0 || prompt.length > MAX_TASK_BYTES) {
-      await this.settleRejectedSpawn(chatId, workspace, call, prompt);
+  async handleSpawnRequest(record: SpawnRequest, chatId: number, workspace: string): Promise<"claimed" | "pending"> {
+    const prompt = record.prompt;
+    if (prompt.trim().length === 0 || prompt.length > MAX_TASK_BYTES) {
+      await this.settleRejectedSpawn(chatId, workspace, record.runId, prompt);
       return "claimed";
     }
     const available = MAX_CONCURRENT_TASKS_PER_CHAT - (this.inFlight.get(chatId)?.length ?? 0);
     if (available <= 0) return "pending";
-    await this.claimAndLaunch(chatId, workspace, call, prompt);
+    await this.claimAndLaunch(chatId, workspace, record.runId, prompt);
     return "claimed";
   }
 
-  /** Stops one running task; a call naming an unknown or settled run is a no-op. */
-  async handleCancel(call: SessionToolCall, chatId: number, workspace: string): Promise<void> {
-    const runId = call.args.runId;
-    if (typeof runId !== "string" || runId.length === 0) return;
-    const entry = this.inFlight.get(chatId)?.find((item) => item.runId === runId);
+  /** Stops one running task; a command naming an unknown or settled run is a no-op. */
+  async handleCancelRequest(record: CancelRequest, chatId: number, workspace: string): Promise<void> {
+    const entry = this.inFlight.get(chatId)?.find((item) => item.runId === record.runId);
     if (entry === undefined) return;
-    await appendSystemEvent(workspace, { type: "task_cancelled", runId, callRef: call.ref });
+    await appendSystemEvent(workspace, { type: "task_cancelled", runId: record.runId });
     await entry.worker.stop();
   }
 
-  /** Records a spawn call with an unusable prompt as claimed then failed, with a followup. */
-  private async settleRejectedSpawn(chatId: number, workspace: string, call: SessionToolCall, prompt: unknown): Promise<void> {
-    const runId = randomUUID();
+  /** Records a spawn command with an unusable prompt as claimed then failed, with a followup. */
+  private async settleRejectedSpawn(chatId: number, workspace: string, runId: string, prompt: string): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
-    const reason = typeof prompt !== "string" || prompt.trim().length === 0
+    const reason = prompt.trim().length === 0
       ? "Task prompt must be a non-empty string"
       : `Task prompt exceeds ${MAX_TASK_BYTES} bytes`;
-    const promptText = typeof prompt === "string" ? prompt : "";
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
-    if (promptText.length > 0) {
-      await writeFile(path.join(runDirectory, PROMPT_FILE), promptText, { encoding: "utf8", mode: 0o600 });
+    if (prompt.length > 0) {
+      await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
     }
-    await appendSystemEvent(workspace, { type: "task_claimed", runId, callRef: call.ref, prompt: promptText });
-    await this.settleTask(chatId, workspace, { runId, prompt: promptText }, runDirectory, {
+    await appendSystemEvent(workspace, { type: "task_claimed", runId });
+    await this.settleTask(chatId, workspace, { runId, prompt }, runDirectory, {
       code: null,
       signal: null,
       stderr: reason,
@@ -244,13 +239,12 @@ export class WorkspaceTasks {
     });
   }
 
-  /** Claims one spawn call into a fresh uuid run directory and launches its background run. */
-  private async claimAndLaunch(chatId: number, workspace: string, call: SessionToolCall, prompt: string): Promise<void> {
-    const runId = randomUUID();
+  /** Claims one spawn command into a fresh uuid run directory and launches its background run. */
+  private async claimAndLaunch(chatId: number, workspace: string, runId: string, prompt: string): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
     await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
-    await appendSystemEvent(workspace, { type: "task_claimed", runId, callRef: call.ref, prompt });
+    await appendSystemEvent(workspace, { type: "task_claimed", runId });
     let worker: WorkspaceTaskWorker;
     try {
       worker = await this.workerFactory({ workspace, runId, prompt });
@@ -397,7 +391,7 @@ export class WorkspaceTasks {
     });
     if (this.flush) {
       try {
-        await this.flush.flushTaskRun(chatId, workspace, task.runId);
+        await this.flush.flush(chatId, workspace);
       } catch (error) {
         this.report(error);
       }

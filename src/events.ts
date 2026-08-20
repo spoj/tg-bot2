@@ -1,7 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { appendJsonl, errorCode, openPinnedDirectory, TG_BOT_DIR } from "./util.js";
-import type { SessionCallRef } from "./session-bus.js";
 import type { Recurrence } from "./schedule-protocol.js";
 
 /**
@@ -46,11 +45,9 @@ export type ChatEvent =
  */
 export type SystemEvent =
   | {
-    /** Host claimed one spawn call. `runId` identifies /workspace/.pi/tasks/<runId>/; `callRef` references the tool call in the agent's session file; `prompt` is the complete task prompt. */
+    /** Host started processing one spawn_request. `runId` matches the request's UUID; the run's files live under /workspace/.pi/tasks/<runId>/. */
     type: "task_claimed";
     runId: string;
-    callRef: SessionCallRef;
-    prompt: string;
   }
   | {
     /** A background task settled. The run's files live under /workspace/.pi/tasks/<runId>/. */
@@ -64,33 +61,25 @@ export type SystemEvent =
     /** The agent asked to stop one running task; the settle that follows lands as aborted. */
     type: "task_cancelled";
     runId: string;
-    callRef: SessionCallRef;
   }
   | {
-    /** Host claimed one send call; `requestId` is the host-assigned UUID; `request` is the full validated request. */
+    /** Host started processing one send_request; `requestId` matches the request's UUID. */
     type: "outbox_claimed";
     requestId: string;
-    callRef: SessionCallRef;
-    request: unknown;
   }
   | {
-    /** Telegram accepted one send call; `requestId` is the host-assigned UUID; `request` is the full request and `data` the raw Telegram response payload. */
+    /** Telegram accepted one send_request; `requestId` matches the request's UUID; `data` is the raw Telegram response payload. */
     type: "outbox_sent";
     requestId: string;
-    callRef: SessionCallRef;
-    request: unknown;
     messageId?: number | undefined;
     pollId?: string | undefined;
     data?: unknown;
   }
   | {
-    /** A rejected send call. `requestId` is the host-assigned UUID; `detail` describes the failure; `request` is the validated request when parsing succeeded, otherwise `raw` is the call's original arguments JSON. */
+    /** A rejected send_request. `requestId` matches the request's UUID; `detail` describes the failure. */
     type: "outbox_rejected";
     requestId: string;
-    callRef: SessionCallRef;
     detail: string;
-    request?: unknown;
-    raw?: string | undefined;
   }
   | {
     /** Host materialized one occurrence of a schedules.json row. `runId` is the host-assigned UUID; prompt/start/recurrence are the row snapshot; `dueAt` is this occurrence's firing time. */
@@ -165,7 +154,7 @@ async function appendLines(
 }
 
 /** The EVENTS protocol section of the SYSTEM_PROMPT, derived from {@link ChatEvent} and {@link SystemEvent}. */
-export const EVENTS_PROMPT = `The host appends two logs under /workspace/.tg-bot/ (one JSON object per line, newest
+export const EVENTS_PROMPT = `Two append-only logs live under /workspace/.tg-bot/ (one JSON object per line, newest
 last; every line starts with {v:1,t,...} where t is an ISO-8601 timestamp).
 chat.jsonl mirrors the Telegram chat window. Event types:
 - message: {v:1,t,type:'message',message,attachments} where message is the raw Telegram
@@ -178,41 +167,44 @@ chat.jsonl mirrors the Telegram chat window. Event types:
   may instead be game_short_name; logged callbacks are message-backed.
 - poll_answer: {v:1,t,type:'poll_answer',poll_answer} where poll_answer is the raw
   Telegram PollAnswer object (poll_id, user, option_ids).
-- send: a confirmation of one of your send tool calls that Telegram accepted:
+- send: a confirmation of one of your send commands that Telegram accepted:
   {v:1,t,type:'send',kind,requestId,messageId?,pollId?,data?} where requestId is the
-  host-assigned UUID and data carries the Telegram response object the request produced
-  (for stop_poll it is the final closed Poll).
-system.jsonl records host activity that never appears in the chat window:
-- task_claimed: {v:1,t,type:'task_claimed',runId,callRef,prompt} when the host claims one
-  of your spawn calls; runId identifies the run directory /workspace/.pi/tasks/<runId>/;
-  callRef {sessionId,recordId,index} references the tool call in your session file; prompt
-  is the complete task prompt.
+  UUID the send tool returned to you and data carries the Telegram response object the
+  request produced (for stop_poll it is the final closed Poll).
+system.jsonl is the shared command-and-outcome log: your host tools append one command
+line per request, and the host appends the outcome lines.
+Commands (written by your tools; the host processes each exactly once):
+- send_request: {v:1,t,type:'send_request',requestId,request} queued by the send tool;
+  requestId is the UUID the tool returns to you and request is your request object.
+- spawn_request: {v:1,t,type:'spawn_request',runId,prompt} queued by the spawn tool;
+  runId is the UUID the tool returns to you.
+- cancel_request: {v:1,t,type:'cancel_request',runId} queued by the cancel tool.
+Outcomes (host-written):
+- outbox_claimed: {v:1,t,type:'outbox_claimed',requestId} when the host starts a send.
+- outbox_sent: {v:1,t,type:'outbox_sent',requestId,messageId?,pollId?,data?} when
+  Telegram accepts it, whether or not it returned a message id; data is the raw
+  Telegram response payload.
+- outbox_rejected: {v:1,t,type:'outbox_rejected',requestId,detail} reports a rejected
+  send; detail describes the failure.
+- task_claimed: {v:1,t,type:'task_claimed',runId} when the host starts a task run;
+  the run's files live under /workspace/.pi/tasks/<runId>/ (prompt.txt, output.md,
+  sessions/, result.json).
 - task_settled: {v:1,t,type:'task_settled',runId,status,exitCode,stderr?} when a
   task finishes: status is done, failed, or aborted (aborted means the run was killed
   via the cancel tool or the host restarted mid-run); stderr carries a bounded failure
   tail when failed.
-- task_cancelled: {v:1,t,type:'task_cancelled',runId,callRef} when you ask to stop one
-  running task; the task_settled that follows lands as aborted.
-- outbox_claimed: {v:1,t,type:'outbox_claimed',requestId,callRef,request} when the host
-  claims one of your send calls; requestId is the host-assigned UUID and request is the
-  full validated request.
-- outbox_sent: {v:1,t,type:'outbox_sent',requestId,callRef,request,messageId?,pollId?,data?}
-  when Telegram accepts a request, whether or not it returned a message id; request is
-  the full request and data is the raw Telegram response payload.
-- outbox_rejected: {v:1,t,type:'outbox_rejected',requestId,callRef,detail,request?,raw?}
-  reports a rejected request; requestId is the host-assigned UUID, request is the
-  validated request when parsing succeeded, otherwise raw is the call's original
-  arguments JSON.
+- task_cancelled: {v:1,t,type:'task_cancelled',runId} when you ask to stop one running
+  task; the task_settled that follows lands as aborted.
 - schedule_run_scheduled: {v:1,t,type:'schedule_run_scheduled',runId,prompt,start,recurrence,dueAt}
   when the host materializes one occurrence of a schedules.json row; runId is the
   host-assigned UUID, prompt/start/recurrence are the row snapshot, dueAt this firing time.
 - schedule_run_fired: {v:1,t,type:'schedule_run_fired',runId} when that occurrence ran.
 - schedule_run_cancelled: {v:1,t,type:'schedule_run_cancelled',runId} when its row was
   removed or edited before it fired.
-Every claimed task is followed by exactly one task_settled; every claimed send call
-is followed by exactly one outbox_sent or outbox_rejected; every schedule_run_scheduled is
-followed by exactly one schedule_run_fired or schedule_run_cancelled. Grep chat.jsonl for
-chat history and system.jsonl for host activity.
+Every send_request is followed by outbox_claimed then exactly one outbox_sent or
+outbox_rejected; every spawn_request by task_claimed then exactly one task_settled;
+every cancel_request by task_cancelled. Grep chat.jsonl for chat history and
+system.jsonl for commands and host activity.
 When a user message or button press arrives, the host interrupts you with a single "."
 prompt that carries no content; read the newest chat.jsonl lines and decide whether the
 user needs a response. Task settlements and send rejections arrive as followup

@@ -215,9 +215,10 @@ its id matches the poll_answer events' poll_id and the matching send event's pol
 {type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from chat.jsonl.
 {type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
 {type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
-The host validates each call, assigns a unique UUID requestId, and records outbox_claimed
-followed by exactly one outbox_sent or outbox_rejected in .tg-bot/system.jsonl; a matching
-send line in chat.jsonl echoes messageId/pollId for later edits, reactions, or deletes.
-A rejected send arrives as a followup quoting the request and the rejection detail —
-fix and resend.
+The send tool records one send_request command (with the requestId it returns to you) in
+.tg-bot/system.jsonl; the host validates it, assigns the outcome events outbox_claimed
+followed by exactly one outbox_sent or outbox_rejected, and a matching send line in
+chat.jsonl echoes messageId/pollId for later edits, reactions, or deletes. A rejected
+send arrives as a followup naming the requestId and the rejection detail — fix and
+resend.
 `;

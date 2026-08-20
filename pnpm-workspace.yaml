@@ -12,3 +12,4 @@ minimumReleaseAgeExclude:
   - '@earendil-works/pi-tui@0.84.2'
   - '@types/node@26.2.0'
   - tsx@4.23.11
+  - nanoid@3.3.18

@@ -1,11 +1,11 @@
 import { execFileSync } from "node:child_process";
 
 const integration = process.argv.includes("--integration");
-
 const steps = [
   { name: "Lint", args: ["lint"] },
   { name: "Typecheck", args: ["typecheck"] },
   { name: "Tests", args: ["test"] },
+  { name: "Dependency audit", args: ["audit"] },
   ...(integration ? [{ name: "Integration tests (bwrap)", args: ["test:integration"] }] : []),
 ];
 

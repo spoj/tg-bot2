@@ -39,6 +39,26 @@ function fakeWorkerFactory(): { factory: Mock<(options: AgentWorkerOptions) => P
   return { factory, runs };
 }
 
+type ManualTimer = { fn: () => void; delay: number };
+function manualTimers() {
+  const pending = new Set<ManualTimer>();
+  const cleared: ManualTimer[] = [];
+  return {
+    cleared,
+    byDelay: (delay: number) => [...pending].filter((entry) => entry.delay === delay),
+    setTimeout: ((fn: () => void, delay: number) => {
+      const timer: ManualTimer = { fn, delay };
+      pending.add(timer);
+      return timer as unknown as NodeJS.Timeout;
+    }) as typeof setTimeout,
+    clearTimeout: ((timer: NodeJS.Timeout) => {
+      const entry = timer as unknown as ManualTimer;
+      pending.delete(entry);
+      cleared.push(entry);
+    }) as typeof clearTimeout,
+  };
+}
+
 const config: Config = {
   token: "token",
   allowedUserIds: new Set([1]),
@@ -51,11 +71,10 @@ function managerOptions(overrides: Record<string, unknown> = {}): ConstructorPar
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
     now: () => 1_000_000,
-    interruptCoalesceMs: 0,
+    combineDebounceMs: 0,
     ...overrides,
   };
 }
-
 async function withDataDir(run: (dataDir: string) => Promise<void>): Promise<void> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-"));
   try {
@@ -117,7 +136,7 @@ it("followup starts a fresh run when the resume window has never opened", async 
   });
 });
 
-it("followup queues behind an active run and drains in order", async () => {
+it("followup queues behind an active run and drains combined in order", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
     const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
@@ -128,11 +147,8 @@ it("followup queues behind an active run and drains in order", async () => {
     expect(runs).toHaveLength(1);
     runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
     await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe("second");
+    expect(runs[1]?.worker.options.message).toBe("second\nthird");
     runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(3));
-    expect(runs[2]?.worker.options.message).toBe("third");
-    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
 });
 
@@ -166,29 +182,156 @@ it("interrupt while idle starts a run immediately", async () => {
   });
 });
 
-it("coalesces an interrupt burst into one worker stop", async () => {
+it("coalesces an interrupt burst into one stop and one combined message", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, interruptCoalesceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup(42, "scheduled");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.interrupt(42, "first");
     await manager.interrupt(42, "second");
+    await manager.interrupt(42, "third");
     await vi.waitFor(() => expect(runs[0]?.stop).toHaveBeenCalledOnce());
     runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
     await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe("first");
+    expect(runs[1]?.worker.options.message).toBe("first\nsecond\nthird");
     runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(3));
-    expect(runs[2]?.worker.options.message).toBe("second");
-    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("combines interrupts while idle into one message after the debounce window", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.interrupt(42, "first");
+    await manager.interrupt(42, "second");
+    await manager.interrupt(42, "third");
+    expect(runs).toHaveLength(0);
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(runs[0]?.worker.options.message).toBe("first\nsecond\nthird");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("force-drains a running burst at the cap and combines interrupts arriving during the abort", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const timers = manualTimers();
+    const manager = new AgentManager({ dataDir }, managerOptions({
+      workerFactory: factory,
+      combineDebounceMs: 100,
+      interruptForceDrainMs: 200,
+      now: () => 10 * 60 * 60 * 1000,
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    }));
+    await manager.followup(42, "scheduled");
+    timers.byDelay(100)[0]?.fn();
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.interrupt(42, "first");
+    await manager.interrupt(42, "second");
+    expect(timers.byDelay(200)).toHaveLength(1);
+    timers.byDelay(200)[0]?.fn();
+    expect(runs[0]?.stop).toHaveBeenCalledOnce();
+    await manager.interrupt(42, "third");
+    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.message).toBe("first\nsecond\nthird");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("force-drains an idle interrupt at the cap", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const timers = manualTimers();
+    const manager = new AgentManager({ dataDir }, managerOptions({
+      workerFactory: factory,
+      combineDebounceMs: 100,
+      interruptForceDrainMs: 200,
+      now: () => 10 * 60 * 60 * 1000,
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    }));
+    await manager.interrupt(42, "first");
+    expect(runs).toHaveLength(0);
+    timers.byDelay(200)[0]?.fn();
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(runs[0]?.worker.options.message).toBe("first");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("queues followups behind interrupts still waiting out the debounce window", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.interrupt(42, "first");
+    await manager.followup(42, "later");
+    expect(runs).toHaveLength(0);
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(runs[0]?.worker.options.message).toBe("first");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]?.worker.options.message).toBe("later");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("combines idle followups into one message after the debounce window", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "first");
+    await manager.followup(42, "second");
+    expect(runs).toHaveLength(0);
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(runs[0]?.worker.options.message).toBe("first\nsecond");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("combines followups queued during a run and delivers them at settle", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, runs } = fakeWorkerFactory();
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup(42, "scheduled");
+    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    await manager.followup(42, "first");
+    await manager.followup(42, "second");
+    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[0]?.stop).not.toHaveBeenCalled();
+    expect(runs[1]?.worker.options.message).toBe("first\nsecond");
+    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+  });
+});
+
+it("restarts the debounce window on each new interrupt without restarting the force cap", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory } = fakeWorkerFactory();
+    const timers = manualTimers();
+    const manager = new AgentManager({ dataDir }, managerOptions({
+      workerFactory: factory,
+      combineDebounceMs: 100,
+      interruptForceDrainMs: 1_000,
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    }));
+    await manager.interrupt(42, "first");
+    const firstDebounce = timers.byDelay(100)[0];
+    expect(firstDebounce).toBeDefined();
+    await manager.interrupt(42, "second");
+    expect(timers.cleared).toContain(firstDebounce);
+    expect(timers.byDelay(100)).toHaveLength(1);
+    expect(timers.byDelay(1_000)).toHaveLength(1);
   });
 });
 
 it("a natural settle cancels the pending interrupt stop", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, interruptCoalesceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup(42, "scheduled");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.interrupt(42, ".");
@@ -200,17 +343,32 @@ it("a natural settle cancels the pending interrupt stop", async () => {
   });
 });
 
-it("rejects a non-timer-safe interrupt coalesce window", () => {
-  expect(() => new AgentManager(config, managerOptions({ interruptCoalesceMs: -1 }))).toThrow("non-negative timer-safe integer");
+it("rejects a non-timer-safe combine debounce window", () => {
+  expect(() => new AgentManager(config, managerOptions({ combineDebounceMs: -1 }))).toThrow("non-negative timer-safe integer");
+});
+
+it("rejects a force drain window shorter than the debounce window", () => {
+  expect(() => new AgentManager(config, managerOptions({ combineDebounceMs: 100, interruptForceDrainMs: 50 }))).toThrow("at least the debounce window");
 });
 
 it("beginShutdown cancels pending interrupt stops", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, interruptCoalesceMs: 10_000, now: () => 10 * 60 * 60 * 1000 }));
+    const timers = manualTimers();
+    const manager = new AgentManager({ dataDir }, managerOptions({
+      workerFactory: factory,
+      combineDebounceMs: 100,
+      interruptForceDrainMs: 1_000,
+      now: () => 10 * 60 * 60 * 1000,
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    }));
     await manager.followup(42, "scheduled");
+    timers.byDelay(100)[0]?.fn();
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.interrupt(42, ".");
+    expect(timers.byDelay(100)).toHaveLength(1);
+    expect(timers.byDelay(1_000)).toHaveLength(1);
     await manager.beginShutdown();
     expect(runs[0]?.stop).toHaveBeenCalledOnce();
     runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });

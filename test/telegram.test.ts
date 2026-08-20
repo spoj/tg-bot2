@@ -76,6 +76,10 @@ async function messageEvent(dataDir: string): Promise<Record<string, unknown>> {
   return events.find((event) => event.type === "message") as Record<string, unknown>;
 }
 
+function wakeArg(prompt: Mock): Record<string, unknown> {
+  return JSON.parse(prompt.mock.calls[0]?.[1] as string) as Record<string, unknown>;
+}
+
 async function firstMessageAttachment(dataDir: string): Promise<Record<string, unknown>> {
   const message = await messageEvent(dataDir);
   return (message.attachments as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
@@ -756,7 +760,13 @@ describe("Telegram location and venue updates", () => {
   it("records a shared location as a message event and wakes the agent", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = await sendLocationUpdate(dataDir, { location: { latitude: 52.52, longitude: 13.405 } });
-      expect(prompt).toHaveBeenCalledWith(42, ".");
+      expect(wakeArg(prompt)).toMatchObject({
+        v: 1,
+        t: expect.any(String),
+        type: "message",
+        message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } },
+        attachments: [],
+      });
       expect(await messageEvent(dataDir)).toMatchObject({ type: "message", message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } }, attachments: [] });
     });
   });
@@ -770,7 +780,13 @@ describe("Telegram location and venue updates", () => {
           address: "Pariser Platz 1",
         },
       });
-      expect(prompt).toHaveBeenCalledWith(42, ".");
+      expect(wakeArg(prompt)).toMatchObject({
+        v: 1,
+        t: expect.any(String),
+        type: "message",
+        message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } },
+        attachments: [],
+      });
       expect(await messageEvent(dataDir)).toMatchObject({ type: "message", message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } }, attachments: [] });
     });
   });
@@ -923,7 +939,12 @@ describe("Telegram callback queries", () => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
-      expect(prompt).toHaveBeenCalledWith(42, ".");
+      expect(wakeArg(prompt)).toMatchObject({
+        v: 1,
+        t: expect.any(String),
+        type: "callback",
+        callback_query: { data: "do_thing", message: { message_id: 7 } },
+      });
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
       expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "do_thing", message: { message_id: 7 } } });
@@ -946,7 +967,12 @@ describe("Telegram callback queries", () => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
-      expect(prompt).toHaveBeenCalledWith(42, ".");
+      expect(wakeArg(prompt)).toMatchObject({
+        v: 1,
+        t: expect.any(String),
+        type: "callback",
+        callback_query: { data: "x".repeat(100) },
+      });
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
       expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "x".repeat(100) } });
     });
@@ -967,14 +993,22 @@ describe("Telegram chat events", () => {
     };
   }
 
-  it("logs a text message event and wakes the agent with the wake prompt", async () => {
+  it("logs a text message event and wakes the agent with the appended jsonl entry", async () => {
     await withWorkspace(async (dataDir) => {
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate(textUpdate("hello") as never);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
       expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", message: { message_id: 7, text: "hello" } });
-      expect(prompt).toHaveBeenCalledWith(42, ".");
+      expect(wakeArg(prompt)).toMatchObject({
+        v: 1,
+        t: expect.any(String),
+        type: "message",
+        message: { message_id: 7, text: "hello" },
+        attachments: [],
+      });
+      const chatLog = await readFile(path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "chat.jsonl"), "utf8");
+      expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
     });
   });
 

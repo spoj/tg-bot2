@@ -107,15 +107,25 @@ const SYSTEM_FILE = "system.jsonl";
  * Appends chat events to the workspace chat log. Opens the `.tg-bot` directory
  * pinned by an O_NOFOLLOW descriptor, then opens the log file once and writes one
  * `{v:1,t:...}` line per event, in order. Best-effort: never rejects and never
- * follows a symbolic link planted at the log directory or file.
+ * follows a symbolic link planted at the log directory or file. Resolves to the
+ * written lines, or undefined when the append failed.
  */
-export async function appendChatEvents(workspace: string, events: ChatEvent[]): Promise<void> {
-  await appendLines(workspace, CHAT_FILE, "chat event", events);
+export async function appendChatEvents(workspace: string, events: ChatEvent[]): Promise<string[] | undefined> {
+  return await appendLines(workspace, CHAT_FILE, "chat event", events);
 }
 
-/** Appends one chat event; see {@link appendChatEvents}. */
-export function appendChatEvent(workspace: string, event: ChatEvent): Promise<void> {
-  return appendChatEvents(workspace, [event]);
+/** Appends one chat event; see {@link appendChatEvents}. Resolves to the written line, or undefined when the append failed. */
+export async function appendChatEvent(workspace: string, event: ChatEvent): Promise<string | undefined> {
+  return (await appendChatEvents(workspace, [event]))?.[0];
+}
+
+/** Serializes one chat event to the exact jsonl line form written by {@link appendChatEvent}: `{v:1, t:"<ISO-8601>", ...event}`. */
+export function chatEventLine(event: ChatEvent): string {
+  return eventLine(event);
+}
+
+function eventLine(event: object): string {
+  return JSON.stringify({ v: 1, t: new Date().toISOString(), ...event });
 }
 
 async function appendSystemEvents(workspace: string, events: SystemEvent[]): Promise<void> {
@@ -132,7 +142,7 @@ async function appendLines(
   fileName: string,
   label: string,
   events: Array<ChatEvent | SystemEvent>,
-): Promise<void> {
+): Promise<string[] | undefined> {
   try {
     const directory = path.join(workspace, TG_BOT_DIR);
     try {
@@ -143,13 +153,15 @@ async function appendLines(
     const pinned = await openPinnedDirectory(directory);
     try {
       const targetFile = path.join(pinned.path, fileName);
-      const records = events.map((event) => JSON.stringify({ v: 1, t: new Date().toISOString(), ...event }));
+      const records = events.map(eventLine);
       await appendJsonl(targetFile, records);
+      return records;
     } finally {
       await pinned.handle.close().catch(() => {});
     }
   } catch (error) {
     console.error(`Failed to append ${label}${events.length === 1 ? "" : "s"}`, error);
+    return undefined;
   }
 }
 
@@ -205,9 +217,12 @@ Every send_request is followed by outbox_claimed then exactly one outbox_sent or
 outbox_rejected; every spawn_request by task_claimed then exactly one task_settled;
 every cancel_request by task_cancelled. Grep chat.jsonl for chat history and
 system.jsonl for commands and host activity.
-When a user message or button press arrives, the host interrupts you with a single "."
-prompt that carries no content; read the newest chat.jsonl lines and decide whether the
-user needs a response. Task settlements and send rejections arrive as followup
-messages describing what happened. Send ALL Telegram output through the send tool;
-never rely on wake prompts for content.
+When a user message or button press arrives, the host interrupts you with the exact
+JSON line it just appended to chat.jsonl for that event ({v:1,t,type,...}); events
+arriving close together are batched, and you receive one combined message holding
+each of their lines. The full objects are there, nothing is summarized. Decide
+whether the user needs a response.
+Task settlements and send rejections arrive as followup messages describing what
+happened, batched into one combined message delivered after your turn. Send ALL
+Telegram output through the send tool.
 `;

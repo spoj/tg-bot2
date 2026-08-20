@@ -60,8 +60,10 @@ export type AgentManagerOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   now?: () => number;
-  /** Quiet window absorbing interrupt bursts into one worker stop; 0 disables it. */
-  interruptCoalesceMs?: number;
+  /** Quiet window with no new input before a queue drains and combines; shared debounce for interrupts and followups. 0 drains immediately. */
+  combineDebounceMs?: number;
+  /** Hard cap on a burst: the active run is stopped this long after the first interrupt even if interrupts keep arriving. */
+  interruptForceDrainMs?: number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
 };
@@ -86,10 +88,14 @@ type ChatState = {
   lastActivityAt: number;
   activityLoaded: boolean;
   closing: boolean;
-  interruptTimer: NodeJS.Timeout | undefined;
+  interruptDebounceTimer: NodeJS.Timeout | undefined;
+  interruptForceTimer: NodeJS.Timeout | undefined;
+  followupDebounceTimer: NodeJS.Timeout | undefined;
+  stopping: boolean;
 };
 
-const INTERRUPT_COALESCE_MS = 2_000;
+const COMBINE_DEBOUNCE_MS = 2_000;
+const INTERRUPT_FORCE_DRAIN_MS = 15_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
 const NEW_SESSION_MARKER = path.join(TG_BOT_DIR, "new-session");
@@ -200,7 +206,8 @@ export class AgentManager {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly now: () => number;
-  private readonly interruptCoalesceMs: number;
+  private readonly combineDebounceMs: number;
+  private readonly interruptForceDrainMs: number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
   private shuttingDown = false;
@@ -212,11 +219,16 @@ export class AgentManager {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.now = options.now ?? Date.now;
-    const coalesceMs = options.interruptCoalesceMs ?? INTERRUPT_COALESCE_MS;
-    if (!Number.isSafeInteger(coalesceMs) || coalesceMs < 0 || coalesceMs > MAX_TIMER_MS) {
-      throw new Error("Interrupt coalesce window must be a non-negative timer-safe integer");
+    const debounceMs = options.combineDebounceMs ?? COMBINE_DEBOUNCE_MS;
+    const forceMs = options.interruptForceDrainMs ?? INTERRUPT_FORCE_DRAIN_MS;
+    if (!Number.isSafeInteger(debounceMs) || debounceMs < 0 || debounceMs > MAX_TIMER_MS) {
+      throw new Error("Combine debounce window must be a non-negative timer-safe integer");
     }
-    this.interruptCoalesceMs = coalesceMs;
+    if (!Number.isSafeInteger(forceMs) || forceMs < 0 || forceMs > MAX_TIMER_MS || forceMs < debounceMs) {
+      throw new Error("Interrupt force drain window must be a timer-safe integer at least the debounce window");
+    }
+    this.combineDebounceMs = debounceMs;
+    this.interruptForceDrainMs = forceMs;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRunWorker({
@@ -227,22 +239,30 @@ export class AgentManager {
     }));
   }
 
-  /** Queues a message behind the active run, or starts one when idle. */
+  /**
+   * Queues a followup — a note to deliver after the current work. Followups never
+   * abort a run: they wait until the run settles with no interrupts pending, or
+   * until the agent is idle, and are then combined into one message. Idle
+   * followups wait out the debounce window to batch; there is no force drain.
+   */
   followup(chatId: number, text: string): Promise<void> {
     if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
     const state = this.state(chatId);
     return state.serial.run(async () => {
       await this.loadActivity(state);
       if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
-      if (state.running) {
-        state.followups.push(text);
-        return;
-      }
-      this.launch(state, text);
+      state.followups.push(text);
+      if (state.running || state.interrupts.length > 0) return;
+      this.restartFollowupDebounceTimer(state);
     });
   }
-
-  /** Terminates the active run and starts one immediately with text; queued followups are preserved. Interrupts arriving within the coalesce window join one stop. */
+  /**
+   * Queues an interrupt. The queue drains — aborting the active run (or just
+   * launching when idle) and delivering every queued interrupt as one combined
+   * message — when no interrupt has arrived for the debounce window, when the
+   * oldest queued interrupt has waited the force-drain window, or when the
+   * active run settles. Queued followups are preserved behind interrupts.
+   */
   interrupt(chatId: number, text: string): Promise<void> {
     if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
     const state = this.state(chatId);
@@ -250,18 +270,13 @@ export class AgentManager {
       await this.loadActivity(state);
       if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
       state.interrupts.push(text);
-      if (!state.running) {
-        this.launch(state, state.interrupts.shift()!);
-        return;
+      this.clearFollowupDebounceTimer(state);
+      if (state.stopping) return;
+      if (state.interruptForceTimer === undefined) {
+        state.interruptForceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(state), this.interruptForceDrainMs);
+        state.interruptForceTimer.unref?.();
       }
-      if (state.interruptTimer !== undefined) return;
-      const worker = state.worker;
-      if (!worker) return;
-      state.interruptTimer = this.setTimeoutFn(() => {
-        state.interruptTimer = undefined;
-        void worker.stop().catch((error) => console.error("Agent interrupt failed", error));
-      }, this.interruptCoalesceMs);
-      state.interruptTimer.unref?.();
+      this.restartInterruptDebounceTimer(state);
     });
   }
 
@@ -301,7 +316,8 @@ export class AgentManager {
   beginShutdown(): Promise<void> {
     this.shuttingDown = true;
     const stops = [...this.states.values()].flatMap((state) => {
-      this.clearInterruptTimer(state);
+      this.clearInterruptTimers(state);
+      this.clearFollowupDebounceTimer(state);
       const worker = state.worker;
       if (!worker) return [];
       return [worker.stop().catch((error) => console.error("Agent shutdown stop failed", error))];
@@ -327,7 +343,10 @@ export class AgentManager {
       lastActivityAt: 0,
       activityLoaded: false,
       closing: false,
-      interruptTimer: undefined,
+      interruptDebounceTimer: undefined,
+      interruptForceTimer: undefined,
+      followupDebounceTimer: undefined,
+      stopping: false,
     };
     this.states.set(chatId, state);
     return state;
@@ -385,24 +404,81 @@ export class AgentManager {
       await state.serial.run(async () => { this.onRunSettled(state); });
     }
   }
-
   private async onRunSettled(state: ChatState): Promise<void> {
-    this.clearInterruptTimer(state);
+    this.clearInterruptTimers(state);
+    this.clearFollowupDebounceTimer(state);
     state.running = false;
     state.worker = undefined;
+    state.stopping = false;
     state.lastActivityAt = this.now();
     await this.persistActivity(state);
-    const next = state.interrupts.shift() ?? state.followups.shift();
+    const next = this.drainInterrupts(state) ?? this.drainFollowups(state);
     if (next === undefined || state.closing || this.shuttingDown) return;
     this.launch(state, next);
   }
 
-  private clearInterruptTimer(state: ChatState): void {
-    if (state.interruptTimer === undefined) return;
-    this.clearTimeoutFn(state.interruptTimer);
-    state.interruptTimer = undefined;
+  /** Drain conditions 1–2: abort the active run, or combine and launch when idle. */
+  private fireInterruptDrain(state: ChatState): void {
+    this.clearInterruptTimers(state);
+    if (state.running) {
+      const worker = state.worker;
+      if (!worker) return;
+      state.stopping = true;
+      void worker.stop().catch((error) => console.error("Agent interrupt failed", error));
+      return;
+    }
+    const combined = this.drainInterrupts(state);
+    if (combined !== undefined) this.launch(state, combined);
   }
 
+  /** Combines the entire interrupt queue into one message and empties it. */
+  private drainInterrupts(state: ChatState): string | undefined {
+    if (state.interrupts.length === 0) return undefined;
+    const combined = state.interrupts.join("\n");
+    state.interrupts.length = 0;
+    return combined;
+  }
+
+  /** Combines the entire followup queue into one message and empties it. */
+  private drainFollowups(state: ChatState): string | undefined {
+    if (state.followups.length === 0) return undefined;
+    const combined = state.followups.join("\n");
+    state.followups.length = 0;
+    return combined;
+  }
+
+  /** Followup debounce: idle only, no force cap; delivers combined followups once the agent is idle with no interrupts pending. */
+  private fireFollowupDrain(state: ChatState): void {
+    this.clearFollowupDebounceTimer(state);
+    if (state.running || state.interrupts.length > 0) return;
+    const combined = this.drainFollowups(state);
+    if (combined !== undefined) this.launch(state, combined);
+  }
+
+  private clearFollowupDebounceTimer(state: ChatState): void {
+    if (state.followupDebounceTimer === undefined) return;
+    this.clearTimeoutFn(state.followupDebounceTimer);
+    state.followupDebounceTimer = undefined;
+  }
+
+  private restartFollowupDebounceTimer(state: ChatState): void {
+    if (state.followupDebounceTimer !== undefined) this.clearTimeoutFn(state.followupDebounceTimer);
+    state.followupDebounceTimer = this.setTimeoutFn(() => this.fireFollowupDrain(state), this.combineDebounceMs);
+    state.followupDebounceTimer.unref?.();
+  }
+
+  private clearInterruptTimers(state: ChatState): void {
+    if (state.interruptDebounceTimer !== undefined) this.clearTimeoutFn(state.interruptDebounceTimer);
+    if (state.interruptForceTimer !== undefined) this.clearTimeoutFn(state.interruptForceTimer);
+    state.interruptDebounceTimer = undefined;
+    state.interruptForceTimer = undefined;
+  }
+
+  private restartInterruptDebounceTimer(state: ChatState): void {
+    if (state.interruptDebounceTimer !== undefined) this.clearTimeoutFn(state.interruptDebounceTimer);
+    state.interruptDebounceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(state), this.combineDebounceMs);
+    state.interruptDebounceTimer.unref?.();
+  }
   private async spawnWorker(state: ChatState, text: string): Promise<AgentRunWorker> {
     const workspace = chatPaths(this.config.dataDir, state.chatId).workspace;
     const { resume, model, thinkingLevel } = await this.runOptions(state, workspace);

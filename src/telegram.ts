@@ -7,7 +7,7 @@ import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } f
 import type { Config } from "./config.js";
 import type { AgentManager, AgentStatus } from "./agent.js";
 import { SerialQueue } from "./queue.js";
-import { appendChatEvent } from "./events.js";
+import { appendChatEvent, chatEventLine, type ChatEvent } from "./events.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
   WorkspaceOutboxSendMediaGroupRequest,
@@ -21,7 +21,7 @@ import type {
 } from "./outbox-protocol.js";
 import { appendJsonl, chatPaths, defined, readJsonl } from "./util.js";
 
-const WAKE_PROMPT = ".";
+
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
@@ -673,7 +673,7 @@ export function createTelegramBot(
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
 
-  const wake = (chatId: number): Promise<void> => agents.interrupt(chatId, WAKE_PROMPT).catch((error) => {
+  const wake = (chatId: number, prompt: string): Promise<void> => agents.interrupt(chatId, prompt).catch((error) => {
     console.error("Telegram wake prompt failed", error);
   });
 
@@ -707,12 +707,9 @@ export function createTelegramBot(
   bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
-      type: "message",
-      message: ctx.message,
-      attachments,
-    });
-    await wake(chatId);
+    const event: ChatEvent = { type: "message", message: ctx.message, attachments };
+    const line = await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, event) ?? chatEventLine(event);
+    await wake(chatId, line);
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
@@ -720,11 +717,9 @@ export function createTelegramBot(
     if (chatId === undefined) return;
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
-    await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
-      type: "callback",
-      callback_query: query,
-    });
-    await wake(chatId);
+    const event: ChatEvent = { type: "callback", callback_query: query };
+    const line = await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, event) ?? chatEventLine(event);
+    await wake(chatId, line);
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;

@@ -78,7 +78,6 @@ vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
   dispatchOutboxRequest: state.dispatchOutboxRequest,
   TelegramDeliveryQueue: state.delivery,
-  WAKE_PROMPT: ".",
 }));
 
 async function importIndex(configure?: () => void): Promise<typeof import("../src/index.js")> {

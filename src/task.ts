@@ -119,7 +119,7 @@ export class WorkspaceTasks {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
-  /** Consumes one task run's session calls before its settle followup; assigned after construction to avoid a construction cycle with the session bus. */
+  /** Consumes the chat's pending system.jsonl commands before the settle followup; assigned after construction to avoid a construction cycle with the request bus. */
   flush: WorkspaceTasksOptions["flush"];
   private readonly heartbeatIntervalMs: number;
   private readonly now: () => number;
@@ -408,7 +408,6 @@ export class WorkspaceTasks {
   /** Sends one status followup per chat with running tasks; silent when everything is idle. */
   private heartbeat(): void {
     for (const [chatId, running] of this.inFlight) {
-      if (running.length === 0) continue;
       const lines = running.map((task) => this.heartbeatLine(task));
       const message = `Task heartbeat: ${running.length} task(s) running.\n${lines.join("\n")}`;
       void this.agent.followup(chatId, message).catch((error) => this.report(error));

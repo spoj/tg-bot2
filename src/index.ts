@@ -23,7 +23,7 @@ export interface DisposableServices {
   delivery: Pick<TelegramDeliveryQueue, "drain">;
 }
 
-// Stops the scheduler, session bus, and tasks, disposes agents, terminates
+// Stops the scheduler, request bus, and tasks, disposes agents, terminates
 // sandboxes, and drains the delivery queue. Each step is guarded so a failure
 // in one never skips the rest.
 export async function finishDisposal(services: DisposableServices): Promise<void> {

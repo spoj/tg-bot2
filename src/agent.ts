@@ -368,8 +368,7 @@ export class AgentManager {
   /** Starts a run for text; must be called with the state's serial queue held. */
   private launch(state: ChatState, text: string): void {
     state.running = true;
-    const run = this.runToCompletion(state, text);
-    void run;
+    void this.runToCompletion(state, text);
   }
 
   private async runToCompletion(state: ChatState, text: string): Promise<void> {

@@ -9,7 +9,7 @@ import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import { SerialQueue } from "./queue.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
-import { chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { chatPaths, defined, errorMessage, isMissing, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 
 export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
@@ -48,7 +48,6 @@ export type WorkspaceTasksOptions = {
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
-const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_TASK_BYTES = 1024 * 1024;
 const MAX_CONCURRENT_TASKS_PER_CHAT = 8;
 const TASK_DIR = "task";
@@ -68,20 +67,6 @@ type ChatWatcher = {
 type InFlightTask = {
   worker: WorkspaceTaskWorker;
 };
-
-function isMissing(error: unknown): boolean {
-  return errorCode(error) === "ENOENT";
-}
-
-function errorMessage(error: unknown): string {
-  let detail: string;
-  try {
-    detail = error instanceof Error ? error.message : String(error);
-  } catch {
-    detail = "unknown error";
-  }
-  return detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
-}
 
 async function readEntries(directory: string) {
   const directoryHandle = await opendir(directory);

@@ -144,7 +144,7 @@ describe("WorkspaceOutbox", () => {
     const outbox = path.join(workspace, ".tg-bot", "outbox");
     const claimName = ".in-progress-0-archived";
     await writeRequest(workspace, claimName, valid());
-    const record = { v: 1, t: "2026-08-19T00:00:00.000Z", type: "outbox_sent", id: "00000000-0000-0000-0000-000000000000", name: claimName, kind: "send_file", request: valid() };
+    const record = { v: 1, t: "2026-08-19T00:00:00.000Z", type: "outbox_sent", requestId: "00000000-0000-0000-0000-000000000000", name: claimName, request: valid() };
     await writeFile(path.join(workspace, ".tg-bot", "system.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
     const dispatch = vi.fn(async () => undefined);
 
@@ -291,7 +291,6 @@ describe("WorkspaceOutbox", () => {
         {
           type: "outbox_sent",
           name: "one.json",
-          kind: "send_file",
           request: { version: 1, type: "send_file", path: "/workspace/report.txt", caption: "Report" },
           messageId: 7,
           data: { message_id: 7 },

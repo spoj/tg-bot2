@@ -6,7 +6,7 @@ import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendChatEvent, appendSystemEvent } from "./events.js";
 import { SerialQueue } from "./queue.js";
-import { chatPaths, defined, errorCode, numericChatId, openPinnedDirectory, readJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { chatPaths, defined, errorCode, errorMessage, isMissing, numericChatId, openPinnedDirectory, readJsonl, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
@@ -24,7 +24,6 @@ export type WorkspaceOutboxOptions = {
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
-const MAX_DIAGNOSTIC_LENGTH = 1_024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const JSON_REQUEST = /\.json$/;
 // Recover claims older than five minutes after crashes without racing active senders.
@@ -49,22 +48,8 @@ type OutboxEntry = {
   path: string;
 };
 
-function isMissing(error: unknown): boolean {
-  return errorCode(error) === "ENOENT";
-}
-
 function isExisting(error: unknown): boolean {
   return errorCode(error) === "EEXIST";
-}
-
-function errorMessage(error: unknown): string {
-  let detail: string;
-  try {
-    detail = error instanceof Error ? error.message : String(error);
-  } catch {
-    detail = "unknown error";
-  }
-  return detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
 }
 
 
@@ -370,13 +355,12 @@ export class WorkspaceOutbox {
         try {
           lease = this.startClaimLease(claim, chatId);
           request = await readRequest(claim.path);
-          await appendSystemEvent(workspace, { type: "outbox_claimed", id: requestId, name: originalName, request });
+          await appendSystemEvent(workspace, { type: "outbox_claimed", requestId, name: originalName, request });
           result = await this.dispatch(chatId, request);
           await appendSystemEvent(workspace, {
             type: "outbox_sent",
-            id: requestId,
+            requestId,
             name: originalName,
-            kind: request.type,
             request,
             ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
           });
@@ -385,7 +369,7 @@ export class WorkspaceOutbox {
               appendChatEvent(workspace, {
                 type: "send",
                 kind: request.type,
-                id: requestId,
+                requestId,
                 name: originalName,
                 ...defined({ messageId: result.messageId }),
                 ...defined({ pollId: result.pollId }),
@@ -551,7 +535,7 @@ export class WorkspaceOutbox {
   private async recordRejection(
     chatId: number,
     workspace: string,
-    id: string,
+    requestId: string,
     name: string,
     error: unknown,
     context: { request?: WorkspaceOutboxRequest; raw?: string },
@@ -559,7 +543,7 @@ export class WorkspaceOutbox {
     const message = `Outbox request ${name} rejected: ${errorMessage(error)}`;
     await appendSystemEvent(workspace, {
       type: "outbox_rejected",
-      id,
+      requestId,
       name,
       detail: message,
       ...defined({ request: context.request }),

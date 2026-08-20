@@ -15,6 +15,22 @@ export function errorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+export function isMissing(error: unknown): boolean {
+  return errorCode(error) === "ENOENT";
+}
+
+const MAX_DIAGNOSTIC_LENGTH = 1_024;
+
+export function errorMessage(error: unknown): string {
+  let detail: string;
+  try {
+    detail = error instanceof Error ? error.message : String(error);
+  } catch {
+    detail = "unknown error";
+  }
+  return detail.length > MAX_DIAGNOSTIC_LENGTH ? `${detail.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : detail;
+}
+
 /**
  * Resolves a canonical directory, rejecting symlinks and path swaps.
  * Returns the canonical path. `expectedRealPath` is an optional caller-known canonical the result must equal.

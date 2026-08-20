@@ -359,7 +359,7 @@ it("status reports settings defaults when no session file exists", async () => {
     });
   });
 });
-it("status counts active background tasks and enabled schedules", async () => {
+it("status counts active background tasks and schedule rows", async () => {
   await withDataDir(async (dataDir) => {
     const workspace = path.join(dataDir, "chats", "42", "workspace");
     const tasks = path.join(workspace, ".pi", "tasks");
@@ -372,15 +372,15 @@ it("status counts active background tasks and enabled schedules", async () => {
     await writeFile(path.join(tgBotDir, "schedules.json"), JSON.stringify({
       version: 1,
       schedules: [
-        { id: "s1", prompt: "p1", dueAt: "2026-08-20T00:00:00.000Z", recurrence: null, enabled: true, lastRunAt: null, runCount: 0 },
-        { id: "s2", prompt: "p2", dueAt: "2026-08-20T01:00:00.000Z", recurrence: null, enabled: false, lastRunAt: null, runCount: 0 },
+        { prompt: "p1", start: "2026-08-20T00:00:00.000Z", recurrence: null },
+        { prompt: "p2", start: "2026-08-20T01:00:00.000Z", recurrence: "daily" },
       ],
     }), "utf8");
 
     const manager = new AgentManager({ dataDir }, managerOptions());
     const status = await manager.status(42);
     expect(status.activeTasks).toBe(1);
-    expect(status.activeSchedules).toBe(1);
+    expect(status.activeSchedules).toBe(2);
   });
 });
 

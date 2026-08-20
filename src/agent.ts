@@ -107,6 +107,88 @@ export async function loadUserSettings(workspace: string): Promise<Record<string
   }
 }
 
+async function readSessionSummary(sessionsDirectory: string): Promise<{
+  messageCount: number;
+  model: { provider: string; id: string } | undefined;
+  thinkingLevel: string | undefined;
+  sessionFile: string;
+} | undefined> {
+  const newestName = await newestSessionFile(sessionsDirectory);
+  if (!newestName) return undefined;
+  try {
+    const raw = await readFile(path.join(sessionsDirectory, newestName), "utf8");
+    let messageCount = 0;
+    let model: { provider: string; id: string } | undefined;
+    let thinkingLevel: string | undefined;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let entry: unknown;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const record = entry as Record<string, unknown>;
+      if (record.type === "message") messageCount += 1;
+      else if (record.type === "model_change" && typeof record.provider === "string" && typeof record.modelId === "string") {
+        model = { provider: record.provider, id: record.modelId };
+      } else if (record.type === "thinking_level_change" && typeof record.thinkingLevel === "string") {
+        thinkingLevel = record.thinkingLevel;
+      }
+    }
+    return { messageCount, model, thinkingLevel, sessionFile: newestName };
+  } catch {
+    return undefined;
+  }
+}
+
+async function newestSessionFile(sessionsDirectory: string): Promise<string | undefined> {
+  try {
+    const entries = await readdir(sessionsDirectory, { withFileTypes: true });
+    let newest: { name: string; mtimeMs: number } | undefined;
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".jsonl")) continue;
+      const fileStat = await stat(path.join(sessionsDirectory, entry.name));
+      if (!newest || fileStat.mtimeMs > newest.mtimeMs) newest = { name: entry.name, mtimeMs: fileStat.mtimeMs };
+    }
+    return newest?.name;
+  } catch {
+    return undefined;
+  }
+}
+
+async function countActiveTasks(workspace: string): Promise<number | undefined> {
+  try {
+    const taskEntries = await readdir(path.join(workspace, ".pi", "tasks"), { withFileTypes: true });
+    let activeTasks = 0;
+    for (const entry of taskEntries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      try {
+        await stat(path.join(workspace, ".pi", "tasks", entry.name, "result.json"));
+      } catch {
+        activeTasks += 1;
+      }
+    }
+    return activeTasks;
+  } catch {
+    // .pi/tasks directory absent or unreadable
+    return undefined;
+  }
+}
+
+async function countActiveSchedules(workspace: string): Promise<number | undefined> {
+  try {
+    const rawSchedules = await readFile(path.join(workspace, TG_BOT_DIR, "schedules.json"), "utf8");
+    const parsedSchedules = JSON.parse(rawSchedules) as { schedules?: unknown[] };
+    if (!Array.isArray(parsedSchedules.schedules)) return undefined;
+    return parsedSchedules.schedules.length;
+  } catch {
+    // schedules.json absent or invalid
+    return undefined;
+  }
+}
+
 export class AgentManager {
   private readonly states = new Map<number, ChatState>();
   private readonly workerFactory: AgentWorkerFactory;
@@ -182,7 +264,6 @@ export class AgentManager {
   }
 
   /** File-based session summary; never spawns a worker. */
-  // eslint-disable-next-line complexity -- assembles a multi-section diagnostic report; refactor once stable
   async status(chatId: number): Promise<AgentStatus> {
     const workspace = chatPaths(this.config.dataDir, chatId).workspace;
     const settings = await loadUserSettings(workspace);
@@ -192,79 +273,25 @@ export class AgentManager {
       messageCount: 0,
       autoCompactionEnabled: (settings.autoCompaction as { enabled?: unknown } | undefined)?.enabled !== false,
     };
-    try {
-      const entries = await readdir(sessionsDirectory, { withFileTypes: true });
-      let newest: { name: string; mtimeMs: number } | undefined;
-      for (const entry of entries) {
-        if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".jsonl")) continue;
-        const fileStat = await stat(path.join(sessionsDirectory, entry.name));
-        if (!newest || fileStat.mtimeMs > newest.mtimeMs) newest = { name: entry.name, mtimeMs: fileStat.mtimeMs };
-      }
-      if (newest) {
-        const raw = await readFile(path.join(sessionsDirectory, newest.name), "utf8");
-        let messageCount = 0;
-        let model: { provider: string; id: string } | undefined;
-        let thinkingLevel: string | undefined;
-        for (const line of raw.split("\n")) {
-          if (!line.trim()) continue;
-          let entry: unknown;
-          try {
-            entry = JSON.parse(line);
-          } catch {
-            continue;
-          }
-          if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
-          const record = entry as Record<string, unknown>;
-          if (record.type === "message") messageCount += 1;
-          else if (record.type === "model_change" && typeof record.provider === "string" && typeof record.modelId === "string") {
-            model = { provider: record.provider, id: record.modelId };
-          } else if (record.type === "thinking_level_change" && typeof record.thinkingLevel === "string") {
-            thinkingLevel = record.thinkingLevel;
-          }
-        }
-        result = {
-          ...defined({ model: model ?? result.model }),
-          thinkingLevel: thinkingLevel ?? result.thinkingLevel,
-          sessionFile: newest.name,
-          messageCount,
-          autoCompactionEnabled: result.autoCompactionEnabled,
-        };
-      }
-    } catch {
-      // A missing or unreadable sessions directory just reports defaults.
+    const session = await readSessionSummary(sessionsDirectory);
+    if (session) {
+      result = {
+        ...defined({ model: session.model }),
+        thinkingLevel: session.thinkingLevel ?? result.thinkingLevel,
+        sessionFile: session.sessionFile,
+        messageCount: session.messageCount,
+        autoCompactionEnabled: result.autoCompactionEnabled,
+      };
     }
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
     const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
     if (!result.model && settingsProvider && settingsModel) {
       result = { ...result, model: { provider: settingsProvider, id: settingsModel } };
     }
-    try {
-      const taskEntries = await readdir(path.join(workspace, ".pi", "tasks"), { withFileTypes: true });
-      let activeTasks = 0;
-      for (const entry of taskEntries) {
-        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-        try {
-          await stat(path.join(workspace, ".pi", "tasks", entry.name, "result.json"));
-        } catch {
-          activeTasks += 1;
-        }
-      }
-      result = { ...result, activeTasks };
-    } catch {
-      // .pi/tasks directory absent or unreadable
-    }
-
-    try {
-      const rawSchedules = await readFile(path.join(workspace, TG_BOT_DIR, "schedules.json"), "utf8");
-      const parsedSchedules = JSON.parse(rawSchedules) as { schedules?: Array<{ enabled?: boolean }> };
-      if (Array.isArray(parsedSchedules.schedules)) {
-        const activeSchedules = parsedSchedules.schedules.filter((s) => s.enabled !== false).length;
-        result = { ...result, activeSchedules };
-      }
-    } catch {
-      // schedules.json absent or invalid
-    }
-
+    const activeTasks = await countActiveTasks(workspace);
+    if (activeTasks !== undefined) result = { ...result, activeTasks };
+    const activeSchedules = await countActiveSchedules(workspace);
+    if (activeSchedules !== undefined) result = { ...result, activeSchedules };
     return result;
   }
 

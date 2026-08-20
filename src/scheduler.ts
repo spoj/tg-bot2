@@ -1,26 +1,14 @@
 import { constants as fsConstants } from "node:fs";
-import { link, lstat, open, readdir, rename, rm } from "node:fs/promises";
+import { open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { appendSystemEvent } from "./events.js";
-import { TG_BOT_DIR, chatPaths, errorCode, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
-import type { Recurrence, ScheduleRecord } from "./schedule-protocol.js";
-
-type StoredScheduleRecord = ScheduleRecord & Record<string, unknown>;
+import { TG_BOT_DIR, isMissing, numericChatId, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
+import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 
 type ScheduleFile = {
   version: 1;
-  schedules: StoredScheduleRecord[];
-} & Record<string, unknown>;
-
-type ScheduleSnapshot = {
-  file: ScheduleFile;
-  raw: string;
-};
-type DueRecord = {
-  chatId: number;
-  metadataRealPath: string;
-  record: StoredScheduleRecord;
+  schedules: ScheduleRow[];
 };
 
 type MaybePromise<T> = T | PromiseLike<T>;
@@ -34,6 +22,22 @@ type WorkspaceSchedulerOptions = {
   logger?: (error: unknown) => void;
 };
 
+type OpenRun = {
+  runId: string;
+  prompt: string;
+  start: string;
+  recurrence: Recurrence | null;
+  dueAt: string;
+};
+
+type FoldedSchedules = {
+  runs: Map<string, OpenRun>;
+  open: Set<string>;
+  rowRun: Map<string, string>;
+  firedRows: Set<string>;
+  lastDueAt: Map<string, string>;
+};
+
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const HOUR_MS = 60 * 60 * 1_000;
@@ -41,15 +45,10 @@ const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
-const WRITE_NEW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW;
 const SCHEDULES_FILE = "schedules.json";
-const MAX_SCHEDULE_ID_LENGTH = 256;
+const SYSTEM_FILE = "system.jsonl";
 const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
 const UTC_ISO = /Z$/u;
-
-function isMissing(error: unknown): boolean {
-  return errorCode(error) === "ENOENT";
-}
 
 function isUtcIso(value: unknown): value is string {
   return typeof value === "string" && UTC_ISO.test(value) && Number.isFinite(Date.parse(value));
@@ -59,28 +58,19 @@ function invalid(message: string): never {
   throw new Error(`Invalid schedules file: ${message}`);
 }
 
-// eslint-disable-next-line complexity -- one branch per record field; the validator shape is inherent
-function validateRecord(value: unknown, index: number): StoredScheduleRecord {
+function validateRow(value: unknown, index: number): ScheduleRow {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    invalid(`record ${index} must be an object`);
+    invalid(`row ${index} must be an object`);
   }
-  const record = value as Record<string, unknown>;
-  if (typeof record.id !== "string" || record.id.length === 0 || record.id.length > MAX_SCHEDULE_ID_LENGTH) {
-    invalid(`record ${index} has an invalid id`);
+  const row = value as Record<string, unknown>;
+  if (typeof row.prompt !== "string" || row.prompt.length === 0 || row.prompt.length > MAX_SCHEDULE_PROMPT_LENGTH) {
+    invalid(`row ${index} has an invalid prompt`);
   }
-  if (typeof record.prompt !== "string" || record.prompt.length === 0 || record.prompt.length > MAX_SCHEDULE_PROMPT_LENGTH) {
-    invalid(`record ${index} has an invalid prompt`);
+  if (!isUtcIso(row.start)) invalid(`row ${index} has an invalid start`);
+  if (row.recurrence !== null && row.recurrence !== "hourly" && row.recurrence !== "daily" && row.recurrence !== "weekly") {
+    invalid(`row ${index} has an invalid recurrence`);
   }
-  if (!isUtcIso(record.dueAt)) invalid(`record ${index} has an invalid dueAt`);
-  if (record.recurrence !== null && record.recurrence !== "hourly" && record.recurrence !== "daily" && record.recurrence !== "weekly") {
-    invalid(`record ${index} has an invalid recurrence`);
-  }
-  if (typeof record.enabled !== "boolean") invalid(`record ${index} has an invalid enabled flag`);
-  if (record.lastRunAt !== null && !isUtcIso(record.lastRunAt)) invalid(`record ${index} has an invalid lastRunAt`);
-  if (typeof record.runCount !== "number" || !Number.isSafeInteger(record.runCount) || record.runCount < 0) {
-    invalid(`record ${index} has an invalid runCount`);
-  }
-  return { ...record } as StoredScheduleRecord;
+  return { prompt: row.prompt, start: row.start, recurrence: row.recurrence as Recurrence | null };
 }
 
 function validateScheduleFile(value: unknown): ScheduleFile {
@@ -88,20 +78,13 @@ function validateScheduleFile(value: unknown): ScheduleFile {
   const file = value as Record<string, unknown>;
   if (file.version !== 1) invalid("version must be 1");
   if (!Array.isArray(file.schedules)) invalid("schedules must be an array");
-  const ids = new Set<string>();
-  const schedules = file.schedules.map((record, index) => {
-    const validated = validateRecord(record, index);
-    if (ids.has(validated.id)) invalid(`duplicate id ${validated.id}`);
-    ids.add(validated.id);
-    return validated;
-  });
-  return { ...file, version: 1, schedules } as ScheduleFile;
+  return { version: 1, schedules: file.schedules.map(validateRow) };
 }
 
-
-function compareStrings(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+function rowKey(row: { prompt: string; start: string; recurrence: Recurrence | null }): string {
+  return JSON.stringify([row.prompt, row.start, row.recurrence]);
 }
+
 function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): string {
   const due = Date.parse(dueAt);
   if (due > now) return dueAt;
@@ -114,9 +97,10 @@ async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<v
   try {
     await handle.close();
   } catch {
-    // Preserve the original read/write error.
+    // Preserve the original read error.
   }
 }
+
 async function readSchedulesFile(handle: Awaited<ReturnType<typeof open>>): Promise<string> {
   const stat = await handle.stat();
   const buffer = Buffer.allocUnsafe(stat.size);
@@ -129,7 +113,68 @@ async function readSchedulesFile(handle: Awaited<ReturnType<typeof open>>): Prom
   return buffer.subarray(0, bytesRead).toString("utf8");
 }
 
-/** Poll workspace-owned schedules from agent-written UTC ISO timestamps. */
+/** Replays schedule events into the folded state: open runs, per-row open mapping, fired rows, and last due times. */
+function foldScheduleEvents(lines: string[]): FoldedSchedules {
+  const state: FoldedSchedules = {
+    runs: new Map(),
+    open: new Set(),
+    rowRun: new Map(),
+    firedRows: new Set(),
+    lastDueAt: new Map(),
+  };
+  for (const line of lines) {
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    foldScheduleEvent(state, entry as Record<string, unknown>);
+  }
+  return state;
+}
+
+function foldScheduleEvent(state: FoldedSchedules, event: Record<string, unknown>): void {
+  if (event.type === "schedule_run_scheduled") {
+    if (
+      typeof event.runId !== "string" || typeof event.prompt !== "string" ||
+      typeof event.start !== "string" || typeof event.dueAt !== "string" ||
+      (event.recurrence !== null && event.recurrence !== "hourly" && event.recurrence !== "daily" && event.recurrence !== "weekly")
+    ) return;
+    const run: OpenRun = {
+      runId: event.runId,
+      prompt: event.prompt,
+      start: event.start,
+      recurrence: event.recurrence as Recurrence | null,
+      dueAt: event.dueAt,
+    };
+    const key = rowKey(run);
+    const displaced = state.rowRun.get(key);
+    if (displaced !== undefined) state.open.delete(displaced);
+    state.runs.set(run.runId, run);
+    state.open.add(run.runId);
+    state.rowRun.set(key, run.runId);
+    state.lastDueAt.set(key, run.dueAt);
+    return;
+  }
+  if (event.type !== "schedule_run_fired" && event.type !== "schedule_run_cancelled") return;
+  if (typeof event.runId !== "string") return;
+  const run = state.runs.get(event.runId);
+  if (!run) return;
+  state.open.delete(event.runId);
+  const key = rowKey(run);
+  if (state.rowRun.get(key) === event.runId) state.rowRun.delete(key);
+  if (event.type === "schedule_run_fired") state.firedRows.add(key);
+}
+
+/**
+ * Event-sourced scheduler. schedules.json is agent-owned intent (prompt/start/recurrence
+ * rows); the host never writes it. Each occurrence is a UUID-keyed run materialized in
+ * system.jsonl: schedule_run_scheduled, schedule_run_fired, schedule_run_cancelled.
+ * Every poll replays the log, reconciles it against the file (cancel vanished rows,
+ * schedule new ones), and fires due runs.
+ */
 export class WorkspaceScheduler {
   private readonly dataDir: string;
   private readonly run: WorkspaceSchedulerOptions["run"];
@@ -212,7 +257,6 @@ export class WorkspaceScheduler {
         .filter((entry): entry is { name: string; chatId: number } => entry.chatId !== undefined)
         .sort((a, b) => a.chatId - b.chatId || a.name.localeCompare(b.name));
 
-      const due: DueRecord[] = [];
       for (const { name, chatId } of chats) {
         let chatDirectory: PinnedDirectory | undefined;
         let workspace: PinnedDirectory | undefined;
@@ -222,24 +266,15 @@ export class WorkspaceScheduler {
           chatDirectory = await openPinnedDirectory(path.join(chatsRoot.path, name), expectedChat);
           workspace = await openPinnedDirectory(path.join(chatDirectory.path, "workspace"), path.join(chatDirectory.realPath, "workspace"));
           metadata = await openPinnedDirectory(path.join(workspace.path, TG_BOT_DIR), path.join(workspace.realPath, TG_BOT_DIR));
-          const scheduleSnapshot = await this.readSchedule(metadata, chatId);
-          if (!scheduleSnapshot) continue;
-          for (const record of scheduleSnapshot.file.schedules) {
-            if (record.enabled && Date.parse(record.dueAt) <= now) {
-              due.push({ chatId, metadataRealPath: metadata.realPath, record });
-            }
-          }
+          await this.reconcileChat(chatId, workspace.path, metadata, now);
         } catch (error) {
-          if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
+          if (!isMissing(error)) this.report(new Error(`Could not process schedules for chat ${chatId}`, { cause: error }));
         } finally {
           if (metadata) await closeQuietly(metadata.handle);
           if (workspace) await closeQuietly(workspace.handle);
           if (chatDirectory) await closeQuietly(chatDirectory.handle);
         }
       }
-
-      due.sort((a, b) => Date.parse(a.record.dueAt) - Date.parse(b.record.dueAt) || a.chatId - b.chatId || compareStrings(a.record.id, b.record.id));
-      for (const item of due) await this.processRecord(item, now);
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
@@ -247,48 +282,74 @@ export class WorkspaceScheduler {
     }
   }
 
-  private async openCurrentMetadata(item: DueRecord): Promise<PinnedDirectory | undefined> {
-    const metadataPath = path.join(chatPaths(this.dataDir, item.chatId).workspace, TG_BOT_DIR);
-    try {
-      return await openPinnedDirectory(metadataPath, item.metadataRealPath);
-    } catch (error) {
-      if (!isMissing(error)) this.report(new Error(`Could not reopen schedules for chat ${item.chatId}`, { cause: error }));
-      return undefined;
+  private async reconcileChat(chatId: number, workspace: string, metadata: PinnedDirectory, now: number): Promise<void> {
+    const rows = await this.readRows(metadata, chatId);
+    if (rows === undefined) return;
+    const state = foldScheduleEvents(await readJsonl(path.join(metadata.path, SYSTEM_FILE)).catch(() => []));
+    const fileKeys = new Set(rows.map(rowKey));
+
+    for (const [key, runId] of state.rowRun) {
+      if (fileKeys.has(key)) continue;
+      await appendSystemEvent(workspace, { type: "schedule_run_cancelled", runId });
+      state.open.delete(runId);
+      state.rowRun.delete(key);
+    }
+
+    for (const row of rows) {
+      const key = rowKey(row);
+      if (state.rowRun.has(key)) continue;
+      if (row.recurrence === null && state.firedRows.has(key)) continue;
+      const previous = state.lastDueAt.get(key);
+      const dueAt = previous !== undefined && row.recurrence !== null
+        ? advanceRecurring(previous, row.recurrence, now)
+        : row.start;
+      await this.scheduleRun(workspace, state, row, dueAt);
+    }
+
+    const due = [...state.open]
+      .map((runId) => state.runs.get(runId))
+      .filter((run): run is OpenRun => run !== undefined && Date.parse(run.dueAt) <= now)
+      .sort((a, b) => Date.parse(a.dueAt) - Date.parse(b.dueAt) || a.prompt.localeCompare(b.prompt));
+
+    for (const run of due) {
+      if (!state.open.has(run.runId)) continue;
+      try {
+        await this.run(chatId, run.prompt);
+      } catch (error) {
+        this.report(new Error(`Schedule run ${run.runId} for chat ${chatId} was not completed`, { cause: error }));
+        continue;
+      }
+      await appendSystemEvent(workspace, { type: "schedule_run_fired", runId: run.runId });
+      state.open.delete(run.runId);
+      const key = rowKey(run);
+      if (state.rowRun.get(key) === run.runId) state.rowRun.delete(key);
+      state.firedRows.add(key);
+      if (run.recurrence !== null) {
+        await this.scheduleRun(workspace, state, run, advanceRecurring(run.dueAt, run.recurrence, now));
+      }
     }
   }
 
-  private async processRecord(item: DueRecord, now: number): Promise<void> {
-    const metadata = await this.openCurrentMetadata(item);
-    if (!metadata) return;
-    let currentSnapshot: ScheduleSnapshot | undefined;
-    try {
-      currentSnapshot = await this.readSchedule(metadata, item.chatId);
-    } finally {
-      await closeQuietly(metadata.handle);
-    }
-    const current = currentSnapshot?.file.schedules.find((record) => record.id === item.record.id);
-    if (!current || !current.enabled || Date.parse(current.dueAt) > now) return;
-
-    try {
-      await this.run(item.chatId, current.prompt);
-      await appendSystemEvent(chatPaths(this.dataDir, item.chatId).workspace, {
-        type: "schedule_triggered",
-        id: current.id,
-        record: current,
-      });
-    } catch (error) {
-      this.report(new Error(`Schedule ${current.id} for chat ${item.chatId} was not completed`, { cause: error }));
-      return;
-    }
-
-    try {
-      await this.markRun(item, current.id, now);
-    } catch (error) {
-      this.report(new Error(`Could not update schedule ${current.id} for chat ${item.chatId}`, { cause: error }));
-    }
+  private async scheduleRun(workspace: string, state: FoldedSchedules, row: { prompt: string; start: string; recurrence: Recurrence | null }, dueAt: string): Promise<void> {
+    const run: OpenRun = { runId: randomUUID(), prompt: row.prompt, start: row.start, recurrence: row.recurrence, dueAt };
+    await appendSystemEvent(workspace, {
+      type: "schedule_run_scheduled",
+      runId: run.runId,
+      prompt: run.prompt,
+      start: run.start,
+      recurrence: run.recurrence,
+      dueAt: run.dueAt,
+    });
+    const key = rowKey(run);
+    const displaced = state.rowRun.get(key);
+    if (displaced !== undefined) state.open.delete(displaced);
+    state.runs.set(run.runId, run);
+    state.open.add(run.runId);
+    state.rowRun.set(key, run.runId);
+    state.lastDueAt.set(key, run.dueAt);
   }
 
-  private async readSchedule(metadata: PinnedDirectory, chatId: number): Promise<ScheduleSnapshot | undefined> {
+  private async readRows(metadata: PinnedDirectory, chatId: number): Promise<ScheduleRow[] | undefined> {
     const filePath = path.join(metadata.path, SCHEDULES_FILE);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     let raw: string;
@@ -303,103 +364,11 @@ export class WorkspaceScheduler {
     } finally {
       if (handle) await closeQuietly(handle);
     }
-
     try {
-      return { file: validateScheduleFile(JSON.parse(raw) as unknown), raw };
+      return validateScheduleFile(JSON.parse(raw) as unknown).schedules;
     } catch (error) {
       this.report(new Error(`Malformed schedules for chat ${chatId}`, { cause: error }));
       return undefined;
-    }
-  }
-
-  // eslint-disable-next-line complexity -- read-verify-swap state machine; one branch per failure mode
-  private async markRun(item: DueRecord, id: string, now: number): Promise<void> {
-    const metadata = await this.openCurrentMetadata(item);
-    if (!metadata) return;
-    const filePath = path.join(metadata.path, SCHEDULES_FILE);
-    const temporaryPath = path.join(metadata.path, `schedules.json.${randomUUID()}.tmp`);
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      const snapshot = await this.readSchedule(metadata, item.chatId);
-      if (!snapshot) return;
-      const { file } = snapshot;
-      const index = file.schedules.findIndex((record) => record.id === id);
-      if (index < 0) return;
-      const current = file.schedules[index]!;
-      const updated: StoredScheduleRecord = {
-        ...current,
-        lastRunAt: new Date(now).toISOString(),
-        runCount: Math.min(current.runCount + 1, Number.MAX_SAFE_INTEGER),
-      };
-      if (current.recurrence === null) {
-        updated.enabled = false;
-      } else if (current.enabled) {
-        updated.dueAt = advanceRecurring(current.dueAt, current.recurrence, now);
-      }
-      file.schedules[index] = updated;
-
-      const expectedRaw = snapshot.raw;
-      handle = await open(temporaryPath, WRITE_NEW, 0o600);
-      const encoded = `${JSON.stringify(file)}\n`;
-      await handle.writeFile(encoded, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-
-      let latest: Awaited<ReturnType<typeof open>> | undefined;
-      let moved = false;
-      const previousPath = path.join(metadata.path, `schedules.json.${randomUUID()}.previous`);
-      try {
-        latest = await open(filePath, READ_FILE);
-        const latestStat = await latest.stat();
-        if (!latestStat.isFile() || latestStat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
-        const latestRaw = await readSchedulesFile(latest);
-        if (latestRaw !== expectedRaw) throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
-        const liveStat = await lstat(filePath);
-        if (!liveStat.isFile() || liveStat.dev !== latestStat.dev || liveStat.ino !== latestStat.ino) {
-          throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
-        }
-
-        // Node has no rename-noreplace/compare-and-swap primitive. Move the checked
-        // inode aside, then install the complete temp file with link(), which never
-        // overwrites a concurrent agent rename. If the inode changed, restore it
-        // only when the destination is still empty.
-        await rename(filePath, previousPath);
-        moved = true;
-        let previous: Awaited<ReturnType<typeof open>> | undefined;
-        try {
-          previous = await open(previousPath, READ_FILE);
-          const previousStat = await previous.stat();
-          const previousRaw = await readSchedulesFile(previous);
-          if (!previousStat.isFile() || previousStat.dev !== latestStat.dev || previousStat.ino !== latestStat.ino || previousRaw !== expectedRaw) {
-            throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
-          }
-        } finally {
-          if (previous) await closeQuietly(previous);
-        }
-        try {
-          await link(temporaryPath, filePath);
-        } catch {
-          throw new Error("schedules.json changed while updating; leaving schedule due for a later poll");
-        }
-        await rm(temporaryPath, { force: true });
-        await rm(previousPath, { force: true });
-        moved = false;
-      } finally {
-        if (latest) await closeQuietly(latest);
-        if (moved) {
-          try {
-            await link(previousPath, filePath);
-          } catch {
-            // A concurrent agent won the empty-path race; preserve its edit.
-          }
-          await rm(previousPath, { force: true }).catch(() => {});
-        }
-      }
-    } finally {
-      if (handle) await closeQuietly(handle);
-      await closeQuietly(metadata.handle);
-      await rm(temporaryPath, { force: true }).catch(() => {});
     }
   }
 

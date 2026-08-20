@@ -3,7 +3,7 @@ import { access, lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node
 import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { requireRealDirectory } from "./util.js";
+import { errorCode, requireRealDirectory } from "./util.js";
 export type PiWorkerChildProcess = ChildProcess;
 type PiWorkerSpawnOptions = Omit<SpawnOptions, "env"> & { env?: NodeJS.ProcessEnv };
 export type PiWorkerSpawn = (executable: string, args: string[], options: PiWorkerSpawnOptions) => ChildProcess;
@@ -137,6 +137,8 @@ export type PiRunSandboxPaths = {
   model?: string;
   /** Thinking level passed as --thinking. */
   thinkingLevel?: string;
+  /** Comma-separated host tool names exposed via the mounted host-tools extension and PI_HOST_TOOLS. */
+  hostTools?: string;
 };
 export type PiRunBwrapResult = { args: string[] };
 
@@ -173,6 +175,9 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   if (!cliStat.isFile()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
 
+  const hostToolsExtension = paths.hostTools === undefined
+    ? undefined
+    : await requireHostToolsExtension(appRoot);
   const nodePath = await requireExecutable("node");
   const args: string[] = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
@@ -191,6 +196,11 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--dir", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
+    ...(hostToolsExtension === undefined ? [] : [
+      "--dir", "/app/extensions",
+      "--ro-bind", hostToolsExtension, "/app/extensions/host-tools.ts",
+      "--setenv", "PI_HOST_TOOLS", paths.hostTools!,
+    ]),
     "--bind", workspace, "/workspace",
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
@@ -208,12 +218,30 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
     "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),
+    ...(hostToolsExtension === undefined ? [] : ["--extension", "/app/extensions/host-tools.ts"]),
     ...(paths.resume ? ["--continue"] : []),
     ...(paths.model === undefined ? [] : ["--model", paths.model]),
     ...(paths.thinkingLevel === undefined ? [] : ["--thinking", paths.thinkingLevel]),
   ];
   args.push("--chdir", "/workspace", "--", nodePath, cliMountPath, ...piArgs);
   return { args };
+}
+
+async function requireHostToolsExtension(appRoot: string): Promise<string> {
+  const extensionPath = path.join(appRoot, "extensions", "host-tools.ts");
+  let stat: Awaited<ReturnType<typeof lstat>>;
+  try {
+    stat = await lstat(extensionPath);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") {
+      throw new Error("Host tools extension must be a regular file");
+    }
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error("Host tools extension must be a regular file");
+  }
+  return await realpath(extensionPath);
 }
 
 function outputCapture(limit: number): {

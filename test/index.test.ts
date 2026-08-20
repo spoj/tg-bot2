@@ -35,11 +35,16 @@ const state = vi.hoisted(() => {
       constructor(options: { dispatch: unknown }) {
         this.dispatch = options.dispatch;
       }
+    }),
+    sessionBus: vi.fn(class WorkspaceSessionBusMock {
+      constructor(_options: unknown) {}
       start = vi.fn(async () => {});
-      stop = vi.fn(async () => { order.push("outbox.stop"); });
+      stop = vi.fn(async () => { order.push("sessionBus.stop"); });
+      flushTaskRun = vi.fn(async () => {});
     }),
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
+      flush: unknown;
       start = vi.fn(async () => {});
       stop = vi.fn(async () => { order.push("tasks.stop"); });
     }),
@@ -55,7 +60,6 @@ const state = vi.hoisted(() => {
   };
 });
 
-
 vi.mock("../src/config.js", () => ({
   parseConfig: () => state.config,
 }));
@@ -68,6 +72,7 @@ vi.mock("../src/sandbox.js", () => ({
 vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
 vi.mock("../src/outbox.js", () => ({ WorkspaceOutbox: state.outbox }));
+vi.mock("../src/session-bus.js", () => ({ WorkspaceSessionBus: state.sessionBus }));
 vi.mock("../src/task.js", () => ({ WorkspaceTasks: state.tasks }));
 vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
@@ -82,6 +87,7 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   state.agentManager.mockClear();
   state.scheduler.mockClear();
   state.outbox.mockClear();
+  state.sessionBus.mockClear();
   state.tasks.mockClear();
   state.createTelegramBot.mockClear();
   state.dispatchOutboxRequest.mockClear();
@@ -100,6 +106,7 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   vi.resetModules();
   return import("../src/index.js");
 }
+
 describe("application startup and shutdown wiring", () => {
   it("passes canonical sandbox paths through every runtime component", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
@@ -113,7 +120,8 @@ describe("application startup and shutdown wiring", () => {
       expect.objectContaining({ appRoot: expect.any(String), bwrapPath: "/validated/bwrap" }),
     );
     expect(state.scheduler).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
-    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
+    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function) }));
+    expect(state.sessionBus).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data", bwrapPath: "/validated/bwrap", agent: state.agentManager.mock.instances[0] }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: ["message", "callback_query", "poll_answer"],
@@ -142,7 +150,7 @@ describe("application startup and shutdown wiring", () => {
 
     state.signalHandlers.SIGTERM?.();
     await vi.waitFor(() => expect(state.order).toEqual([
-      "bot.stop", "agents.beginShutdown", "scheduler.stop", "outbox.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
+      "bot.stop", "agents.beginShutdown", "scheduler.stop", "sessionBus.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
     ]));
     expect(process.exitCode).toBeUndefined();
 
@@ -170,7 +178,7 @@ describe("finishDisposal", () => {
       services: {
         agents: { disposeAll: step("disposeAll") },
         scheduler: { stop: step("scheduler.stop") },
-        outbox: { stop: step("outbox.stop") },
+        sessionBus: { stop: step("sessionBus.stop") },
         tasks: { stop: step("tasks.stop") },
         delivery: { drain: step("delivery.drain") },
       },
@@ -183,7 +191,7 @@ describe("finishDisposal", () => {
 
     await finishDisposal(services);
 
-    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "sessionBus.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
@@ -194,7 +202,7 @@ describe("finishDisposal", () => {
 
     await expect(finishDisposal(services)).resolves.toBeUndefined();
 
-    expect(calls).toEqual(["scheduler.stop", "outbox.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "sessionBus.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });

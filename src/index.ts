@@ -3,6 +3,7 @@ import { AgentManager } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
+import { WorkspaceSessionBus } from "./session-bus.js";
 import { WorkspaceTasks } from "./task.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
 import { pathToFileURL } from "node:url";
@@ -17,12 +18,12 @@ export function isIntentionalSignalAbort(error: unknown): boolean {
 export interface DisposableServices {
   agents: Pick<AgentManager, "disposeAll">;
   scheduler: Pick<WorkspaceScheduler, "stop">;
-  outbox: Pick<WorkspaceOutbox, "stop">;
+  sessionBus: Pick<WorkspaceSessionBus, "stop">;
   tasks: Pick<WorkspaceTasks, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
 }
 
-// Stops the scheduler, outbox, and tasks, disposes agents, terminates
+// Stops the scheduler, session bus, and tasks, disposes agents, terminates
 // sandboxes, and drains the delivery queue. Each step is guarded so a failure
 // in one never skips the rest.
 export async function finishDisposal(services: DisposableServices): Promise<void> {
@@ -32,9 +33,9 @@ export async function finishDisposal(services: DisposableServices): Promise<void
     console.error("Scheduler shutdown failed", error);
   }
   try {
-    await services.outbox.stop();
+    await services.sessionBus.stop();
   } catch (error) {
-    console.error("Outbox shutdown failed", error);
+    console.error("Session bus shutdown failed", error);
   }
   try {
     await services.tasks.stop();
@@ -72,7 +73,6 @@ export async function main(): Promise<void> {
     run: (chatId, prompt) => agentManager.followup(chatId, prompt),
   });
   const outboxInstance = new WorkspaceOutbox({
-    dataDir,
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
     agent: agentManager,
   });
@@ -84,6 +84,13 @@ export async function main(): Promise<void> {
     terminateProcessGroup,
     agent: agentManager,
   });
+  const sessionBus = new WorkspaceSessionBus({
+    dataDir,
+    onSend: (call, chatId, workspace, resume) => outboxInstance.handleSend(call, chatId, workspace, resume),
+    onSpawn: (call, chatId, workspace) => tasksInstance.handleSpawn(call, chatId, workspace),
+    onCancel: (call, chatId, workspace) => tasksInstance.handleCancel(call, chatId, workspace),
+  });
+  tasksInstance.flush = sessionBus;
 
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -101,7 +108,7 @@ export async function main(): Promise<void> {
         console.error("Agent abort failed", error);
       });
       await agentShutdown;
-      await finishDisposal({ agents: agentManager, scheduler: schedulerInstance, outbox: outboxInstance, tasks: tasksInstance, delivery: deliveryQueue });
+      await finishDisposal({ agents: agentManager, scheduler: schedulerInstance, sessionBus, tasks: tasksInstance, delivery: deliveryQueue });
     })();
     return shutdownPromise;
   };
@@ -114,12 +121,12 @@ export async function main(): Promise<void> {
       await shutdown("startup interrupted");
       return;
     }
-    await outboxInstance.start();
+    await tasksInstance.start();
     if (shuttingDown) {
       await shutdown("startup interrupted");
       return;
     }
-    await tasksInstance.start();
+    await sessionBus.start();
     if (shuttingDown) {
       await shutdown("startup interrupted");
       return;
@@ -138,7 +145,6 @@ export async function main(): Promise<void> {
     throw error;
   }
 }
-
 const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
   main().catch((error) => {

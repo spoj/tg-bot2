@@ -29,6 +29,7 @@ export type PiRunWorkerOptions = PiRunSandboxPaths & {
 const DEFAULT_STOP_GRACE_MS = 1_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
+const MAX_ACTIVITY_TEXT = 240;
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -63,6 +64,7 @@ async function ensureWebSearchConfig(workspace: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
 }
+
 async function ensurePromptFile(appRoot: string, content: string): Promise<string> {
   const hash = createHash("sha256").update(content, "utf8").digest("hex");
   const promptDir = path.join(appRoot, ".prompts");
@@ -75,6 +77,7 @@ async function ensurePromptFile(appRoot: string, content: string): Promise<strin
   }
   return promptFile;
 }
+
 async function prepareWorkspace(workspace: string): Promise<void> {
   await ensurePrivateDirectory(workspace);
   for (const relative of [
@@ -82,8 +85,6 @@ async function prepareWorkspace(workspace: string): Promise<void> {
     ".pi/agent",
     ".pi/sessions",
     ".tg-bot",
-    ".tg-bot/outbox",
-    ".tg-bot/task",
     ".cache",
     ".cache/npm",
     ".cache/uv",
@@ -109,6 +110,8 @@ export class PiRunWorker {
   private process: PiWorkerChildProcess | undefined;
   private stdout = "";
   private stderr = "";
+  private lastActivityAt = 0;
+  private lastActivity = "";
 
   constructor(options: PiRunWorkerOptions) {
     this.options = options;
@@ -123,11 +126,27 @@ export class PiRunWorker {
     this.stopGraceMs = stopGraceMs;
   }
 
+  /** When the run last wrote output, and the tail of what it wrote. */
+  activity(): { at: number; text: string } {
+    return { at: this.lastActivityAt, text: this.lastActivity };
+  }
+
+  private noteActivity(chunk: string | Buffer): void {
+    this.lastActivityAt = Date.now();
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    const trimmed = text.trim();
+    if (trimmed.length > 0) {
+      this.lastActivity = trimmed.length <= MAX_ACTIVITY_TEXT ? trimmed : `${trimmed.slice(0, MAX_ACTIVITY_TEXT - 1)}…`;
+    }
+  }
+
   /** Runs one turn to completion; resolves with the exit result. */
   async run(): Promise<PiRunResult> {
     if (this.process) throw new Error("Pi run worker is already running");
     this.stdout = "";
     this.stderr = "";
+    this.lastActivityAt = 0;
+    this.lastActivity = "";
     try {
       return await this.runInternal();
     } finally {
@@ -168,6 +187,7 @@ export class PiRunWorker {
         sessionDir: this.options.sessionDir,
         model: this.options.model,
         thinkingLevel: this.options.thinkingLevel,
+        hostTools: this.options.hostTools,
       }),
     });
     let child: PiWorkerChildProcess;
@@ -184,9 +204,11 @@ export class PiRunWorker {
 
     const exited = new Promise<PiRunResult>((resolve) => {
       child.stdout?.on("data", (chunk: Buffer | string) => {
+        this.noteActivity(chunk);
         this.stdout = boundedCapture(this.stdout, chunk);
       });
       child.stderr?.on("data", (chunk: Buffer | string) => {
+        this.noteActivity(chunk);
         this.stderr = boundedCapture(this.stderr, chunk);
       });
       child.once("exit", (code, signal) => {

@@ -1,25 +1,27 @@
 export const TASKS_PROMPT = `Background tasks hand work to a fresh Pi agent while you stay free: keep working, or end
-your turn — the host wakes you when each task settles. To start one, write ONE file under
-/workspace/.tg-bot/task/ named <name>.txt or <name>.md (letters, digits, dots, hyphens,
-underscores; 64 chars max). The file content is the complete prompt — the task agent is a
-fresh Pi agent with its own session in the same /workspace and no other context, so
-include everything it needs. Up to 8 tasks run per chat at a time; extra files wait in
-lexical order. Delete a pending task file to cancel it before it is claimed.
+your turn — the host wakes you when each task settles. To start one, call the spawn tool
+with { prompt: "<complete prompt>" }. The task agent is a fresh Pi agent with its own
+session in the same /workspace and no other context, so include everything it needs. Up
+to 8 tasks run per chat at a time; further spawns are queued by the host and start as
+slots free.
 
-Each task runs in a host-generated directory /workspace/.pi/tasks/<uuid>/ holding your
-prompt file (kept under its original name), output.md (the final report on success),
-sessions/, and result.json. To check a task's state, find the run directory containing
-your prompt file: no result.json means it is still running; result.json means settled with
-status done, failed, or aborted (aborted = the run was killed or the host restarted
-mid-run; rewrite the task file to retry). Every transition — task_claimed then one
-task_settled — is recorded in .tg-bot/system.jsonl, and each task_settled arrives as a
-followup naming the prompt and its run directory. Run directories accumulate until you
-delete them; system.jsonl is the durable index. Task agents cannot reach Telegram;
-relay anything user-facing yourself.
+Each task runs in a host-generated directory /workspace/.pi/tasks/<uuid>/ holding
+prompt.txt (your prompt), output.md (the final report on success), sessions/, and
+result.json. To check a task's state, find its run directory: no result.json means it is
+still running; result.json means settled with status done, failed, or aborted (aborted =
+the run was killed or the host restarted mid-run; spawn it again to retry). Every
+transition — task_claimed then one task_settled — is recorded in .tg-bot/system.jsonl,
+and each task_settled arrives as a followup quoting the prompt and naming the run
+directory. To stop a running task mid-run, call the cancel tool with { runId: "<uuid>" }
+using the uuid from its task_claimed event; the settle that follows lands as aborted.
+Run directories accumulate until you delete them; system.jsonl is the durable index.
+Task agents cannot reach you; they can send Telegram messages through their send tool,
+so relay anything user-facing you want to control yourself.
 `;
 
 export const TASK_RUNNER_PROMPT = `You are a background task agent spawned by a persistent Telegram personal agent. You work
 in its /workspace with your own separate session. Complete the assigned task fully and
 autonomously; your final message is captured as your report, so end with a complete
-answer. You cannot send Telegram messages.
+answer. You have a send tool that queues Telegram messages to the user; the host delivers
+each call, so use it for progress updates or to send the final result.
 `;

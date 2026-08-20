@@ -183,18 +183,18 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
   return { ...request, version: 1, type: request.type } as WorkspaceOutboxRequest;
 }
 
-export const OUTBOX_PROMPT = `To send files or messages through Telegram, write one request per send under
-/workspace/.tg-bot/outbox/. Request types:
-{version:1,type:"send_file",path,caption?,kind?,reply_to_message_id?,disable_notification?}
+export const OUTBOX_PROMPT = `To send files or messages through Telegram, call the send tool once per send with the
+request object as its argument. Request types:
+{type:"send_file",path,caption?,kind?,reply_to_message_id?,disable_notification?}
 sends the file at path (relative to /workspace or an absolute /workspace/... path)
 with an optional caption; kind is "auto" (default: images are sent as photos,
 audio as audio, video as video, other files as documents, and images over 10 MB
 as documents) or an explicit "photo", "audio", "video", "voice", or "document".
-{version:1,type:"send_media_group",media,reply_to_message_id?,disable_notification?}
+{type:"send_media_group",media,reply_to_message_id?,disable_notification?}
 sends an album: media is an array of 2-10 items, each {type:"photo"|"video",media,caption?,parse_mode?,caption_entities?,show_caption_above_media?,has_spoiler?,width?,height?,duration?,supports_streaming?} where
 media is the workspace path and type picks InputMediaPhoto or InputMediaVideo. The
 matching send event's messageId is the first message of the album.
-{version:1,type:"send_message",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
+{type:"send_message",text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
 sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
 plain text; malformed markup is resent as plain text; parse_mode and entities
 are mutually exclusive), entities is a list of {type,offset,length} message
@@ -202,24 +202,22 @@ entities, link_preview_options is a Telegram LinkPreviewOptions object,
 reply_markup is Telegram reply-markup JSON such as an inline_keyboard button
 list, reply_to_message_id targets an earlier message, and
 disable_notification sends silently.
-{version:1,type:"send_location",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
+{type:"send_location",latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
 sends a location pin (venue {title,address} sends a named venue instead).
-{version:1,type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
+{type:"send_poll",question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
 poll_answer event in chat.jsonl; the matching send line in chat.jsonl
 records pollId.
-{version:1,type:"stop_poll",message_id,reply_markup?} closes a poll early. Telegram's
+{type:"stop_poll",message_id,reply_markup?} closes a poll early. Telegram's
 final closed Poll arrives as the data field of the matching send event in chat.jsonl;
 its id matches the poll_answer events' poll_id and the matching send event's pollId.
-{version:1,type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from chat.jsonl.
-{version:1,type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
-{version:1,type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
-The request's filename is its name: the host assigns a unique UUID id upon claim,
-echoes both id and name in matching send and system events, and names it in rejection reports.
-Filenames must be unique per send but their content never matters beyond that: no id field
-exists inside the request. Write each request to a temporary filename that does not end in .json,
-then atomically rename it to the final unique *.json request name.
-Every request is reported in .tg-bot/system.jsonl as outbox_claimed followed by one terminal
-outbox_sent or outbox_rejected event. Requests leave no other trace in the outbox directory.
+{type:"send_reaction",message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message from chat.jsonl.
+{type:"edit_message",message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message).
+{type:"delete_message",message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message).
+The host validates each call, assigns a unique UUID requestId, and records outbox_claimed
+followed by exactly one outbox_sent or outbox_rejected in .tg-bot/system.jsonl; a matching
+send line in chat.jsonl echoes messageId/pollId for later edits, reactions, or deletes.
+A rejected send arrives as a followup quoting the request and the rejection detail —
+fix and resend.
 `;

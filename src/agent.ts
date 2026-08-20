@@ -41,6 +41,8 @@ export type AgentWorkerOptions = {
   appRoot: string;
   bwrapPath?: string;
   appendSystemPrompt?: string;
+  /** Comma-separated host tool names exposed to the run (send, spawn, cancel). */
+  hostTools?: string;
   message: string;
   resume: boolean;
   model?: string;
@@ -410,6 +412,7 @@ export class AgentManager {
       appRoot: this.appRoot,
       ...defined({ bwrapPath: this.bwrapPath }),
       appendSystemPrompt: SYSTEM_PROMPT,
+      hostTools: "send,spawn,cancel",
       message: text,
       resume,
       ...defined({ model, thinkingLevel }),

@@ -174,6 +174,46 @@ it("binds appendSystemPrompt read-only to /app/append-system-prompt.md", async (
     await rm(f.root, { recursive: true, force: true });
   }
 });
+it("binds the host-tools extension read-only and exposes the tool list via PI_HOST_TOOLS", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const extension = path.join(appRoot, "extensions", "host-tools.ts");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await mkdir(path.dirname(extension), { recursive: true });
+    await writeFile(extension, "export default () => {};\n", { mode: 0o600 });
+    const workerArgs = await buildPiRunBwrapArgs({
+      workspace: f.workspace,
+      appRoot,
+      hostTools: "send,spawn,cancel",
+    });
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--dir", "/app/extensions",
+      "--ro-bind", await realpath(extension), "/app/extensions/host-tools.ts",
+      "--setenv", "PI_HOST_TOOLS", "send,spawn,cancel",
+    ]));
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--extension", "/app/extensions/host-tools.ts",
+    ]));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+it("rejects a missing host-tools extension before building argv", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await expect(buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, hostTools: "send" }))
+      .rejects.toThrow("Host tools extension must be a regular file");
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
 
 
 it("does not follow or clobber a write-probe symlink", async () => {

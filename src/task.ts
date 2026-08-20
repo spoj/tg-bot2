@@ -1,26 +1,27 @@
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants, watch } from "node:fs";
-import type { FSWatcher, Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, opendir, rm, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import path from "node:path";
 import type { AgentManager } from "./agent.js";
 import { appendSystemEvent } from "./events.js";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
-import { SerialQueue } from "./queue.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
+import type { SessionToolCall } from "./session-bus.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
-import { chatPaths, defined, errorMessage, isMissing, numericChatId, openPinnedDirectory, TG_BOT_DIR, type PinnedDirectory } from "./util.js";
+import { chatPaths, defined, errorMessage, isMissing, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
 
 export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
   stop(): Promise<void>;
+  /** When the run last wrote output, and the tail of what it wrote. */
+  activity(): { at: number; text: string };
 };
 
 export type WorkspaceTaskWorkerOptions = {
   workspace: string;
   /** Host-generated uuid identifying this run's directory under .pi/tasks/. */
   runId: string;
-  /** The complete prompt read from the claimed task file. */
+  /** The complete prompt from the spawn call. */
   prompt: string;
 };
 
@@ -35,74 +36,48 @@ export type WorkspaceTasksOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
-  /** Receives a completion followup per settled task, naming the prompt and its run directory. */
+  /** Receives a completion followup per settled task, quoting the prompt and naming the run directory. */
   agent: Pick<AgentManager, "followup">;
-  pollIntervalMs?: number;
+  /** Consumes one task run's session calls before its settle followup, so task sends order before the completion message. */
+  flush?: { flushTaskRun(chatId: number, workspace: string, runId: string): Promise<void> };
+  heartbeatIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
-  watch?: typeof watch;
   logger?: (error: unknown) => void;
 };
 
-const DEFAULT_POLL_INTERVAL_MS = 5_000;
-const WATCH_DEBOUNCE_MS = 50;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_TASK_BYTES = 1024 * 1024;
 const MAX_CONCURRENT_TASKS_PER_CHAT = 8;
-const TASK_DIR = "task";
 const TASKS_DIR = path.join(".pi", "tasks");
 const SESSIONS_DIR = "sessions";
+const PROMPT_FILE = "prompt.txt";
 const OUTPUT_FILE = "output.md";
 const RESULT_FILE = "result.json";
-const TASK_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(txt|md)$/u;
-const NO_FOLLOW = fsConstants.O_NOFOLLOW;
-const NON_BLOCKING = fsConstants.O_NONBLOCK;
-
-type ChatWatcher = {
-  watcher: FSWatcher;
-  debounce: NodeJS.Timeout | undefined;
-};
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+const MAX_QUOTE_LENGTH = 120;
 
 type InFlightTask = {
   worker: WorkspaceTaskWorker;
+  runId: string;
+  prompt: string;
+  startedAt: number;
 };
 
-async function readEntries(directory: string) {
-  const directoryHandle = await opendir(directory);
-  const entries = [];
+async function readDirEntries(directory: string): Promise<Dirent[]> {
+  const handle = await opendir(directory);
+  const entries: Dirent[] = [];
   try {
     for (;;) {
-      const entry = await directoryHandle.read();
+      const entry = await handle.read();
       if (entry === null) break;
       entries.push(entry);
     }
   } finally {
-    await directoryHandle.close().catch(() => {});
+    await handle.close().catch(() => {});
   }
   return entries;
-}
-
-/** Reads a claimed task file without following symlinks; rejects empty or oversized prompts. */
-async function readTaskPrompt(filePath: string): Promise<string> {
-  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("Task file is not a regular file");
-    if (stat.size > MAX_TASK_BYTES) throw new Error(`Task file exceeds ${MAX_TASK_BYTES} bytes`);
-    const buffer = Buffer.allocUnsafe(MAX_TASK_BYTES);
-    let bytesRead = 0;
-    while (bytesRead < buffer.length) {
-      const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, null);
-      bytesRead += result.bytesRead;
-      if (result.bytesRead === 0) break;
-    }
-    const prompt = buffer.subarray(0, bytesRead).toString("utf8");
-    if (prompt.trim().length === 0) throw new Error("Task prompt must not be empty");
-    return prompt;
-  } finally {
-    await handle.close();
-  }
 }
 
 /** Ensures the tasks root is a real directory, replacing a planted symlink. */
@@ -116,20 +91,25 @@ async function ensureTasksDirectory(workspace: string): Promise<string> {
   return directory;
 }
 
-/** Finds the claimed prompt file inside a run directory, keeping the agent's original filename. */
-async function findTaskFile(runDirectory: string): Promise<string | undefined> {
-  const entries = await readEntries(runDirectory);
-  return entries.find((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))?.name;
+function truncate(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
 
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.floor(milliseconds / 1_000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+}
 
 /**
- * Runs agent-submitted background tasks: watches .tg-bot/task/*.txt|md, claims files into
- * host-generated uuid run directories under .pi/tasks/ (up to 8 concurrent per chat),
- * records every settlement in system.jsonl, and sends the agent a completion followup
- * naming the prompt and the run directory. Every started task settles exactly once —
- * immediately on exit (any signal included), or at the next boot via an aborted stamp
- * when the host itself died mid-run.
+ * Runs agent-spawned background tasks: claims spawn tool calls into host-generated uuid
+ * run directories under .pi/tasks/ (up to 8 concurrent per chat; excess calls are retried
+ * as slots free), records every settlement in system.jsonl, and sends the agent a
+ * completion followup quoting the prompt. Cancel tool calls stop a run mid-flight.
+ * Every started task settles exactly once — immediately on exit (any signal included),
+ * or at the next boot via an aborted stamp when the host itself died mid-run.
  */
 export class WorkspaceTasks {
   private readonly agent: WorkspaceTasksOptions["agent"];
@@ -140,25 +120,23 @@ export class WorkspaceTasks {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
-  private readonly pollIntervalMs: number;
+  /** Consumes one task run's session calls before its settle followup; assigned after construction to avoid a construction cycle with the session bus. */
+  flush: WorkspaceTasksOptions["flush"];
+  private readonly heartbeatIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
-  private readonly watchFs: typeof watch;
   private readonly logger: (error: unknown) => void;
-  private readonly queues = new Map<number, SerialQueue>();
-  private readonly chatWatchers = new Map<number, ChatWatcher>();
   private readonly inFlight = new Map<number, InFlightTask[]>();
   private readonly pendingSettles = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | undefined;
-  private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
   private running = false;
 
   constructor(options: WorkspaceTasksOptions) {
-    const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > MAX_TIMER_MS) {
-      throw new Error("Task poll interval must be a positive timer-safe integer");
+    const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    if (!Number.isSafeInteger(heartbeatIntervalMs) || heartbeatIntervalMs <= 0 || heartbeatIntervalMs > MAX_TIMER_MS) {
+      throw new Error("Task heartbeat interval must be a positive timer-safe integer");
     }
     this.dataDir = path.resolve(options.dataDir);
     this.appRoot = path.resolve(options.appRoot);
@@ -167,17 +145,18 @@ export class WorkspaceTasks {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.agent = options.agent;
-    this.pollIntervalMs = pollIntervalMs;
+    this.flush = options.flush;
+    this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
     this.logger = options.logger ?? ((error) => console.error("Workspace task error", error));
-    this.watchFs = options.watch ?? watch;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRunWorker({
       workspace: workerOptions.workspace,
       appRoot: this.appRoot,
       ...defined({ bwrapPath: this.bwrapPath }),
       appendSystemPrompt: TASK_RUNNER_PROMPT,
+      hostTools: "send",
       message: workerOptions.prompt,
       resume: false,
       sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
@@ -186,30 +165,26 @@ export class WorkspaceTasks {
       ...defined({ stopGraceMs: this.stopGraceMs }),
     }));
   }
-
   async start(): Promise<void> {
     if (this.running) {
       if (this.startInFlight) await this.startInFlight;
       return;
     }
     this.running = true;
-    const initialPoll = this.stampAbortedRuns().then(() => this.poll());
-    this.startInFlight = initialPoll;
+    const initialStamp = this.stampAbortedRuns();
+    this.startInFlight = initialStamp;
     try {
-      await initialPoll;
+      await initialStamp;
     } finally {
-      if (this.startInFlight === initialPoll) this.startInFlight = undefined;
+      if (this.startInFlight === initialStamp) this.startInFlight = undefined;
     }
     if (!this.running) return;
-    this.timer = this.schedule(() => {
-      void this.poll().catch((error) => this.report(error));
-    }, this.pollIntervalMs);
+    this.timer = this.schedule(() => this.heartbeat(), this.heartbeatIntervalMs);
     (this.timer as unknown as { unref?: () => void }).unref?.();
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    this.closeWatchers();
     if (this.timer !== undefined) {
       this.cancelSchedule(this.timer);
       this.timer = undefined;
@@ -219,208 +194,68 @@ export class WorkspaceTasks {
     for (;;) {
       const pending: Promise<void>[] = [];
       if (this.startInFlight) pending.push(this.startInFlight);
-      if (this.pollInFlight) pending.push(this.pollInFlight);
       for (const settle of [...this.pendingSettles]) pending.push(settle.catch(() => {}));
-      let queued = 0;
-      for (const queue of this.queues.values()) queued += queue.size;
-      if (queued > 0) pending.push((async (): Promise<void> => {
-        for (;;) {
-          const live = [...this.queues.values()];
-          if (live.length === 0) return;
-          await Promise.all(live.map((queue) => queue.idle()));
-          await Promise.resolve();
-        }
-      })());
       if (pending.length === 0) return;
       await Promise.all(pending);
     }
   }
 
-  /** Poll numeric chat workspaces; concurrent calls share one operation. */
-  async poll(): Promise<void> {
-    if (this.pollInFlight) return this.pollInFlight;
-    const operation = this.runPoll();
-    this.pollInFlight = operation;
-    try {
-      await operation;
-    } finally {
-      if (this.pollInFlight === operation) this.pollInFlight = undefined;
+  /** Claims one spawn call; "pending" when the chat is at its concurrency limit. */
+  async handleSpawn(call: SessionToolCall, chatId: number, workspace: string): Promise<"claimed" | "pending"> {
+    const prompt = call.args.prompt;
+    if (typeof prompt !== "string" || prompt.trim().length === 0 || prompt.length > MAX_TASK_BYTES) {
+      await this.settleRejectedSpawn(chatId, workspace, call, prompt);
+      return "claimed";
     }
+    const available = MAX_CONCURRENT_TASKS_PER_CHAT - (this.inFlight.get(chatId)?.length ?? 0);
+    if (available <= 0) return "pending";
+    await this.claimAndLaunch(chatId, workspace, call, prompt);
+    return "claimed";
   }
 
-  /** Process one numeric chat workspace; same-chat calls are serialized. */
-  async processChat(chatId: number, chatsRoot?: PinnedDirectory): Promise<void> {
-    if (!Number.isSafeInteger(chatId)) throw new Error("Task chat ID must be a safe integer");
-    const workspace = chatPaths(this.dataDir, chatId).workspace;
-    await this.enqueueChatScan(chatId, workspace, chatsRoot);
+  /** Stops one running task; a call naming an unknown or settled run is a no-op. */
+  async handleCancel(call: SessionToolCall, chatId: number, workspace: string): Promise<void> {
+    const runId = call.args.runId;
+    if (typeof runId !== "string" || runId.length === 0) return;
+    const entry = this.inFlight.get(chatId)?.find((item) => item.runId === runId);
+    if (entry === undefined) return;
+    await appendSystemEvent(workspace, { type: "task_cancelled", runId, callRef: call.ref });
+    await entry.worker.stop();
   }
 
-  private enqueueChatScan(chatId: number, workspace: string, chatsRoot?: PinnedDirectory): Promise<void> {
-    let queue = this.queues.get(chatId);
-    if (!queue) {
-      queue = new SerialQueue();
-      this.queues.set(chatId, queue);
+  /** Records a spawn call with an unusable prompt as claimed then failed, with a followup. */
+  private async settleRejectedSpawn(chatId: number, workspace: string, call: SessionToolCall, prompt: unknown): Promise<void> {
+    const runId = randomUUID();
+    const runDirectory = path.join(workspace, TASKS_DIR, runId);
+    const reason = typeof prompt !== "string" || prompt.trim().length === 0
+      ? "Task prompt must be a non-empty string"
+      : `Task prompt exceeds ${MAX_TASK_BYTES} bytes`;
+    const promptText = typeof prompt === "string" ? prompt : "";
+    await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
+    if (promptText.length > 0) {
+      await writeFile(path.join(runDirectory, PROMPT_FILE), promptText, { encoding: "utf8", mode: 0o600 });
     }
-    return queue.run(() => this.processChatNow(chatId, workspace, chatsRoot)).finally(() => {
-      if (queue.size === 0 && this.queues.get(chatId) === queue) {
-        this.queues.delete(chatId);
-      }
+    await appendSystemEvent(workspace, { type: "task_claimed", runId, callRef: call.ref, prompt: promptText });
+    await this.settleTask(chatId, workspace, { runId, prompt: promptText }, runDirectory, {
+      code: null,
+      signal: null,
+      stderr: reason,
+      stdout: "",
     });
   }
 
-  /** Watch one chat's task directory, scheduling a debounced scan on filesystem events. */
-  private async ensureWatcher(chatId: number, workspace: string): Promise<void> {
-    if (!this.running || this.chatWatchers.has(chatId)) return;
-    const taskDirectory = path.join(workspace, TG_BOT_DIR, TASK_DIR);
-    let stat: Stats;
-    try {
-      stat = await lstat(taskDirectory);
-    } catch (error) {
-      if (!isMissing(error)) this.report(error);
-      return;
-    }
-    if (!this.running) return;
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return;
-    let watcher: FSWatcher;
-    try {
-      watcher = this.watchFs(taskDirectory);
-    } catch (error) {
-      this.report(error);
-      return;
-    }
-    const entry: ChatWatcher = { watcher, debounce: undefined };
-    this.chatWatchers.set(chatId, entry);
-    watcher.on("change", () => this.debounceChatScan(chatId, workspace));
-    watcher.on("rename", () => this.debounceChatScan(chatId, workspace));
-    const disarm = (): void => {
-      if (this.chatWatchers.get(chatId) !== entry) return;
-      clearTimeout(entry.debounce);
-      entry.debounce = undefined;
-      this.chatWatchers.delete(chatId);
-    };
-    watcher.on("error", disarm);
-    watcher.on("close", disarm);
-  }
-
-  private debounceChatScan(chatId: number, workspace: string): void {
-    const entry = this.chatWatchers.get(chatId);
-    if (!entry) return;
-    clearTimeout(entry.debounce);
-    entry.debounce = setTimeout(() => {
-      if (this.chatWatchers.get(chatId) !== entry) return;
-      entry.debounce = undefined;
-      void this.enqueueChatScan(chatId, workspace).catch((error) => this.report(error));
-    }, WATCH_DEBOUNCE_MS);
-    entry.debounce.unref();
-  }
-
-  private closeWatchers(): void {
-    for (const entry of this.chatWatchers.values()) {
-      clearTimeout(entry.debounce);
-      entry.debounce = undefined;
-      try {
-        entry.watcher.close();
-      } catch {
-        // Watcher teardown must never interrupt shutdown.
-      }
-    }
-    this.chatWatchers.clear();
-  }
-
-  private async runPoll(): Promise<void> {
-    let chatsRoot: PinnedDirectory | undefined;
-    try {
-      chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readEntries(chatsRoot.path);
-      const chats = entries
-        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-        .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
-        .filter((entry): entry is { chatId: number; name: string } => entry.chatId !== undefined)
-        .sort((a, b) => a.name.localeCompare(b.name));
-
-      for (const { chatId } of chats) {
-        const workspace = chatPaths(this.dataDir, chatId).workspace;
-        if (this.running) await this.ensureWatcher(chatId, workspace);
-        try {
-          await this.processChat(chatId, chatsRoot);
-        } catch (error) {
-          this.report(error);
-        }
-      }
-    } catch (error) {
-      if (!isMissing(error)) this.report(error);
-    } finally {
-      if (chatsRoot) await this.closeDirectory(chatsRoot);
-    }
-  }
-
-  private async processChatNow(chatId: number, workspace: string, chatsRoot?: PinnedDirectory): Promise<void> {
-    let openedChatsRoot: PinnedDirectory | undefined;
-    let chatDirectory: PinnedDirectory | undefined;
-    let workspaceDirectory: PinnedDirectory | undefined;
-    let metadata: PinnedDirectory | undefined;
-    let taskDirectory: PinnedDirectory | undefined;
-    try {
-      openedChatsRoot = chatsRoot ?? await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      chatDirectory = await openPinnedDirectory(path.join(openedChatsRoot.path, String(chatId)));
-      workspaceDirectory = await openPinnedDirectory(path.join(chatDirectory.path, "workspace"));
-      if (workspaceDirectory.realPath !== path.join(chatDirectory.realPath, "workspace")) {
-        throw new Error(`Workspace for chat ${chatId} is outside the chat directory`);
-      }
-      metadata = await openPinnedDirectory(path.join(workspaceDirectory.path, TG_BOT_DIR));
-      taskDirectory = await openPinnedDirectory(path.join(metadata.path, TASK_DIR));
-
-      const entries = (await readEntries(taskDirectory.path))
-        .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && TASK_FILE.test(entry.name))
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-      if (entries.length === 0) return;
-      const available = MAX_CONCURRENT_TASKS_PER_CHAT - (this.inFlight.get(chatId)?.length ?? 0);
-      if (available <= 0) return;
-      await ensureTasksDirectory(workspace);
-      for (const name of entries.slice(0, available)) {
-        await this.claimAndLaunch(chatId, workspace, name, taskDirectory).catch((error) => this.report(error));
-      }
-    } catch (error) {
-      if (!isMissing(error)) this.report(error);
-    } finally {
-      if (taskDirectory) await this.closeDirectory(taskDirectory);
-      if (metadata) await this.closeDirectory(metadata);
-      if (workspaceDirectory) await this.closeDirectory(workspaceDirectory);
-      if (chatDirectory) await this.closeDirectory(chatDirectory);
-      if (chatsRoot === undefined && openedChatsRoot) await this.closeDirectory(openedChatsRoot);
-    }
-  }
-
-  /** Claims one pending task file into a fresh uuid run directory and launches its background run. */
-  private async claimAndLaunch(chatId: number, workspace: string, name: string, taskDirectory: PinnedDirectory): Promise<void> {
+  /** Claims one spawn call into a fresh uuid run directory and launches its background run. */
+  private async claimAndLaunch(chatId: number, workspace: string, call: SessionToolCall, prompt: string): Promise<void> {
     const runId = randomUUID();
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
-    try {
-      await rename(path.join(taskDirectory.path, name), path.join(runDirectory, name));
-    } catch (error) {
-      if (isMissing(error)) return; // The agent deleted the pending task.
-      throw error;
-    }
-    await appendSystemEvent(workspace, { type: "task_claimed", name, runId });
-    let prompt: string;
-    try {
-      prompt = await readTaskPrompt(path.join(runDirectory, name));
-    } catch (error) {
-      await this.settleTask(chatId, workspace, name, runId, runDirectory, {
-        code: null,
-        signal: null,
-        stderr: errorMessage(error),
-        stdout: "",
-      });
-      return;
-    }
+    await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
+    await appendSystemEvent(workspace, { type: "task_claimed", runId, callRef: call.ref, prompt });
     let worker: WorkspaceTaskWorker;
     try {
       worker = await this.workerFactory({ workspace, runId, prompt });
     } catch (error) {
-      await this.settleTask(chatId, workspace, name, runId, runDirectory, {
+      await this.settleTask(chatId, workspace, { runId, prompt }, runDirectory, {
         code: null,
         signal: null,
         stderr: errorMessage(error),
@@ -428,14 +263,14 @@ export class WorkspaceTasks {
       });
       return;
     }
-    this.launchTask(chatId, workspace, name, runId, runDirectory, worker);
+    this.launchTask(chatId, workspace, { runId, prompt }, runDirectory, worker);
   }
 
-  private launchTask(chatId: number, workspace: string, name: string, runId: string, runDirectory: string, worker: WorkspaceTaskWorker): void {
+  private launchTask(chatId: number, workspace: string, task: { runId: string; prompt: string }, runDirectory: string, worker: WorkspaceTaskWorker): void {
     const running = this.inFlight.get(chatId) ?? [];
-    running.push({ worker });
+    running.push({ worker, runId: task.runId, prompt: task.prompt, startedAt: this.now() });
     this.inFlight.set(chatId, running);
-    const settle = this.runAndSettle(chatId, workspace, name, runId, runDirectory, worker);
+    const settle = this.runAndSettle(chatId, workspace, task, runDirectory, worker);
     this.pendingSettles.add(settle);
     void settle
       .catch((error) => this.report(error))
@@ -445,8 +280,7 @@ export class WorkspaceTasks {
   private async runAndSettle(
     chatId: number,
     workspace: string,
-    name: string,
-    runId: string,
+    task: { runId: string; prompt: string },
     runDirectory: string,
     worker: WorkspaceTaskWorker,
   ): Promise<void> {
@@ -463,7 +297,7 @@ export class WorkspaceTasks {
         else this.inFlight.set(chatId, next);
       }
     }
-    await this.settleTask(chatId, workspace, name, runId, runDirectory, result);
+    await this.settleTask(chatId, workspace, task, runDirectory, result);
   }
 
   /**
@@ -475,12 +309,12 @@ export class WorkspaceTasks {
     let chatsRoot: PinnedDirectory | undefined;
     try {
       chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readEntries(chatsRoot.path);
+      const entries = await readDirEntries(chatsRoot.path);
       const chats = entries
         .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-        .map((entry) => ({ chatId: numericChatId(entry.name), name: entry.name }))
-        .filter((entry): entry is { chatId: number; name: string } => entry.chatId !== undefined);
-      for (const { chatId } of chats) {
+        .map((entry) => numericChatId(entry.name))
+        .filter((chatId): chatId is number => chatId !== undefined);
+      for (const chatId of chats) {
         const workspace = chatPaths(this.dataDir, chatId).workspace;
         try {
           await this.stampAbortedChatRuns(workspace);
@@ -491,7 +325,7 @@ export class WorkspaceTasks {
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
-      if (chatsRoot) await this.closeDirectory(chatsRoot);
+      if (chatsRoot) await chatsRoot.handle.close().catch((error) => this.report(error));
     }
   }
 
@@ -503,7 +337,7 @@ export class WorkspaceTasks {
       this.report(error);
       return;
     }
-    const entries = await readEntries(tasksPath);
+    const entries = await readDirEntries(tasksPath);
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const runDirectory = path.join(tasksPath, entry.name);
@@ -514,15 +348,19 @@ export class WorkspaceTasks {
           this.report(error);
           continue;
         }
-        const name = await findTaskFile(runDirectory);
-        if (name === undefined) {
-          await rm(runDirectory, { recursive: true, force: true }).catch(() => {});
+        try {
+          await lstat(path.join(runDirectory, PROMPT_FILE));
+        } catch (promptError) {
+          if (isMissing(promptError)) {
+            await rm(runDirectory, { recursive: true, force: true }).catch(() => {});
+            continue;
+          }
+          this.report(promptError);
           continue;
         }
         await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
         await appendSystemEvent(workspace, {
           type: "task_settled",
-          name,
           runId: entry.name,
           status: "aborted",
           exitCode: null,
@@ -535,8 +373,7 @@ export class WorkspaceTasks {
   private async settleTask(
     chatId: number,
     workspace: string,
-    name: string,
-    runId: string,
+    task: { runId: string; prompt: string },
     runDirectory: string,
     result: PiRunResult,
   ): Promise<void> {
@@ -553,19 +390,43 @@ export class WorkspaceTasks {
     }), { encoding: "utf8", mode: 0o600 });
     await appendSystemEvent(workspace, {
       type: "task_settled",
-      name,
-      runId,
+      runId: task.runId,
       status,
       exitCode: result.code,
       ...defined({ stderr }),
     });
+    if (this.flush) {
+      try {
+        await this.flush.flushTaskRun(chatId, workspace, task.runId);
+      } catch (error) {
+        this.report(error);
+      }
+    }
     const outcome = status === "done"
       ? "finished"
       : status === "failed"
         ? `failed (exit ${result.code ?? "unknown"})`
         : `aborted (${result.signal ?? "stopped"})`;
-    const message = `Task ${name} ${outcome}. Prompt, output, session, and result files: /workspace/.pi/tasks/${runId}/`;
+    const message = `Task "${truncate(task.prompt, MAX_QUOTE_LENGTH)}" ${outcome}. Run files: /workspace/.pi/tasks/${task.runId}/`;
     void this.agent.followup(chatId, message).catch((error) => this.report(error));
+  }
+
+  /** Sends one status followup per chat with running tasks; silent when everything is idle. */
+  private heartbeat(): void {
+    for (const [chatId, running] of this.inFlight) {
+      if (running.length === 0) continue;
+      const lines = running.map((task) => this.heartbeatLine(task));
+      const message = `Task heartbeat: ${running.length} task(s) running.\n${lines.join("\n")}`;
+      void this.agent.followup(chatId, message).catch((error) => this.report(error));
+    }
+  }
+
+  private heartbeatLine(task: InFlightTask): string {
+    const { at, text } = task.worker.activity();
+    const running = formatDuration(Math.max(0, this.now() - task.startedAt));
+    const idle = at > 0 ? formatDuration(Math.max(0, this.now() - at)) : "unknown";
+    const snippet = text.trim().length > 0 ? `; last output: "${truncate(text.trim(), MAX_QUOTE_LENGTH)}"` : "";
+    return `- ${task.runId} "${truncate(task.prompt, 80)}" running ${running}, last activity ${idle} ago${snippet}`;
   }
 
   private report(error: unknown): void {
@@ -573,14 +434,6 @@ export class WorkspaceTasks {
       this.logger(error);
     } catch {
       // Diagnostics must never interrupt task processing.
-    }
-  }
-
-  private async closeDirectory(directory: PinnedDirectory): Promise<void> {
-    try {
-      await directory.handle.close();
-    } catch (error) {
-      this.report(error);
     }
   }
 }

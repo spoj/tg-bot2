@@ -190,14 +190,14 @@ describe("WorkspaceOutbox", () => {
 
   it("rejects send_media_group requests with fewer than two items or wrong item types", async () => {
     const { workspace } = await fixture();
-    const followup = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, sendRecord("req-1", { type: "send_media_group", chat_id: 42, media: [{ type: "photo", media: "a.png" }] }), { notifier: { followup, interrupt: vi.fn() } });
-    await send(workspace, dispatch, sendRecord("req-2", { type: "send_media_group", chat_id: 42, media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] }), { notifier: { followup, interrupt: vi.fn() } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_media_group", chat_id: 42, media: [{ type: "photo", media: "a.png" }] }), { notifier: { followup: vi.fn(), interrupt } });
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_media_group", chat_id: 42, media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] }), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));
-    expect(followup).toHaveBeenCalledWith("Send req-1 rejected: Outbox request media must be an array of 2 to 10 items");
-    expect(followup).toHaveBeenCalledWith("Send req-2 rejected: Outbox request media item type must be photo or video");
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledTimes(2));
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Outbox request media must be an array of 2 to 10 items");
+    expect(interrupt).toHaveBeenCalledWith("Send req-2 rejected: Outbox request media item type must be photo or video");
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
       { requestId: "req-1", detail: expect.stringContaining("2 to 10 items") },
@@ -207,11 +207,11 @@ describe("WorkspaceOutbox", () => {
 
   it("discards structurally invalid sends and notifies the agent", async () => {
     const { workspace } = await fixture();
-    const followup = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, sendRecord("req-1", { type: "send_file", chat_id: 42, path: "x", kind: "weird" }), { notifier: { followup, interrupt: vi.fn() } });
-    await send(workspace, dispatch, sendRecord("req-2", { type: "send_file", chat_id: 42, path: 7 }), { notifier: { followup, interrupt: vi.fn() } });
-    await send(workspace, dispatch, sendRecord("req-3", "not-an-object"), { notifier: { followup, interrupt: vi.fn() } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_file", chat_id: 42, path: "x", kind: "weird" }), { notifier: { followup: vi.fn(), interrupt } });
+    await send(workspace, dispatch, sendRecord("req-2", { type: "send_file", chat_id: 42, path: 7 }), { notifier: { followup: vi.fn(), interrupt } });
+    await send(workspace, dispatch, sendRecord("req-3", "not-an-object"), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
@@ -219,30 +219,30 @@ describe("WorkspaceOutbox", () => {
       { requestId: "req-2", detail: expect.stringContaining("must be a non-empty string") },
       { requestId: "req-3", detail: expect.stringContaining("must be a JSON object") },
     ]);
-    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(3));
-    expect(followup).toHaveBeenCalledWith("Send req-1 rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
-    expect(followup).toHaveBeenCalledWith("Send req-3 rejected: Outbox request must be a JSON object");
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledTimes(3));
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
+    expect(interrupt).toHaveBeenCalledWith("Send req-3 rejected: Outbox request must be a JSON object");
   });
 
   it("discards oversized sends without delivering them", async () => {
     const { workspace } = await fixture();
-    const followup = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, sendRecord("req-1", { type: "send_file", chat_id: 42, path: "x".repeat(1024 * 1024) }), { notifier: { followup, interrupt: vi.fn() } });
+    await send(workspace, dispatch, sendRecord("req-1", { type: "send_file", chat_id: 42, path: "x".repeat(1024 * 1024) }), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([{ requestId: "req-1", detail: expect.stringContaining("exceeds 1048576 bytes") }]);
-    expect(followup).toHaveBeenCalledTimes(1);
+    expect(interrupt).toHaveBeenCalledTimes(1);
   });
 
   it("notifies the agent when the dispatcher throws, logging outbox_rejected", async () => {
     const { workspace } = await fixture();
     await allowChat(workspace, 42);
-    const followup = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
-    await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup, interrupt: vi.fn() } });
-    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(followup).toHaveBeenCalledWith("Send req-1 rejected: upload failed");
+    await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup: vi.fn(), interrupt } });
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: upload failed");
     const events = await logEvents(workspace);
     expect(events).toMatchObject([
       { type: "outbox_rejected", requestId: "req-1", chat_id: 42, detail: expect.stringContaining("upload failed") },
@@ -337,12 +337,12 @@ describe("WorkspaceOutbox", () => {
   it("rejects sends to chats not on the allow list", async () => {
     const { workspace } = await fixture();
     await allowChat(workspace, 99);
-    const followup = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup, interrupt: vi.fn() } });
+    await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(followup).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list");
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list");
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
       { requestId: "req-1", chat_id: 42, detail: expect.stringContaining("not on the allow list") },
@@ -366,12 +366,12 @@ describe("WorkspaceOutbox", () => {
   it("fails closed when allowed.json is malformed", async () => {
     const { workspace } = await fixture();
     await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), "{ not valid json", "utf8");
-    const followup = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => undefined);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup, interrupt: vi.fn() } });
+    await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(followup).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list");
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list");
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
       { requestId: "req-1", chat_id: 42, detail: expect.stringContaining("not on the allow list") },

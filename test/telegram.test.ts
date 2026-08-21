@@ -836,25 +836,24 @@ describe("Telegram rich messages", () => {
     });
   });
 
-  it("resends malformed markup as plain text and keeps the message fields", async () => {
+  it("rejects malformed markup and throws GrammyError without plain retry", async () => {
     const bot = fakeBot();
     const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
     sendMessage.mockRejectedValueOnce(new GrammyError(
       "Bad Request: can't parse entities",
       { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
       "sendMessage",
-      { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
+      { chat_id: 42, text: "<b>hi", parse_mode: "HTML" },
     ));
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
       type: "send_message",
       chat_id: 42,
-      text: "<b>hi</b>",
+      text: "<b>hi",
       parse_mode: "HTML",
       reply_to_message_id: 7,
-    })).resolves.toBe(123);
-    expect(sendMessage).toHaveBeenCalledTimes(2);
-    expect(sendMessage.mock.calls[1]).toEqual([42, "<b>hi</b>", { reply_to_message_id: 7 }]);
+    })).rejects.toThrow(/can't parse entities/);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("propagates non-parse failures without a plain retry", async () => {
@@ -911,30 +910,26 @@ describe("Telegram message editing and deletion", () => {
     });
   });
 
-  it("resends a malformed edit as plain text", async () => {
+  it("rejects a malformed edit without plain retry", async () => {
     const bot = fakeBot();
     const editMessageText = bot.api.editMessageText as unknown as Mock;
     editMessageText.mockRejectedValueOnce(new GrammyError(
       "Bad Request: can't parse entities",
       { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
       "editMessageText",
-      { chat_id: 42, message_id: 7, text: "<b>updated</b>", parse_mode: "HTML" },
+      { chat_id: 42, message_id: 7, text: "<b>updated", parse_mode: "HTML" },
     ));
     await expect(sendTelegramEditMessage(bot, 42, {
       version: 1,
       type: "edit_message",
       chat_id: 42,
       message_id: 7,
-      text: "<b>updated</b>",
+      text: "<b>updated",
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-    })).resolves.toBe(123);
-    expect(editMessageText).toHaveBeenCalledTimes(2);
-    expect(editMessageText.mock.calls[1]).toEqual([42, 7, "<b>updated</b>", {
-      link_preview_options: { is_disabled: true },
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-    }]);
+    })).rejects.toThrow(/can't parse entities/);
+    expect(editMessageText).toHaveBeenCalledTimes(1);
   });
 
   it("deletes a message through the Bot API", async () => {

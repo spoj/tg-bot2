@@ -122,34 +122,38 @@ export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: 
   await bot.api.setMessageReaction(chatId, messageId, reaction as never);
 }
 
-function isTelegramParseFailure(error: unknown): boolean {
-  return error instanceof GrammyError && /can['’]t parse|cannot parse/i.test(error.description);
-}
-
-async function withPlainFallback<T>(parseMode: "HTML" | "MarkdownV2" | undefined, send: (parseMode?: "HTML" | "MarkdownV2") => Promise<T>): Promise<T> {
-  try {
-    return await send(parseMode);
-  } catch (error) {
-    if (parseMode === undefined || !isTelegramParseFailure(error)) throw error;
-    return await send(undefined);
-  }
-}
-
-/** Sends one rich message; malformed markup falls back to the same text as plain. */
+/** Sends one rich message. */
 export async function sendTelegramRichMessage(bot: Bot, chatId: number, request: WorkspaceOutboxSendMessageRequest): Promise<number> {
-  return withPlainFallback(request.parse_mode, async (parseMode) => {
-    const sent = await bot.api.sendMessage(chatId, request.text, defined({ parse_mode: parseMode, reply_markup: request.reply_markup as never, reply_to_message_id: request.reply_to_message_id, entities: request.entities as never, link_preview_options: request.link_preview_options as never, disable_notification: request.disable_notification }));
-    return sent.message_id;
-  });
-}
-/** Edits one message; malformed markup falls back to the same text as plain. */
-export async function sendTelegramEditMessage(bot: Bot, chatId: number, request: WorkspaceOutboxEditMessageRequest): Promise<number> {
-  return withPlainFallback(request.parse_mode, async (parseMode) => {
-    const sent = await bot.api.editMessageText(chatId, request.message_id, request.text, defined({ parse_mode: parseMode, entities: request.entities as never, link_preview_options: request.link_preview_options as never, reply_markup: request.reply_markup as never })) as { message_id: number };
-    return sent.message_id;
-  });
+  const sent = await bot.api.sendMessage(
+    chatId,
+    request.text,
+    defined({
+      parse_mode: request.parse_mode,
+      reply_markup: request.reply_markup as never,
+      reply_to_message_id: request.reply_to_message_id,
+      entities: request.entities as never,
+      link_preview_options: request.link_preview_options as never,
+      disable_notification: request.disable_notification,
+    }),
+  );
+  return sent.message_id;
 }
 
+/** Edits one message. */
+export async function sendTelegramEditMessage(bot: Bot, chatId: number, request: WorkspaceOutboxEditMessageRequest): Promise<number> {
+  const sent = await bot.api.editMessageText(
+    chatId,
+    request.message_id,
+    request.text,
+    defined({
+      parse_mode: request.parse_mode,
+      entities: request.entities as never,
+      link_preview_options: request.link_preview_options as never,
+      reply_markup: request.reply_markup as never,
+    }),
+  ) as { message_id: number };
+  return sent.message_id;
+}
 export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId: number): Promise<void> {
   await bot.api.deleteMessage(chatId, messageId);
 }

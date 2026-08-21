@@ -211,8 +211,7 @@ media is the workspace path and type picks InputMediaPhoto or InputMediaVideo. T
 matching send event's messageId is the first message of the album.
 {type:"send_message",chat_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
 sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
-plain text; malformed markup is resent as plain text; parse_mode and entities
-are mutually exclusive), entities is a list of {type,offset,length} message
+plain text; parse_mode and entities are mutually exclusive), entities is a list of {type,offset,length} message
 entities, link_preview_options is a Telegram LinkPreviewOptions object,
 reply_markup is Telegram reply-markup JSON such as an inline_keyboard button
 list, reply_to_message_id targets an earlier message, and

@@ -142,7 +142,7 @@ export class EventSink {
         break;
       }
       case "outbox_rejected":
-        await this.notifier!.followup(`Send ${event.requestId} rejected: ${event.detail}`);
+        await this.notifier!.interrupt(`Send ${event.requestId} rejected: ${event.detail}`);
         break;
       case "schedule_run_fired":
         await this.notifier!.followup(event.prompt);

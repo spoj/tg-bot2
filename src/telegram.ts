@@ -678,6 +678,28 @@ function chatTitle(chat: TelegramChatInfo): string | undefined {
   return name || undefined;
 }
 
+export function isMessageDirectedToBot(message: Message, botInfo?: { id: number; username?: string }): boolean {
+  if (!botInfo) return true;
+  if (message.reply_to_message?.from?.id === botInfo.id) return true;
+
+  const botUsername = botInfo.username?.toLowerCase();
+  const text = message.text ?? message.caption ?? "";
+  const entities = message.entities ?? message.caption_entities ?? [];
+
+  for (const entity of entities) {
+    if (entity.type === "text_mention" && entity.user?.id === botInfo.id) return true;
+    if (entity.type === "mention" && botUsername) {
+      const mention = text.slice(entity.offset, entity.offset + entity.length).toLowerCase();
+      if (mention === `@${botUsername}`) return true;
+    }
+    if (entity.type === "bot_command" && botUsername) {
+      const command = text.slice(entity.offset, entity.offset + entity.length).toLowerCase();
+      if (command.endsWith(`@${botUsername}`)) return true;
+    }
+  }
+  return false;
+}
+
 async function isChatAllowed(workspace: string, chatId: number, events?: EventSink): Promise<boolean> {
   const allowed = await syncAllowlist(workspace, events);
   return allowed !== null && allowed.includes(chatId);
@@ -745,7 +767,9 @@ export function createTelegramBot(
   bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    await events.emit({ type: "message", chat_id: chatId, message: ctx.message, attachments });
+    const isPrivate = ctx.chat.type === "private" || chatId > 0;
+    const notify = isPrivate || isMessageDirectedToBot(ctx.message, bot.botInfo);
+    await events.emit({ type: "message", chat_id: chatId, message: ctx.message, attachments }, { notify });
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;

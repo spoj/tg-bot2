@@ -106,10 +106,11 @@ export class EventSink {
     private readonly logger: (error: unknown) => void = (error) => console.error("EventSink notification error", error),
   ) {}
 
-  async emit(event: BotEvent): Promise<string | undefined> {
+  async emit(event: BotEvent, options?: { notify?: boolean }): Promise<string | undefined> {
     const lines = await appendEvents(this.workspace, [event]);
     const line = lines?.[0] ?? eventLine(event);
-    if (this.notifier) {
+    const shouldNotify = options?.notify ?? true;
+    if (this.notifier && shouldNotify) {
       try {
         await this.notify(event, line);
       } catch (error) {

@@ -27,6 +27,7 @@ import {
 import type { AgentStatus } from "../src/agent.js";
 import { appendEvents, EventSink } from "../src/events.js";
 import { botPaths } from "../src/util.js";
+import { isMessageDirectedToBot } from "../src/telegram.js";
 import { resetAllowlistCache } from "../src/allowlist.js";
 
 const execFile = promisify(execFileCallback);
@@ -1143,6 +1144,121 @@ describe("Telegram ingress gate", () => {
       const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
       expect(denied).toHaveLength(1);
       expect(denied[0]).toMatchObject({ chat_id: 999 });
+    });
+  });
+
+  it("logs ambient group messages silently without interrupting the agent", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [-100]);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+
+      await bot.handleUpdate({
+        update_id: 1,
+        message: {
+          message_id: 1,
+          date: 1_700_000_000,
+          chat: { id: -100, type: "group", title: "Busy Work Group" },
+          from: { id: 42, is_bot: false, first_name: "Alice" },
+          text: "Just discussing general work stuff",
+        },
+      } as never);
+
+      expect(prompt).not.toHaveBeenCalled();
+      const events = await readLogEvents(dataDir);
+      expect(events.some((e) => e.type === "message" && e.chat_id === -100)).toBe(true);
+    });
+  });
+
+  it("interrupts the agent when mentioned or directly replied to in a group", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [-100]);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+
+      // 1. Direct mention
+      await bot.handleUpdate({
+        update_id: 2,
+        message: {
+          message_id: 2,
+          date: 1_700_000_000,
+          chat: { id: -100, type: "group", title: "Busy Work Group" },
+          from: { id: 42, is_bot: false, first_name: "Alice" },
+          text: "Hey @test_bot can you summarize this?",
+          entities: [{ type: "mention", offset: 4, length: 9 }],
+        },
+      } as never);
+      expect(prompt).toHaveBeenCalledTimes(1);
+
+      // 2. Direct reply
+      await bot.handleUpdate({
+        update_id: 3,
+        message: {
+          message_id: 3,
+          date: 1_700_000_000,
+          chat: { id: -100, type: "group", title: "Busy Work Group" },
+          from: { id: 42, is_bot: false, first_name: "Alice" },
+          text: "Yes, exactly that",
+          reply_to_message: { message_id: 10, from: { id: 999, is_bot: true, first_name: "Test" } },
+        },
+      } as never);
+      expect(prompt).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("isMessageDirectedToBot", () => {
+    const botInfo = { id: 999, username: "test_bot" };
+
+    it("detects direct replies to the bot", () => {
+      const msg = {
+        message_id: 1,
+        date: 100,
+        chat: { id: -100, type: "group" },
+        reply_to_message: { message_id: 2, date: 90, chat: { id: -100, type: "group" }, from: { id: 999, is_bot: true, first_name: "Bot" } },
+      } as never;
+      expect(isMessageDirectedToBot(msg, botInfo)).toBe(true);
+    });
+
+    it("detects @username mentions in text and captions", () => {
+      const msgWithText = {
+        message_id: 1,
+        date: 100,
+        chat: { id: -100, type: "group" },
+        text: "hello @TEST_BOT what is up",
+        entities: [{ type: "mention", offset: 6, length: 9 }],
+      } as never;
+      expect(isMessageDirectedToBot(msgWithText, botInfo)).toBe(true);
+
+      const msgWithCaption = {
+        message_id: 2,
+        date: 100,
+        chat: { id: -100, type: "group" },
+        caption: "check this @test_bot",
+        caption_entities: [{ type: "mention", offset: 11, length: 9 }],
+      } as never;
+      expect(isMessageDirectedToBot(msgWithCaption, botInfo)).toBe(true);
+    });
+
+    it("detects text_mention user IDs", () => {
+      const msg = {
+        message_id: 1,
+        date: 100,
+        chat: { id: -100, type: "group" },
+        text: "hello bot",
+        entities: [{ type: "text_mention", offset: 6, length: 3, user: { id: 999, is_bot: true, first_name: "Bot" } }],
+      } as never;
+      expect(isMessageDirectedToBot(msg, botInfo)).toBe(true);
+    });
+
+    it("returns false for ambient group messages without mentions or replies", () => {
+      const msg = {
+        message_id: 1,
+        date: 100,
+        chat: { id: -100, type: "group" },
+        text: "hello everyone @someone_else",
+        entities: [{ type: "mention", offset: 15, length: 13 }],
+      } as never;
+      expect(isMessageDirectedToBot(msg, botInfo)).toBe(false);
     });
   });
 

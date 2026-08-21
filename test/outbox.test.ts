@@ -24,10 +24,7 @@ async function fixture(): Promise<{ dataDir: string; workspace: string }> {
 
 async function allowChat(workspace: string, chatId: number): Promise<void> {
   const allowFile = path.join(workspace, ".tg-bot", "allowed.json");
-  await writeFile(allowFile, JSON.stringify({
-    version: 1,
-    chats: [{ chat_id: chatId, added_by: "agent", added_at: "2026-01-01T00:00:00.000Z" }],
-  }, null, 2) + "\n", "utf8");
+  await writeFile(allowFile, JSON.stringify([chatId], null, 2) + "\n", "utf8");
 }
 
 async function logEvents(workspace: string): Promise<Array<Record<string, unknown>>> {

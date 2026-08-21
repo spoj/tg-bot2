@@ -27,6 +27,7 @@ import {
 import type { AgentStatus } from "../src/agent.js";
 import { appendEvents, EventSink } from "../src/events.js";
 import { botPaths } from "../src/util.js";
+import { resetAllowlistCache } from "../src/allowlist.js";
 
 const execFile = promisify(execFileCallback);
 function fakeBot() {
@@ -52,9 +53,12 @@ function fakeBot() {
 
 async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
   const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-"));
+  resetAllowlistCache();
   try {
+    await writeAllowedChats(workspace, [42]);
     await run(workspace);
   } finally {
+    resetAllowlistCache();
     await rm(workspace, { recursive: true, force: true });
   }
 }
@@ -70,11 +74,11 @@ async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]
   const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
   return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
-async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string }>): Promise<void> {
+async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string } | number>): Promise<void> {
   const directory = path.join(workspaceDir(dataDir), ".tg-bot");
   await mkdir(directory, { recursive: true });
-  const entries = chats.map((chat) => ({ ...chat, added_by: "bootstrap" as const, added_at: "2026-01-01T00:00:00.000Z" }));
-  await writeFile(path.join(directory, "allowed.json"), `${JSON.stringify({ version: 1, chats: entries }, null, 2)}\n`);
+  const ids = chats.map((chat) => (typeof chat === "number" ? chat : chat.chat_id));
+  await writeFile(path.join(directory, "allowed.json"), `${JSON.stringify(ids, null, 2)}\n`);
 }
 
 async function waitForChatEvents(dataDir: string, predicate: (events: Record<string, unknown>[]) => boolean): Promise<Record<string, unknown>[]> {
@@ -743,7 +747,9 @@ describe("Telegram attachment downloads", () => {
       await withWorkspace(async (dataDir) => {
         const outside = path.join(dataDir, "outside");
         const workspace = workspaceDir(dataDir);
-        await mkdir(outside);
+        await rm(workspace, { recursive: true, force: true });
+        await mkdir(path.join(outside, ".tg-bot"), { recursive: true });
+        await writeFile(path.join(outside, ".tg-bot", "allowed.json"), JSON.stringify([42]));
         await mkdir(path.dirname(workspace), { recursive: true });
         await symlink(outside, workspace);
         const response = chunkedResponse([new TextEncoder().encode("secret")]);
@@ -1070,23 +1076,39 @@ describe("Telegram ingress gate", () => {
     };
   }
 
-  it("bootstraps the first-ever chat when allowed.json is missing", async () => {
+  it("drops a message and fails closed when allowed.json is missing", async () => {
     await withWorkspace(async (dataDir) => {
+      await rm(path.join(workspaceDir(dataDir), ".tg-bot", "allowed.json"), { force: true });
+      resetAllowlistCache();
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate(messageUpdate(42, { title: "Bootstrap Group" }) as never);
 
-      const allowed = JSON.parse(await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "allowed.json"), "utf8")) as { version: number; chats: Array<Record<string, unknown>> };
-      expect(allowed.version).toBe(1);
-      expect(allowed.chats).toHaveLength(1);
-      expect(allowed.chats[0]).toMatchObject({ chat_id: 42, title: "Bootstrap Group", added_by: "bootstrap" });
-
+      expect(prompt).not.toHaveBeenCalled();
       const system = await readLogEvents(dataDir);
-      expect(system.some((event) => event.type === "chat_allowed" && event.chat_id === 42 && event.added_by === "bootstrap")).toBe(true);
+      expect(system.some((event) => event.type === "chat_denied" && event.chat_id === 42)).toBe(true);
+    });
+  });
+  it("emits allowlist_updated when allowed.json is detected and updated", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [42, 100]);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
 
+      await bot.handleUpdate(messageUpdate(42) as never);
       expect(prompt).toHaveBeenCalledTimes(1);
-      expect(wakeArg(prompt)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7 } });
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42 });
+
+      const events = await readLogEvents(dataDir);
+      expect(events.some((event) => event.type === "allowlist_updated" && JSON.stringify(event.chats) === JSON.stringify([42, 100]))).toBe(true);
+
+      await writeAllowedChats(dataDir, [42, 100, 200]);
+      await bot.handleUpdate(messageUpdate(200) as never);
+      expect(prompt).toHaveBeenCalledTimes(2);
+
+      const eventsAfter = await readLogEvents(dataDir);
+      const allowEvents = eventsAfter.filter((event) => event.type === "allowlist_updated");
+      expect(allowEvents).toHaveLength(2);
+      expect(allowEvents[1]).toMatchObject({ type: "allowlist_updated", chats: [42, 100, 200] });
     });
   });
 

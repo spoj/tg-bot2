@@ -54,8 +54,7 @@ export class WorkspaceOutbox {
     }
     const chatId = request.chat_id;
     const allowed = await readAllowedFile(this.workspace);
-    const chatAllowed = allowed.status === "ready" && allowed.chats.some((entry) => entry.chat_id === chatId);
-    if (!chatAllowed) {
+    if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) {
       await this.recordRejection(record.requestId, chatId, new Error(`Chat ${chatId} is not on the allow list`));
       return;
     }

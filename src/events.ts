@@ -28,12 +28,9 @@ export type BotEvent =
     poll_answer: unknown;
   }
   | {
-    /** Host bootstrapped or accepted one chat into the allow list (bootstrap is the first-ever chatter; agent edits are not logged here). */
-    type: "chat_allowed";
-    chat_id: number;
-    title?: string | undefined;
-    added_by: "bootstrap";
-    added_at: string;
+    /** The allow list of chat IDs was updated or detected on change. `chats` is the complete sorted list of allowed chat IDs. */
+    type: "allowlist_updated";
+    chats: number[];
   }
   | {
     /** A message, button press, or vote arrived from a chat the allow list does not include; the host dropped it without waking the agent. */
@@ -150,7 +147,7 @@ export class EventSink {
         await this.notifier!.followup(event.prompt);
         break;
       default:
-        // outbox_sent, poll_answer, chat_allowed, chat_denied, schedule_run_scheduled, schedule_run_cancelled
+        // outbox_sent, poll_answer, allowlist_updated, chat_denied, schedule_run_scheduled, schedule_run_cancelled
         break;
     }
   }
@@ -243,8 +240,8 @@ Outcomes (host-written, exactly one terminal event per command):
 - schedule_run_fired: {v:1,t,type:'schedule_run_fired',runId,prompt} when that occurrence ran.
 - schedule_run_cancelled: {v:1,t,type:'schedule_run_cancelled',runId} when its row was
   removed or edited before it fired.
-- chat_allowed: {v:1,t,type:'chat_allowed',chat_id,title?,added_by,added_at} when the
-  host bootstraps the very first chat that ever messaged you into the allow list.
+- allowlist_updated: {v:1,t,type:'allowlist_updated',chats:[...]} when the host
+  detects a change to allowed.json, recording the full sorted list of active chat IDs.
 - chat_denied: {v:1,t,type:'chat_denied',chat_id,title?} when a message, button press,
   or poll vote arrived from a chat your allow list does not include; the host dropped
   it without interrupting you. Read these to decide whether to allow a chat.

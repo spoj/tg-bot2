@@ -1,25 +1,16 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { errorCode, TG_BOT_DIR } from "./util.js";
+import type { EventSink } from "./events.js";
 
 /**
- * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, the single source of
- * truth for which chats the agent may talk to. The host only enforces it — it
- * writes nothing but the one-time bootstrap entry (and that only when the file
- * does not exist yet).
+ * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, containing an array of safe integer chat IDs.
+ * The host enforces it both ways and emits `allowlist_updated` whenever changes are detected.
  */
-
-export type AllowedChat = {
-  chat_id: number;
-  title?: string;
-  added_by: "bootstrap" | "agent";
-  added_at: string;
-};
-
 export type AllowedFile =
   | { status: "missing" }
   | { status: "malformed" }
-  | { status: "ready"; chats: AllowedChat[] };
+  | { status: "ready"; chats: number[] };
 
 const ALLOWED_FILE = "allowed.json";
 
@@ -27,7 +18,7 @@ export function allowedFilePath(workspace: string): string {
   return path.join(workspace, TG_BOT_DIR, ALLOWED_FILE);
 }
 
-/** Reads the allow list. Missing and malformed files are distinct states: missing bootstraps, malformed fails closed. */
+/** Reads the allow list. Missing and malformed files are distinct states (both fail closed). */
 export async function readAllowedFile(workspace: string): Promise<AllowedFile> {
   let raw: string;
   try {
@@ -44,45 +35,62 @@ export async function readAllowedFile(workspace: string): Promise<AllowedFile> {
     console.error("Malformed allowed.json", error);
     return { status: "malformed" };
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    console.error("Malformed allowed.json: root must be an object");
+
+  let rawList: unknown[];
+  if (Array.isArray(parsed)) {
+    rawList = parsed;
+  } else if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).chats)) {
+    rawList = (parsed as Record<string, unknown>).chats as unknown[];
+  } else {
+    console.error("Malformed allowed.json: root must be an array of chat IDs or object with chats array");
     return { status: "malformed" };
   }
-  const chats = (parsed as Record<string, unknown>).chats;
-  if (!Array.isArray(chats)) {
-    console.error("Malformed allowed.json: chats must be an array");
-    return { status: "malformed" };
-  }
-  const result: AllowedChat[] = [];
-  for (const entry of chats) {
-    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
-      console.error("Malformed allowed.json: chat entries must be objects");
+
+  const ids: number[] = [];
+  for (const item of rawList) {
+    let id: unknown = item;
+    if (item !== null && typeof item === "object" && "chat_id" in item) {
+      id = (item as Record<string, unknown>).chat_id;
+    }
+    if (typeof id !== "number" || !Number.isSafeInteger(id)) {
+      console.error("Malformed allowed.json: chat IDs must be safe integers");
       return { status: "malformed" };
     }
-    const chat = entry as Record<string, unknown>;
-    if (typeof chat.chat_id !== "number" || !Number.isSafeInteger(chat.chat_id)) {
-      console.error("Malformed allowed.json: chat_id must be a safe integer");
-      return { status: "malformed" };
-    }
-    const title = typeof chat.title === "string" ? chat.title : undefined;
-    const addedBy = chat.added_by === "bootstrap" ? "bootstrap" : "agent";
-    const addedAt = typeof chat.added_at === "string" ? chat.added_at : "";
-    result.push({ chat_id: chat.chat_id, ...(title === undefined ? {} : { title }), added_by: addedBy, added_at: addedAt });
+    ids.push(id);
   }
-  return { status: "ready", chats: result };
+
+  const uniqueSorted = Array.from(new Set(ids)).sort((a, b) => a - b);
+  return { status: "ready", chats: uniqueSorted };
 }
 
-/** One-time bootstrap: creates the file exclusively, so the first chatter wins a concurrent race. Resolves false when the file already exists. */
-export async function bootstrapAllowedChat(workspace: string, entry: AllowedChat): Promise<boolean> {
-  const directory = path.join(workspace, TG_BOT_DIR);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const content = `${JSON.stringify({ version: 1, chats: [entry] }, null, 2)}\n`;
-  try {
-    await writeFile(allowedFilePath(workspace), content, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "EEXIST") return false;
-    console.error("Failed to write allowed.json", error);
-    return false;
+const lastEmittedAllowlists = new Map<string, string>();
+
+/** Clears the cached allowlist state for testing. */
+export function resetAllowlistCache(workspace?: string): void {
+  if (workspace) lastEmittedAllowlists.delete(workspace);
+  else lastEmittedAllowlists.clear();
+}
+
+/**
+ * Synchronizes the allow list: reads `allowed.json`, compares against the last emitted
+ * state for this workspace, and emits `allowlist_updated` if changed.
+ */
+export async function syncAllowlist(workspace: string, events?: EventSink): Promise<number[] | null> {
+  const file = await readAllowedFile(workspace);
+  if (file.status !== "ready") {
+    if (lastEmittedAllowlists.has(workspace)) {
+      lastEmittedAllowlists.delete(workspace);
+      await events?.emit({ type: "allowlist_updated", chats: [] });
+    }
+    return null;
   }
+
+  const serialized = JSON.stringify(file.chats);
+  const previous = lastEmittedAllowlists.get(workspace);
+  if (previous !== serialized) {
+    lastEmittedAllowlists.set(workspace, serialized);
+    await events?.emit({ type: "allowlist_updated", chats: file.chats });
+  }
+
+  return file.chats;
 }

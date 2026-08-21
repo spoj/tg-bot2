@@ -7,7 +7,7 @@ import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } f
 import type { Config } from "./config.js";
 import type { AgentStatus } from "./agent.js";
 import type { EventSink } from "./events.js";
-import { bootstrapAllowedChat, readAllowedFile, type AllowedChat } from "./allowlist.js";
+import { syncAllowlist } from "./allowlist.js";
 import { SerialQueue } from "./queue.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
@@ -678,47 +678,23 @@ function chatTitle(chat: TelegramChatInfo): string | undefined {
   return name || undefined;
 }
 
-async function isChatAllowed(workspace: string, chatId: number): Promise<boolean> {
-  const file = await readAllowedFile(workspace);
-  return file.status === "ready" && file.chats.some((entry) => entry.chat_id === chatId);
+async function isChatAllowed(workspace: string, chatId: number, events?: EventSink): Promise<boolean> {
+  const allowed = await syncAllowlist(workspace, events);
+  return allowed !== null && allowed.includes(chatId);
 }
 
 /**
- * The ingress gate: allowed chats pass; a missing allow list bootstraps the very
- * first chatter; everything else is denied with a chat_denied audit event and no
- * reply. A malformed allow list fails closed.
+ * The ingress gate: allowed chats pass; everything else is denied with a chat_denied
+ * audit event and no reply. A missing or malformed allow list fails closed.
  */
 async function gateChat(workspace: string, events: EventSink, chat: TelegramChatInfo): Promise<boolean> {
   const chatId = chat.id;
   if (!Number.isSafeInteger(chatId)) return false;
   const denied = () => events.emit({ type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) });
-  const file = await readAllowedFile(workspace);
-  if (file.status === "ready") {
-    if (file.chats.some((entry) => entry.chat_id === chatId)) return true;
-    await denied();
-    return false;
-  }
-  if (file.status === "missing") {
-    const entry: AllowedChat = {
-      chat_id: chatId,
-      ...defined({ title: chatTitle(chat) }),
-      added_by: "bootstrap",
-      added_at: new Date().toISOString(),
-    };
-    const created = await bootstrapAllowedChat(workspace, entry);
-    if (created) {
-      await events.emit({
-        type: "chat_allowed",
-        chat_id: chatId,
-        ...defined({ title: chatTitle(chat) }),
-        added_by: "bootstrap",
-        added_at: entry.added_at,
-      });
-      return true;
-    }
-    // Lost a concurrent bootstrap race; re-read and gate normally.
-    const again = await readAllowedFile(workspace);
-    if (again.status === "ready" && again.chats.some((entry) => entry.chat_id === chatId)) return true;
+
+  const allowed = await syncAllowlist(workspace, events);
+  if (allowed && allowed.includes(chatId)) {
+    return true;
   }
   await denied();
   return false;
@@ -783,7 +759,7 @@ export function createTelegramBot(
     const answer = ctx.pollAnswer;
     const chatId = await findPollOwnerChat(botDir, answer.poll_id);
     if (chatId === undefined) return;
-    if (!(await isChatAllowed(workspace, chatId))) return;
+    if (!(await isChatAllowed(workspace, chatId, events))) return;
     await events.emit({
       type: "poll_answer",
       chat_id: chatId,

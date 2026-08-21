@@ -27,7 +27,7 @@ import {
 import type { AgentStatus } from "../src/agent.js";
 import { appendEvents, EventSink } from "../src/events.js";
 import { botPaths } from "../src/util.js";
-import { isMessageDirectedToBot, resetKnockCache } from "../src/telegram.js";
+import { isMessageDirectedToBot } from "../src/telegram.js";
 import { resetAllowlistCache } from "../src/allowlist.js";
 
 const execFile = promisify(execFileCallback);
@@ -54,13 +54,11 @@ function fakeBot() {
 async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
   const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-"));
   resetAllowlistCache();
-  resetKnockCache();
   try {
     await writeAllowedChats(workspace, [42]);
     await run(workspace);
   } finally {
     resetAllowlistCache();
-    resetKnockCache();
     await rm(workspace, { recursive: true, force: true });
   }
 }

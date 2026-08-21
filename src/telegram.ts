@@ -6,8 +6,9 @@ import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } from "grammy/types";
 import type { Config } from "./config.js";
 import type { AgentStatus } from "./agent.js";
-import type { EventSink } from "./events.js";
+import { EVENTS_FILE, type EventSink } from "./events.js";
 import { syncAllowlist } from "./allowlist.js";
+import { TG_BOT_DIR, appendJsonl, botPaths, defined, readJsonl } from "./util.js";
 import { SerialQueue } from "./queue.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
@@ -20,7 +21,6 @@ import type {
   WorkspaceOutboxDispatchResult,
   WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-import { appendJsonl, botPaths, defined, readJsonl } from "./util.js";
 
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
@@ -709,20 +709,27 @@ async function isChatAllowed(workspace: string, chatId: number, events?: EventSi
   return allowed !== null && allowed.includes(chatId);
 }
 
-const recentKnockTimestamps = new Map<number, number>();
-const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
+export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
 
-/** Resets the knock cooldown cache (used for test isolation). */
-export function resetKnockCache(): void {
-  recentKnockTimestamps.clear();
-}
-
-function shouldNotifyKnock(chatId: number): boolean {
+export async function shouldNotifyKnock(workspace: string, chatId: number, now = Date.now()): Promise<boolean> {
   if (chatId <= 0) return false;
-  const now = Date.now();
-  const last = recentKnockTimestamps.get(chatId) ?? 0;
-  if (now - last < KNOCK_COOLDOWN_MS) return false;
-  recentKnockTimestamps.set(chatId, now);
+  try {
+    const lines = await readJsonl(path.join(workspace, TG_BOT_DIR, EVENTS_FILE));
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line) continue;
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed.type === "chat_denied" && parsed.chat_id === chatId && typeof parsed.t === "string") {
+        const lastTime = new Date(parsed.t).getTime();
+        if (!Number.isNaN(lastTime) && now - lastTime < KNOCK_COOLDOWN_MS) {
+          return false;
+        }
+        break;
+      }
+    }
+  } catch {
+    // Missing or unreadable events.jsonl
+  }
   return true;
 }
 
@@ -733,19 +740,19 @@ function shouldNotifyKnock(chatId: number): boolean {
 async function gateChat(workspace: string, events: EventSink, chat: TelegramChatInfo): Promise<boolean> {
   const chatId = chat.id;
   if (!Number.isSafeInteger(chatId)) return false;
-  const denied = () => events.emit(
-    { type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) },
-    { notify: shouldNotifyKnock(chatId) },
-  );
 
   const allowed = await syncAllowlist(workspace, events);
   if (allowed && allowed.includes(chatId)) {
     return true;
   }
-  await denied();
+
+  const notify = await shouldNotifyKnock(workspace, chatId);
+  await events.emit(
+    { type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) },
+    { notify },
+  );
   return false;
 }
-
 export function createTelegramBot(
   config: Config,
   events: EventSink,

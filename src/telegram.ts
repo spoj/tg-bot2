@@ -8,7 +8,7 @@ import type { Config } from "./config.js";
 import type { AgentStatus } from "./agent.js";
 import { EVENTS_FILE, type EventSink } from "./events.js";
 import { syncAllowlist } from "./allowlist.js";
-import { TG_BOT_DIR, appendJsonl, botPaths, defined, readJsonl } from "./util.js";
+import { TG_BOT_DIR, botPaths, defined, readJsonl } from "./util.js";
 import { SerialQueue } from "./queue.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
@@ -164,7 +164,7 @@ export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; w
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
     case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: paths.workspace, request }) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
-    case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(paths.botDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
+    case "send_poll": return sendTelegramPoll(bot, chatId, request);
     case "stop_poll": return { messageId: request.message_id, data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
     case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return undefined;
     case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
@@ -341,36 +341,32 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
   if (!first) throw new Error("Telegram returned an empty media group");
   return first.message_id;
 }
-const POLL_OWNER_STORE_NAME = "poll-owners.jsonl";
-
-/** Records poll ownership in a host-side store the sandbox cannot reach (only /workspace is mounted). */
-export async function recordPollOwner(botDir: string, chatId: number, pollId: string): Promise<void> {
-  await appendJsonl(
-    path.join(botDir, POLL_OWNER_STORE_NAME),
-    JSON.stringify({ chatId, pollId }),
-  );
-}
-
-/** Maps a poll id back to the chat that sent it via the host-side owner store. */
-async function findPollOwnerChat(botDir: string, pollId: string): Promise<number | undefined> {
+/** Maps a poll id back to the chat that sent it via events.jsonl. */
+export async function findPollOwnerChat(workspace: string, pollId: string): Promise<number | undefined> {
   let lines: string[];
   try {
-    lines = await readJsonl(path.join(botDir, POLL_OWNER_STORE_NAME));
+    lines = await readJsonl(path.join(workspace, TG_BOT_DIR, EVENTS_FILE));
   } catch {
     return undefined;
   }
-  for (const line of lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
     let record: unknown;
     try {
       record = JSON.parse(line);
     } catch {
       continue;
     }
-    if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
-    const candidate = record as Record<string, unknown>;
-    if (candidate.pollId !== pollId) continue;
-    if (typeof candidate.chatId !== "number" || !Number.isSafeInteger(candidate.chatId)) continue;
-    return candidate.chatId;
+    if (
+      record !== null &&
+      typeof record === "object" &&
+      (record as Record<string, unknown>).type === "outbox_sent" &&
+      (record as Record<string, unknown>).pollId === pollId &&
+      typeof (record as Record<string, unknown>).chat_id === "number"
+    ) {
+      return (record as Record<string, unknown>).chat_id as number;
+    }
   }
   return undefined;
 }
@@ -760,7 +756,7 @@ export function createTelegramBot(
   statusProvider?: { status(): Promise<AgentStatus> },
 ): Bot {
   const bot = new Bot(config.token);
-  const { botDir, workspace } = botPaths(config.dataDir, config.botId);
+  const { workspace } = botPaths(config.dataDir, config.botId);
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
 
@@ -812,7 +808,7 @@ export function createTelegramBot(
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
-    const chatId = await findPollOwnerChat(botDir, answer.poll_id);
+    const chatId = await findPollOwnerChat(workspace, answer.poll_id);
     if (chatId === undefined) return;
     if (!(await isChatAllowed(workspace, chatId, events))) return;
     await events.emit({

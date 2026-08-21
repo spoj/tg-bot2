@@ -11,17 +11,16 @@ import {
   createTelegramBot,
   deleteTelegramMessage,
   formatStatus,
-  recordPollOwner,
   attachmentSource,
   sendTelegramEditMessage,
   sendTelegramLocation,
+  sendTelegramMediaGroup,
   sendTelegramPoll,
   sendTelegramReaction,
   sendTelegramRichMessage,
-  stopTelegramPoll,
   sendWorkspaceFile,
-  sendTelegramMediaGroup,
   splitTelegramText,
+  stopTelegramPoll,
   TelegramDeliveryQueue,
 } from "../src/telegram.js";
 import type { AgentStatus } from "../src/agent.js";
@@ -65,15 +64,23 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
 function workspaceDir(dataDir: string): string {
   return botPaths(dataDir, 999).workspace;
 }
-
-function botDir(dataDir: string): string {
-  return botPaths(dataDir, 999).botDir;
-}
-
 async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]> {
   const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
-  return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  const result: Record<string, unknown>[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed !== null && typeof parsed === "object") {
+        result.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Skip corrupt test lines
+    }
+  }
+  return result;
 }
+
 async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string } | number>): Promise<void> {
   const directory = path.join(workspaceDir(dataDir), ".tg-bot");
   await mkdir(directory, { recursive: true });
@@ -1401,7 +1408,7 @@ describe("Telegram poll answers", () => {
   it("records a poll answer event for the owning chat without waking", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await recordPollOwner(botDir(dataDir), 42, "poll-9");
+      await appendEvents(workspaceDir(dataDir), [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
@@ -1425,13 +1432,12 @@ describe("Telegram poll answers", () => {
     });
   });
 
-  it("skips corrupt or non-object registry lines while resolving owners", async () => {
+  it("skips corrupt or non-matching event log lines while resolving owners", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const storePath = path.join(botDir(dataDir), "poll-owners.jsonl");
-      await mkdir(path.dirname(storePath), { recursive: true });
-      await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
-      await recordPollOwner(botDir(dataDir), 42, "poll-9");
+      const eventsPath = path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl");
+      await writeFile(eventsPath, "null\nnot json\n{\"type\":\"outbox_sent\",\"pollId\":\"poll-other\",\"chat_id\":42}\n", "utf8");
+      await appendEvents(workspaceDir(dataDir), [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
@@ -1475,7 +1481,7 @@ describe("Telegram poll answers", () => {
   it("drops poll answers for a poll owned by a chat not on the allow list", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await recordPollOwner(botDir(dataDir), 999, "poll-999");
+      await appendEvents(workspaceDir(dataDir), [{ type: "outbox_sent", requestId: "req-1", chat_id: 999, pollId: "poll-999" }]);
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({

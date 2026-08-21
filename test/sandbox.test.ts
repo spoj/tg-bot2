@@ -214,6 +214,31 @@ it("rejects a missing host-tools extension before building argv", async () => {
     await rm(f.root, { recursive: true, force: true });
   }
 });
+it("binds the multimodal extension read-only when present", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const multimodal = path.join(appRoot, "extensions", "multimodal.ts");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await mkdir(path.dirname(multimodal), { recursive: true });
+    await writeFile(multimodal, "export default () => {};\n", { mode: 0o600 });
+    const workerArgs = await buildPiRunBwrapArgs({
+      workspace: f.workspace,
+      appRoot,
+    });
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--dir", "/app/extensions",
+      "--ro-bind", await realpath(multimodal), "/app/extensions/multimodal.ts",
+    ]));
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--extension", "/app/extensions/multimodal.ts",
+    ]));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
 
 
 it("does not follow or clobber a write-probe symlink", async () => {

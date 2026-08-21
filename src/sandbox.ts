@@ -150,11 +150,33 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
   return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
 }
 
-/** Build the Pi one-shot run profile; appRoot, source, and .env stay out while dependencies remain read-only. */
-export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiRunBwrapResult> {
-  const workspace = await requireRealDirectory(paths.workspace, "Pi worker workspace", path.resolve(paths.workspace));
-  const appRoot = await requireRealDirectory(paths.appRoot, "Pi worker appRoot", path.resolve(paths.appRoot));
+type ExtensionConfig = {
+  hostToolsExtension: string | undefined;
+  hostTools: string | undefined;
+  multimodalExtension: string | undefined;
+};
 
+function buildExtensionMountArgs(config: ExtensionConfig): { mountArgs: string[]; cliArgs: string[] } {
+  const mountArgs: string[] = [];
+  const cliArgs: string[] = [];
+  if (config.hostToolsExtension !== undefined || config.multimodalExtension !== undefined) {
+    mountArgs.push("--dir", "/app/extensions");
+  }
+  if (config.hostToolsExtension !== undefined) {
+    mountArgs.push(
+      "--ro-bind", config.hostToolsExtension, "/app/extensions/host-tools.ts",
+      "--setenv", "PI_HOST_TOOLS", config.hostTools!,
+    );
+    cliArgs.push("--extension", "/app/extensions/host-tools.ts");
+  }
+  if (config.multimodalExtension !== undefined) {
+    mountArgs.push("--ro-bind", config.multimodalExtension, "/app/extensions/multimodal.ts");
+    cliArgs.push("--extension", "/app/extensions/multimodal.ts");
+  }
+  return { mountArgs, cliArgs };
+}
+
+async function resolveNodeModulesAndCli(appRoot: string, requestedCli?: string): Promise<{ nodeModules: string; cliMountPath: string }> {
   const nodeModulesPath = path.join(appRoot, "node_modules");
   const nodeModulesStat = await lstat(nodeModulesPath);
   if (!nodeModulesStat.isDirectory()) {
@@ -166,18 +188,32 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     throw new Error("Pi worker node_modules canonical target must remain under appRoot");
   }
   const defaultCli = path.join(nodeModules, "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-  const requestedCli = paths.cliPath ?? defaultCli;
-  const hostCliPath = requestedCli.startsWith("/app/node_modules/")
-    ? path.join(nodeModules, requestedCli.slice("/app/node_modules/".length))
-    : path.isAbsolute(requestedCli) ? requestedCli : path.resolve(appRoot, requestedCli);
+  const targetCli = requestedCli ?? defaultCli;
+  const hostCliPath = targetCli.startsWith("/app/node_modules/")
+    ? path.join(nodeModules, targetCli.slice("/app/node_modules/".length))
+    : path.isAbsolute(targetCli) ? targetCli : path.resolve(appRoot, targetCli);
   const cliStat = await lstat(hostCliPath);
   const cliPath = await realpath(hostCliPath);
   if (!cliStat.isFile()) throw new Error("Pi worker CLI must be a regular file");
   const cliMountPath = relativeMountPath(nodeModules, cliPath, "/app/node_modules", "Pi worker CLI");
+  return { nodeModules, cliMountPath };
+}
+
+/** Build the Pi one-shot run profile; appRoot, source, and .env stay out while dependencies remain read-only. */
+export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiRunBwrapResult> {
+  const workspace = await requireRealDirectory(paths.workspace, "Pi worker workspace", path.resolve(paths.workspace));
+  const appRoot = await requireRealDirectory(paths.appRoot, "Pi worker appRoot", path.resolve(paths.appRoot));
+  const { nodeModules, cliMountPath } = await resolveNodeModulesAndCli(appRoot, paths.cliPath);
 
   const hostToolsExtension = paths.hostTools === undefined
     ? undefined
     : await requireHostToolsExtension(appRoot);
+  const multimodalExtension = await findExtension(appRoot, "multimodal.ts");
+  const { mountArgs, cliArgs } = buildExtensionMountArgs({
+    hostToolsExtension,
+    hostTools: paths.hostTools,
+    multimodalExtension,
+  });
   const nodePath = await requireExecutable("node");
   const args: string[] = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
@@ -196,11 +232,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--dir", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
-    ...(hostToolsExtension === undefined ? [] : [
-      "--dir", "/app/extensions",
-      "--ro-bind", hostToolsExtension, "/app/extensions/host-tools.ts",
-      "--setenv", "PI_HOST_TOOLS", paths.hostTools!,
-    ]),
+    ...mountArgs,
     "--bind", workspace, "/workspace",
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
@@ -218,7 +250,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
     "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),
-    ...(hostToolsExtension === undefined ? [] : ["--extension", "/app/extensions/host-tools.ts"]),
+    ...cliArgs,
     ...(paths.resume ? ["--continue"] : []),
     ...(paths.model === undefined ? [] : ["--model", paths.model]),
     ...(paths.thinkingLevel === undefined ? [] : ["--thinking", paths.thinkingLevel]),
@@ -242,6 +274,21 @@ async function requireHostToolsExtension(appRoot: string): Promise<string> {
     throw new Error("Host tools extension must be a regular file");
   }
   return await realpath(extensionPath);
+}
+async function findExtension(appRoot: string, name: string): Promise<string | undefined> {
+  const extensionPath = path.join(appRoot, "extensions", name);
+  try {
+    const stat = await lstat(extensionPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return undefined;
+    }
+    return await realpath(extensionPath);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 function outputCapture(limit: number): {

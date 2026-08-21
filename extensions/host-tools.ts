@@ -43,10 +43,10 @@ const SEND_SCHEMA = Type.Object({
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
 
-/** Appends one command line to system.jsonl; a single O_APPEND write, atomic across processes. */
+/** Appends one command line to events.jsonl; a single O_APPEND write, atomic across processes. */
 function appendCommand(record: Record<string, unknown>): void {
   const line = `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...record })}\n`;
-  appendFileSync("/workspace/.tg-bot/system.jsonl", line, { encoding: "utf8", mode: 0o600 });
+  appendFileSync("/workspace/.tg-bot/events.jsonl", line, { encoding: "utf8", mode: 0o600 });
 }
 
 function text(content: string): ToolResult {

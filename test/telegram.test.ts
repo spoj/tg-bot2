@@ -25,7 +25,7 @@ import {
   TelegramDeliveryQueue,
 } from "../src/telegram.js";
 import type { AgentStatus } from "../src/agent.js";
-import { appendChatEvents } from "../src/events.js";
+import { appendEvents, EventSink } from "../src/events.js";
 import { botPaths } from "../src/util.js";
 
 const execFile = promisify(execFileCallback);
@@ -58,10 +58,6 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
     await rm(workspace, { recursive: true, force: true });
   }
 }
-async function readChatEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "chat.jsonl"), "utf8").catch(() => "");
-  return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
-}
 function workspaceDir(dataDir: string): string {
   return botPaths(dataDir, 999).workspace;
 }
@@ -69,8 +65,9 @@ function workspaceDir(dataDir: string): string {
 function botDir(dataDir: string): string {
   return botPaths(dataDir, 999).botDir;
 }
-async function readSystemEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "system.jsonl"), "utf8").catch(() => "");
+
+async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]> {
+  const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
   return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string }>): Promise<void> {
@@ -83,7 +80,7 @@ async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number
 async function waitForChatEvents(dataDir: string, predicate: (events: Record<string, unknown>[]) => boolean): Promise<Record<string, unknown>[]> {
   let events: Record<string, unknown>[] = [];
   await vi.waitFor(async () => {
-    events = await readChatEvents(dataDir);
+    events = await readLogEvents(dataDir);
     if (!predicate(events)) throw new Error("chat events not yet flushed");
   });
   return events;
@@ -111,11 +108,14 @@ async function makeTestBot(
   { fetchResult, recordRequests = false }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean } = {},
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
+  const events = new EventSink(workspaceDir(dataDir), { interrupt: agents.interrupt, followup: vi.fn(async () => undefined) });
   const bot = createTelegramBot(
     { token: "999:test-token", botId: 999, dataDir },
-    agents as never,
+    events,
+    undefined,
+    "status" in agents ? (agents as { status: () => Promise<AgentStatus> }) : undefined,
   );
-  Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
+  (bot as unknown as { botInfo: unknown }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
   const fakeFetch: typeof fetch = async (input, init) => {
     if (recordRequests) {
       sentRequests.push({
@@ -140,13 +140,12 @@ async function runAttachmentFixture(
   beforeUpdate?: (bot: Bot) => void,
 ): Promise<Mock> {
   const prompt = vi.fn(async () => undefined);
+  const events = new EventSink(workspaceDir(dataDir), { interrupt: prompt, followup: vi.fn(async () => undefined) });
   const bot = createTelegramBot({
     token: "999:test-token",
     botId: 999,
     dataDir,
-  }, {
-    interrupt: prompt,
-  } as never);
+  }, events);
   (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
   bot.api.getFile = vi.fn(getFileImplementation) as unknown as typeof bot.api.getFile;
   (bot.api as unknown as { sendChatAction: ReturnType<typeof vi.fn> }).sendChatAction = vi.fn(async () => ({}));
@@ -984,7 +983,7 @@ describe("Telegram callback queries", () => {
       await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
       expect(prompt).not.toHaveBeenCalled();
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(false);
-      expect((await readChatEvents(dataDir)).some((event) => event.type === "callback")).toBe(false);
+      expect((await readLogEvents(dataDir)).some((event) => event.type === "callback")).toBe(false);
     });
   });
 
@@ -1035,7 +1034,7 @@ describe("Telegram chat events", () => {
         message: { message_id: 7, text: "hello" },
         attachments: [],
       });
-      const chatLog = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "chat.jsonl"), "utf8");
+      const chatLog = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl"), "utf8");
       expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
     });
   });
@@ -1044,9 +1043,9 @@ describe("Telegram chat events", () => {
     await withWorkspace(async (workspace) => {
       const eventsDir = path.join(workspace, ".tg-bot");
       await mkdir(eventsDir, { recursive: true });
-      const fifoPath = path.join(eventsDir, "chat.jsonl");
+      const fifoPath = path.join(eventsDir, "events.jsonl");
       execFileSync("mkfifo", [fifoPath]);
-      await expect(appendChatEvents(workspace, [{ type: "message", chat_id: 42, message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
+      await expect(appendEvents(workspace, [{ type: "message", chat_id: 42, message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
       expect((await lstat(fifoPath)).isFIFO()).toBe(true);
     });
   }, 2_000);
@@ -1082,7 +1081,7 @@ describe("Telegram ingress gate", () => {
       expect(allowed.chats).toHaveLength(1);
       expect(allowed.chats[0]).toMatchObject({ chat_id: 42, title: "Bootstrap Group", added_by: "bootstrap" });
 
-      const system = await readSystemEvents(dataDir);
+      const system = await readLogEvents(dataDir);
       expect(system.some((event) => event.type === "chat_allowed" && event.chat_id === 42 && event.added_by === "bootstrap")).toBe(true);
 
       expect(prompt).toHaveBeenCalledTimes(1);
@@ -1100,9 +1099,8 @@ describe("Telegram ingress gate", () => {
 
       expect(prompt).not.toHaveBeenCalled();
       expect(sentRequests.some((request) => request.url.endsWith("/sendMessage"))).toBe(false);
-      expect(await readChatEvents(dataDir)).toEqual([]);
 
-      const denied = (await readSystemEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
       expect(denied).toHaveLength(1);
       expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 999, title: "Secret Group" });
     });
@@ -1120,7 +1118,7 @@ describe("Telegram ingress gate", () => {
 
       await bot.handleUpdate(messageUpdate(999) as never);
       expect(prompt).toHaveBeenCalledTimes(1);
-      const denied = (await readSystemEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
       expect(denied).toHaveLength(1);
       expect(denied[0]).toMatchObject({ chat_id: 999 });
     });
@@ -1138,8 +1136,7 @@ describe("Telegram ingress gate", () => {
       await bot.handleUpdate(messageUpdate(42) as never);
 
       expect(prompt).not.toHaveBeenCalled();
-      expect(await readChatEvents(dataDir)).toEqual([]);
-      const denied = (await readSystemEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
       expect(denied).toHaveLength(1);
       expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 42 });
       expect(await readFile(malformed, "utf8")).toBe("{ not valid json\n");
@@ -1306,7 +1303,7 @@ describe("Telegram poll answers", () => {
         },
       } as never);
       expect(prompt).not.toHaveBeenCalled();
-      expect((await readChatEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
+      expect((await readLogEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
     });
   });
 
@@ -1325,7 +1322,7 @@ describe("Telegram poll answers", () => {
         },
       } as never);
       expect(prompt).not.toHaveBeenCalled();
-      expect((await readChatEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
+      expect((await readLogEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
     });
   });
 });

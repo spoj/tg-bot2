@@ -1,7 +1,8 @@
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
-import { isMissing, readJsonl } from "./util.js";
+import { TG_BOT_DIR, isMissing, readJsonl } from "./util.js";
+import { EVENTS_FILE } from "./events.js";
 
 /** One send_request command: the agent's tool minted requestId and the raw request object. */
 export type SendRequest = {
@@ -24,7 +25,6 @@ export type CancelRequest = {
 export type SendRequestHandler = (
   record: SendRequest,
   workspace: string,
-  resume: boolean,
 ) => Promise<void>;
 /** Consumes one spawn_request; "pending" means the task slots are at capacity and the command must be retried. */
 export type SpawnRequestHandler = (
@@ -48,11 +48,9 @@ export type WorkspaceRequestBusOptions = {
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MAX_TIMER_MS = 2_147_483_647;
-const SYSTEM_LOG = path.join(".tg-bot", "system.jsonl");
+const EVENTS_LOG = path.join(TG_BOT_DIR, EVENTS_FILE);
 const MAX_RECORD_BYTES = 8 * 1024 * 1024;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
-const NON_BLOCKING = fsConstants.O_NONBLOCK;
-
 type ChatScanState = {
   /** Byte offset into system.jsonl; the log is append-only, so offsets are stable for a process lifetime. */
   offset: number;
@@ -60,10 +58,8 @@ type ChatScanState = {
   partial: string;
   /** Commands routed this lifetime, by UUID. */
   consumed: Set<string>;
-  /** UUIDs already claimed or terminated in system.jsonl; never re-routed. */
+  /** UUIDs already terminated in system.jsonl; never re-routed. */
   bootConsumed: Set<string>;
-  /** requestIds claimed without a terminal event; re-dispatched at boot. */
-  sendResume: Set<string>;
   /** Spawn commands awaiting a free slot. */
   pending: SpawnRequest[];
   booted: boolean;
@@ -100,7 +96,7 @@ export function parseCommand(line: string): SendRequest | SpawnRequest | CancelR
 
 /** Reads bytes after offset without following symlinks; a planted symlink throws ELOOP and the file is skipped. */
 async function readTail(filePath: string, offset: number): Promise<{ text: string; nextOffset: number }> {
-  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) return { text: "", nextOffset: offset };
@@ -239,7 +235,6 @@ export class WorkspaceRequestBus {
       partial: "",
       consumed: new Set(),
       bootConsumed: new Set(),
-      sendResume: new Set(),
       pending: [],
       booted: false,
     };
@@ -249,16 +244,15 @@ export class WorkspaceRequestBus {
     return state;
   }
 
-  /** Rebuilds claim state from system.jsonl so boot replay neither re-dispatches settled commands nor drops open ones. */
+  /** Rebuilds terminal outcome state from system.jsonl so boot replay skips completed commands. */
   private async loadBootState(workspace: string, state: ChatScanState): Promise<void> {
     let lines: string[];
     try {
-      lines = await readJsonl(path.join(workspace, SYSTEM_LOG));
+      lines = await readJsonl(path.join(workspace, EVENTS_LOG));
     } catch (error) {
       if (!isMissing(error)) this.report(error);
       return;
     }
-    const openSends = new Set<string>();
     for (const line of lines) {
       let record: unknown;
       try {
@@ -272,25 +266,10 @@ export class WorkspaceRequestBus {
         : typeof typed.runId === "string" && typed.runId.length > 0 ? typed.runId
           : undefined;
       if (id === undefined) continue;
-      switch (typed.type) {
-        case "outbox_claimed":
-          openSends.add(id);
-          break;
-        case "outbox_sent":
-        case "outbox_rejected":
-          openSends.delete(id);
-          state.bootConsumed.add(id);
-          break;
-        case "task_claimed":
-        case "task_settled":
-        case "task_cancelled":
-          state.bootConsumed.add(id);
-          break;
-        default:
-          break;
+      if (typed.type === "outbox_sent" || typed.type === "outbox_rejected" || typed.type === "task_settled") {
+        state.bootConsumed.add(id);
       }
     }
-    for (const requestId of openSends) state.sendResume.add(requestId);
   }
 
   private async runPoll(): Promise<void> {
@@ -313,7 +292,7 @@ export class WorkspaceRequestBus {
         else state.pending.push(record);
       }
     }
-    const file = path.join(workspace, SYSTEM_LOG);
+    const file = path.join(workspace, EVENTS_LOG);
     const previous = state.offset;
     let tail: { text: string; nextOffset: number };
     try {
@@ -349,8 +328,7 @@ export class WorkspaceRequestBus {
     if ("request" in record) {
       // send_request
       state.consumed.add(id);
-      const resume = state.sendResume.has(record.requestId);
-      await this.invoke(() => this.options.onSend(record, workspace, resume));
+      await this.invoke(() => this.options.onSend(record, workspace));
       return;
     }
     // cancel_request

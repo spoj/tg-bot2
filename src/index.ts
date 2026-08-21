@@ -6,6 +6,7 @@ import { WorkspaceScheduler } from "./scheduler.js";
 import { WorkspaceRequestBus } from "./request-bus.js";
 import { WorkspaceTasks } from "./task.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
+import { EventSink } from "./events.js";
 import { botPaths } from "./util.js";
 import { pathToFileURL } from "node:url";
 
@@ -69,27 +70,29 @@ export async function main(): Promise<void> {
   const { workspace } = paths;
 
   const agentManager = new AgentManager({ workspace }, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup });
+  const eventSink = new EventSink(workspace, agentManager);
   const deliveryQueue = new TelegramDeliveryQueue();
-  const bot = createTelegramBot(runtimeConfig, agentManager, deliveryQueue);
+  const bot = createTelegramBot(runtimeConfig, eventSink, deliveryQueue, agentManager);
   const schedulerInstance = new WorkspaceScheduler({
     workspace,
-    run: (prompt) => agentManager.followup(prompt),
+    events: eventSink,
   });
   const outboxInstance = new WorkspaceOutbox({
+    workspace,
+    events: eventSink,
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, request)),
-    agent: agentManager,
   });
   const tasksInstance = new WorkspaceTasks({
     workspace,
+    events: eventSink,
     appRoot: process.cwd(),
     bwrapPath,
     spawnProcess,
     terminateProcessGroup,
-    agent: agentManager,
   });
   const requestBus = new WorkspaceRequestBus({
     workspace,
-    onSend: (record, ws, resume) => outboxInstance.handleSendRequest(record, ws, resume),
+    onSend: (record, ws) => outboxInstance.handleSendRequest(record, ws),
     onSpawn: (record, ws) => tasksInstance.handleSpawnRequest(record, ws),
     onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
   });

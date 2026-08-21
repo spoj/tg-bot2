@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { WorkspaceTasks, type WorkspaceTaskWorkerOptions, type WorkspaceTasksOptions } from "../src/task.js";
+import { EventSink, type EventNotifier } from "../src/events.js";
 import type { PiRunResult } from "../src/pi-worker.js";
 import type { CancelRequest, SpawnRequest } from "../src/request-bus.js";
 
@@ -28,8 +29,8 @@ function cancelRecord(runId: string): CancelRequest {
   return { runId };
 }
 
-async function systemEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
-  const contents = await readFile(path.join(workspace, ".tg-bot", "system.jsonl"), "utf8");
+async function logEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
+  const contents = await readFile(path.join(workspace, ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
@@ -64,33 +65,35 @@ function fakeWorkerFactory() {
 const success = (stdout = "final report"): PiRunResult => ({ code: 0, signal: null, stderr: "", stdout });
 
 function setupTasks(
-  dataDir: string,
+  workspace: string,
   factory: Mock,
-  options: Partial<WorkspaceTasksOptions> = {},
-): WorkspaceTasks {
-  return new WorkspaceTasks({
-    workspace: path.join(dataDir, "workspace"),
+  options: Partial<WorkspaceTasksOptions> & { notifier?: EventNotifier } = {},
+): { service: WorkspaceTasks; events: EventSink } {
+  const events = new EventSink(workspace, options.notifier ?? { followup: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined) });
+  const service = new WorkspaceTasks({
+    workspace,
+    events,
     appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
-    agent: { followup: vi.fn(async () => undefined) },
     workerFactory: factory,
     ...options,
   });
+  return { service, events };
 }
 
 describe("WorkspaceTasks", () => {
   it("rejects heartbeat intervals above the timer-safe limit", async () => {
-    const { dataDir } = await fixture();
+    const { workspace } = await fixture();
     const { factory } = fakeWorkerFactory();
-    expect(() => setupTasks(dataDir, factory, { heartbeatIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
+    expect(() => setupTasks(workspace, factory, { heartbeatIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
   });
 
   it("claims a spawn command into a uuid run directory, records output, and sends a completion followup", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     const claim = service.handleSpawnRequest(spawnRecord("run-1", "Investigate the parser regression."), workspace);
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
@@ -105,31 +108,30 @@ describe("WorkspaceTasks", () => {
 
     expect(await readFile(path.join(runDir, "output.md"), "utf8")).toBe("the findings");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "done", exitCode: 0 });
-    expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task_claimed", runId: "run-1" },
+    expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "done", exitCode: 0 },
     ]);
     expect(followup).toHaveBeenCalledWith(`Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("truncates long prompts in the completion followup", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     await service.handleSpawnRequest(spawnRecord("run-1", "x".repeat(500)), workspace);
     tasks[0]?.resolveRun(success());
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
     const message = (followup.mock.calls as unknown[][])[0]?.[0] as string;
-    expect(message).toContain(`"${"x".repeat(119)}…"`);
+    expect(message).toContain(`"${"x".repeat(99)}…"`);
   });
 
   it("reports a failed run with a stderr tail and no output file", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     await service.handleSpawnRequest(spawnRecord("run-1", "do the thing"), workspace);
     tasks[0]?.resolveRun({ code: 3, signal: null, stderr: "boom", stdout: "" });
@@ -138,50 +140,48 @@ describe("WorkspaceTasks", () => {
     const runDir = path.join(workspace, ".pi", "tasks", "run-1");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "failed", exitCode: 3, stderr: "boom" });
     await expect(readFile(path.join(runDir, "output.md"), "utf8")).rejects.toThrow();
-    expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task_claimed", runId: "run-1" },
+    expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "failed", exitCode: 3, stderr: "boom" },
     ]);
     expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("reports a worker that fails to spawn as a failed task", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const factory = vi.fn(async () => {
       throw new Error("bwrap missing");
     });
     const followup = vi.fn(async () => undefined);
 
-    await setupTasks(dataDir, factory, { agent: { followup } }).handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
+    await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
 
-    expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task_claimed", runId: "run-1" },
+    expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "failed", stderr: "bwrap missing" },
     ]);
     expect(followup).toHaveBeenCalledOnce();
   });
 
   it("settles an empty or oversized prompt as failed without spawning", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     expect(await service.handleSpawnRequest(spawnRecord("run-empty", "   "), workspace)).toBe("claimed");
     expect(await service.handleSpawnRequest(spawnRecord("run-big", "x".repeat(1024 * 1024 + 1)), workspace)).toBe("claimed");
     expect(factory).not.toHaveBeenCalled();
     expect(followup).toHaveBeenCalledTimes(2);
     expect(followup).toHaveBeenNthCalledWith(1, expect.stringContaining('Task "   " failed (exit unknown). Run files: /workspace/.pi/tasks/run-empty/'));
-    const events = await systemEvents(workspace);
-    expect(events.filter((event) => event.type === "task_claimed")).toHaveLength(2);
+    const events = await logEvents(workspace);
     expect(events.filter((event) => event.type === "task_settled")).toHaveLength(2);
   });
 
   it("runs up to eight tasks concurrently and reports the rest as pending until slots free", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     for (let index = 0; index < 8; index += 1) {
       expect(await service.handleSpawnRequest(spawnRecord(`run-${index}`, `prompt ${index}`), workspace)).toBe("claimed");
@@ -200,10 +200,10 @@ describe("WorkspaceTasks", () => {
   });
 
   it("settles a signal-killed run as aborted with a followup", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
     tasks[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
@@ -211,50 +211,47 @@ describe("WorkspaceTasks", () => {
 
     const runDir = path.join(workspace, ".pi", "tasks", "run-1");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted", signal: "SIGTERM" });
-    expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task_claimed", runId: "run-1" },
+    expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "aborted" },
     ]);
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted (SIGTERM). Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/run-1/`);
   });
 
-  it("cancels a running task mid-run and records the request", async () => {
-    const { dataDir, workspace } = await fixture();
+  it("cancels a running task mid-run and settles as aborted", async () => {
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
 
     await service.handleSpawnRequest(spawnRecord("run-1", "long prompt"), workspace);
     await service.handleCancelRequest(cancelRecord("run-1"), workspace);
 
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(await systemEvents(workspace)).toMatchObject([
-      { type: "task_claimed", runId: "run-1" },
-      { type: "task_cancelled", runId: "run-1" },
+    expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "aborted" },
     ]);
   });
 
   it("ignores cancels for unknown runs", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
-    const service = setupTasks(dataDir, factory);
+    const { service } = setupTasks(workspace, factory);
 
     await service.handleSpawnRequest(spawnRecord("run-real", "real"), workspace);
     await service.handleCancelRequest(cancelRecord("run-missing"), workspace);
     expect(tasks[0]?.stop).not.toHaveBeenCalled();
-    expect(await systemEvents(workspace)).toMatchObject([{ type: "task_claimed", runId: "run-real" }]);
+    expect(await logEvents(workspace)).toHaveLength(0);
   });
 
   it("flushes pending commands before the settle followup", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
     const flush = {
       flush: vi.fn(async () => undefined),
     };
-    const service = setupTasks(dataDir, factory, { agent: { followup }, flush });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() }, flush });
 
     await service.handleSpawnRequest(spawnRecord("run-1", "flush me"), workspace);
     tasks[0]?.resolveRun(success());
@@ -263,7 +260,7 @@ describe("WorkspaceTasks", () => {
   });
 
   it("stamps aborted settles at boot for runs the host died on", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const deadRun = path.join(workspace, ".pi", "tasks", "22222222-2222-4222-8222-222222222222");
     await mkdir(path.join(deadRun, "sessions"), { recursive: true });
     await writeFile(path.join(deadRun, "prompt.txt"), "prompt", "utf8");
@@ -273,14 +270,14 @@ describe("WorkspaceTasks", () => {
     await mkdir(settledRun, { recursive: true });
     await writeFile(path.join(settledRun, "result.json"), '{"status":"done"}\n', "utf8");
     const { factory, tasks } = fakeWorkerFactory();
-    const service = setupTasks(dataDir, factory);
+    const { service } = setupTasks(workspace, factory);
 
     await service.start();
 
     expect(factory).not.toHaveBeenCalled();
     expect(tasks).toHaveLength(0);
     expect(await readJson(path.join(deadRun, "result.json"))).toEqual({ status: "aborted" });
-    expect(await systemEvents(workspace)).toMatchObject([
+    expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "22222222-2222-4222-8222-222222222222", status: "aborted", exitCode: null },
     ]);
     expect(await readJson(path.join(settledRun, "result.json"))).toEqual({ status: "done" });
@@ -289,10 +286,10 @@ describe("WorkspaceTasks", () => {
   });
 
   it("stop() stops in-flight workers and settles them as aborted", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
-    const service = setupTasks(dataDir, factory, { agent: { followup } });
+    const { service } = setupTasks(workspace, factory, { notifier: { followup, interrupt: vi.fn() } });
     await service.start();
 
     await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
@@ -302,11 +299,11 @@ describe("WorkspaceTasks", () => {
 
     const runDir = path.join(workspace, ".pi", "tasks", "run-1");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted" });
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted (SIGTERM). Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("sends a heartbeat followup while tasks run and stays silent when idle", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const followup = vi.fn(async () => undefined);
     const callbacks: Array<() => void> = [];
@@ -316,8 +313,8 @@ describe("WorkspaceTasks", () => {
     }) as unknown as typeof setInterval;
     const clearInterval = vi.fn() as unknown as typeof globalThis.clearInterval;
     const now = vi.fn(() => 60_000);
-    const service = setupTasks(dataDir, factory, {
-      agent: { followup },
+    const { service } = setupTasks(workspace, factory, {
+      notifier: { followup, interrupt: vi.fn() },
       setInterval: setIntervalMock,
       clearInterval,
       now,

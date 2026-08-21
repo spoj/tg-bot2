@@ -1,8 +1,7 @@
 import { lstat, mkdir, opendir, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
-import type { AgentManager } from "./agent.js";
-import { appendSystemEvent } from "./events.js";
+import type { EventSink } from "./events.js";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { CancelRequest, SpawnRequest } from "./request-bus.js";
@@ -35,8 +34,8 @@ export type WorkspaceTasksOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
-  /** Receives a completion followup per settled task, quoting the prompt and naming the run directory. */
-  agent: Pick<AgentManager, "followup">;
+  /** Unified event sink for task settlements and heartbeat followups. */
+  events: EventSink;
   /** Consumes pending commands from system.jsonl before each settle followup, so task sends order before the completion message. */
   flush?: { flush(workspace: string): Promise<void> };
   heartbeatIntervalMs?: number;
@@ -105,13 +104,13 @@ function formatDuration(milliseconds: number): string {
 /**
  * Runs agent-spawned background tasks: claims spawn tool calls into host-generated uuid
  * run directories under .pi/tasks/ (up to 8 concurrent; excess calls are retried
- * as slots free), records every settlement in system.jsonl, and sends the agent a
+ * as slots free), records every settlement in events.jsonl, and sends the agent a
  * completion followup quoting the prompt. Cancel tool calls stop a run mid-flight.
  * Every started task settles exactly once — immediately on exit (any signal included),
  * or at the next boot via an aborted stamp when the host itself died mid-run.
  */
 export class WorkspaceTasks {
-  private readonly agent: WorkspaceTasksOptions["agent"];
+  private readonly events: EventSink;
   private readonly workspace: string;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
@@ -143,7 +142,7 @@ export class WorkspaceTasks {
     this.spawnProcess = options.spawnProcess;
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
-    this.agent = options.agent;
+    this.events = options.events;
     this.flush = options.flush;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.now = options.now ?? Date.now;
@@ -212,14 +211,13 @@ export class WorkspaceTasks {
   }
 
   /** Stops one running task; a command naming an unknown or settled run is a no-op. */
-  async handleCancelRequest(record: CancelRequest, workspace: string): Promise<void> {
+  async handleCancelRequest(record: CancelRequest, _workspace: string): Promise<void> {
     const entry = this.inFlight.find((item) => item.runId === record.runId);
     if (entry === undefined) return;
-    await appendSystemEvent(workspace, { type: "task_cancelled", runId: record.runId });
     await entry.worker.stop();
   }
 
-  /** Records a spawn command whose prompt is unusable as claimed then failed, with a followup. */
+  /** Records a spawn command whose prompt is unusable as failed, with a followup. */
   private async settleRejectedSpawn(workspace: string, runId: string, prompt: string): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     const reason = prompt.trim().length === 0
@@ -229,7 +227,6 @@ export class WorkspaceTasks {
     if (prompt.length > 0) {
       await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
     }
-    await appendSystemEvent(workspace, { type: "task_claimed", runId });
     await this.settleTask(workspace, { runId, prompt }, runDirectory, {
       code: null,
       signal: null,
@@ -238,12 +235,11 @@ export class WorkspaceTasks {
     });
   }
 
-  /** Claims one spawn command into a fresh uuid run directory and launches its background run. */
+  /** Launches a background task in a fresh uuid run directory. */
   private async claimAndLaunch(workspace: string, runId: string, prompt: string): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
     await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
-    await appendSystemEvent(workspace, { type: "task_claimed", runId });
     let worker: WorkspaceTaskWorker;
     try {
       worker = await this.workerFactory({ workspace, runId, prompt });
@@ -321,7 +317,7 @@ export class WorkspaceTasks {
           continue;
         }
         await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
-        await appendSystemEvent(workspace, {
+        await this.events.emit({
           type: "task_settled",
           runId: entry.name,
           status: "aborted",
@@ -349,13 +345,6 @@ export class WorkspaceTasks {
       signal: result.signal,
       ...defined({ stderr }),
     }), { encoding: "utf8", mode: 0o600 });
-    await appendSystemEvent(workspace, {
-      type: "task_settled",
-      runId: task.runId,
-      status,
-      exitCode: result.code,
-      ...defined({ stderr }),
-    });
     if (this.flush) {
       try {
         await this.flush.flush(workspace);
@@ -363,13 +352,14 @@ export class WorkspaceTasks {
         this.report(error);
       }
     }
-    const outcome = status === "done"
-      ? "finished"
-      : status === "failed"
-        ? `failed (exit ${result.code ?? "unknown"})`
-        : `aborted (${result.signal ?? "stopped"})`;
-    const message = `Task "${truncate(task.prompt, MAX_QUOTE_LENGTH)}" ${outcome}. Run files: /workspace/.pi/tasks/${task.runId}/`;
-    void this.agent.followup(message).catch((error) => this.report(error));
+    await this.events.emit({
+      type: "task_settled",
+      runId: task.runId,
+      prompt: task.prompt,
+      status,
+      exitCode: result.code,
+      ...defined({ stderr }),
+    });
   }
 
   /** Sends one status followup while tasks run; silent when everything is idle. */
@@ -377,7 +367,7 @@ export class WorkspaceTasks {
     if (this.inFlight.length === 0) return;
     const lines = this.inFlight.map((task) => this.heartbeatLine(task));
     const message = `Task heartbeat: ${this.inFlight.length} task(s) running.\n${lines.join("\n")}`;
-    void this.agent.followup(message).catch((error) => this.report(error));
+    void this.events.followup(message).catch((error) => this.report(error));
   }
 
   private heartbeatLine(task: InFlightTask): string {

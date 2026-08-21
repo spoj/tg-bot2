@@ -1,14 +1,15 @@
-import { appendFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  WorkspaceRequestBus,
   parseCommand,
   splitRecords,
+  WorkspaceRequestBus,
   type CancelRequestHandler,
   type SendRequestHandler,
   type SpawnRequestHandler,
+  type WorkspaceRequestBusOptions,
 } from "../src/request-bus.js";
 
 const temporaryDirectories: string[] = [];
@@ -19,7 +20,7 @@ afterEach(async () => {
 });
 
 async function fixture(): Promise<{ dataDir: string; workspace: string }> {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-request-test-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-bus-test-"));
   temporaryDirectories.push(dataDir);
   const workspace = path.join(dataDir, "workspace");
   await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
@@ -27,30 +28,34 @@ async function fixture(): Promise<{ dataDir: string; workspace: string }> {
 }
 
 function setupBus(
-  dataDir: string,
-  handlers: { onSend?: SendRequestHandler; onSpawn?: SpawnRequestHandler; onCancel?: CancelRequestHandler } = {},
+  workspace: string,
+  options: Partial<WorkspaceRequestBusOptions> = {},
 ): WorkspaceRequestBus {
   return new WorkspaceRequestBus({
-    workspace: path.join(dataDir, "workspace"),
-    onSend: handlers.onSend ?? vi.fn<SendRequestHandler>(async () => undefined),
-    onSpawn: handlers.onSpawn ?? vi.fn<SpawnRequestHandler>(async () => "claimed"),
-    onCancel: handlers.onCancel ?? vi.fn<CancelRequestHandler>(async () => undefined),
+    workspace,
+    onSend: options.onSend ?? (async () => undefined),
+    onSpawn: options.onSpawn ?? (async () => "claimed"),
+    onCancel: options.onCancel ?? (async () => undefined),
+    ...options,
   });
 }
 
-function sendRequest(requestId = "req-1", request: unknown = { type: "send_message", text: "hi" }): string {
-  return `${JSON.stringify({ v: 1, t: "t", type: "send_request", requestId, request })}\n`;
+function sendRequest(requestId = "req-1"): string {
+  return `${JSON.stringify({ v: 1, t: "t", type: "send_request", requestId, request: { type: "send_message", text: "hi" } })}\n`;
 }
+
 function spawnRequest(runId = "run-1", prompt = "do it"): string {
   return `${JSON.stringify({ v: 1, t: "t", type: "spawn_request", runId, prompt })}\n`;
 }
+
 function cancelRequest(runId = "run-1"): string {
   return `${JSON.stringify({ v: 1, t: "t", type: "cancel_request", runId })}\n`;
 }
+
 const outcome = (record: Record<string, unknown>): string => `${JSON.stringify({ v: 1, t: "t", ...record })}\n`;
 
 async function writeLog(workspace: string, lines: string[]): Promise<void> {
-  await writeFile(path.join(workspace, ".tg-bot", "system.jsonl"), lines.join(""), "utf8");
+  await writeFile(path.join(workspace, ".tg-bot", "events.jsonl"), lines.join(""), "utf8");
 }
 
 describe("parseCommand", () => {
@@ -60,7 +65,7 @@ describe("parseCommand", () => {
     expect(parseCommand(cancelRequest())).toEqual({ runId: "run-1" });
     expect(parseCommand("not json")).toBeUndefined();
     expect(parseCommand(outcome({ type: "task_settled", runId: "run-1", status: "done", exitCode: 0 }))).toBeUndefined();
-    expect(parseCommand(outcome({ type: "outbox_claimed", requestId: "req-1" }))).toBeUndefined();
+    expect(parseCommand(outcome({ type: "outbox_sent", requestId: "req-1" }))).toBeUndefined();
     expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "spawn_request", runId: "run-1", prompt: 7 })}\n`)).toBeUndefined();
     expect(parseCommand("x".repeat(8 * 1024 * 1024 + 1))).toBeUndefined();
   });
@@ -77,132 +82,128 @@ describe("splitRecords", () => {
 
 describe("WorkspaceRequestBus", () => {
   it("routes fresh commands once and skips them on later polls", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     await writeLog(workspace, [sendRequest()]);
     const onSend = vi.fn<SendRequestHandler>(async () => undefined);
-    const bus = setupBus(dataDir, { onSend });
+    const bus = setupBus(workspace, { onSend });
 
     await bus.poll();
-    expect(onSend).toHaveBeenCalledWith({ requestId: "req-1", request: { type: "send_message", text: "hi" } }, workspace, false);
+    expect(onSend).toHaveBeenCalledWith({ requestId: "req-1", request: { type: "send_message", text: "hi" } }, workspace);
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
   });
 
-  it("boot replay skips terminal sends, resumes open claims, and skips claimed tasks and cancels", async () => {
-    const { dataDir, workspace } = await fixture();
+  it("boot replay skips terminal sends and tasks, and routes fresh ones", async () => {
+    const { workspace } = await fixture();
     await writeLog(workspace, [
       sendRequest("req-done"),
-      outcome({ type: "outbox_claimed", requestId: "req-done" }),
-      outcome({ type: "outbox_sent", requestId: "req-done" }),
-      sendRequest("req-open"),
-      outcome({ type: "outbox_claimed", requestId: "req-open" }),
+      outcome({ type: "outbox_sent", requestId: "req-done", chat_id: 42 }),
+      sendRequest("req-rejected"),
+      outcome({ type: "outbox_rejected", requestId: "req-rejected", detail: "failed" }),
       spawnRequest("run-done"),
-      outcome({ type: "task_claimed", runId: "run-done" }),
-      cancelRequest("run-cancelled"),
-      outcome({ type: "task_cancelled", runId: "run-cancelled" }),
+      outcome({ type: "task_settled", runId: "run-done", status: "done", exitCode: 0 }),
       sendRequest("req-fresh"),
       spawnRequest("run-fresh"),
-      cancelRequest("run-unknown"),
+      cancelRequest("run-cancel-fresh"),
     ]);
     const onSend = vi.fn<SendRequestHandler>(async () => undefined);
     const onSpawn = vi.fn<SpawnRequestHandler>(async () => "claimed");
     const onCancel = vi.fn<CancelRequestHandler>(async () => undefined);
-    const bus = setupBus(dataDir, { onSend, onSpawn, onCancel });
+    const bus = setupBus(workspace, { onSend, onSpawn, onCancel });
 
     await bus.poll();
 
-    expect(onSend.mock.calls.map(([record]) => record.requestId)).toEqual(["req-open", "req-fresh"]);
-    expect(onSend).toHaveBeenNthCalledWith(1, expect.objectContaining({ requestId: "req-open" }), workspace, true);
-    expect(onSend).toHaveBeenNthCalledWith(2, expect.objectContaining({ requestId: "req-fresh" }), workspace, false);
+    expect(onSend.mock.calls.map(([record]) => record.requestId)).toEqual(["req-fresh"]);
+    expect(onSend).toHaveBeenCalledWith(expect.objectContaining({ requestId: "req-fresh" }), workspace);
     expect(onSpawn).toHaveBeenCalledTimes(1);
     expect(onSpawn).toHaveBeenCalledWith({ runId: "run-fresh", prompt: "do it" }, workspace);
     expect(onCancel).toHaveBeenCalledTimes(1);
-    expect(onCancel).toHaveBeenCalledWith({ runId: "run-unknown" }, workspace);
+    expect(onCancel).toHaveBeenCalledWith({ runId: "run-cancel-fresh" }, workspace);
   });
 
   it("retries pending spawns until a slot frees", async () => {
-    const { dataDir, workspace } = await fixture();
+    const { workspace } = await fixture();
     await writeLog(workspace, [spawnRequest("run-1", "queued")]);
     const onSpawn = vi.fn<SpawnRequestHandler>(async () => "pending");
-    const bus = setupBus(dataDir, { onSpawn });
+    const bus = setupBus(workspace, { onSpawn });
     await bus.poll();
     expect(onSpawn).toHaveBeenCalledTimes(1);
 
     onSpawn.mockResolvedValue("claimed");
     await bus.poll();
     expect(onSpawn).toHaveBeenCalledTimes(2);
+
     await bus.poll();
     expect(onSpawn).toHaveBeenCalledTimes(2);
   });
 
-  it("reads partial records once the writer completes them", async () => {
-    const { dataDir, workspace } = await fixture();
-    const full = sendRequest("req-partial").trimEnd();
-    await writeLog(workspace, [full.slice(0, full.length - 10)]);
+  it("resumes reading across polls when a record arrives in fragments", async () => {
+    const { workspace } = await fixture();
+    const full = sendRequest("req-split");
+    await writeLog(workspace, [full.slice(0, -10)]);
     const onSend = vi.fn<SendRequestHandler>(async () => undefined);
-    const bus = setupBus(dataDir, { onSend });
+    const bus = setupBus(workspace, { onSend });
 
     await bus.poll();
     expect(onSend).not.toHaveBeenCalled();
 
-    await appendFile(path.join(workspace, ".tg-bot", "system.jsonl"), `${full.slice(-10)}\n`, "utf8");
+    await appendFile(path.join(workspace, ".tg-bot", "events.jsonl"), `${full.slice(-10)}\n`, "utf8");
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
   });
 
-  it("re-reads a truncated log and routes only new commands", async () => {
-    const { dataDir, workspace } = await fixture();
-    const padding = `${JSON.stringify({ v: 1, t: "t", type: "custom", customType: "pad", data: "x".repeat(2_000) })}\n`;
-    await writeLog(workspace, [sendRequest("req-1"), padding]);
+  it("resets offset and reads from the start when events.jsonl is truncated", async () => {
+    const { workspace } = await fixture();
+    const target = path.join(workspace, ".tg-bot", "events.jsonl");
+    await writeFile(target, `${sendRequest("req-1")}${sendRequest("req-2")}`, "utf8");
     const onSend = vi.fn<SendRequestHandler>(async () => undefined);
-    const bus = setupBus(dataDir, { onSend });
+    const bus = setupBus(workspace, { onSend });
 
-    await bus.poll();
-    expect(onSend).toHaveBeenCalledTimes(1);
-
-    // The agent truncated the shared log; the consumed command stays deduped while
-    // the new one is routed.
-    await writeLog(workspace, [sendRequest("req-2")]);
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(2);
-    expect(onSend.mock.calls[1]?.[0]?.requestId).toBe("req-2");
+
+    await truncate(target, 0);
+    await appendFile(target, sendRequest("req-3"), "utf8");
+    await bus.poll();
+    expect(onSend).toHaveBeenCalledTimes(3);
+    expect(onSend).toHaveBeenLastCalledWith(expect.objectContaining({ requestId: "req-3" }), workspace);
   });
 
-  it("flush consumes newly written commands", async () => {
-    const { dataDir, workspace } = await fixture();
-    const onSend = vi.fn<SendRequestHandler>(async () => undefined);
-    const bus = setupBus(dataDir, { onSend });
-
+  it("flushes unconsumed commands synchronously through the flush interface", async () => {
+    const { workspace } = await fixture();
     await writeLog(workspace, [sendRequest("req-1")]);
-    await bus.flush(workspace);
-    expect(onSend).toHaveBeenCalledTimes(1);
-    await bus.flush(workspace);
+    const onSend = vi.fn<SendRequestHandler>(async () => undefined);
+    const bus = setupBus(workspace, { onSend });
+
+    await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
 
-    await appendFile(path.join(workspace, ".tg-bot", "system.jsonl"), sendRequest("req-2"), "utf8");
+    await appendFile(path.join(workspace, ".tg-bot", "events.jsonl"), sendRequest("req-2"), "utf8");
     await bus.flush(workspace);
     expect(onSend).toHaveBeenCalledTimes(2);
   });
 
-  it("survives handler errors without re-emitting", async () => {
-    const { dataDir, workspace } = await fixture();
-    await writeLog(workspace, [sendRequest()]);
-    const onSend = vi.fn<SendRequestHandler>(async () => { throw new Error("handler boom"); });
-    const bus = setupBus(dataDir, { onSend });
+  it("continues polling when a handler throws an error", async () => {
+    const { workspace } = await fixture();
+    await writeLog(workspace, [sendRequest("req-1")]);
+    const errors: unknown[] = [];
+    const bus = setupBus(workspace, {
+      onSend: vi.fn<SendRequestHandler>(async () => { throw new Error("handler threw"); }),
+      logger: (error) => errors.push(error),
+    });
 
     await bus.poll();
-    expect(onSend).toHaveBeenCalledTimes(1);
-    await bus.poll();
-    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toBe("handler threw");
   });
 
-  it("skips a planted symlinked system.jsonl", async () => {
-    const { dataDir, workspace } = await fixture();
+  it("skips a planted symlinked events.jsonl", async () => {
+    const { workspace } = await fixture();
     const target = path.join(workspace, "outside.jsonl");
     await writeFile(target, sendRequest(), "utf8");
-    await symlink(target, path.join(workspace, ".tg-bot", "system.jsonl"));
+    await symlink(target, path.join(workspace, ".tg-bot", "events.jsonl"));
     const onSend = vi.fn<SendRequestHandler>(async () => undefined);
-    const bus = setupBus(dataDir, { onSend });
+    const bus = setupBus(workspace, { onSend });
 
     await bus.poll();
     expect(onSend).not.toHaveBeenCalled();

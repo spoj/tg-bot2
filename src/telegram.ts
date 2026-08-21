@@ -5,10 +5,10 @@ import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } from "grammy/types";
 import type { Config } from "./config.js";
-import type { AgentManager, AgentStatus } from "./agent.js";
+import type { AgentStatus } from "./agent.js";
+import type { EventSink } from "./events.js";
 import { bootstrapAllowedChat, readAllowedFile, type AllowedChat } from "./allowlist.js";
 import { SerialQueue } from "./queue.js";
-import { appendChatEvent, appendSystemEvent, chatEventLine, type ChatEvent } from "./events.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
   WorkspaceOutboxSendMediaGroupRequest,
@@ -688,10 +688,10 @@ async function isChatAllowed(workspace: string, chatId: number): Promise<boolean
  * first chatter; everything else is denied with a chat_denied audit event and no
  * reply. A malformed allow list fails closed.
  */
-async function gateChat(workspace: string, chat: TelegramChatInfo): Promise<boolean> {
+async function gateChat(workspace: string, events: EventSink, chat: TelegramChatInfo): Promise<boolean> {
   const chatId = chat.id;
   if (!Number.isSafeInteger(chatId)) return false;
-  const denied = () => appendSystemEvent(workspace, { type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) });
+  const denied = () => events.emit({ type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) });
   const file = await readAllowedFile(workspace);
   if (file.status === "ready") {
     if (file.chats.some((entry) => entry.chat_id === chatId)) return true;
@@ -707,7 +707,7 @@ async function gateChat(workspace: string, chat: TelegramChatInfo): Promise<bool
     };
     const created = await bootstrapAllowedChat(workspace, entry);
     if (created) {
-      await appendSystemEvent(workspace, {
+      await events.emit({
         type: "chat_allowed",
         chat_id: chatId,
         ...defined({ title: chatTitle(chat) }),
@@ -726,17 +726,14 @@ async function gateChat(workspace: string, chat: TelegramChatInfo): Promise<bool
 
 export function createTelegramBot(
   config: Config,
-  agents: AgentManager,
+  events: EventSink,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
+  statusProvider?: { status(): Promise<AgentStatus> },
 ): Bot {
   const bot = new Bot(config.token);
   const { botDir, workspace } = botPaths(config.dataDir, config.botId);
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
-
-  const wake = (prompt: string): Promise<void> => agents.interrupt(prompt).catch((error) => {
-    console.error("Telegram wake prompt failed", error);
-  });
 
   bot.use(async (ctx, next) => {
     // poll_answer updates carry no chat; their handler routes and gates them.
@@ -745,7 +742,7 @@ export function createTelegramBot(
       await next();
       return;
     }
-    if (!(await gateChat(workspace, chat))) return;
+    if (!(await gateChat(workspace, events, chat))) return;
     await next();
   });
 
@@ -754,9 +751,13 @@ export function createTelegramBot(
   });
 
   bot.command("status", async (ctx) => {
+    if (!statusProvider) {
+      await queuedReply(ctx, "Status is not available.");
+      return;
+    }
     let state: AgentStatus;
     try {
-      state = await agents.status();
+      state = await statusProvider.status();
     } catch (error) {
       console.error("Failed to get status", error);
       await queuedReply(ctx, "I could not get the status. Please try again.");
@@ -768,9 +769,7 @@ export function createTelegramBot(
   bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    const event: ChatEvent = { type: "message", chat_id: chatId, message: ctx.message, attachments };
-    const line = await appendChatEvent(workspace, event) ?? chatEventLine(event);
-    await wake(line);
+    await events.emit({ type: "message", chat_id: chatId, message: ctx.message, attachments });
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
@@ -778,22 +777,19 @@ export function createTelegramBot(
     if (chatId === undefined) return;
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
-    const event: ChatEvent = { type: "callback", chat_id: chatId, callback_query: query };
-    const line = await appendChatEvent(workspace, event) ?? chatEventLine(event);
-    await wake(line);
+    await events.emit({ type: "callback", chat_id: chatId, callback_query: query });
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
     const chatId = await findPollOwnerChat(botDir, answer.poll_id);
     if (chatId === undefined) return;
     if (!(await isChatAllowed(workspace, chatId))) return;
-    void appendChatEvent(workspace, {
+    await events.emit({
       type: "poll_answer",
       chat_id: chatId,
       poll_answer: answer,
     });
   });
-
 
   bot.catch((error) => {
     const cause = error.error;

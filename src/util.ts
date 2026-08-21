@@ -19,6 +19,14 @@ export function isMissing(error: unknown): boolean {
   return errorCode(error) === "ENOENT";
 }
 
+export async function closeQuietly(handle: { close(): Promise<void> }): Promise<void> {
+  try {
+    await handle.close();
+  } catch {
+    // Suppress close errors
+  }
+}
+
 const MAX_DIAGNOSTIC_LENGTH = 1_024;
 
 export function errorMessage(error: unknown): string {

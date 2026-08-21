@@ -122,12 +122,12 @@ describe("application startup and shutdown wiring", () => {
       { workspace: "/canonical-data/bots/123/workspace" },
       expect.objectContaining({ appRoot: expect.any(String), bwrapPath: "/validated/bwrap" }),
     );
-    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as { workspace: string; run: (prompt: string) => unknown };
+    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as { workspace: string; events: unknown };
     expect(schedulerOptions.workspace).toBe("/canonical-data/bots/123/workspace");
-    expect(typeof schedulerOptions.run).toBe("function");
-    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function) }));
+    expect(schedulerOptions.events).toBeDefined();
+    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), events: expect.any(Object) }));
     expect(state.requestBus).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace" }));
-    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace", bwrapPath: "/validated/bwrap", agent: state.agentManager.mock.instances[0] }));
+    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace", bwrapPath: "/validated/bwrap", events: expect.any(Object) }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: ["message", "callback_query", "poll_answer"],
     }));

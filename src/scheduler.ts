@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { appendSystemEvent } from "./events.js";
+import { EVENTS_FILE, type EventSink } from "./events.js";
 import { TG_BOT_DIR, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 
@@ -11,10 +11,10 @@ type ScheduleFile = {
   schedules: ScheduleRow[];
 };
 
-type MaybePromise<T> = T | PromiseLike<T>;
-type WorkspaceSchedulerOptions = {
+export type WorkspaceSchedulerOptions = {
   workspace: string;
-  run: (prompt: string) => MaybePromise<void>;
+  /** Unified event sink for schedule occurrences and fired prompt followups. */
+  events: EventSink;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -46,7 +46,6 @@ const WEEK_MS = 7 * DAY_MS;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
 const SCHEDULES_FILE = "schedules.json";
-const SYSTEM_FILE = "system.jsonl";
 const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
 const UTC_ISO = /Z$/u;
 
@@ -171,13 +170,13 @@ function foldScheduleEvent(state: FoldedSchedules, event: Record<string, unknown
 /**
  * Event-sourced scheduler. schedules.json is agent-owned intent (prompt/start/recurrence
  * rows); the host never writes it. Each occurrence is a UUID-keyed run materialized in
- * system.jsonl: schedule_run_scheduled, schedule_run_fired, schedule_run_cancelled.
+ * events.jsonl: schedule_run_scheduled, schedule_run_fired, schedule_run_cancelled.
  * Every poll replays the log, reconciles it against the file (cancel vanished rows,
  * schedule new ones), and fires due runs.
  */
 export class WorkspaceScheduler {
   private readonly workspace: string;
-  private readonly run: WorkspaceSchedulerOptions["run"];
+  private readonly events: EventSink;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
@@ -194,7 +193,7 @@ export class WorkspaceScheduler {
       throw new Error("Scheduler poll interval must be a positive timer-safe integer");
     }
     this.workspace = path.resolve(options.workspace);
-    this.run = options.run;
+    this.events = options.events;
     this.pollIntervalMs = pollIntervalMs;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
@@ -264,12 +263,12 @@ export class WorkspaceScheduler {
   private async reconcile(workspace: string, metadata: PinnedDirectory, now: number): Promise<void> {
     const rows = await this.readRows(metadata);
     if (rows === undefined) return;
-    const state = foldScheduleEvents(await readJsonl(path.join(metadata.path, SYSTEM_FILE)).catch(() => []));
+    const state = foldScheduleEvents(await readJsonl(path.join(metadata.path, EVENTS_FILE)).catch(() => []));
     const fileKeys = new Set(rows.map(rowKey));
 
     for (const [key, runId] of state.rowRun) {
       if (fileKeys.has(key)) continue;
-      await appendSystemEvent(workspace, { type: "schedule_run_cancelled", runId });
+      await this.events.emit({ type: "schedule_run_cancelled", runId });
       state.open.delete(runId);
       state.rowRun.delete(key);
     }
@@ -282,7 +281,7 @@ export class WorkspaceScheduler {
       const dueAt = previous !== undefined && row.recurrence !== null
         ? advanceRecurring(previous, row.recurrence, now)
         : row.start;
-      await this.scheduleRun(workspace, state, row, dueAt);
+      await this.scheduleRun(state, row, dueAt);
     }
 
     const due = [...state.open]
@@ -292,26 +291,20 @@ export class WorkspaceScheduler {
 
     for (const run of due) {
       if (!state.open.has(run.runId)) continue;
-      try {
-        await this.run(run.prompt);
-      } catch (error) {
-        this.report(new Error(`Schedule run ${run.runId} was not completed`, { cause: error }));
-        continue;
-      }
-      await appendSystemEvent(workspace, { type: "schedule_run_fired", runId: run.runId });
+      await this.events.emit({ type: "schedule_run_fired", runId: run.runId, prompt: run.prompt });
       state.open.delete(run.runId);
       const key = rowKey(run);
       if (state.rowRun.get(key) === run.runId) state.rowRun.delete(key);
       state.firedRows.add(key);
       if (run.recurrence !== null) {
-        await this.scheduleRun(workspace, state, run, advanceRecurring(run.dueAt, run.recurrence, now));
+        await this.scheduleRun(state, run, advanceRecurring(run.dueAt, run.recurrence, now));
       }
     }
   }
 
-  private async scheduleRun(workspace: string, state: FoldedSchedules, row: { prompt: string; start: string; recurrence: Recurrence | null }, dueAt: string): Promise<void> {
+  private async scheduleRun(state: FoldedSchedules, row: { prompt: string; start: string; recurrence: Recurrence | null }, dueAt: string): Promise<void> {
     const run: OpenRun = { runId: randomUUID(), prompt: row.prompt, start: row.start, recurrence: row.recurrence, dueAt };
-    await appendSystemEvent(workspace, {
+    await this.events.emit({
       type: "schedule_run_scheduled",
       runId: run.runId,
       prompt: run.prompt,

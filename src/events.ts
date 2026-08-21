@@ -82,6 +82,28 @@ export type BotEvent =
     /** A scheduled occurrence was retired because its row vanished or changed in schedules.json. */
     type: "schedule_run_cancelled";
     runId: string;
+  }
+  | {
+    /** A browser tab was created / attached. */
+    type: "browser_tab_opened";
+    tabId: string;
+    targetId?: string | undefined;
+    url?: string | undefined;
+  }
+  | {
+    /** A browser tab navigation settled on a destination URL and title. */
+    type: "browser_tab_navigated";
+    tabId: string;
+    url: string;
+    title?: string | undefined;
+  }
+  | {
+    /** A browser tab was closed (explicitly by agent, or evicted by host after idle timeout). */
+    type: "browser_tab_closed";
+    tabId: string;
+    reason: "explicit" | "idle_timeout" | "process_exit";
+    url?: string | undefined;
+    durationMs?: number | undefined;
   };
 
 export const EVENTS_FILE = "events.jsonl";

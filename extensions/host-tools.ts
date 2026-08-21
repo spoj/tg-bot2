@@ -12,13 +12,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  */
 
 const SEND_SCHEMA = Type.Object({
-  chat_id: Type.Number({ description: "The Telegram chat id to send to; must be on the allow list" }),
-  type: Type.String({ description: "Request type: send_file, send_media_group, send_message, send_location, send_poll, stop_poll, send_reaction, edit_message, or delete_message" }),
-  path: Type.Optional(Type.String()),
+  chat_id: Type.Number({ description: "The Telegram chat id to send to (from incoming events or allowed list); direct assistant text is not delivered to Telegram" }),
+  type: Type.String({ description: "Request type: send_message, send_file, send_media_group, send_location, send_poll, stop_poll, send_reaction, edit_message, or delete_message" }),
+  path: Type.Optional(Type.String({ description: "Workspace file path for send_file (relative or /workspace/...)" })),
   caption: Type.Optional(Type.String()),
   kind: Type.Optional(Type.String()),
-  text: Type.Optional(Type.String()),
-  parse_mode: Type.Optional(Type.String()),
+  text: Type.Optional(Type.String({ description: "Message text for send_message or edit_message" })),
+  parse_mode: Type.Optional(Type.String({ description: "Optional formatting: 'HTML' or 'MarkdownV2' (omit for plain text)" })),
   entities: Type.Optional(Type.Array(Type.Any())),
   link_preview_options: Type.Optional(Type.Any()),
   reply_markup: Type.Optional(Type.Any()),
@@ -60,7 +60,7 @@ function failure(error: unknown): ToolResult {
 const HOST_TOOLS = {
   send: {
     label: "Send Telegram message",
-    description: "Queue one Telegram send: a message, file, media album, location, poll, reaction, edit, or delete. The host validates and delivers it; failures arrive as followup messages.",
+    description: "Send a message, file, media album, location, poll, reaction, edit, or delete to a Telegram chat. You MUST use this tool to communicate with users on Telegram — direct assistant text output is not delivered to Telegram chats. The host validates and delivers it; failures arrive as followup messages.",
     parameters: SEND_SCHEMA,
     execute: (request: Record<string, unknown>): ToolResult => {
       const requestId = randomUUID();
@@ -74,8 +74,8 @@ const HOST_TOOLS = {
   },
   spawn: {
     label: "Spawn background task",
-    description: "Start a background task with a fresh Pi agent. Include the complete prompt; the result arrives as a followup message when the task settles.",
-    parameters: Type.Object({ prompt: Type.String({ description: "The complete prompt for the task agent" }) }),
+    description: "Start an autonomous background task with a fresh Pi agent in the workspace. Pass a complete self-contained prompt. The result arrives as a followup message when the task settles; cancel it anytime with the cancel tool.",
+    parameters: Type.Object({ prompt: Type.String({ description: "The complete prompt with all instructions and context for the background task agent" }) }),
     execute: (params: { prompt: string }): ToolResult => {
       const runId = randomUUID();
       try {
@@ -88,8 +88,8 @@ const HOST_TOOLS = {
   },
   cancel: {
     label: "Cancel background task",
-    description: "Stop a running background task, identified by the runId the spawn tool returned.",
-    parameters: Type.Object({ runId: Type.String({ description: "The task run UUID" }) }),
+    description: "Stop a running background task by the runId returned by the spawn tool. The task is aborted and its settle followup arrives with aborted status.",
+    parameters: Type.Object({ runId: Type.String({ description: "The task run UUID returned by the spawn tool" }) }),
     execute: (params: { runId: string }): ToolResult => {
       try {
         appendCommand({ type: "cancel_request", runId: params.runId });

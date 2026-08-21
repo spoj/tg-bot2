@@ -196,10 +196,12 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
 }
 
 export const OUTBOX_PROMPT = `To send files or messages through Telegram, call the send tool once per send with the
-request object as its argument. Every request object requires chat_id: the numeric
-Telegram chat to send to — the chat_id of the chat event you are answering, or any
-other chat on your allow list (/workspace/.tg-bot/allowed.json). The host rejects
-sends to chats that are not allowed. Request types:
+request object as its argument. Direct assistant text output is not delivered to Telegram
+chats — calling the send tool is the only way to reply to users or send messages. Every
+request object requires chat_id: the numeric Telegram chat to send to — the chat_id of the
+chat event you are answering, or any other chat on your allow list
+(/workspace/.tg-bot/allowed.json). The host rejects sends to chats that are not allowed.
+Request types:
 {type:"send_file",chat_id,path,caption?,kind?,reply_to_message_id?,disable_notification?}
 sends the file at path (relative to /workspace or an absolute /workspace/... path)
 with an optional caption; kind is "auto" (default: images are sent as photos,

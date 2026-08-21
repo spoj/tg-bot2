@@ -6,6 +6,7 @@ import { WorkspaceScheduler } from "./scheduler.js";
 import { WorkspaceRequestBus } from "./request-bus.js";
 import { WorkspaceTasks } from "./task.js";
 import type { Bot } from "grammy";
+import { HostBrowserManager } from "./browser.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
 import { EventSink } from "./events.js";
 import { botPaths } from "./util.js";
@@ -24,6 +25,7 @@ export interface DisposableServices {
   requestBus: Pick<WorkspaceRequestBus, "stop">;
   tasks: Pick<WorkspaceTasks, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
+  browser?: Pick<HostBrowserManager, "stop">;
 }
 
 export interface BotInstance {
@@ -35,6 +37,7 @@ export interface BotInstance {
   requestBus: WorkspaceRequestBus;
   tasks: WorkspaceTasks;
   delivery: TelegramDeliveryQueue;
+  browser: HostBrowserManager;
 }
 
 // Stops the scheduler, request bus, and tasks, disposes agents, terminates
@@ -70,6 +73,13 @@ export async function finishDisposal(services: DisposableServices): Promise<void
     await services.delivery.drain();
   } catch (error) {
     console.error("Telegram delivery drain failed", error);
+  }
+  if (services.browser) {
+    try {
+      await services.browser.stop();
+    } catch (error) {
+      console.error("Browser shutdown failed", error);
+    }
   }
 }
 
@@ -112,6 +122,8 @@ export async function main(): Promise<void> {
     });
     tasksInstance.flush = requestBus;
 
+    const browserManager = new HostBrowserManager({ workspace });
+
     return {
       config: runtimeConfig,
       paths,
@@ -121,6 +133,7 @@ export async function main(): Promise<void> {
       requestBus,
       tasks: tasksInstance,
       delivery: deliveryQueue,
+      browser: browserManager,
     };
   });
 
@@ -167,6 +180,15 @@ export async function main(): Promise<void> {
         return;
       }
       await instance.requestBus.start();
+      if (shuttingDown) {
+        await shutdown("startup interrupted");
+        return;
+      }
+      try {
+        await instance.browser.start();
+      } catch (error) {
+        console.error(`Browser startup failed for bot ${instance.config.botId}`, error);
+      }
       if (shuttingDown) {
         await shutdown("startup interrupted");
         return;

@@ -23,6 +23,7 @@ so relay anything user-facing you want to control yourself.
 export const TASK_RUNNER_PROMPT = `You are a background task agent spawned by a persistent Telegram personal agent. You work
 in its /workspace with your own separate session. Complete the assigned task fully and
 autonomously; your final message is captured as your report, so end with a complete
-answer. You have a send tool that queues Telegram messages to the user; the host delivers
-each call, so use it for progress updates or to send the final result.
+answer. You have a send tool that queues Telegram messages to the user; direct assistant
+text output is not delivered to Telegram chats, so call the send tool if you need to send
+progress updates or message a chat directly.
 `;

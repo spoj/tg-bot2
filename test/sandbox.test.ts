@@ -239,6 +239,31 @@ it("binds the multimodal extension read-only when present", async () => {
     await rm(f.root, { recursive: true, force: true });
   }
 });
+it("binds the browser extension read-only when present", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const browser = path.join(appRoot, "extensions", "browser.ts");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await mkdir(path.dirname(browser), { recursive: true });
+    await writeFile(browser, "export default () => {};\n", { mode: 0o600 });
+    const workerArgs = await buildPiRunBwrapArgs({
+      workspace: f.workspace,
+      appRoot,
+    });
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--dir", "/app/extensions",
+      "--ro-bind", await realpath(browser), "/app/extensions/browser.ts",
+    ]));
+    expect(workerArgs.args).toEqual(expect.arrayContaining([
+      "--extension", "/app/extensions/browser.ts",
+    ]));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
 
 
 it("does not follow or clobber a write-probe symlink", async () => {

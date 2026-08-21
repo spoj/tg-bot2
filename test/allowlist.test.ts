@@ -98,4 +98,34 @@ describe("allowlist", () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
+
+  it("seeds from events.jsonl across reboots and does not re-emit if unchanged", async () => {
+    const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    resetAllowlistCache(workspace);
+    try {
+      await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
+      await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), JSON.stringify([10, 20]));
+
+      const eventsFile = path.join(workspace, ".tg-bot", "events.jsonl");
+      // Pre-seed events.jsonl with matching allowlist_updated event
+      await writeFile(eventsFile, `${JSON.stringify({ v: 1, t: new Date().toISOString(), type: "allowlist_updated", chats: [10, 20] })}\n`);
+
+      const events: Record<string, unknown>[] = [];
+      const fakeEvents = {
+        emit: (event: Record<string, unknown>) => {
+          events.push(event);
+          return Promise.resolve();
+        },
+      } as unknown as EventSink;
+
+      // Reset in-memory cache to simulate fresh process boot
+      resetAllowlistCache(workspace);
+
+      expect(await syncAllowlist(workspace, fakeEvents)).toEqual([10, 20]);
+      expect(events).toHaveLength(0); // No event emitted because log already has [10, 20]
+    } finally {
+      resetAllowlistCache(workspace);
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 });

@@ -1,8 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { errorCode, TG_BOT_DIR } from "./util.js";
-import type { EventSink } from "./events.js";
-
+import { errorCode, readJsonl, TG_BOT_DIR } from "./util.js";
+import { EVENTS_FILE, type EventSink } from "./events.js";
 /**
  * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, containing an array of safe integer chat IDs.
  * The host enforces it both ways and emits `allowlist_updated` whenever changes are detected.
@@ -71,9 +70,26 @@ export function resetAllowlistCache(workspace?: string): void {
   else lastEmittedAllowlists.clear();
 }
 
+async function lastLoggedAllowlist(workspace: string): Promise<string | undefined> {
+  try {
+    const lines = await readJsonl(path.join(workspace, TG_BOT_DIR, EVENTS_FILE));
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line) continue;
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed.type === "allowlist_updated" && Array.isArray(parsed.chats)) {
+        return JSON.stringify(parsed.chats);
+      }
+    }
+  } catch {
+    // Missing or empty file
+  }
+  return undefined;
+}
+
 /**
  * Synchronizes the allow list: reads `allowed.json`, compares against the last emitted
- * state for this workspace, and emits `allowlist_updated` if changed.
+ * state (seeded from `events.jsonl` on first check), and emits `allowlist_updated` if changed.
  */
 export async function syncAllowlist(workspace: string, events?: EventSink): Promise<number[] | null> {
   const file = await readAllowedFile(workspace);
@@ -86,6 +102,13 @@ export async function syncAllowlist(workspace: string, events?: EventSink): Prom
   }
 
   const serialized = JSON.stringify(file.chats);
+  if (!lastEmittedAllowlists.has(workspace)) {
+    const logged = await lastLoggedAllowlist(workspace);
+    if (logged !== undefined) {
+      lastEmittedAllowlists.set(workspace, logged);
+    }
+  }
+
   const previous = lastEmittedAllowlists.get(workspace);
   if (previous !== serialized) {
     lastEmittedAllowlists.set(workspace, serialized);

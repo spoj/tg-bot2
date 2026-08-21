@@ -18,7 +18,18 @@ const state = vi.hoisted(() => {
     order,
     agents,
     bot,
-    config: { token: "123:token", botId: 123, dataDir: "/requested" },
+    config: {
+      dataDir: "/requested",
+      bots: [
+        {
+          token: "123:token",
+          botId: 123,
+          dataDir: "/requested",
+          botDir: "/requested/bots/123",
+          workspace: "/requested/bots/123/workspace",
+        },
+      ],
+    },
     sandbox: { dataDir: "/canonical-data", bwrapPath: "/validated/bwrap" },
     signalHandlers: {} as Record<string, () => void>,
     checkSandboxEnvironment: vi.fn(),
@@ -65,7 +76,7 @@ const state = vi.hoisted(() => {
 });
 
 vi.mock("../src/config.js", () => ({
-  parseConfig: () => state.config,
+  loadConfig: async () => state.config,
 }));
 vi.mock("../src/sandbox.js", () => ({
   checkSandboxEnvironment: state.checkSandboxEnvironment,
@@ -167,6 +178,36 @@ describe("application startup and shutdown wiring", () => {
     expect(isIntentionalSignalAbort(new Error("Telegram polling failed"))).toBe(false);
     expect(isIntentionalSignalAbort(new Error("Aborted delay"))).toBe(true);
     expect(isIntentionalSignalAbort(Object.assign(new Error("cancelled"), { name: "AbortError" }))).toBe(true);
+  });
+
+  it("starts and stops all configured bots when multiple bots exist", async () => {
+    const start1 = deferred<void>();
+    const start2 = deferred<void>();
+    state.config = {
+      dataDir: "/requested",
+      bots: [
+        { token: "100:token100", botId: 100, dataDir: "/requested", botDir: "/requested/bots/100", workspace: "/requested/bots/100/workspace" },
+        { token: "200:token200", botId: 200, dataDir: "/requested", botDir: "/requested/bots/200", workspace: "/requested/bots/200/workspace" },
+      ],
+    };
+    let callCount = 0;
+    const index = await importIndex(() => {
+      state.bot.start.mockImplementation(() => {
+        callCount++;
+        return callCount === 1 ? start1.promise : start2.promise;
+      });
+    });
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledTimes(2));
+    expect(state.agentManager).toHaveBeenCalledTimes(2);
+    expect(state.scheduler).toHaveBeenCalledTimes(2);
+    expect(state.requestBus).toHaveBeenCalledTimes(2);
+    expect(state.tasks).toHaveBeenCalledTimes(2);
+
+    state.signalHandlers.SIGINT?.();
+    await vi.waitFor(() => expect(state.bot.stop).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(state.agents.beginShutdown).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(state.agents.disposeAll).toHaveBeenCalledTimes(2));
   });
 });
 

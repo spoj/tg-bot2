@@ -11,17 +11,19 @@ Personal Telegram agent. The trusted host process owns the Telegram token; every
 
 ```sh
 pnpm install
-cp .env.example .env        # TG_BOT_TOKEN, DATA_DIR
-set -a; . ./.env; set +a
+# Add a bot under ~/.local/share/tg-bot2/bots/<botId>/auth.json (or DATA_DIR/bots/<botId>/auth.json)
+mkdir -p ~/.local/share/tg-bot2/bots/<botId>
+echo '{"token": "<TG_BOT_TOKEN>"}' > ~/.local/share/tg-bot2/bots/<botId>/auth.json
+chmod 600 ~/.local/share/tg-bot2/bots/<botId>/auth.json
 pnpm build
 pnpm start
 ```
 
-Provider credentials go under `DATA_DIR/workspace/.pi/agent/` before the first prompt. A systemd unit example lives at `deploy/tg-bot2.service.example`.
+A single instance listens to all bots found in `$DATA_DIR/bots/` (defaults to `~/.local/share/tg-bot2`). Provider credentials go under `DATA_DIR/bots/<botId>/workspace/.pi/agent/` before the first prompt. A systemd unit example lives at `deploy/tg-bot2.service.example`.
 
 ## Chat access
 
-One agent serves several Telegram chats — private chats and groups — from one workspace. The agent owns its allow list at `DATA_DIR/workspace/.tg-bot/allowed.json`; the host enforces it in both directions. The first chat that ever messages the bot is added automatically, and the agent manages every later change.
+Each bot serves several Telegram chats — private chats and groups — from its own workspace. The bot's agent owns its allow list at `DATA_DIR/bots/<botId>/workspace/.tg-bot/allowed.json`; the host enforces it in both directions. The first chat that ever messages the bot is added automatically, and the agent manages every later change.
 
 ## Key entry points
 

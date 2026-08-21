@@ -709,6 +709,23 @@ async function isChatAllowed(workspace: string, chatId: number, events?: EventSi
   return allowed !== null && allowed.includes(chatId);
 }
 
+const recentKnockTimestamps = new Map<number, number>();
+const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
+
+/** Resets the knock cooldown cache (used for test isolation). */
+export function resetKnockCache(): void {
+  recentKnockTimestamps.clear();
+}
+
+function shouldNotifyKnock(chatId: number): boolean {
+  if (chatId <= 0) return false;
+  const now = Date.now();
+  const last = recentKnockTimestamps.get(chatId) ?? 0;
+  if (now - last < KNOCK_COOLDOWN_MS) return false;
+  recentKnockTimestamps.set(chatId, now);
+  return true;
+}
+
 /**
  * The ingress gate: allowed chats pass; everything else is denied with a chat_denied
  * audit event and no reply. A missing or malformed allow list fails closed.
@@ -716,7 +733,10 @@ async function isChatAllowed(workspace: string, chatId: number, events?: EventSi
 async function gateChat(workspace: string, events: EventSink, chat: TelegramChatInfo): Promise<boolean> {
   const chatId = chat.id;
   if (!Number.isSafeInteger(chatId)) return false;
-  const denied = () => events.emit({ type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) });
+  const denied = () => events.emit(
+    { type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) },
+    { notify: shouldNotifyKnock(chatId) },
+  );
 
   const allowed = await syncAllowlist(workspace, events);
   if (allowed && allowed.includes(chatId)) {

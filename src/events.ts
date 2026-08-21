@@ -147,8 +147,16 @@ export class EventSink {
       case "schedule_run_fired":
         await this.notifier!.followup(event.prompt);
         break;
+      case "chat_denied": {
+        if (event.chat_id > 0) {
+          const title = event.title ? ` ("${event.title}")` : "";
+          const message = `Access denied for private chat ${event.chat_id}${title}. To allow, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`;
+          await this.notifier!.followup(message);
+        }
+        break;
+      }
       default:
-        // outbox_sent, poll_answer, allowlist_updated, chat_denied, schedule_run_scheduled, schedule_run_cancelled
+        // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled
         break;
     }
   }

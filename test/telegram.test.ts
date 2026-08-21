@@ -27,7 +27,7 @@ import {
 import type { AgentStatus } from "../src/agent.js";
 import { appendEvents, EventSink } from "../src/events.js";
 import { botPaths } from "../src/util.js";
-import { isMessageDirectedToBot } from "../src/telegram.js";
+import { isMessageDirectedToBot, resetKnockCache } from "../src/telegram.js";
 import { resetAllowlistCache } from "../src/allowlist.js";
 
 const execFile = promisify(execFileCallback);
@@ -51,15 +51,16 @@ function fakeBot() {
     },
   } as unknown as Bot;
 }
-
 async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
   const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-"));
   resetAllowlistCache();
+  resetKnockCache();
   try {
     await writeAllowedChats(workspace, [42]);
     await run(workspace);
   } finally {
     resetAllowlistCache();
+    resetKnockCache();
     await rm(workspace, { recursive: true, force: true });
   }
 }
@@ -109,11 +110,12 @@ let sentRequests: Array<{ url: string; body: string }> = [];
 
 async function makeTestBot(
   dataDir: string,
-  agents: { interrupt: Mock<(text: string) => Promise<void>> },
+  agents: { interrupt: Mock<(text: string) => Promise<void>>; followup?: Mock<(text: string) => Promise<void>> },
   { fetchResult, recordRequests = false }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean } = {},
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
-  const events = new EventSink(workspaceDir(dataDir), { interrupt: agents.interrupt, followup: vi.fn(async () => undefined) });
+  const followup = agents.followup ?? vi.fn(async () => undefined);
+  const events = new EventSink(workspaceDir(dataDir), { interrupt: agents.interrupt, followup });
   const bot = createTelegramBot(
     { token: "999:test-token", botId: 999, dataDir },
     events,
@@ -1121,6 +1123,38 @@ describe("Telegram ingress gate", () => {
       const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
       expect(denied).toHaveLength(1);
       expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 999, title: "Secret Group" });
+    });
+  });
+
+  it("notifies agent on first knock from private chat and rate limits repeated knocks", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const interrupt = vi.fn(async () => undefined);
+      const followup = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt, followup });
+
+      // First knock from stranger 999
+      await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(followup).toHaveBeenCalledTimes(1);
+      expect(followup).toHaveBeenCalledWith(expect.stringContaining("Access denied for private chat 999"));
+
+      // Second knock from stranger 999 (rate limited, no extra followup)
+      await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
+      expect(followup).toHaveBeenCalledTimes(1);
+
+      // Knock from unlisted group -500 (silently logged, no followup)
+      await bot.handleUpdate({
+        update_id: 10,
+        message: {
+          message_id: 1,
+          date: 100,
+          chat: { id: -500, type: "group", title: "Random Group" },
+          from: { id: 777, is_bot: false, first_name: "Bob" },
+          text: "hello",
+        },
+      } as never);
+      expect(followup).toHaveBeenCalledTimes(1);
     });
   });
 

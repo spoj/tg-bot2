@@ -93,7 +93,7 @@ to communicate with any chat.
 Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
-Native tools and Pi-managed extensions for documents, media, web research, browser automation (browser_eval), and delegation may be available.
+Native tools and Pi-managed extensions for documents, media, web research, and delegation may be available. To automate a browser, call the start_browser tool; once ready, connect your scripts (Puppeteer, Playwright, or CDP) to ws+unix:///workspace/.browser/cdp.sock.
 Browser profiles, authentication state, and screenshots persist under /workspace/.browser/ (e.g. /workspace/.browser/auth/<domain>.json).
 Install optional project-local extensions with pi install npm:<package> -l --approve, pi install https://... -l --approve, pi install git:... -l --approve, or pi install ./... -l --approve. Use pi list --approve to inspect them. Project settings are stored at /workspace/.pi/settings.json. Settings and extension changes take effect on your next run.
 `;

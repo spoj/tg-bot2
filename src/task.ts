@@ -154,7 +154,7 @@ export class WorkspaceTasks {
       appRoot: this.appRoot,
       ...defined({ bwrapPath: this.bwrapPath }),
       appendSystemPrompt: TASK_RUNNER_PROMPT,
-      hostTools: "send",
+      hostTools: "send,start_browser",
       message: workerOptions.prompt,
       resume: false,
       sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,

@@ -84,26 +84,28 @@ export type BotEvent =
     runId: string;
   }
   | {
-    /** A browser tab was created / attached. */
-    type: "browser_tab_opened";
-    tabId: string;
-    targetId?: string | undefined;
-    url?: string | undefined;
+    /** Agent requested a browser instance via start_browser. */
+    type: "browser_requested";
+    requestId: string;
   }
   | {
-    /** A browser tab navigation settled on a destination URL and title. */
-    type: "browser_tab_navigated";
-    tabId: string;
-    url: string;
-    title?: string | undefined;
+    /** Browser instance is running and accepting CDP connections on the UNIX socket. */
+    type: "browser_ready";
+    requestId?: string | undefined;
+    status: "started" | "existing";
+    socketPath: string;
+    wsEndpoint: string;
   }
   | {
-    /** A browser tab was closed (explicitly by agent, or evicted by host after idle timeout). */
-    type: "browser_tab_closed";
-    tabId: string;
-    reason: "explicit" | "idle_timeout" | "process_exit";
-    url?: string | undefined;
-    durationMs?: number | undefined;
+    /** Host failed to launch Chrome (binary missing, spawn error, socket error, etc.). */
+    type: "browser_request_failed";
+    requestId: string;
+    error: string;
+  }
+  | {
+    /** Browser instance terminated and UNIX socket was cleaned up. */
+    type: "browser_closed";
+    reason: "idle_timeout" | "agent_close" | "process_exit" | "host_shutdown";
   };
 
 export const EVENTS_FILE = "events.jsonl";
@@ -177,8 +179,16 @@ export class EventSink {
         }
         break;
       }
+      case "browser_ready": {
+        const statusLabel = event.status === "started" ? "started" : "reused existing";
+        await this.notifier!.followup(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`);
+        break;
+      }
+      case "browser_request_failed":
+        await this.notifier!.followup(`Browser request ${event.requestId} failed: ${event.error}`);
+        break;
       default:
-        // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled
+        // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_requested, browser_closed
         break;
     }
   }
@@ -255,6 +265,7 @@ Commands (written by your tools to the same events.jsonl log; the host processes
 - spawn_request: {v:1,t,type:'spawn_request',runId,prompt} queued by the spawn tool;
   runId is the UUID the tool returns to you.
 - cancel_request: {v:1,t,type:'cancel_request',runId} queued by the cancel tool.
+- browser_requested: {v:1,t,type:'browser_requested',requestId} queued by the start_browser tool.
 Outcomes (host-written, exactly one terminal event per command):
 - outbox_sent: {v:1,t,type:'outbox_sent',requestId,chat_id,messageId?,pollId?,data?}
   when Telegram accepts it, whether or not it returned a message id; data is the raw
@@ -276,6 +287,12 @@ Outcomes (host-written, exactly one terminal event per command):
 - chat_denied: {v:1,t,type:'chat_denied',chat_id,title?} when a message, button press,
   or poll vote arrived from a chat your allow list does not include; the host dropped
   it without interrupting you. Read these to decide whether to allow a chat.
+- browser_ready: {v:1,t,type:'browser_ready',requestId?,status,socketPath,wsEndpoint} when
+  Chrome is running and accepting CDP WebSocket connections on the UNIX domain socket.
+- browser_request_failed: {v:1,t,type:'browser_request_failed',requestId,error} when
+  the host fails to launch Chrome.
+- browser_closed: {v:1,t,type:'browser_closed',reason} when Chrome exits (idle_timeout,
+  agent_close, process_exit, host_shutdown).
 Every send_request is followed by exactly one outbox_sent or outbox_rejected; every
 spawn_request (and cancel) by exactly one task_settled. Grep events.jsonl for chat
 history, commands, and host activity.

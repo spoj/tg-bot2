@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import fs from "node:fs";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * Host-tools extension: send/spawn/cancel tools that append one command record to the
- * shared /workspace/.tg-bot/system.jsonl log. The host tails that log, validates each
+ * Host-tools extension: send/spawn/cancel/start_browser tools that append one command record
+ * to the shared /workspace/.tg-bot/events.jsonl log. The host tails that log, validates each
  * command, and performs the real work; the tool mints the UUID and returns it, so the
  * agent gets its correlation id in-context. PI_HOST_TOOLS selects which tools a run
- * exposes (chat runs: send,spawn,cancel; task runs: send).
+ * exposes (chat runs: send,spawn,cancel,start_browser; task runs: send,start_browser).
  */
 
 const SEND_SCHEMA = Type.Object({
@@ -46,7 +46,7 @@ type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Rec
 /** Appends one command line to events.jsonl; a single O_APPEND write, atomic across processes. */
 function appendCommand(record: Record<string, unknown>): void {
   const line = `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...record })}\n`;
-  appendFileSync("/workspace/.tg-bot/events.jsonl", line, { encoding: "utf8", mode: 0o600 });
+  fs.appendFileSync("/workspace/.tg-bot/events.jsonl", line, { encoding: "utf8", mode: 0o600 });
 }
 
 function text(content: string): ToolResult {
@@ -94,6 +94,20 @@ const HOST_TOOLS = {
       try {
         appendCommand({ type: "cancel_request", runId: params.runId });
         return text(`Cancel requested for ${params.runId}; the host stops the task if it is still running.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  start_browser: {
+    label: "Start browser",
+    description: "Request a headless Chrome browser instance. The host launches Chrome with pipe transport and proxies it to a workspace UNIX domain socket (/workspace/.browser/cdp.sock), then emits a browser_ready event with the connection handle.",
+    parameters: Type.Object({}),
+    execute: (): ToolResult => {
+      const requestId = randomUUID();
+      try {
+        appendCommand({ type: "browser_requested", requestId });
+        return text(`Browser requested (ID: ${requestId}). A browser_ready event will arrive once Chrome and the socket proxy are ready.`);
       } catch (error) {
         return failure(error);
       }

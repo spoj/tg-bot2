@@ -114,16 +114,15 @@ export async function main(): Promise<void> {
       spawnProcess,
       terminateProcessGroup,
     });
+    const browserManager = new HostBrowserManager({ workspace, events: eventSink });
     const requestBus = new WorkspaceRequestBus({
       workspace,
       onSend: (record, ws) => outboxInstance.handleSendRequest(record, ws),
       onSpawn: (record, ws) => tasksInstance.handleSpawnRequest(record, ws),
       onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
+      onStartBrowser: (record) => browserManager.handleStartBrowserRequest(record).then(() => {}),
     });
     tasksInstance.flush = requestBus;
-
-    const browserManager = new HostBrowserManager({ workspace });
-
     return {
       config: runtimeConfig,
       paths,
@@ -185,9 +184,9 @@ export async function main(): Promise<void> {
         return;
       }
       try {
-        await instance.browser.start();
+        await instance.browser.cleanupStaleArtifacts();
       } catch (error) {
-        console.error(`Browser startup failed for bot ${instance.config.botId}`, error);
+        console.error(`Browser artifact cleanup failed for bot ${instance.config.botId}`, error);
       }
       if (shuttingDown) {
         await shutdown("startup interrupted");

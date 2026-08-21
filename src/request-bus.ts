@@ -21,6 +21,10 @@ export type CancelRequest = {
   runId: string;
 };
 
+/** One browser_requested command: the agent's tool minted requestId. */
+export type StartBrowserRequest = {
+  requestId: string;
+};
 /** Consumes one send_request; `resume` means the command was claimed but its dispatch never reached a terminal event. */
 export type SendRequestHandler = (
   record: SendRequest,
@@ -35,11 +39,15 @@ export type SpawnRequestHandler = (
 /** Consumes one cancel_request; a command naming an unknown or settled run is a no-op. */
 export type CancelRequestHandler = (record: CancelRequest, workspace: string) => Promise<void>;
 
+/** Consumes one browser_requested command to start Chrome and the socket bridge. */
+export type StartBrowserRequestHandler = (record: StartBrowserRequest, workspace: string) => Promise<void>;
+
 export type WorkspaceRequestBusOptions = {
   workspace: string;
   onSend: SendRequestHandler;
   onSpawn: SpawnRequestHandler;
   onCancel: CancelRequestHandler;
+  onStartBrowser?: StartBrowserRequestHandler;
   pollIntervalMs?: number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
@@ -66,12 +74,14 @@ type ChatScanState = {
 };
 
 function commandId(type: string, record: Record<string, unknown>): string | undefined {
-  const id = record[type === "send_request" ? "requestId" : "runId"];
+  const id = record[type === "send_request" || type === "browser_requested" ? "requestId" : "runId"];
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
+export type CommandRequest = SendRequest | SpawnRequest | CancelRequest | StartBrowserRequest;
+
 /** Parses one system.jsonl line into a command record; undefined for outcomes, junk, or malformed commands. */
-export function parseCommand(line: string): SendRequest | SpawnRequest | CancelRequest | undefined {
+export function parseCommand(line: string): CommandRequest | undefined {
   if (line.length > MAX_RECORD_BYTES) return undefined;
   let record: unknown;
   try {
@@ -89,6 +99,7 @@ export function parseCommand(line: string): SendRequest | SpawnRequest | CancelR
     return typeof prompt === "string" ? { runId: id, prompt } : undefined;
   }
   if (typed.type === "cancel_request") return { runId: id };
+  if (typed.type === "browser_requested") return { requestId: id };
   return undefined;
 }
 
@@ -266,7 +277,13 @@ export class WorkspaceRequestBus {
         : typeof typed.runId === "string" && typed.runId.length > 0 ? typed.runId
           : undefined;
       if (id === undefined) continue;
-      if (typed.type === "outbox_sent" || typed.type === "outbox_rejected" || typed.type === "task_settled") {
+      if (
+        typed.type === "outbox_sent" ||
+        typed.type === "outbox_rejected" ||
+        typed.type === "task_settled" ||
+        typed.type === "browser_ready" ||
+        typed.type === "browser_request_failed"
+      ) {
         state.bootConsumed.add(id);
       }
     }
@@ -311,11 +328,17 @@ export class WorkspaceRequestBus {
       await this.route(workspace, state, record);
     }
   }
-  private async route(workspace: string, state: ChatScanState, record: SendRequest | SpawnRequest | CancelRequest): Promise<void> {
+  private async route(workspace: string, state: ChatScanState, record: CommandRequest): Promise<void> {
     const id = "requestId" in record ? record.requestId : record.runId;
     if (state.consumed.has(id)) return;
     if (state.bootConsumed.has(id)) {
       state.consumed.add(id);
+      return;
+    }
+    if ("request" in record) {
+      // send_request
+      state.consumed.add(id);
+      await this.invoke(() => this.options.onSend(record, workspace));
       return;
     }
     if ("prompt" in record) {
@@ -325,10 +348,12 @@ export class WorkspaceRequestBus {
       else state.pending.push(record);
       return;
     }
-    if ("request" in record) {
-      // send_request
+    if ("requestId" in record) {
+      // browser_requested
       state.consumed.add(id);
-      await this.invoke(() => this.options.onSend(record, workspace));
+      if (this.options.onStartBrowser) {
+        await this.invoke(() => this.options.onStartBrowser!(record, workspace));
+      }
       return;
     }
     // cancel_request

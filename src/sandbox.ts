@@ -12,16 +12,24 @@ export { spawnProcess };
 /** Terminate the process group, then the child if needed. */
 export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid !== undefined && child.pid > 0) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // The group may exit before signalling.
-    }
+    terminatePid(child.pid, signal);
+    return;
   }
   try { child.kill(signal); } catch { /* already exited */ }
 }
 
+/** Terminate a process group by PID, then the PID itself if needed. */
+export function terminatePid(pid: number, signal: NodeJS.Signals): void {
+  if (pid > 0) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // The group may exit before signalling.
+    }
+    try { process.kill(pid, signal); } catch { /* already exited */ }
+  }
+}
 export type SandboxPaths = { workspace: string; sessions: string; readOnlyPaths?: string[] };
 export type SandboxRequest = {
   executable: string;
@@ -154,13 +162,12 @@ type ExtensionConfig = {
   hostToolsExtension: string | undefined;
   hostTools: string | undefined;
   multimodalExtension: string | undefined;
-  browserExtension: string | undefined;
 };
 
 function buildExtensionMountArgs(config: ExtensionConfig): { mountArgs: string[]; cliArgs: string[] } {
   const mountArgs: string[] = [];
   const cliArgs: string[] = [];
-  if (config.hostToolsExtension !== undefined || config.multimodalExtension !== undefined || config.browserExtension !== undefined) {
+  if (config.hostToolsExtension !== undefined || config.multimodalExtension !== undefined) {
     mountArgs.push("--dir", "/app/extensions");
   }
   if (config.hostToolsExtension !== undefined) {
@@ -173,10 +180,6 @@ function buildExtensionMountArgs(config: ExtensionConfig): { mountArgs: string[]
   if (config.multimodalExtension !== undefined) {
     mountArgs.push("--ro-bind", config.multimodalExtension, "/app/extensions/multimodal.ts");
     cliArgs.push("--extension", "/app/extensions/multimodal.ts");
-  }
-  if (config.browserExtension !== undefined) {
-    mountArgs.push("--ro-bind", config.browserExtension, "/app/extensions/browser.ts");
-    cliArgs.push("--extension", "/app/extensions/browser.ts");
   }
   return { mountArgs, cliArgs };
 }
@@ -214,12 +217,10 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     ? undefined
     : await requireHostToolsExtension(appRoot);
   const multimodalExtension = await findExtension(appRoot, "multimodal.ts");
-  const browserExtension = await findExtension(appRoot, "browser.ts");
   const { mountArgs, cliArgs } = buildExtensionMountArgs({
     hostToolsExtension,
     hostTools: paths.hostTools,
     multimodalExtension,
-    browserExtension,
   });
   const nodePath = await requireExecutable("node");
   const args: string[] = [

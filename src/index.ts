@@ -6,6 +6,7 @@ import { WorkspaceScheduler } from "./scheduler.js";
 import { WorkspaceRequestBus } from "./request-bus.js";
 import { WorkspaceTasks } from "./task.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
+import { botPaths } from "./util.js";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -64,20 +65,22 @@ export async function main(): Promise<void> {
   const sandbox = await checkSandboxEnvironment(config.dataDir);
   const { dataDir, bwrapPath } = sandbox;
   const runtimeConfig = { ...config, dataDir };
+  const paths = botPaths(dataDir, runtimeConfig.botId);
+  const { workspace } = paths;
 
-  const agentManager = new AgentManager(runtimeConfig, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup });
+  const agentManager = new AgentManager({ workspace }, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup });
   const deliveryQueue = new TelegramDeliveryQueue();
   const bot = createTelegramBot(runtimeConfig, agentManager, deliveryQueue);
   const schedulerInstance = new WorkspaceScheduler({
-    dataDir,
+    workspace,
     run: (prompt) => agentManager.followup(prompt),
   });
   const outboxInstance = new WorkspaceOutbox({
-    dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
+    dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, request)),
     agent: agentManager,
   });
   const tasksInstance = new WorkspaceTasks({
-    dataDir,
+    workspace,
     appRoot: process.cwd(),
     bwrapPath,
     spawnProcess,
@@ -85,10 +88,10 @@ export async function main(): Promise<void> {
     agent: agentManager,
   });
   const requestBus = new WorkspaceRequestBus({
-    dataDir,
-    onSend: (record, workspace, resume) => outboxInstance.handleSendRequest(record, workspace, resume),
-    onSpawn: (record, workspace) => tasksInstance.handleSpawnRequest(record, workspace),
-    onCancel: (record, workspace) => tasksInstance.handleCancelRequest(record, workspace),
+    workspace,
+    onSend: (record, ws, resume) => outboxInstance.handleSendRequest(record, ws, resume),
+    onSpawn: (record, ws) => tasksInstance.handleSpawnRequest(record, ws),
+    onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
   });
   tasksInstance.flush = requestBus;
 

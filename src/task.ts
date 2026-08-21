@@ -7,7 +7,7 @@ import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { CancelRequest, SpawnRequest } from "./request-bus.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
-import { defined, errorMessage, isMissing, workspacePath } from "./util.js";
+import { defined, errorMessage, isMissing } from "./util.js";
 
 export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
@@ -27,7 +27,7 @@ export type WorkspaceTaskWorkerOptions = {
 export type WorkspaceTaskWorkerFactory = (options: WorkspaceTaskWorkerOptions) => WorkspaceTaskWorker | Promise<WorkspaceTaskWorker>;
 
 export type WorkspaceTasksOptions = {
-  dataDir: string;
+  workspace: string;
   appRoot: string;
   bwrapPath?: string;
   /** Process-control seams injected by the composition root; the default worker factory passes them to the Pi run worker. */
@@ -112,7 +112,7 @@ function formatDuration(milliseconds: number): string {
  */
 export class WorkspaceTasks {
   private readonly agent: WorkspaceTasksOptions["agent"];
-  private readonly dataDir: string;
+  private readonly workspace: string;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
   private readonly spawnProcess: PiWorkerSpawn;
@@ -137,7 +137,7 @@ export class WorkspaceTasks {
     if (!Number.isSafeInteger(heartbeatIntervalMs) || heartbeatIntervalMs <= 0 || heartbeatIntervalMs > MAX_TIMER_MS) {
       throw new Error("Task heartbeat interval must be a positive timer-safe integer");
     }
-    this.dataDir = path.resolve(options.dataDir);
+    this.workspace = path.resolve(options.workspace);
     this.appRoot = path.resolve(options.appRoot);
     this.bwrapPath = options.bwrapPath;
     this.spawnProcess = options.spawnProcess;
@@ -291,7 +291,7 @@ export class WorkspaceTasks {
    * stamped dir never matches again.
    */
   private async stampAbortedRuns(): Promise<void> {
-    const workspace = workspacePath(this.dataDir);
+    const workspace = this.workspace;
     let tasksPath: string;
     try {
       tasksPath = await ensureTasksDirectory(workspace);

@@ -18,7 +18,7 @@ const state = vi.hoisted(() => {
     order,
     agents,
     bot,
-    config: { token: "token", dataDir: "/requested" },
+    config: { token: "123:token", botId: 123, dataDir: "/requested" },
     sandbox: { dataDir: "/canonical-data", bwrapPath: "/validated/bwrap" },
     signalHandlers: {} as Record<string, () => void>,
     checkSandboxEnvironment: vi.fn(),
@@ -119,15 +119,15 @@ describe("application startup and shutdown wiring", () => {
     expect(state.checkSandboxEnvironment).toHaveBeenCalledOnce();
     expect(state.checkSandboxEnvironment).toHaveBeenCalledWith("/requested");
     expect(state.agentManager).toHaveBeenCalledWith(
-      { ...state.config, dataDir: "/canonical-data" },
+      { workspace: "/canonical-data/bots/123/workspace" },
       expect.objectContaining({ appRoot: expect.any(String), bwrapPath: "/validated/bwrap" }),
     );
-    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as { dataDir: string; run: (prompt: string) => unknown };
-    expect(schedulerOptions.dataDir).toBe("/canonical-data");
+    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as { workspace: string; run: (prompt: string) => unknown };
+    expect(schedulerOptions.workspace).toBe("/canonical-data/bots/123/workspace");
     expect(typeof schedulerOptions.run).toBe("function");
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function) }));
-    expect(state.requestBus).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
-    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data", bwrapPath: "/validated/bwrap", agent: state.agentManager.mock.instances[0] }));
+    expect(state.requestBus).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace" }));
+    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace", bwrapPath: "/validated/bwrap", agent: state.agentManager.mock.instances[0] }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: ["message", "callback_query", "poll_answer"],
     }));
@@ -142,8 +142,7 @@ describe("application startup and shutdown wiring", () => {
     const outbox = state.outbox.mock.instances[0] as { dispatch: (chatId: number, req: unknown) => Promise<unknown> };
     const request = { type: "send_message", version: 1, id: "x", text: "hi" };
     const result = await outbox.dispatch(42, request);
-
-    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(state.bot, "/canonical-data", 42, request);
+    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(state.bot, { botDir: "/canonical-data/bots/123", workspace: "/canonical-data/bots/123/workspace" }, 42, request);
     expect(result).toEqual({ messageId: 7 });
   });
 

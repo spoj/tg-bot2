@@ -2,9 +2,8 @@ import { readFile, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
-import type { Config } from "./config.js";
 import { SerialQueue } from "./queue.js";
-import { TG_BOT_DIR, defined, workspacePath } from "./util.js";
+import { TG_BOT_DIR, defined } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
 import { EVENTS_PROMPT } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
@@ -194,6 +193,7 @@ async function countActiveSchedules(workspace: string): Promise<number | undefin
 }
 
 export class AgentManager {
+  private readonly workspace: string;
   private readonly state: AgentState;
   private readonly workerFactory: AgentWorkerFactory;
   private readonly appRoot: string;
@@ -208,7 +208,8 @@ export class AgentManager {
   private readonly clearTimeoutFn: typeof clearTimeout;
   private shuttingDown = false;
 
-  constructor(private readonly config: Pick<Config, "dataDir">, options: AgentManagerOptions) {
+  constructor(config: { workspace: string }, options: AgentManagerOptions) {
+    this.workspace = path.resolve(config.workspace);
     this.appRoot = path.resolve(options.appRoot);
     this.bwrapPath = options.bwrapPath;
     this.spawnProcess = options.spawnProcess;
@@ -288,7 +289,7 @@ export class AgentManager {
 
   /** File-based session summary; never spawns a worker. */
   async status(): Promise<AgentStatus> {
-    const workspace = workspacePath(this.config.dataDir);
+    const workspace = this.workspace;
     const settings = await loadUserSettings(workspace);
     const sessionsDirectory = path.join(workspace, ".pi", "sessions");
     let result: AgentStatus = {
@@ -433,9 +434,8 @@ export class AgentManager {
     state.interruptDebounceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(), this.combineDebounceMs);
     state.interruptDebounceTimer.unref?.();
   }
-
   private async spawnWorker(text: string): Promise<AgentRunWorker> {
-    const workspace = workspacePath(this.config.dataDir);
+    const workspace = this.workspace;
     const { resume, model, thinkingLevel } = await this.runOptions(workspace);
     return await this.workerFactory({
       workspace,

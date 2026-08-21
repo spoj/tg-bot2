@@ -26,6 +26,7 @@ import {
 } from "../src/telegram.js";
 import type { AgentStatus } from "../src/agent.js";
 import { appendChatEvents } from "../src/events.js";
+import { botPaths } from "../src/util.js";
 
 const execFile = promisify(execFileCallback);
 function fakeBot() {
@@ -61,9 +62,12 @@ async function readChatEvents(dataDir: string): Promise<Record<string, unknown>[
   const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "chat.jsonl"), "utf8").catch(() => "");
   return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
-
 function workspaceDir(dataDir: string): string {
-  return path.join(dataDir, "workspace");
+  return botPaths(dataDir, 999).workspace;
+}
+
+function botDir(dataDir: string): string {
+  return botPaths(dataDir, 999).botDir;
 }
 async function readSystemEvents(dataDir: string): Promise<Record<string, unknown>[]> {
   const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "system.jsonl"), "utf8").catch(() => "");
@@ -108,7 +112,7 @@ async function makeTestBot(
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
   const bot = createTelegramBot(
-    { token: "test-token", dataDir },
+    { token: "999:test-token", botId: 999, dataDir },
     agents as never,
   );
   Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
@@ -137,7 +141,8 @@ async function runAttachmentFixture(
 ): Promise<Mock> {
   const prompt = vi.fn(async () => undefined);
   const bot = createTelegramBot({
-    token: "test-token",
+    token: "999:test-token",
+    botId: 999,
     dataDir,
   }, {
     interrupt: prompt,
@@ -639,7 +644,7 @@ describe("Telegram attachment downloads", () => {
         ]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
         expect((await firstMessageAttachment(dataDir)).failure).toMatch(/20 MB/);
-        expect(await readFile(path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+        expect(await readFile(path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
       });
     } finally {
       vi.unstubAllGlobals();
@@ -676,7 +681,7 @@ describe("Telegram attachment downloads", () => {
           new TextEncoder().encode("telegram"),
         ]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        const destination = path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7", "report.txt");
+        const destination = path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7", "report.txt");
         expect(await readFile(destination, "utf8")).toBe("hello telegram");
         const attachment = await firstMessageAttachment(dataDir);
         expect(attachment.mimeType).toBe("text/plain");
@@ -690,7 +695,7 @@ describe("Telegram attachment downloads", () => {
   it("does not publish an attachment after its pinned directory is replaced", async () => {
     try {
       await withWorkspace(async (dataDir) => {
-        const directory = path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7");
+        const directory = path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7");
         await mkdir(directory, { recursive: true });
         let pulls = 0;
         let replaced = false;
@@ -724,7 +729,7 @@ describe("Telegram attachment downloads", () => {
         const fileName = `${"界".repeat(100)}.txt`;
         await runAttachmentFixture(dataDir, vi.fn(async () => chunkedResponse([new TextEncoder().encode("hello")])) as unknown as typeof fetch, fileName);
         expect((await firstMessageAttachment(dataDir)).failure).toBeUndefined();
-        const directory = path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7");
+        const directory = path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7");
         const [savedName] = await readdir(directory);
         expect(savedName).toBeDefined();
         expect(Buffer.byteLength(savedName!)).toBeLessThanOrEqual(255);
@@ -738,8 +743,9 @@ describe("Telegram attachment downloads", () => {
     try {
       await withWorkspace(async (dataDir) => {
         const outside = path.join(dataDir, "outside");
-        const workspace = path.join(dataDir, "workspace");
+        const workspace = workspaceDir(dataDir);
         await mkdir(outside);
+        await mkdir(path.dirname(workspace), { recursive: true });
         await symlink(outside, workspace);
         const response = chunkedResponse([new TextEncoder().encode("secret")]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
@@ -1029,7 +1035,7 @@ describe("Telegram chat events", () => {
         message: { message_id: 7, text: "hello" },
         attachments: [],
       });
-      const chatLog = await readFile(path.join(dataDir, "workspace", ".tg-bot", "chat.jsonl"), "utf8");
+      const chatLog = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "chat.jsonl"), "utf8");
       expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
     });
   });
@@ -1233,7 +1239,7 @@ describe("Telegram poll answers", () => {
   it("records a poll answer event for the owning chat without waking", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await recordPollOwner(dataDir, 42, "poll-9");
+      await recordPollOwner(botDir(dataDir), 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
@@ -1260,9 +1266,10 @@ describe("Telegram poll answers", () => {
   it("skips corrupt or non-object registry lines while resolving owners", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const storePath = path.join(dataDir, "poll-owners.jsonl");
+      const storePath = path.join(botDir(dataDir), "poll-owners.jsonl");
+      await mkdir(path.dirname(storePath), { recursive: true });
       await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
-      await recordPollOwner(dataDir, 42, "poll-9");
+      await recordPollOwner(botDir(dataDir), 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
@@ -1306,7 +1313,7 @@ describe("Telegram poll answers", () => {
   it("drops poll answers for a poll owned by a chat not on the allow list", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await recordPollOwner(dataDir, 999, "poll-999");
+      await recordPollOwner(botDir(dataDir), 999, "poll-999");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({

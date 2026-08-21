@@ -20,7 +20,7 @@ import type {
   WorkspaceOutboxDispatchResult,
   WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-import { appendJsonl, defined, readJsonl, workspacePath } from "./util.js";
+import { appendJsonl, botPaths, defined, readJsonl } from "./util.js";
 
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
@@ -154,13 +154,13 @@ export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId:
   await bot.api.deleteMessage(chatId, messageId);
 }
 
-export async function dispatchOutboxRequest(bot: Bot, dataDir: string, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
+export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; workspace: string }, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
   switch (request.type) {
-    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: workspacePath(dataDir), sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
+    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: paths.workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
-    case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: workspacePath(dataDir), request }) };
+    case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: paths.workspace, request }) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
-    case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
+    case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(paths.botDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
     case "stop_poll": return { messageId: request.message_id, data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
     case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return undefined;
     case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
@@ -340,18 +340,18 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
 const POLL_OWNER_STORE_NAME = "poll-owners.jsonl";
 
 /** Records poll ownership in a host-side store the sandbox cannot reach (only /workspace is mounted). */
-export async function recordPollOwner(dataDir: string, chatId: number, pollId: string): Promise<void> {
+export async function recordPollOwner(botDir: string, chatId: number, pollId: string): Promise<void> {
   await appendJsonl(
-    path.join(dataDir, POLL_OWNER_STORE_NAME),
+    path.join(botDir, POLL_OWNER_STORE_NAME),
     JSON.stringify({ chatId, pollId }),
   );
 }
 
 /** Maps a poll id back to the chat that sent it via the host-side owner store. */
-async function findPollOwnerChat(dataDir: string, pollId: string): Promise<number | undefined> {
+async function findPollOwnerChat(botDir: string, pollId: string): Promise<number | undefined> {
   let lines: string[];
   try {
-    lines = await readJsonl(path.join(dataDir, POLL_OWNER_STORE_NAME));
+    lines = await readJsonl(path.join(botDir, POLL_OWNER_STORE_NAME));
   } catch {
     return undefined;
   }
@@ -598,7 +598,7 @@ async function downloadAttachment(
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
-    const workspace = workspacePath(config.dataDir);
+    const { workspace } = botPaths(config.dataDir, config.botId);
     const attachmentDirectory = await ensureAttachmentDirectory(workspace, chatId, date, message.message_id);
     let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
     let temporary: string | undefined;
@@ -730,7 +730,7 @@ export function createTelegramBot(
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
 ): Bot {
   const bot = new Bot(config.token);
-  const workspace = workspacePath(config.dataDir);
+  const { botDir, workspace } = botPaths(config.dataDir, config.botId);
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
 
@@ -784,7 +784,7 @@ export function createTelegramBot(
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
-    const chatId = await findPollOwnerChat(config.dataDir, answer.poll_id);
+    const chatId = await findPollOwnerChat(botDir, answer.poll_id);
     if (chatId === undefined) return;
     if (!(await isChatAllowed(workspace, chatId))) return;
     void appendChatEvent(workspace, {

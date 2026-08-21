@@ -47,11 +47,17 @@ function makeScheduler(
   dataDir: string,
   options: Partial<ConstructorParameters<typeof WorkspaceScheduler>[0]> = {},
 ): WorkspaceScheduler {
+  const {
+    workspace = path.join(dataDir, "workspace"),
+    run = async () => undefined,
+    now = () => NOW,
+    ...rest
+  } = options;
   return new WorkspaceScheduler({
-    ...defined(options),
-    dataDir,
-    run: options.run ?? (async () => undefined),
-    now: options.now ?? (() => NOW),
+    workspace,
+    run,
+    now,
+    ...defined(rest),
   });
 }
 
@@ -282,7 +288,7 @@ describe("WorkspaceScheduler lifecycle", () => {
     const interval = fakeInterval();
     const run = vi.fn(async () => undefined);
     const scheduler = new WorkspaceScheduler({
-      dataDir,
+      workspace: path.join(dataDir, "workspace"),
       run,
       now: () => NOW,
       setInterval: interval.setIntervalMock as unknown as typeof setInterval,

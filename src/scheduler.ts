@@ -13,7 +13,7 @@ type ScheduleFile = {
 
 type MaybePromise<T> = T | PromiseLike<T>;
 type WorkspaceSchedulerOptions = {
-  dataDir: string;
+  workspace: string;
   run: (prompt: string) => MaybePromise<void>;
   pollIntervalMs?: number;
   now?: () => number;
@@ -176,7 +176,7 @@ function foldScheduleEvent(state: FoldedSchedules, event: Record<string, unknown
  * schedule new ones), and fires due runs.
  */
 export class WorkspaceScheduler {
-  private readonly dataDir: string;
+  private readonly workspace: string;
   private readonly run: WorkspaceSchedulerOptions["run"];
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
@@ -193,7 +193,7 @@ export class WorkspaceScheduler {
     if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > MAX_TIMER_MS) {
       throw new Error("Scheduler poll interval must be a positive timer-safe integer");
     }
-    this.dataDir = path.resolve(options.dataDir);
+    this.workspace = path.resolve(options.workspace);
     this.run = options.run;
     this.pollIntervalMs = pollIntervalMs;
     this.now = options.now ?? Date.now;
@@ -250,7 +250,7 @@ export class WorkspaceScheduler {
     let workspace: PinnedDirectory | undefined;
     let metadata: PinnedDirectory | undefined;
     try {
-      workspace = await openPinnedDirectory(path.join(this.dataDir, "workspace"));
+      workspace = await openPinnedDirectory(this.workspace);
       metadata = await openPinnedDirectory(path.join(workspace.path, TG_BOT_DIR), path.join(workspace.realPath, TG_BOT_DIR));
       await this.reconcile(workspace.path, metadata, now);
     } catch (error) {

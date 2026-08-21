@@ -31,7 +31,7 @@ function setupBus(
   handlers: { onSend?: SendRequestHandler; onSpawn?: SpawnRequestHandler; onCancel?: CancelRequestHandler } = {},
 ): WorkspaceRequestBus {
   return new WorkspaceRequestBus({
-    dataDir,
+    workspace: path.join(dataDir, "workspace"),
     onSend: handlers.onSend ?? vi.fn<SendRequestHandler>(async () => undefined),
     onSpawn: handlers.onSpawn ?? vi.fn<SpawnRequestHandler>(async () => "claimed"),
     onCancel: handlers.onCancel ?? vi.fn<CancelRequestHandler>(async () => undefined),

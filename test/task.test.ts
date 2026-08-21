@@ -69,7 +69,7 @@ function setupTasks(
   options: Partial<WorkspaceTasksOptions> = {},
 ): WorkspaceTasks {
   return new WorkspaceTasks({
-    dataDir,
+    workspace: path.join(dataDir, "workspace"),
     appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),

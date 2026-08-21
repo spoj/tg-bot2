@@ -53,9 +53,14 @@ export async function requireRealDirectory(candidate: string, label: string, exp
 
 export const TG_BOT_DIR = ".tg-bot";
 
-/** The one workspace this bot's agent owns: `dataDir/workspace`, mounted at /workspace in every sandbox run. */
-export function workspacePath(dataDir: string): string {
-  return path.join(dataDir, "workspace");
+/** Derives canonical directories for one bot: `DATA_DIR/bots/<botId>` and its persistent workspace. */
+export function botPaths(dataDir: string, botId: number): { botDir: string; workspace: string } {
+  if (!Number.isSafeInteger(botId)) throw new Error("Telegram bot ID must be a safe integer");
+  const botDir = path.join(dataDir, "bots", String(botId));
+  return {
+    botDir,
+    workspace: path.join(botDir, "workspace"),
+  };
 }
 
 export type PinnedDirectory = {

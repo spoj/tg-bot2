@@ -36,7 +36,7 @@ export type SpawnRequestHandler = (
 export type CancelRequestHandler = (record: CancelRequest, workspace: string) => Promise<void>;
 
 export type WorkspaceRequestBusOptions = {
-  dataDir: string;
+  workspace: string;
   onSend: SendRequestHandler;
   onSpawn: SpawnRequestHandler;
   onCancel: CancelRequestHandler;
@@ -175,7 +175,7 @@ export class WorkspaceRequestBus {
       throw new Error("Request poll interval must be a positive timer-safe integer");
     }
     this.options = options;
-    this.workspace = path.join(path.resolve(options.dataDir), "workspace");
+    this.workspace = path.resolve(options.workspace);
     this.pollIntervalMs = pollIntervalMs;
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;

@@ -14,7 +14,6 @@ import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
 import { EVENTS_PROMPT } from "../src/events.js";
 import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
 import { TASKS_PROMPT } from "../src/task-protocol.js";
-import type { Config } from "../src/config.js";
 import { deferred } from "./helpers.js";
 
 type RunResult = { code: number | null; signal: NodeJS.Signals | null; stderr: string; stdout: string };
@@ -59,10 +58,7 @@ function manualTimers() {
   };
 }
 
-const config: Config = {
-  token: "token",
-  dataDir: "/tmp/tg-bot2-test",
-};
+const testConfig = { workspace: "/tmp/tg-bot2-test/workspace" };
 
 function managerOptions(overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
   return {
@@ -129,7 +125,7 @@ it("loadUserSettings tolerates missing, empty, and malformed files", async () =>
 it("followup starts a fresh run when the resume window has never opened", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup(".");
     await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
     expect(factory.mock.calls[0]?.[0]).toMatchObject({ message: ".", resume: false, appendSystemPrompt: SYSTEM_PROMPT });
@@ -141,7 +137,7 @@ it("followup starts a fresh run when the resume window has never opened", async 
 it("followup queues behind an active run and drains combined in order", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("first");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.followup("second");
@@ -157,7 +153,7 @@ it("followup queues behind an active run and drains combined in order", async ()
 it("interrupt kills the active run and runs next, preserving queued followups", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.followup("queued");
@@ -176,7 +172,7 @@ it("interrupt kills the active run and runs next, preserving queued followups", 
 it("interrupt while idle starts a run immediately", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.interrupt(".");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     expect(factory.mock.calls[0]?.[0].message).toBe(".");
@@ -187,7 +183,7 @@ it("interrupt while idle starts a run immediately", async () => {
 it("coalesces an interrupt burst into one stop and one combined message", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.interrupt("first");
@@ -204,7 +200,7 @@ it("coalesces an interrupt burst into one stop and one combined message", async 
 it("combines interrupts while idle into one message after the debounce window", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.interrupt("first");
     await manager.interrupt("second");
     await manager.interrupt("third");
@@ -219,7 +215,7 @@ it("force-drains a running burst at the cap and combines interrupts arriving dur
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
     const timers = manualTimers();
-    const manager = new AgentManager({ dataDir }, managerOptions({
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
       workerFactory: factory,
       combineDebounceMs: 100,
       interruptForceDrainMs: 200,
@@ -247,7 +243,7 @@ it("force-drains an idle interrupt at the cap", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
     const timers = manualTimers();
-    const manager = new AgentManager({ dataDir }, managerOptions({
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
       workerFactory: factory,
       combineDebounceMs: 100,
       interruptForceDrainMs: 200,
@@ -267,7 +263,7 @@ it("force-drains an idle interrupt at the cap", async () => {
 it("queues followups behind interrupts still waiting out the debounce window", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.interrupt("first");
     await manager.followup("later");
     expect(runs).toHaveLength(0);
@@ -283,7 +279,7 @@ it("queues followups behind interrupts still waiting out the debounce window", a
 it("combines idle followups into one message after the debounce window", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("first");
     await manager.followup("second");
     expect(runs).toHaveLength(0);
@@ -296,7 +292,7 @@ it("combines idle followups into one message after the debounce window", async (
 it("combines followups queued during a run and delivers them at settle", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.followup("first");
@@ -313,7 +309,7 @@ it("restarts the debounce window on each new interrupt without restarting the fo
   await withDataDir(async (dataDir) => {
     const { factory } = fakeWorkerFactory();
     const timers = manualTimers();
-    const manager = new AgentManager({ dataDir }, managerOptions({
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
       workerFactory: factory,
       combineDebounceMs: 100,
       interruptForceDrainMs: 1_000,
@@ -333,7 +329,7 @@ it("restarts the debounce window on each new interrupt without restarting the fo
 it("a natural settle cancels the pending interrupt stop", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.interrupt(".");
@@ -346,18 +342,18 @@ it("a natural settle cancels the pending interrupt stop", async () => {
 });
 
 it("rejects a non-timer-safe combine debounce window", () => {
-  expect(() => new AgentManager(config, managerOptions({ combineDebounceMs: -1 }))).toThrow("non-negative timer-safe integer");
+  expect(() => new AgentManager(testConfig, managerOptions({ combineDebounceMs: -1 }))).toThrow("non-negative timer-safe integer");
 });
 
 it("rejects a force drain window shorter than the debounce window", () => {
-  expect(() => new AgentManager(config, managerOptions({ combineDebounceMs: 100, interruptForceDrainMs: 50 }))).toThrow("at least the debounce window");
+  expect(() => new AgentManager(testConfig, managerOptions({ combineDebounceMs: 100, interruptForceDrainMs: 50 }))).toThrow("at least the debounce window");
 });
 
 it("beginShutdown cancels pending interrupt stops", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
     const timers = manualTimers();
-    const manager = new AgentManager({ dataDir }, managerOptions({
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
       workerFactory: factory,
       combineDebounceMs: 100,
       interruptForceDrainMs: 1_000,
@@ -391,7 +387,7 @@ it("resumes within the window and starts fresh after it closes", async () => {
 
     let now = tenHours;
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => now }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => now }));
     await manager.followup("one");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     expect(runs[0]?.worker.options.resume).toBe(false);
@@ -419,7 +415,7 @@ it("a new-session marker forces a fresh run and is consumed", async () => {
     const tenHours = 10 * 60 * 60 * 1000;
     let now = tenHours;
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => now }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => now }));
     await manager.followup("one");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
@@ -444,7 +440,7 @@ it("passes settings defaults as model and thinking CLI args", async () => {
       defaultThinkingLevel: "high",
     });
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup(".");
     await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
@@ -467,7 +463,7 @@ it("a restart resumes a recent session file and starts fresh after the window cl
     await utimes(sessionFile, new Date(), new Date(now - 60_000));
 
     const first = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: first.factory, now: () => now }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: first.factory, now: () => now }));
     await manager.followup(".");
     await vi.waitFor(() => expect(first.runs).toHaveLength(1));
     expect(first.factory.mock.calls[0]?.[0].resume).toBe(true);
@@ -475,7 +471,7 @@ it("a restart resumes a recent session file and starts fresh after the window cl
 
     await utimes(sessionFile, new Date(), new Date(now - 3 * 60 * 60 * 1000));
     const second = fakeWorkerFactory();
-    const secondManager = new AgentManager({ dataDir }, managerOptions({ workerFactory: second.factory, now: () => now }));
+    const secondManager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: second.factory, now: () => now }));
     await secondManager.followup(".");
     await vi.waitFor(() => expect(second.runs).toHaveLength(1));
     expect(second.factory.mock.calls[0]?.[0].resume).toBe(false);
@@ -500,7 +496,7 @@ it("status reads the newest session file and settings defaults without spawning"
       JSON.stringify({ type: "message", id: "m2", parentId: "m1", timestamp: "2026-02-01T00:00:04.000Z", message: { role: "assistant", content: [] } }),
     ].join("\n"), "utf8");
 
-    const manager = new AgentManager({ dataDir }, managerOptions());
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions());
     const status: AgentStatus = await manager.status();
     expect(status).toEqual({
       model: { provider: "anthropic", id: "claude" },
@@ -515,7 +511,7 @@ it("status reads the newest session file and settings defaults without spawning"
 it("status reports settings defaults when no session file exists", async () => {
   await withDataDir(async (dataDir) => {
     await settingsFile(dataDir, { defaultModel: "claude", defaultProvider: "anthropic" });
-    const manager = new AgentManager({ dataDir }, managerOptions());
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions());
     await expect(manager.status()).resolves.toEqual({
       model: { provider: "anthropic", id: "claude" },
       thinkingLevel: "off",
@@ -543,7 +539,7 @@ it("status counts active background tasks and schedule rows", async () => {
       ],
     }), "utf8");
 
-    const manager = new AgentManager({ dataDir }, managerOptions());
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions());
     const status = await manager.status();
     expect(status.activeTasks).toBe(1);
     expect(status.activeSchedules).toBe(2);
@@ -553,7 +549,7 @@ it("status counts active background tasks and schedule rows", async () => {
 it("beginShutdown stops active runs and rejects later work", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("one");
     await vi.waitFor(() => expect(runs).toHaveLength(1));
     await manager.beginShutdown();
@@ -568,7 +564,7 @@ it("a failed run logs and continues draining queued followups", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { factory, runs } = fakeWorkerFactory();
-      const manager = new AgentManager({ dataDir }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
       await manager.followup("one");
       await vi.waitFor(() => expect(runs).toHaveLength(1));
       await manager.followup("two");

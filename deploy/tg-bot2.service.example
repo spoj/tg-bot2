@@ -11,8 +11,8 @@ User=tg-bot2
 Group=tg-bot2
 # EDIT REQUIRED: absolute path to the checked-out/build deployment.
 WorkingDirectory=/opt/tg-bot2
-# EDIT REQUIRED: absolute path to a mode-0600 file containing TG_BOT_TOKEN,
-# ALLOWED_USER_IDS, and DATA_DIR.
+# EDIT REQUIRED: absolute path to a mode-0600 file containing TG_BOT_TOKEN
+# and DATA_DIR.
 EnvironmentFile=/etc/tg-bot2/tg-bot2.env
 # EDIT REQUIRED: node binary and built entrypoint installed on this host.
 ExecStart=/usr/bin/node /opt/tg-bot2/dist/src/index.js

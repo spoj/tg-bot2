@@ -58,8 +58,22 @@ async function withWorkspace(run: (workspace: string) => Promise<void>): Promise
   }
 }
 async function readChatEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "chat.jsonl"), "utf8").catch(() => "");
+  const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "chat.jsonl"), "utf8").catch(() => "");
   return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function workspaceDir(dataDir: string): string {
+  return path.join(dataDir, "workspace");
+}
+async function readSystemEvents(dataDir: string): Promise<Record<string, unknown>[]> {
+  const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "system.jsonl"), "utf8").catch(() => "");
+  return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string }>): Promise<void> {
+  const directory = path.join(workspaceDir(dataDir), ".tg-bot");
+  await mkdir(directory, { recursive: true });
+  const entries = chats.map((chat) => ({ ...chat, added_by: "bootstrap" as const, added_at: "2026-01-01T00:00:00.000Z" }));
+  await writeFile(path.join(directory, "allowed.json"), `${JSON.stringify({ version: 1, chats: entries }, null, 2)}\n`);
 }
 
 async function waitForChatEvents(dataDir: string, predicate: (events: Record<string, unknown>[]) => boolean): Promise<Record<string, unknown>[]> {
@@ -77,7 +91,7 @@ async function messageEvent(dataDir: string): Promise<Record<string, unknown>> {
 }
 
 function wakeArg(prompt: Mock): Record<string, unknown> {
-  return JSON.parse(prompt.mock.calls[0]?.[1] as string) as Record<string, unknown>;
+  return JSON.parse(prompt.mock.calls[0]?.[0] as string) as Record<string, unknown>;
 }
 
 async function firstMessageAttachment(dataDir: string): Promise<Record<string, unknown>> {
@@ -89,12 +103,12 @@ let sentRequests: Array<{ url: string; body: string }> = [];
 
 async function makeTestBot(
   dataDir: string,
-  agents: { interrupt: Mock<(chatId: number, text: string) => Promise<void>> },
+  agents: { interrupt: Mock<(text: string) => Promise<void>> },
   { fetchResult, recordRequests = false }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean } = {},
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
   const bot = createTelegramBot(
-    { token: "test-token", allowedUserIds: new Set([42]), dataDir },
+    { token: "test-token", dataDir },
     agents as never,
   );
   Object.assign(bot, { botInfo: { id: 999, is_bot: true, first_name: "Test", username: "test_bot" } });
@@ -124,7 +138,6 @@ async function runAttachmentFixture(
   const prompt = vi.fn(async () => undefined);
   const bot = createTelegramBot({
     token: "test-token",
-    allowedUserIds: new Set([42]),
     dataDir,
   }, {
     interrupt: prompt,
@@ -372,6 +385,7 @@ it("sends a media group as an album with mapped items and options", async () => 
       version: 1 as const,
       id: "album",
       type: "send_media_group" as const,
+      chat_id: 42,
       media: [
         { type: "photo" as const, media: "a.png", caption: "first" },
         { type: "video" as const, media: "/workspace/b.mp4", caption: "x".repeat(2_000) },
@@ -399,6 +413,7 @@ it("rejects media group items that escape the workspace", async () => {
       version: 1 as const,
       id: "album",
       type: "send_media_group" as const,
+      chat_id: 42,
       media: [
         { type: "photo" as const, media: "ok.png" },
         { type: "video" as const, media: "/workspace/../outside.mp4" },
@@ -541,7 +556,7 @@ it("rejects a regular file that grows beyond the upload cap after stat", async (
 
 describe("Telegram attachment downloads", () => {
   it("bounds a stalled Telegram getFile call with the attachment deadline", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       await withWorkspace(async (dataDir) => {
         const getFile = vi.fn(() => new Promise<{ file_id: string; file_path?: string }>(() => {}));
@@ -551,8 +566,7 @@ describe("Telegram attachment downloads", () => {
           "report.txt",
           getFile,
         );
-        await Promise.resolve();
-        await Promise.resolve();
+        await vi.waitFor(() => expect(getFile).toHaveBeenCalled());
         await vi.advanceTimersByTimeAsync(30_000);
         await fixture;
         expect(getFile).toHaveBeenCalledOnce();
@@ -595,7 +609,7 @@ describe("Telegram attachment downloads", () => {
     }
   });
   it("bounds a stalled Telegram fetch with AbortController", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       await withWorkspace(async (dataDir) => {
         let signal: AbortSignal | null | undefined;
@@ -604,8 +618,7 @@ describe("Telegram attachment downloads", () => {
           return new Promise<Response>(() => {});
         });
         const fixture = runAttachmentFixture(dataDir, fetchMock as unknown as typeof fetch);
-        await Promise.resolve();
-        await Promise.resolve();
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
         await vi.advanceTimersByTimeAsync(30_000);
         await fixture;
         expect(signal?.aborted).toBe(true);
@@ -626,7 +639,7 @@ describe("Telegram attachment downloads", () => {
         ]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
         expect((await firstMessageAttachment(dataDir)).failure).toMatch(/20 MB/);
-        expect(await readFile(path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+        expect(await readFile(path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
       });
     } finally {
       vi.unstubAllGlobals();
@@ -663,12 +676,12 @@ describe("Telegram attachment downloads", () => {
           new TextEncoder().encode("telegram"),
         ]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        const destination = path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7", "report.txt");
+        const destination = path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7", "report.txt");
         expect(await readFile(destination, "utf8")).toBe("hello telegram");
         const attachment = await firstMessageAttachment(dataDir);
         expect(attachment.mimeType).toBe("text/plain");
         expect(attachment.originalName).toBe("report.txt");
-        expect(attachment.path).toBe("/workspace/attachments/2023-11-14/7/report.txt");
+        expect(attachment.path).toBe("/workspace/attachments/42/2023-11-14/7/report.txt");
       });
     } finally {
       vi.unstubAllGlobals();
@@ -677,7 +690,7 @@ describe("Telegram attachment downloads", () => {
   it("does not publish an attachment after its pinned directory is replaced", async () => {
     try {
       await withWorkspace(async (dataDir) => {
-        const directory = path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7");
+        const directory = path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7");
         await mkdir(directory, { recursive: true });
         let pulls = 0;
         let replaced = false;
@@ -711,7 +724,7 @@ describe("Telegram attachment downloads", () => {
         const fileName = `${"界".repeat(100)}.txt`;
         await runAttachmentFixture(dataDir, vi.fn(async () => chunkedResponse([new TextEncoder().encode("hello")])) as unknown as typeof fetch, fileName);
         expect((await firstMessageAttachment(dataDir)).failure).toBeUndefined();
-        const directory = path.join(dataDir, "chats", "42", "workspace", "attachments", "2023-11-14", "7");
+        const directory = path.join(dataDir, "workspace", "attachments", "42", "2023-11-14", "7");
         const [savedName] = await readdir(directory);
         expect(savedName).toBeDefined();
         expect(Buffer.byteLength(savedName!)).toBeLessThanOrEqual(255);
@@ -721,19 +734,17 @@ describe("Telegram attachment downloads", () => {
     }
   });
 
-  it("rejects a pre-existing symlinked chat workspace", async () => {
+  it("rejects a pre-existing symlinked workspace", async () => {
     try {
       await withWorkspace(async (dataDir) => {
-        const chatRoot = path.join(dataDir, "chats", "42");
         const outside = path.join(dataDir, "outside");
-        const workspace = path.join(chatRoot, "workspace");
-        await mkdir(chatRoot, { recursive: true });
+        const workspace = path.join(dataDir, "workspace");
         await mkdir(outside);
         await symlink(outside, workspace);
         const response = chunkedResponse([new TextEncoder().encode("secret")]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
         expect((await firstMessageAttachment(dataDir)).failure).toMatch(/download failed/);
-        expect(await readFile(path.join(outside, "attachments", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+        expect(await readFile(path.join(outside, "attachments", "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
       });
     } finally {
       vi.unstubAllGlobals();
@@ -764,10 +775,11 @@ describe("Telegram location and venue updates", () => {
         v: 1,
         t: expect.any(String),
         type: "message",
+        chat_id: 42,
         message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } },
         attachments: [],
       });
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } }, attachments: [] });
+      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } }, attachments: [] });
     });
   });
 
@@ -784,10 +796,11 @@ describe("Telegram location and venue updates", () => {
         v: 1,
         t: expect.any(String),
         type: "message",
+        chat_id: 42,
         message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } },
         attachments: [],
       });
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } }, attachments: [] });
+      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } }, attachments: [] });
     });
   });
 });
@@ -797,6 +810,7 @@ describe("Telegram rich messages", () => {
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
       type: "send_message",
+      chat_id: 42,
       text: "<b>hi</b>",
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
@@ -822,6 +836,7 @@ describe("Telegram rich messages", () => {
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
       type: "send_message",
+      chat_id: 42,
       text: "<b>hi</b>",
       parse_mode: "HTML",
       reply_to_message_id: 7,
@@ -839,7 +854,7 @@ describe("Telegram rich messages", () => {
       "sendMessage",
       { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
     ));
-    await expect(sendTelegramRichMessage(bot, 42, { version: 1, type: "send_message", text: "<b>hi</b>", parse_mode: "HTML" })).rejects.toThrow("chat not found");
+    await expect(sendTelegramRichMessage(bot, 42, { version: 1, type: "send_message", chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" })).rejects.toThrow("chat not found");
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -848,6 +863,7 @@ describe("Telegram rich messages", () => {
     await expect(sendTelegramRichMessage(bot, 42, {
       version: 1,
       type: "send_message",
+      chat_id: 42,
       text: "hi",
       entities: [{ type: "bold", offset: 0, length: 2 }],
       link_preview_options: { is_disabled: true },
@@ -868,6 +884,7 @@ describe("Telegram message editing and deletion", () => {
     await expect(sendTelegramEditMessage(bot, 42, {
       version: 1,
       type: "edit_message",
+      chat_id: 42,
       message_id: 7,
       text: "<b>updated</b>",
       parse_mode: "HTML",
@@ -894,6 +911,7 @@ describe("Telegram message editing and deletion", () => {
     await expect(sendTelegramEditMessage(bot, 42, {
       version: 1,
       type: "edit_message",
+      chat_id: 42,
       message_id: 7,
       text: "<b>updated</b>",
       parse_mode: "HTML",
@@ -916,16 +934,16 @@ describe("Telegram message editing and deletion", () => {
 });
 
 describe("Telegram callback queries", () => {
-  function callbackUpdate(fromId: number, data: string) {
+  function callbackUpdate(chatId: number, data: string) {
     return {
       update_id: 2,
       callback_query: {
         id: "cb-1",
-        from: { id: fromId, is_bot: false, first_name: "Test" },
+        from: { id: chatId, is_bot: false, first_name: "Test" },
         message: {
           message_id: 7,
           date: 1_700_000_000,
-          chat: { id: 42, type: "private" },
+          chat: { id: chatId, type: "private" },
           from: { id: 999, is_bot: true, first_name: "Test" },
         },
         chat_instance: "ci",
@@ -943,16 +961,18 @@ describe("Telegram callback queries", () => {
         v: 1,
         t: expect.any(String),
         type: "callback",
+        chat_id: 42,
         callback_query: { data: "do_thing", message: { message_id: 7 } },
       });
       expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
-      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "do_thing", message: { message_id: 7 } } });
+      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", chat_id: 42, callback_query: { data: "do_thing", message: { message_id: 7 } } });
     });
   });
 
-  it("rejects unauthorized button presses without a callback event", async () => {
+  it("rejects a button press from a chat not on the allow list without answering or recording", async () => {
     await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
       await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
@@ -971,10 +991,11 @@ describe("Telegram callback queries", () => {
         v: 1,
         t: expect.any(String),
         type: "callback",
+        chat_id: 42,
         callback_query: { data: "x".repeat(100) },
       });
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
-      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", callback_query: { data: "x".repeat(100) } });
+      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", chat_id: 42, callback_query: { data: "x".repeat(100) } });
     });
   });
 });
@@ -999,15 +1020,16 @@ describe("Telegram chat events", () => {
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate(textUpdate("hello") as never);
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
-      expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", message: { message_id: 7, text: "hello" } });
+      expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, text: "hello" } });
       expect(wakeArg(prompt)).toMatchObject({
         v: 1,
         t: expect.any(String),
         type: "message",
+        chat_id: 42,
         message: { message_id: 7, text: "hello" },
         attachments: [],
       });
-      const chatLog = await readFile(path.join(dataDir, "chats", "42", "workspace", ".tg-bot", "chat.jsonl"), "utf8");
+      const chatLog = await readFile(path.join(dataDir, "workspace", ".tg-bot", "chat.jsonl"), "utf8");
       expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
     });
   });
@@ -1018,7 +1040,7 @@ describe("Telegram chat events", () => {
       await mkdir(eventsDir, { recursive: true });
       const fifoPath = path.join(eventsDir, "chat.jsonl");
       execFileSync("mkfifo", [fifoPath]);
-      await expect(appendChatEvents(workspace, [{ type: "message", message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
+      await expect(appendChatEvents(workspace, [{ type: "message", chat_id: 42, message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
       expect((await lstat(fifoPath)).isFIFO()).toBe(true);
     });
   }, 2_000);
@@ -1028,12 +1050,104 @@ describe("Telegram chat events", () => {
 
 
 
+
+describe("Telegram ingress gate", () => {
+  function messageUpdate(chatId: number, chat: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      update_id: 1,
+      message: {
+        message_id: 7,
+        date: 1_700_000_000,
+        chat: { id: chatId, type: "private", ...chat },
+        from: { id: chatId, is_bot: false, first_name: "Test" },
+        text: "hello",
+      },
+    };
+  }
+
+  it("bootstraps the first-ever chat when allowed.json is missing", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate(messageUpdate(42, { title: "Bootstrap Group" }) as never);
+
+      const allowed = JSON.parse(await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "allowed.json"), "utf8")) as { version: number; chats: Array<Record<string, unknown>> };
+      expect(allowed.version).toBe(1);
+      expect(allowed.chats).toHaveLength(1);
+      expect(allowed.chats[0]).toMatchObject({ chat_id: 42, title: "Bootstrap Group", added_by: "bootstrap" });
+
+      const system = await readSystemEvents(dataDir);
+      expect(system.some((event) => event.type === "chat_allowed" && event.chat_id === 42 && event.added_by === "bootstrap")).toBe(true);
+
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(wakeArg(prompt)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7 } });
+      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42 });
+    });
+  });
+
+  it("drops a message from a chat that is not on the allow list", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
+      await bot.handleUpdate(messageUpdate(999, { title: "Secret Group" }) as never);
+
+      expect(prompt).not.toHaveBeenCalled();
+      expect(sentRequests.some((request) => request.url.endsWith("/sendMessage"))).toBe(false);
+      expect(await readChatEvents(dataDir)).toEqual([]);
+
+      const denied = (await readSystemEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      expect(denied).toHaveLength(1);
+      expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 999, title: "Secret Group" });
+    });
+  });
+
+  it("admits a listed chat and denies an unlisted one", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+
+      await bot.handleUpdate(messageUpdate(42) as never);
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(wakeArg(prompt)).toMatchObject({ type: "message", chat_id: 42 });
+
+      await bot.handleUpdate(messageUpdate(999) as never);
+      expect(prompt).toHaveBeenCalledTimes(1);
+      const denied = (await readSystemEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      expect(denied).toHaveLength(1);
+      expect(denied[0]).toMatchObject({ chat_id: 999 });
+    });
+  });
+
+  it("fails closed when allowed.json is malformed", async () => {
+    await withWorkspace(async (dataDir) => {
+      const directory = path.join(workspaceDir(dataDir), ".tg-bot");
+      await mkdir(directory, { recursive: true });
+      const malformed = path.join(directory, "allowed.json");
+      await writeFile(malformed, "{ not valid json\n", "utf8");
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+
+      await bot.handleUpdate(messageUpdate(42) as never);
+
+      expect(prompt).not.toHaveBeenCalled();
+      expect(await readChatEvents(dataDir)).toEqual([]);
+      const denied = (await readSystemEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      expect(denied).toHaveLength(1);
+      expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 42 });
+      expect(await readFile(malformed, "utf8")).toBe("{ not valid json\n");
+    });
+  });
+});
+
 describe("Telegram locations, polls, and reactions", () => {
   it("sends a location pin with optional fields", async () => {
     const bot = fakeBot();
     await expect(sendTelegramLocation(bot, 42, {
       version: 1,
       type: "send_location",
+      chat_id: 42,
       latitude: 52.52,
       longitude: 13.405,
       heading: 180,
@@ -1048,6 +1162,7 @@ describe("Telegram locations, polls, and reactions", () => {
     await expect(sendTelegramLocation(bot, 42, {
       version: 1,
       type: "send_location",
+      chat_id: 42,
       latitude: 52.5163,
       longitude: 13.3777,
       venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
@@ -1061,6 +1176,7 @@ describe("Telegram locations, polls, and reactions", () => {
     await expect(sendTelegramLocation(bot, 42, {
       version: 1,
       type: "send_location",
+      chat_id: 42,
       latitude: 52.5163,
       longitude: 13.3777,
       venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
@@ -1076,6 +1192,7 @@ describe("Telegram locations, polls, and reactions", () => {
     await expect(sendTelegramPoll(bot, 42, {
       version: 1,
       type: "send_poll",
+      chat_id: 42,
       question: "Pick one",
       options: ["a", "b"],
       is_anonymous: false,
@@ -1115,6 +1232,7 @@ describe("Telegram locations, polls, and reactions", () => {
 describe("Telegram poll answers", () => {
   it("records a poll answer event for the owning chat without waking", async () => {
     await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
       await recordPollOwner(dataDir, 42, "poll-9");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
@@ -1130,6 +1248,7 @@ describe("Telegram poll answers", () => {
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
         type: "poll_answer",
+        chat_id: 42,
         poll_answer: {
           poll_id: "poll-9",
           option_ids: [1, 2],
@@ -1140,6 +1259,7 @@ describe("Telegram poll answers", () => {
 
   it("skips corrupt or non-object registry lines while resolving owners", async () => {
     await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
       const storePath = path.join(dataDir, "poll-owners.jsonl");
       await writeFile(storePath, "null\nnot json\n{\"pollId\":\"poll-9\",\"chatId\":\"42\"}\n", "utf8");
       await recordPollOwner(dataDir, 42, "poll-9");
@@ -1157,13 +1277,14 @@ describe("Telegram poll answers", () => {
       const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
         type: "poll_answer",
+        chat_id: 42,
         poll_answer: {
           poll_id: "poll-9",
           option_ids: [0],
         },
       });
-      });
     });
+  });
 
   it("drops poll answers from unknown polls", async () => {
     await withWorkspace(async (dataDir) => {
@@ -1174,6 +1295,25 @@ describe("Telegram poll answers", () => {
         poll_answer: {
           poll_id: "poll-missing",
           user: { id: 42, is_bot: false, first_name: "Test" },
+          option_ids: [0],
+        },
+      } as never);
+      expect(prompt).not.toHaveBeenCalled();
+      expect((await readChatEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
+    });
+  });
+
+  it("drops poll answers for a poll owned by a chat not on the allow list", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      await recordPollOwner(dataDir, 999, "poll-999");
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate({
+        update_id: 3,
+        poll_answer: {
+          poll_id: "poll-999",
+          user: { id: 999, is_bot: false, first_name: "Test" },
           option_ids: [0],
         },
       } as never);
@@ -1217,9 +1357,9 @@ describe("Telegram commands", () => {
   };
 
   type FakeAgents = {
-    followup: Mock<(chatId: number, text: string) => Promise<void>>;
-    interrupt: Mock<(chatId: number, text: string) => Promise<void>>;
-    status: Mock<(chatId: number) => Promise<AgentStatus>>;
+    followup: Mock<(text: string) => Promise<void>>;
+    interrupt: Mock<(text: string) => Promise<void>>;
+    status: Mock<() => Promise<AgentStatus>>;
   };
 
   function makeAgents(overrides: Partial<FakeAgents> = {}): FakeAgents {
@@ -1236,14 +1376,14 @@ describe("Telegram commands", () => {
     return end === -1 ? text.length : end;
   }
 
-  async function sendCommand(bot: Bot, text: string, fromId = 42): Promise<void> {
+  async function sendCommand(bot: Bot, text: string, chatId = 42): Promise<void> {
     await bot.handleUpdate({
       update_id: 1,
       message: {
         message_id: 1,
         date: 1_700_000_000,
-        chat: { id: fromId, type: "private" },
-        from: { id: fromId, is_bot: false, first_name: "Test" },
+        chat: { id: chatId, type: "private" },
+        from: { id: chatId, is_bot: false, first_name: "Test" },
         text,
         entities: [{ type: "bot_command", offset: 0, length: commandLength(text) }],
       },
@@ -1256,44 +1396,58 @@ describe("Telegram commands", () => {
       .map((request) => (JSON.parse(request.body) as { text: string }).text);
   }
 
-  it("rejects unauthorized users before running command handlers", async () => {
-    const agents = makeAgents();
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/status", 999);
-    expect(replies(bot)).toEqual(["Unauthorized."]);
-    expect(agents.status).not.toHaveBeenCalled();
-  });
-
   it("/start sends the personal-agent help text", async () => {
-    const agents = makeAgents();
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/start");
-    expect(replies(bot)).toEqual([
-      "Personal agent. Send text, attachments, or a location pin to continue your persistent session. /status shows the current model, thinking level, and session summary.",
-    ]);
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const agents = makeAgents();
+      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
+      await sendCommand(bot, "/start");
+      expect(replies(bot)).toEqual([
+        "Personal agent. Send text, attachments, or a location pin to continue your persistent session. /status shows the current model, thinking level, and session summary.",
+      ]);
+    });
   });
 
-  it("/status reports the session state", async () => {
-    const agents = makeAgents({
-      status: vi.fn(async () => ({
-        model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
-        thinkingLevel: "medium",
-        sessionFile: "42.jsonl",
-        messageCount: 7,
-        autoCompactionEnabled: true,
-      })),
+  it("/status on an allowed chat reports the session state via agents.status() with no args", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const agents = makeAgents({
+        status: vi.fn(async () => ({
+          model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
+          thinkingLevel: "medium",
+          sessionFile: "42.jsonl",
+          messageCount: 7,
+          autoCompactionEnabled: true,
+        })),
+      });
+      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
+      await sendCommand(bot, "/status");
+      expect(agents.status).toHaveBeenCalledTimes(1);
+      expect(agents.status.mock.calls[0]).toEqual([]);
+      expect(replies(bot)).toEqual([
+        "Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7",
+      ]);
     });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/status");
-    expect(replies(bot)).toEqual([
-      "Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7",
-    ]);
   });
 
   it("/status reports a friendly failure", async () => {
-    const agents = makeAgents({ status: vi.fn(async () => { throw new Error("boom"); }) });
-    const bot = await makeTestBot("/tmp/ignored", agents, { recordRequests: true });
-    await sendCommand(bot, "/status");
-    expect(replies(bot)).toEqual(["I could not get the status. Please try again."]);
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const agents = makeAgents({ status: vi.fn(async () => { throw new Error("boom"); }) });
+      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
+      await sendCommand(bot, "/status");
+      expect(replies(bot)).toEqual(["I could not get the status. Please try again."]);
+    });
+  });
+
+  it("/status on a denied chat sends no reply at all", async () => {
+    await withWorkspace(async (dataDir) => {
+      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
+      const agents = makeAgents();
+      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
+      await sendCommand(bot, "/status", 999);
+      expect(agents.status).not.toHaveBeenCalled();
+      expect(replies(bot)).toEqual([]);
+    });
   });
 });

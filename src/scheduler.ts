@@ -1,9 +1,9 @@
 import { constants as fsConstants } from "node:fs";
-import { open, readdir } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { appendSystemEvent } from "./events.js";
-import { TG_BOT_DIR, isMissing, numericChatId, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
+import { TG_BOT_DIR, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 
 type ScheduleFile = {
@@ -14,7 +14,7 @@ type ScheduleFile = {
 type MaybePromise<T> = T | PromiseLike<T>;
 type WorkspaceSchedulerOptions = {
   dataDir: string;
-  run: (chatId: number, prompt: string) => MaybePromise<void>;
+  run: (prompt: string) => MaybePromise<void>;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -234,7 +234,7 @@ export class WorkspaceScheduler {
     if (pendingPoll) await pendingPoll.catch(() => {});
   }
 
-  /** Poll numeric chat workspaces; concurrent calls share one operation. */
+  /** Polls the bot's workspace; concurrent calls share one operation. */
   async poll(now = this.now()): Promise<void> {
     if (this.pollInFlight) return this.pollInFlight;
     const operation = this.runPoll(now);
@@ -247,43 +247,22 @@ export class WorkspaceScheduler {
   }
 
   private async runPoll(now: number): Promise<void> {
-    let chatsRoot: PinnedDirectory | undefined;
+    let workspace: PinnedDirectory | undefined;
+    let metadata: PinnedDirectory | undefined;
     try {
-      chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readdir(chatsRoot.path, { withFileTypes: true });
-      const chats = entries
-        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-        .map((entry) => ({ name: entry.name, chatId: numericChatId(entry.name) }))
-        .filter((entry): entry is { name: string; chatId: number } => entry.chatId !== undefined)
-        .sort((a, b) => a.chatId - b.chatId || a.name.localeCompare(b.name));
-
-      for (const { name, chatId } of chats) {
-        let chatDirectory: PinnedDirectory | undefined;
-        let workspace: PinnedDirectory | undefined;
-        let metadata: PinnedDirectory | undefined;
-        try {
-          const expectedChat = path.join(chatsRoot.realPath, name);
-          chatDirectory = await openPinnedDirectory(path.join(chatsRoot.path, name), expectedChat);
-          workspace = await openPinnedDirectory(path.join(chatDirectory.path, "workspace"), path.join(chatDirectory.realPath, "workspace"));
-          metadata = await openPinnedDirectory(path.join(workspace.path, TG_BOT_DIR), path.join(workspace.realPath, TG_BOT_DIR));
-          await this.reconcileChat(chatId, workspace.path, metadata, now);
-        } catch (error) {
-          if (!isMissing(error)) this.report(new Error(`Could not process schedules for chat ${chatId}`, { cause: error }));
-        } finally {
-          if (metadata) await closeQuietly(metadata.handle);
-          if (workspace) await closeQuietly(workspace.handle);
-          if (chatDirectory) await closeQuietly(chatDirectory.handle);
-        }
-      }
+      workspace = await openPinnedDirectory(path.join(this.dataDir, "workspace"));
+      metadata = await openPinnedDirectory(path.join(workspace.path, TG_BOT_DIR), path.join(workspace.realPath, TG_BOT_DIR));
+      await this.reconcile(workspace.path, metadata, now);
     } catch (error) {
       if (!isMissing(error)) this.report(error);
     } finally {
-      if (chatsRoot) await closeQuietly(chatsRoot.handle);
+      if (metadata) await closeQuietly(metadata.handle);
+      if (workspace) await closeQuietly(workspace.handle);
     }
   }
 
-  private async reconcileChat(chatId: number, workspace: string, metadata: PinnedDirectory, now: number): Promise<void> {
-    const rows = await this.readRows(metadata, chatId);
+  private async reconcile(workspace: string, metadata: PinnedDirectory, now: number): Promise<void> {
+    const rows = await this.readRows(metadata);
     if (rows === undefined) return;
     const state = foldScheduleEvents(await readJsonl(path.join(metadata.path, SYSTEM_FILE)).catch(() => []));
     const fileKeys = new Set(rows.map(rowKey));
@@ -314,9 +293,9 @@ export class WorkspaceScheduler {
     for (const run of due) {
       if (!state.open.has(run.runId)) continue;
       try {
-        await this.run(chatId, run.prompt);
+        await this.run(run.prompt);
       } catch (error) {
-        this.report(new Error(`Schedule run ${run.runId} for chat ${chatId} was not completed`, { cause: error }));
+        this.report(new Error(`Schedule run ${run.runId} was not completed`, { cause: error }));
         continue;
       }
       await appendSystemEvent(workspace, { type: "schedule_run_fired", runId: run.runId });
@@ -349,7 +328,7 @@ export class WorkspaceScheduler {
     state.lastDueAt.set(key, run.dueAt);
   }
 
-  private async readRows(metadata: PinnedDirectory, chatId: number): Promise<ScheduleRow[] | undefined> {
+  private async readRows(metadata: PinnedDirectory): Promise<ScheduleRow[] | undefined> {
     const filePath = path.join(metadata.path, SCHEDULES_FILE);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     let raw: string;
@@ -359,7 +338,7 @@ export class WorkspaceScheduler {
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
       raw = await readSchedulesFile(handle);
     } catch (error) {
-      if (!isMissing(error)) this.report(new Error(`Could not read schedules for chat ${chatId}`, { cause: error }));
+      if (!isMissing(error)) this.report(new Error("Could not read schedules", { cause: error }));
       return undefined;
     } finally {
       if (handle) await closeQuietly(handle);
@@ -367,7 +346,7 @@ export class WorkspaceScheduler {
     try {
       return validateScheduleFile(JSON.parse(raw) as unknown).schedules;
     } catch (error) {
-      this.report(new Error(`Malformed schedules for chat ${chatId}`, { cause: error }));
+      this.report(new Error("Malformed schedules", { cause: error }));
       return undefined;
     }
   }
@@ -376,7 +355,7 @@ export class WorkspaceScheduler {
     try {
       this.logger(error);
     } catch {
-      // Logging must not stop another chat's schedule from being processed.
+      // Diagnostics must never interrupt schedule processing.
     }
   }
 }

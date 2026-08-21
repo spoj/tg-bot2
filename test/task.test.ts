@@ -16,7 +16,7 @@ afterEach(async () => {
 async function fixture(): Promise<{ dataDir: string; workspace: string }> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-task-test-"));
   temporaryDirectories.push(dataDir);
-  const workspace = path.join(dataDir, "chats", "42", "workspace");
+  const workspace = path.join(dataDir, "workspace");
   await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
   return { dataDir, workspace };
 }
@@ -92,7 +92,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
-    const claim = service.handleSpawnRequest(spawnRecord("run-1", "Investigate the parser regression."), 42, workspace);
+    const claim = service.handleSpawnRequest(spawnRecord("run-1", "Investigate the parser regression."), workspace);
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
     expect(await claim).toBe("claimed");
     expect(tasks[0]?.options).toMatchObject({ runId: "run-1", prompt: "Investigate the parser regression." });
@@ -109,7 +109,7 @@ describe("WorkspaceTasks", () => {
       { type: "task_claimed", runId: "run-1" },
       { type: "task_settled", runId: "run-1", status: "done", exitCode: 0 },
     ]);
-    expect(followup).toHaveBeenCalledWith(42, `Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("truncates long prompts in the completion followup", async () => {
@@ -118,10 +118,10 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "x".repeat(500)), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "x".repeat(500)), workspace);
     tasks[0]?.resolveRun(success());
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    const message = (followup.mock.calls as unknown[][])[0]?.[1] as string;
+    const message = (followup.mock.calls as unknown[][])[0]?.[0] as string;
     expect(message).toContain(`"${"x".repeat(119)}…"`);
   });
 
@@ -131,7 +131,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "do the thing"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "do the thing"), workspace);
     tasks[0]?.resolveRun({ code: 3, signal: null, stderr: "boom", stdout: "" });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
 
@@ -142,7 +142,7 @@ describe("WorkspaceTasks", () => {
       { type: "task_claimed", runId: "run-1" },
       { type: "task_settled", runId: "run-1", status: "failed", exitCode: 3, stderr: "boom" },
     ]);
-    expect(followup).toHaveBeenCalledWith(42, `Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("reports a worker that fails to spawn as a failed task", async () => {
@@ -152,7 +152,7 @@ describe("WorkspaceTasks", () => {
     });
     const followup = vi.fn(async () => undefined);
 
-    await setupTasks(dataDir, factory, { agent: { followup } }).handleSpawnRequest(spawnRecord("run-1", "prompt"), 42, workspace);
+    await setupTasks(dataDir, factory, { agent: { followup } }).handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
 
     expect(await systemEvents(workspace)).toMatchObject([
       { type: "task_claimed", runId: "run-1" },
@@ -167,11 +167,11 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
-    expect(await service.handleSpawnRequest(spawnRecord("run-empty", "   "), 42, workspace)).toBe("claimed");
-    expect(await service.handleSpawnRequest(spawnRecord("run-big", "x".repeat(1024 * 1024 + 1)), 42, workspace)).toBe("claimed");
+    expect(await service.handleSpawnRequest(spawnRecord("run-empty", "   "), workspace)).toBe("claimed");
+    expect(await service.handleSpawnRequest(spawnRecord("run-big", "x".repeat(1024 * 1024 + 1)), workspace)).toBe("claimed");
     expect(factory).not.toHaveBeenCalled();
     expect(followup).toHaveBeenCalledTimes(2);
-    expect(followup).toHaveBeenNthCalledWith(1, 42, expect.stringContaining('Task "   " failed (exit unknown). Run files: /workspace/.pi/tasks/run-empty/'));
+    expect(followup).toHaveBeenNthCalledWith(1, expect.stringContaining('Task "   " failed (exit unknown). Run files: /workspace/.pi/tasks/run-empty/'));
     const events = await systemEvents(workspace);
     expect(events.filter((event) => event.type === "task_claimed")).toHaveLength(2);
     expect(events.filter((event) => event.type === "task_settled")).toHaveLength(2);
@@ -184,15 +184,15 @@ describe("WorkspaceTasks", () => {
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
     for (let index = 0; index < 8; index += 1) {
-      expect(await service.handleSpawnRequest(spawnRecord(`run-${index}`, `prompt ${index}`), 42, workspace)).toBe("claimed");
+      expect(await service.handleSpawnRequest(spawnRecord(`run-${index}`, `prompt ${index}`), workspace)).toBe("claimed");
     }
     expect(tasks).toHaveLength(8);
-    expect(await service.handleSpawnRequest(spawnRecord("run-extra", "prompt 8"), 42, workspace)).toBe("pending");
+    expect(await service.handleSpawnRequest(spawnRecord("run-extra", "prompt 8"), workspace)).toBe("pending");
     expect(tasks).toHaveLength(8);
 
     tasks[0]?.resolveRun(success());
     await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(1));
-    expect(await service.handleSpawnRequest(spawnRecord("run-extra", "prompt 8"), 42, workspace)).toBe("claimed");
+    expect(await service.handleSpawnRequest(spawnRecord("run-extra", "prompt 8"), workspace)).toBe("claimed");
     expect(tasks).toHaveLength(9);
     expect(tasks[8]?.options.prompt).toBe("prompt 8");
     for (const task of tasks) task.resolveRun(success());
@@ -205,7 +205,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
     tasks[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
 
@@ -215,7 +215,7 @@ describe("WorkspaceTasks", () => {
       { type: "task_claimed", runId: "run-1" },
       { type: "task_settled", runId: "run-1", status: "aborted" },
     ]);
-    expect(followup).toHaveBeenCalledWith(42, `Task "prompt" aborted (SIGTERM). Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted (SIGTERM). Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("cancels a running task mid-run and records the request", async () => {
@@ -224,8 +224,8 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const service = setupTasks(dataDir, factory, { agent: { followup } });
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "long prompt"), 42, workspace);
-    await service.handleCancelRequest(cancelRecord("run-1"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "long prompt"), workspace);
+    await service.handleCancelRequest(cancelRecord("run-1"), workspace);
 
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
@@ -241,8 +241,8 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = fakeWorkerFactory();
     const service = setupTasks(dataDir, factory);
 
-    await service.handleSpawnRequest(spawnRecord("run-real", "real"), 42, workspace);
-    await service.handleCancelRequest(cancelRecord("run-missing"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-real", "real"), workspace);
+    await service.handleCancelRequest(cancelRecord("run-missing"), workspace);
     expect(tasks[0]?.stop).not.toHaveBeenCalled();
     expect(await systemEvents(workspace)).toMatchObject([{ type: "task_claimed", runId: "run-real" }]);
   });
@@ -256,10 +256,10 @@ describe("WorkspaceTasks", () => {
     };
     const service = setupTasks(dataDir, factory, { agent: { followup }, flush });
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "flush me"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "flush me"), workspace);
     tasks[0]?.resolveRun(success());
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    expect(flush.flush).toHaveBeenCalledWith(42, workspace);
+    expect(flush.flush).toHaveBeenCalledWith(workspace);
   });
 
   it("stamps aborted settles at boot for runs the host died on", async () => {
@@ -295,14 +295,14 @@ describe("WorkspaceTasks", () => {
     const service = setupTasks(dataDir, factory, { agent: { followup } });
     await service.start();
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "prompt"), workspace);
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
     await service.stop();
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
 
     const runDir = path.join(workspace, ".pi", "tasks", "run-1");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted" });
-    expect(followup).toHaveBeenCalledWith(42, `Task "prompt" aborted (SIGTERM). Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted (SIGTERM). Run files: /workspace/.pi/tasks/run-1/`);
   });
 
   it("sends a heartbeat followup while tasks run and stays silent when idle", async () => {
@@ -328,12 +328,12 @@ describe("WorkspaceTasks", () => {
     callbacks[0]?.();
     expect(followup).not.toHaveBeenCalled();
 
-    await service.handleSpawnRequest(spawnRecord("run-1", "heartbeat me"), 42, workspace);
+    await service.handleSpawnRequest(spawnRecord("run-1", "heartbeat me"), workspace);
     tasks[0]?.activity.mockReturnValue({ at: 45_000, text: "still thinking" });
     now.mockReturnValue(300_000);
     callbacks[0]?.();
     expect(followup).toHaveBeenCalledTimes(1);
-    const message = (followup.mock.calls as unknown[][])[0]?.[1] as string;
+    const message = (followup.mock.calls as unknown[][])[0]?.[0] as string;
     expect(message).toContain("1 task(s) running");
     expect(message).toContain('"heartbeat me"');
     expect(message).toContain('running 4m');

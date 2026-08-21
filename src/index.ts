@@ -70,7 +70,7 @@ export async function main(): Promise<void> {
   const bot = createTelegramBot(runtimeConfig, agentManager, deliveryQueue);
   const schedulerInstance = new WorkspaceScheduler({
     dataDir,
-    run: (chatId, prompt) => agentManager.followup(chatId, prompt),
+    run: (prompt) => agentManager.followup(prompt),
   });
   const outboxInstance = new WorkspaceOutbox({
     dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, dataDir, chatId, request)),
@@ -86,9 +86,9 @@ export async function main(): Promise<void> {
   });
   const requestBus = new WorkspaceRequestBus({
     dataDir,
-    onSend: (record, chatId, workspace, resume) => outboxInstance.handleSendRequest(record, chatId, workspace, resume),
-    onSpawn: (record, chatId, workspace) => tasksInstance.handleSpawnRequest(record, chatId, workspace),
-    onCancel: (record, chatId, workspace) => tasksInstance.handleCancelRequest(record, chatId, workspace),
+    onSend: (record, workspace, resume) => outboxInstance.handleSendRequest(record, workspace, resume),
+    onSpawn: (record, workspace) => tasksInstance.handleSpawnRequest(record, workspace),
+    onCancel: (record, workspace) => tasksInstance.handleCancelRequest(record, workspace),
   });
   tasksInstance.flush = requestBus;
 

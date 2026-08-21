@@ -21,7 +21,7 @@ afterEach(async () => {
 async function fixture(): Promise<{ dataDir: string; workspace: string }> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-request-test-"));
   temporaryDirectories.push(dataDir);
-  const workspace = path.join(dataDir, "chats", "42", "workspace");
+  const workspace = path.join(dataDir, "workspace");
   await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
   return { dataDir, workspace };
 }
@@ -83,7 +83,7 @@ describe("WorkspaceRequestBus", () => {
     const bus = setupBus(dataDir, { onSend });
 
     await bus.poll();
-    expect(onSend).toHaveBeenCalledWith({ requestId: "req-1", request: { type: "send_message", text: "hi" } }, 42, workspace, false);
+    expect(onSend).toHaveBeenCalledWith({ requestId: "req-1", request: { type: "send_message", text: "hi" } }, workspace, false);
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
   });
@@ -111,13 +111,13 @@ describe("WorkspaceRequestBus", () => {
 
     await bus.poll();
 
-    expect(onSend.mock.calls.map(([record]) => (record as { requestId: string }).requestId)).toEqual(["req-open", "req-fresh"]);
-    expect(onSend).toHaveBeenNthCalledWith(1, expect.objectContaining({ requestId: "req-open" }), 42, workspace, true);
-    expect(onSend).toHaveBeenNthCalledWith(2, expect.objectContaining({ requestId: "req-fresh" }), 42, workspace, false);
+    expect(onSend.mock.calls.map(([record]) => record.requestId)).toEqual(["req-open", "req-fresh"]);
+    expect(onSend).toHaveBeenNthCalledWith(1, expect.objectContaining({ requestId: "req-open" }), workspace, true);
+    expect(onSend).toHaveBeenNthCalledWith(2, expect.objectContaining({ requestId: "req-fresh" }), workspace, false);
     expect(onSpawn).toHaveBeenCalledTimes(1);
-    expect(onSpawn).toHaveBeenCalledWith({ runId: "run-fresh", prompt: "do it" }, 42, workspace);
+    expect(onSpawn).toHaveBeenCalledWith({ runId: "run-fresh", prompt: "do it" }, workspace);
     expect(onCancel).toHaveBeenCalledTimes(1);
-    expect(onCancel).toHaveBeenCalledWith({ runId: "run-unknown" }, 42, workspace);
+    expect(onCancel).toHaveBeenCalledWith({ runId: "run-unknown" }, workspace);
   });
 
   it("retries pending spawns until a slot frees", async () => {
@@ -165,7 +165,7 @@ describe("WorkspaceRequestBus", () => {
     await writeLog(workspace, [sendRequest("req-2")]);
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(2);
-    expect((onSend.mock.calls[1]?.[0] as { requestId: string }).requestId).toBe("req-2");
+    expect(onSend.mock.calls[1]?.[0]?.requestId).toBe("req-2");
   });
 
   it("flush consumes newly written commands", async () => {
@@ -174,19 +174,18 @@ describe("WorkspaceRequestBus", () => {
     const bus = setupBus(dataDir, { onSend });
 
     await writeLog(workspace, [sendRequest("req-1")]);
-    await bus.flush(42, workspace);
+    await bus.flush(workspace);
     expect(onSend).toHaveBeenCalledTimes(1);
-    await bus.flush(42, workspace);
+    await bus.flush(workspace);
     expect(onSend).toHaveBeenCalledTimes(1);
 
     await appendFile(path.join(workspace, ".tg-bot", "system.jsonl"), sendRequest("req-2"), "utf8");
-    await bus.flush(42, workspace);
+    await bus.flush(workspace);
     expect(onSend).toHaveBeenCalledTimes(2);
   });
 
-  it("ignores non-numeric chat directories and survives handler errors without re-emitting", async () => {
+  it("survives handler errors without re-emitting", async () => {
     const { dataDir, workspace } = await fixture();
-    await mkdir(path.join(dataDir, "chats", "not-a-chat", "workspace", ".tg-bot"), { recursive: true });
     await writeLog(workspace, [sendRequest()]);
     const onSend = vi.fn<SendRequestHandler>(async () => { throw new Error("handler boom"); });
     const bus = setupBus(dataDir, { onSend });

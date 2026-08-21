@@ -12,6 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  */
 
 const SEND_SCHEMA = Type.Object({
+  chat_id: Type.Number({ description: "The Telegram chat id to send to; must be on the allow list" }),
   type: Type.String({ description: "Request type: send_file, send_media_group, send_message, send_location, send_poll, stop_poll, send_reaction, edit_message, or delete_message" }),
   path: Type.Optional(Type.String()),
   caption: Type.Optional(Type.String()),

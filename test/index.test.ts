@@ -18,7 +18,7 @@ const state = vi.hoisted(() => {
     order,
     agents,
     bot,
-    config: { token: "token", allowedUserIds: new Set([42]), dataDir: "/requested" },
+    config: { token: "token", dataDir: "/requested" },
     sandbox: { dataDir: "/canonical-data", bwrapPath: "/validated/bwrap" },
     signalHandlers: {} as Record<string, () => void>,
     checkSandboxEnvironment: vi.fn(),
@@ -27,6 +27,10 @@ const state = vi.hoisted(() => {
       disposeAll = agents.disposeAll;
     }),
     scheduler: vi.fn(class WorkspaceSchedulerMock {
+      options: unknown;
+      constructor(options: unknown) {
+        this.options = options;
+      }
       start = vi.fn(async () => {});
       stop = vi.fn(async () => { order.push("scheduler.stop"); });
     }),
@@ -118,7 +122,9 @@ describe("application startup and shutdown wiring", () => {
       { ...state.config, dataDir: "/canonical-data" },
       expect.objectContaining({ appRoot: expect.any(String), bwrapPath: "/validated/bwrap" }),
     );
-    expect(state.scheduler).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
+    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as { dataDir: string; run: (prompt: string) => unknown };
+    expect(schedulerOptions.dataDir).toBe("/canonical-data");
+    expect(typeof schedulerOptions.run).toBe("function");
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function) }));
     expect(state.requestBus).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data" }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ dataDir: "/canonical-data", bwrapPath: "/validated/bwrap", agent: state.agentManager.mock.instances[0] }));

@@ -16,22 +16,22 @@ function row(overrides: Partial<ScheduleRow> = {}): ScheduleRow {
   return { prompt: "water the plants", start: "2026-01-10T12:00:00.000Z", recurrence: null, ...overrides };
 }
 
-async function writeSchedules(dataDir: string, chatId: number, schedules: unknown): Promise<string> {
-  const metadata = path.join(dataDir, "chats", String(chatId), "workspace", ".tg-bot");
+async function writeSchedules(dataDir: string, schedules: unknown): Promise<string> {
+  const metadata = path.join(dataDir, "workspace", ".tg-bot");
   await mkdir(metadata, { recursive: true });
   const filePath = path.join(metadata, "schedules.json");
   await writeFile(filePath, JSON.stringify({ version: 1, schedules }), "utf8");
   return filePath;
 }
 
-async function systemEvents(dataDir: string, chatId: number): Promise<Array<Record<string, unknown>>> {
-  const filePath = path.join(dataDir, "chats", String(chatId), "workspace", ".tg-bot", "system.jsonl");
+async function systemEvents(dataDir: string): Promise<Array<Record<string, unknown>>> {
+  const filePath = path.join(dataDir, "workspace", ".tg-bot", "system.jsonl");
   const contents = await readFile(filePath, "utf8").catch(() => "");
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-async function appendSystemLine(dataDir: string, chatId: number, event: Record<string, unknown>): Promise<void> {
-  const filePath = path.join(dataDir, "chats", String(chatId), "workspace", ".tg-bot", "system.jsonl");
+async function appendSystemLine(dataDir: string, event: Record<string, unknown>): Promise<void> {
+  const filePath = path.join(dataDir, "workspace", ".tg-bot", "system.jsonl");
   await writeFile(filePath, `${JSON.stringify({ v: 1, t: new Date().toISOString(), ...event })}\n`, { flag: "a" });
 }
 
@@ -67,33 +67,33 @@ function fakeInterval() {
 
 describe("WorkspaceScheduler firing", () => {
   it("fires a due one-shot exactly once and leaves schedules.json untouched", async () => withDirectory(async (dataDir) => {
-    const filePath = await writeSchedules(dataDir, 42, [row()]);
+    const filePath = await writeSchedules(dataDir, [row()]);
     const before = await readFile(filePath, "utf8");
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
 
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
-    expect(run).toHaveBeenCalledWith(42, "water the plants");
-    const events = await systemEvents(dataDir, 42);
+    expect(run).toHaveBeenCalledWith("water the plants");
+    const events = await systemEvents(dataDir);
     expect(events.map((event) => event.type)).toEqual(["schedule_run_scheduled", "schedule_run_fired"]);
     expect(events[0]).toMatchObject({ runId: expect.any(String), prompt: "water the plants", start: "2026-01-10T12:00:00.000Z", recurrence: null, dueAt: "2026-01-10T12:00:00.000Z" });
     expect(events[1]?.runId).toBe(events[0]?.runId);
 
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
-    expect(await systemEvents(dataDir, 42)).toHaveLength(2);
+    expect(await systemEvents(dataDir)).toHaveLength(2);
     expect(await readFile(filePath, "utf8")).toBe(before);
   }));
 
   it("does not fire a one-shot with a future start but materializes the open run", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row({ start: "2026-01-10T14:00:00.000Z" })]);
+    await writeSchedules(dataDir, [row({ start: "2026-01-10T14:00:00.000Z" })]);
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
 
     await scheduler.poll(NOW);
     expect(run).not.toHaveBeenCalled();
-    const events = await systemEvents(dataDir, 42);
+    const events = await systemEvents(dataDir);
     expect(events.map((event) => event.type)).toEqual(["schedule_run_scheduled"]);
 
     await scheduler.poll(Date.parse("2026-01-10T14:00:01.000Z"));
@@ -101,13 +101,13 @@ describe("WorkspaceScheduler firing", () => {
   }));
 
   it("fires recurring rows on the start-anchored grid with fresh run ids", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row({ start: "2026-01-07T09:00:00.000Z", recurrence: "daily" })]);
+    await writeSchedules(dataDir, [row({ start: "2026-01-07T09:00:00.000Z", recurrence: "daily" })]);
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
 
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
-    const events = await systemEvents(dataDir, 42);
+    const events = await systemEvents(dataDir);
     expect(events.map((event) => event.type)).toEqual([
       "schedule_run_scheduled", "schedule_run_fired", "schedule_run_scheduled",
     ]);
@@ -117,20 +117,20 @@ describe("WorkspaceScheduler firing", () => {
 
     await scheduler.poll(Date.parse("2026-01-11T09:00:01.000Z"));
     expect(run).toHaveBeenCalledTimes(2);
-    const after = await systemEvents(dataDir, 42);
+    const after = await systemEvents(dataDir);
     expect(after.at(-1)).toMatchObject({ type: "schedule_run_scheduled", dueAt: "2026-01-12T09:00:00.000Z" });
   }));
 
   it("cancels the open run when a row is deleted and never fires it", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row({ start: "2026-01-10T14:00:00.000Z" })]);
+    await writeSchedules(dataDir, [row({ start: "2026-01-10T14:00:00.000Z" })]);
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
     await scheduler.poll(NOW);
 
-    await writeSchedules(dataDir, 42, []);
+    await writeSchedules(dataDir, []);
     await scheduler.poll(NOW);
     expect(run).not.toHaveBeenCalled();
-    const events = await systemEvents(dataDir, 42);
+    const events = await systemEvents(dataDir);
     expect(events.map((event) => event.type)).toEqual(["schedule_run_scheduled", "schedule_run_cancelled"]);
     expect(events[1]?.runId).toBe(events[0]?.runId);
 
@@ -139,13 +139,13 @@ describe("WorkspaceScheduler firing", () => {
   }));
 
   it("treats a row edit as cancel of the old run and a new run at the new start", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row({ start: "2026-01-10T14:00:00.000Z" })]);
+    await writeSchedules(dataDir, [row({ start: "2026-01-10T14:00:00.000Z" })]);
     const scheduler = makeScheduler(dataDir);
     await scheduler.poll(NOW);
 
-    await writeSchedules(dataDir, 42, [row({ start: "2026-01-10T15:00:00.000Z" })]);
+    await writeSchedules(dataDir, [row({ start: "2026-01-10T15:00:00.000Z" })]);
     await scheduler.poll(NOW);
-    const events = await systemEvents(dataDir, 42);
+    const events = await systemEvents(dataDir);
     expect(events.map((event) => event.type)).toEqual([
       "schedule_run_scheduled", "schedule_run_cancelled", "schedule_run_scheduled",
     ]);
@@ -154,16 +154,16 @@ describe("WorkspaceScheduler firing", () => {
   }));
 
   it("fires identical duplicate rows once (content dedup) with one open run", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row(), row()]);
+    await writeSchedules(dataDir, [row(), row()]);
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
-    expect(await systemEvents(dataDir, 42)).toHaveLength(2);
+    expect(await systemEvents(dataDir)).toHaveLength(2);
   }));
 
   it("fires two same-prompt rows at different starts independently", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [
+    await writeSchedules(dataDir, [
       row({ start: "2026-01-10T12:00:00.000Z" }),
       row({ start: "2026-01-10T12:15:00.000Z" }),
     ]);
@@ -171,13 +171,13 @@ describe("WorkspaceScheduler firing", () => {
     const scheduler = makeScheduler(dataDir, { run });
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(2);
-    const events = await systemEvents(dataDir, 42);
+    const events = await systemEvents(dataDir);
     expect(events).toHaveLength(4);
     expect(new Set(events.map((event) => event.runId)).size).toBe(2);
   }));
 
   it("retries an open run on the next poll when run() rejects", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row()]);
+    await writeSchedules(dataDir, [row()]);
     const run = vi.fn(async () => undefined)
       .mockRejectedValueOnce(new Error("agent busy"));
     const errors: unknown[] = [];
@@ -185,52 +185,52 @@ describe("WorkspaceScheduler firing", () => {
 
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
-    expect(await systemEvents(dataDir, 42)).toHaveLength(1); // scheduled only, no fired
+    expect(await systemEvents(dataDir)).toHaveLength(1); // scheduled only, no fired
     expect(errors).toHaveLength(1);
 
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(2);
-    expect(await systemEvents(dataDir, 42)).toHaveLength(2); // fired on retry
+    expect(await systemEvents(dataDir)).toHaveLength(2); // fired on retry
   }));
 
   it("replays a fired recurring run with no successor (crash window) onto the next grid point", async () => withDirectory(async (dataDir) => {
     const firedDueAt = "2026-01-09T09:00:00.000Z";
-    await writeSchedules(dataDir, 42, [row({ start: firedDueAt, recurrence: "daily" })]);
-    await appendSystemLine(dataDir, 42, {
+    await writeSchedules(dataDir, [row({ start: firedDueAt, recurrence: "daily" })]);
+    await appendSystemLine(dataDir, {
       type: "schedule_run_scheduled",
       runId: "run-old-1", prompt: "water the plants", start: firedDueAt, recurrence: "daily", dueAt: firedDueAt,
     });
-    await appendSystemLine(dataDir, 42, { type: "schedule_run_fired", runId: "run-old-1" });
+    await appendSystemLine(dataDir, { type: "schedule_run_fired", runId: "run-old-1" });
 
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
     await scheduler.poll(NOW);
     expect(run).not.toHaveBeenCalled(); // next grid point after now is 01-11T09:00
-    const events = await systemEvents(dataDir, 42);
+    const events = await systemEvents(dataDir);
     expect(events.at(-1)).toMatchObject({ type: "schedule_run_scheduled", dueAt: "2026-01-11T09:00:00.000Z" });
   }));
 
   it("never re-fires a one-shot row re-added with identical content after deletion", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row()]);
+    await writeSchedules(dataDir, [row()]);
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
 
-    await writeSchedules(dataDir, 42, []);
+    await writeSchedules(dataDir, []);
     await scheduler.poll(NOW);
-    await writeSchedules(dataDir, 42, [row()]);
+    await writeSchedules(dataDir, [row()]);
     await scheduler.poll(NOW);
     expect(run).toHaveBeenCalledTimes(1);
-    const types = (await systemEvents(dataDir, 42)).map((event) => event.type);
+    const types = (await systemEvents(dataDir)).map((event) => event.type);
     expect(types.filter((type) => type === "schedule_run_fired")).toHaveLength(1);
   }));
 
   it("ignores unrelated and malformed log lines while folding", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row()]);
-    await appendSystemLine(dataDir, 42, { type: "outbox_claimed", id: "x", name: "x.json", request: {} });
-    await appendSystemLine(dataDir, 42, "not json at all" as unknown as Record<string, unknown>);
-    await appendSystemLine(dataDir, 42, { type: "schedule_run_scheduled", runId: 7 });
+    await writeSchedules(dataDir, [row()]);
+    await appendSystemLine(dataDir, { type: "outbox_claimed", id: "x", name: "x.json", request: {} });
+    await appendSystemLine(dataDir, "not json at all" as unknown as Record<string, unknown>);
+    await appendSystemLine(dataDir, { type: "schedule_run_scheduled", runId: 7 });
 
     const run = vi.fn(async () => undefined);
     const scheduler = makeScheduler(dataDir, { run });
@@ -241,16 +241,16 @@ describe("WorkspaceScheduler firing", () => {
 
 describe("WorkspaceScheduler validation", () => {
   it("reports a malformed schedules file and appends nothing", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [{ prompt: "x", start: "not-a-date", recurrence: null }]);
+    await writeSchedules(dataDir, [{ prompt: "x", start: "not-a-date", recurrence: null }]);
     const errors: unknown[] = [];
     const scheduler = makeScheduler(dataDir, { logger: (error) => errors.push(error) });
     await scheduler.poll(NOW);
     expect(errors).toHaveLength(1);
-    expect(await systemEvents(dataDir, 42)).toHaveLength(0);
+    expect(await systemEvents(dataDir)).toHaveLength(0);
   }));
 
   it("reports a wrong-version schedules file and appends nothing", async () => withDirectory(async (dataDir) => {
-    const metadata = path.join(dataDir, "chats", "42", "workspace", ".tg-bot");
+    const metadata = path.join(dataDir, "workspace", ".tg-bot");
     await mkdir(metadata, { recursive: true });
     await writeFile(path.join(metadata, "schedules.json"), JSON.stringify({ version: 2, schedules: [] }), "utf8");
     const errors: unknown[] = [];
@@ -260,7 +260,7 @@ describe("WorkspaceScheduler validation", () => {
   }));
 
   it("rejects an invalid recurrence", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [{ prompt: "x", start: "2026-01-10T12:00:00.000Z", recurrence: "yearly" }]);
+    await writeSchedules(dataDir, [{ prompt: "x", start: "2026-01-10T12:00:00.000Z", recurrence: "yearly" }]);
     const errors: unknown[] = [];
     const scheduler = makeScheduler(dataDir, { logger: (error) => errors.push(error) });
     await scheduler.poll(NOW);
@@ -272,13 +272,13 @@ describe("WorkspaceScheduler validation", () => {
     const scheduler = makeScheduler(dataDir, { run });
     await scheduler.poll(NOW);
     expect(run).not.toHaveBeenCalled();
-    expect(await systemEvents(dataDir, 42)).toHaveLength(0);
+    expect(await systemEvents(dataDir)).toHaveLength(0);
   }));
 });
 
 describe("WorkspaceScheduler lifecycle", () => {
   it("start() polls immediately and registers an interval; stop() clears it", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row()]);
+    await writeSchedules(dataDir, [row()]);
     const interval = fakeInterval();
     const run = vi.fn(async () => undefined);
     const scheduler = new WorkspaceScheduler({
@@ -299,7 +299,7 @@ describe("WorkspaceScheduler lifecycle", () => {
   }));
 
   it("concurrent polls share one operation", async () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, 42, [row()]);
+    await writeSchedules(dataDir, [row()]);
     let concurrent = 0;
     let maximum = 0;
     const run = vi.fn(async () => {

@@ -1,8 +1,7 @@
 import { constants as fsConstants } from "node:fs";
-import { open, opendir } from "node:fs/promises";
-import type { Dirent } from "node:fs";
+import { open } from "node:fs/promises";
 import path from "node:path";
-import { chatPaths, isMissing, numericChatId, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
+import { isMissing, readJsonl } from "./util.js";
 
 /** One send_request command: the agent's tool minted requestId and the raw request object. */
 export type SendRequest = {
@@ -24,20 +23,17 @@ export type CancelRequest = {
 /** Consumes one send_request; `resume` means the command was claimed but its dispatch never reached a terminal event. */
 export type SendRequestHandler = (
   record: SendRequest,
-  chatId: number,
   workspace: string,
   resume: boolean,
 ) => Promise<void>;
-
-/** Consumes one spawn_request; "pending" means the chat is at capacity and the command must be retried. */
+/** Consumes one spawn_request; "pending" means the task slots are at capacity and the command must be retried. */
 export type SpawnRequestHandler = (
   record: SpawnRequest,
-  chatId: number,
   workspace: string,
 ) => Promise<"claimed" | "pending">;
 
 /** Consumes one cancel_request; a command naming an unknown or settled run is a no-op. */
-export type CancelRequestHandler = (record: CancelRequest, chatId: number, workspace: string) => Promise<void>;
+export type CancelRequestHandler = (record: CancelRequest, workspace: string) => Promise<void>;
 
 export type WorkspaceRequestBusOptions = {
   dataDir: string;
@@ -100,20 +96,7 @@ export function parseCommand(line: string): SendRequest | SpawnRequest | CancelR
   return undefined;
 }
 
-async function readDirEntries(directory: string): Promise<Dirent[]> {
-  const handle = await opendir(directory);
-  const entries: Dirent[] = [];
-  try {
-    for (;;) {
-      const entry = await handle.read();
-      if (entry === null) break;
-      entries.push(entry);
-    }
-  } finally {
-    await handle.close().catch(() => {});
-  }
-  return entries;
-}
+
 
 /** Reads bytes after offset without following symlinks; a planted symlink throws ELOOP and the file is skipped. */
 async function readTail(filePath: string, offset: number): Promise<{ text: string; nextOffset: number }> {
@@ -170,17 +153,17 @@ export function splitRecords(text: string): { lines: string[]; partial: string }
  * extracts send_request/spawn_request/cancel_request records, dedupes against the
  * claim events in the same log, and routes each command to its handler exactly once.
  * Boot replay re-dispatches open outbox claims (claimed without a terminal event);
- * spawn commands over a chat's concurrency limit are retried each poll. The agent's
+ * spawn commands over the task concurrency limit are retried each poll. The agent's
  * tools append commands with O_APPEND; the host's outcome appends interleave safely.
  */
 export class WorkspaceRequestBus {
   private readonly options: Required<Pick<WorkspaceRequestBusOptions, "onSend" | "onSpawn" | "onCancel">> & WorkspaceRequestBusOptions;
-  private readonly dataDir: string;
+  private readonly workspace: string;
   private readonly pollIntervalMs: number;
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
-  private readonly states = new Map<number, ChatScanState>();
+  private state: ChatScanState | undefined;
   private timer: NodeJS.Timeout | undefined;
   private pollInFlight: Promise<void> | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -192,7 +175,7 @@ export class WorkspaceRequestBus {
       throw new Error("Request poll interval must be a positive timer-safe integer");
     }
     this.options = options;
-    this.dataDir = path.resolve(options.dataDir);
+    this.workspace = path.join(path.resolve(options.dataDir), "workspace");
     this.pollIntervalMs = pollIntervalMs;
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
@@ -244,15 +227,13 @@ export class WorkspaceRequestBus {
   }
 
   /** Consumes any commands written since the last scan, so settle followups order after a task's sends. */
-  async flush(chatId: number, workspace: string): Promise<void> {
-    if (!Number.isSafeInteger(chatId)) return;
-    const state = await this.ensureState(chatId, workspace);
-    await this.scanChat(chatId, workspace, state, false);
+  async flush(workspace: string): Promise<void> {
+    const state = await this.ensureState(workspace);
+    await this.scanWorkspace(workspace, state, false);
   }
 
-  private async ensureState(chatId: number, workspace: string): Promise<ChatScanState> {
-    const existing = this.states.get(chatId);
-    if (existing) return existing;
+  private async ensureState(workspace: string): Promise<ChatScanState> {
+    if (this.state) return this.state;
     const state: ChatScanState = {
       offset: 0,
       partial: "",
@@ -262,7 +243,7 @@ export class WorkspaceRequestBus {
       pending: [],
       booted: false,
     };
-    this.states.set(chatId, state);
+    this.state = state;
     await this.loadBootState(workspace, state);
     state.booted = true;
     return state;
@@ -313,38 +294,21 @@ export class WorkspaceRequestBus {
   }
 
   private async runPoll(): Promise<void> {
-    let chatsRoot: PinnedDirectory | undefined;
     try {
-      chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readDirEntries(chatsRoot.path);
-      const chats = entries
-        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-        .map((entry) => numericChatId(entry.name))
-        .filter((chatId): chatId is number => chatId !== undefined)
-        .sort((a, b) => a - b);
-      for (const chatId of chats) {
-        const workspace = chatPaths(this.dataDir, chatId).workspace;
-        try {
-          const state = await this.ensureState(chatId, workspace);
-          await this.scanChat(chatId, workspace, state, true);
-        } catch (error) {
-          if (!isMissing(error)) this.report(error);
-        }
-      }
+      const state = await this.ensureState(this.workspace);
+      await this.scanWorkspace(this.workspace, state, true);
     } catch (error) {
       if (!isMissing(error)) this.report(error);
-    } finally {
-      if (chatsRoot) await chatsRoot.handle.close().catch((error) => this.report(error));
     }
   }
 
-  private async scanChat(chatId: number, workspace: string, state: ChatScanState, retryPending: boolean): Promise<void> {
+  private async scanWorkspace(workspace: string, state: ChatScanState, retryPending: boolean): Promise<void> {
     // Retry spawns left pending by the previous poll before scanning new commands.
     if (retryPending) {
       const pending = state.pending;
       state.pending = [];
       for (const record of pending) {
-        const result = await this.invokeSpawn(chatId, workspace, record);
+        const result = await this.invokeSpawn(workspace, record);
         if (result === "claimed") state.consumed.add(record.runId);
         else state.pending.push(record);
       }
@@ -365,11 +329,10 @@ export class WorkspaceRequestBus {
     for (const line of lines) {
       const record = parseCommand(line);
       if (record === undefined) continue;
-      await this.route(chatId, workspace, state, record);
+      await this.route(workspace, state, record);
     }
   }
-
-  private async route(chatId: number, workspace: string, state: ChatScanState, record: SendRequest | SpawnRequest | CancelRequest): Promise<void> {
+  private async route(workspace: string, state: ChatScanState, record: SendRequest | SpawnRequest | CancelRequest): Promise<void> {
     const id = "requestId" in record ? record.requestId : record.runId;
     if (state.consumed.has(id)) return;
     if (state.bootConsumed.has(id)) {
@@ -378,7 +341,7 @@ export class WorkspaceRequestBus {
     }
     if ("prompt" in record) {
       // spawn_request
-      const result = await this.invokeSpawn(chatId, workspace, record);
+      const result = await this.invokeSpawn(workspace, record);
       if (result === "claimed") state.consumed.add(record.runId);
       else state.pending.push(record);
       return;
@@ -387,12 +350,12 @@ export class WorkspaceRequestBus {
       // send_request
       state.consumed.add(id);
       const resume = state.sendResume.has(record.requestId);
-      await this.invoke(() => this.options.onSend(record, chatId, workspace, resume));
+      await this.invoke(() => this.options.onSend(record, workspace, resume));
       return;
     }
     // cancel_request
     state.consumed.add(id);
-    await this.invoke(() => this.options.onCancel(record, chatId, workspace));
+    await this.invoke(() => this.options.onCancel(record, workspace));
   }
 
   private async invoke(operation: () => Promise<void>): Promise<void> {
@@ -403,9 +366,9 @@ export class WorkspaceRequestBus {
     }
   }
 
-  private async invokeSpawn(chatId: number, workspace: string, record: SpawnRequest): Promise<"claimed" | "pending"> {
+  private async invokeSpawn(workspace: string, record: SpawnRequest): Promise<"claimed" | "pending"> {
     try {
-      return await this.options.onSpawn(record, chatId, workspace);
+      return await this.options.onSpawn(record, workspace);
     } catch (error) {
       this.report(error);
       return "claimed";

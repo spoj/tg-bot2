@@ -1,18 +1,19 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { Config } from "./config.js";
 import { SerialQueue } from "./queue.js";
-import { TG_BOT_DIR, chatPaths, defined } from "./util.js";
+import { TG_BOT_DIR, defined, workspacePath } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
 import { EVENTS_PROMPT } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 import { TASKS_PROMPT } from "./task-protocol.js";
 
 export const SYSTEM_PROMPT = [
-`You are a persistent personal agent reached through Telegram.
+`You are a persistent personal agent reached through Telegram. You serve several
+chats at once: private chats with individual people and groups you choose. Every chat
+event names its chat_id; answer a chat by calling the send tool with that chat_id.
 Your writable persistent workspace is /workspace.
 Runtime, authentication, and session files are writable under /workspace/.pi.
 Attachments are ordinary data paths under /workspace/...; read them from those paths.
@@ -25,12 +26,12 @@ Install optional project-local extensions with pi install npm:<package> -l --app
   TASKS_PROMPT,
   `Keep Telegram-facing answers concise unless the user asks for detail.
 /status is a host command that reports your current model, thinking level, and session summary.
+You own the chat allow list at /workspace/.tg-bot/allowed.json: {version:1,chats:[{chat_id,title?,added_by,added_at},...]}. The host enforces it both ways — messages from unlisted chats never reach you, and your sends to unlisted chat_ids are rejected. On a fresh workspace the first chat that ever messages you is added automatically (added_by:"bootstrap"); after that the file is fully yours: edit it to allow or remove chats (chat_denied events in system.jsonl show who is knocking). Delete the file to reset to bootstrap.
 Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
 Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, touch /workspace/.tg-bot/new-session (any empty file) and the next run starts fresh.
 Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
 `,
 ].join("");
-
 export type AgentRunWorker = {
   run(): Promise<PiRunResult>;
   stop(): Promise<void>;
@@ -78,15 +79,12 @@ export type AgentStatus = {
   activeSchedules?: number;
 };
 
-type ChatState = {
-  chatId: number;
+type AgentState = {
   serial: SerialQueue;
   worker: AgentRunWorker | undefined;
   running: boolean;
   followups: string[];
   interrupts: string[];
-  lastActivityAt: number;
-  activityLoaded: boolean;
   closing: boolean;
   interruptDebounceTimer: NodeJS.Timeout | undefined;
   interruptForceTimer: NodeJS.Timeout | undefined;
@@ -99,7 +97,6 @@ const INTERRUPT_FORCE_DRAIN_MS = 15_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
 const NEW_SESSION_MARKER = path.join(TG_BOT_DIR, "new-session");
-const ACTIVITY_FILE = "activity.json";
 
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
@@ -114,17 +111,16 @@ export async function loadUserSettings(workspace: string): Promise<Record<string
     return {};
   }
 }
-
 async function readSessionSummary(sessionsDirectory: string): Promise<{
   messageCount: number;
   model: { provider: string; id: string } | undefined;
   thinkingLevel: string | undefined;
   sessionFile: string;
 } | undefined> {
-  const newestName = await newestSessionFile(sessionsDirectory);
-  if (!newestName) return undefined;
+  const newest = await newestSessionFile(sessionsDirectory);
+  if (!newest) return undefined;
   try {
-    const raw = await readFile(path.join(sessionsDirectory, newestName), "utf8");
+    const raw = await readFile(path.join(sessionsDirectory, newest.name), "utf8");
     let messageCount = 0;
     let model: { provider: string; id: string } | undefined;
     let thinkingLevel: string | undefined;
@@ -145,13 +141,13 @@ async function readSessionSummary(sessionsDirectory: string): Promise<{
         thinkingLevel = record.thinkingLevel;
       }
     }
-    return { messageCount, model, thinkingLevel, sessionFile: newestName };
+    return { messageCount, model, thinkingLevel, sessionFile: newest.name };
   } catch {
     return undefined;
   }
 }
 
-async function newestSessionFile(sessionsDirectory: string): Promise<string | undefined> {
+async function newestSessionFile(sessionsDirectory: string): Promise<{ name: string; mtimeMs: number } | undefined> {
   try {
     const entries = await readdir(sessionsDirectory, { withFileTypes: true });
     let newest: { name: string; mtimeMs: number } | undefined;
@@ -160,7 +156,7 @@ async function newestSessionFile(sessionsDirectory: string): Promise<string | un
       const fileStat = await stat(path.join(sessionsDirectory, entry.name));
       if (!newest || fileStat.mtimeMs > newest.mtimeMs) newest = { name: entry.name, mtimeMs: fileStat.mtimeMs };
     }
-    return newest?.name;
+    return newest;
   } catch {
     return undefined;
   }
@@ -198,7 +194,7 @@ async function countActiveSchedules(workspace: string): Promise<number | undefin
 }
 
 export class AgentManager {
-  private readonly states = new Map<number, ChatState>();
+  private readonly state: AgentState;
   private readonly workerFactory: AgentWorkerFactory;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
@@ -237,6 +233,18 @@ export class AgentManager {
       terminateProcessGroup: this.terminateProcessGroup,
       ...defined({ stopGraceMs: this.stopGraceMs }),
     }));
+    this.state = {
+      serial: new SerialQueue(),
+      worker: undefined,
+      running: false,
+      followups: [],
+      interrupts: [],
+      closing: false,
+      interruptDebounceTimer: undefined,
+      interruptForceTimer: undefined,
+      followupDebounceTimer: undefined,
+      stopping: false,
+    };
   }
 
   /**
@@ -245,11 +253,10 @@ export class AgentManager {
    * until the agent is idle, and are then combined into one message. Idle
    * followups wait out the debounce window to batch; there is no force drain.
    */
-  followup(chatId: number, text: string): Promise<void> {
+  followup(text: string): Promise<void> {
     if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
-    const state = this.state(chatId);
+    const state = this.state;
     return state.serial.run(async () => {
-      await this.loadActivity(state);
       if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
       state.followups.push(text);
       if (state.running || state.interrupts.length > 0) return;
@@ -263,17 +270,16 @@ export class AgentManager {
    * oldest queued interrupt has waited the force-drain window, or when the
    * active run settles. Queued followups are preserved behind interrupts.
    */
-  interrupt(chatId: number, text: string): Promise<void> {
+  interrupt(text: string): Promise<void> {
     if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
-    const state = this.state(chatId);
+    const state = this.state;
     return state.serial.run(async () => {
-      await this.loadActivity(state);
       if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
       state.interrupts.push(text);
       this.clearFollowupDebounceTimer(state);
       if (state.stopping) return;
       if (state.interruptForceTimer === undefined) {
-        state.interruptForceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(state), this.interruptForceDrainMs);
+        state.interruptForceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(), this.interruptForceDrainMs);
         state.interruptForceTimer.unref?.();
       }
       this.restartInterruptDebounceTimer(state);
@@ -281,8 +287,8 @@ export class AgentManager {
   }
 
   /** File-based session summary; never spawns a worker. */
-  async status(chatId: number): Promise<AgentStatus> {
-    const workspace = chatPaths(this.config.dataDir, chatId).workspace;
+  async status(): Promise<AgentStatus> {
+    const workspace = workspacePath(this.config.dataDir);
     const settings = await loadUserSettings(workspace);
     const sessionsDirectory = path.join(workspace, ".pi", "sessions");
     let result: AgentStatus = {
@@ -312,16 +318,16 @@ export class AgentManager {
     return result;
   }
 
-  /** Synchronous gate: terminates every active run. */
+  /** Synchronous gate: terminates the active run. */
   beginShutdown(): Promise<void> {
     this.shuttingDown = true;
-    const stops = [...this.states.values()].flatMap((state) => {
-      this.clearInterruptTimers(state);
-      this.clearFollowupDebounceTimer(state);
-      const worker = state.worker;
-      if (!worker) return [];
-      return [worker.stop().catch((error) => console.error("Agent shutdown stop failed", error))];
-    });
+    const state = this.state;
+    this.clearInterruptTimers(state);
+    this.clearFollowupDebounceTimer(state);
+    const worker = state.worker;
+    const stops = worker === undefined
+      ? []
+      : [worker.stop().catch((error) => console.error("Agent shutdown stop failed", error))];
     return Promise.allSettled(stops).then(() => {});
   }
 
@@ -329,70 +335,17 @@ export class AgentManager {
     await this.beginShutdown();
   }
 
-
-  private state(chatId: number): ChatState {
-    const existing = this.states.get(chatId);
-    if (existing) return existing;
-    const state: ChatState = {
-      chatId,
-      serial: new SerialQueue(),
-      worker: undefined,
-      running: false,
-      followups: [],
-      interrupts: [],
-      lastActivityAt: 0,
-      activityLoaded: false,
-      closing: false,
-      interruptDebounceTimer: undefined,
-      interruptForceTimer: undefined,
-      followupDebounceTimer: undefined,
-      stopping: false,
-    };
-    this.states.set(chatId, state);
-    return state;
-  }
-
-  private async loadActivity(state: ChatState): Promise<void> {
-    if (state.activityLoaded) return;
-    state.activityLoaded = true;
-    try {
-      const raw = await readFile(this.activityPath(state.chatId), "utf8");
-      const parsed: unknown = JSON.parse(raw);
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const at = (parsed as Record<string, unknown>).at;
-        if (typeof at === "number" && Number.isSafeInteger(at)) state.lastActivityAt = at;
-      }
-    } catch {
-      // Missing or malformed activity records start with a fresh session.
-    }
-  }
-
-  private activityPath(chatId: number): string {
-    return path.join(this.config.dataDir, "chats", String(chatId), ACTIVITY_FILE);
-  }
-
-  private async persistActivity(state: ChatState): Promise<void> {
-    const file = this.activityPath(state.chatId);
-    const temp = `${file}.${randomUUID()}.tmp`;
-    try {
-      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-      await writeFile(temp, JSON.stringify({ at: state.lastActivityAt }), { encoding: "utf8", mode: 0o600 });
-      await rename(temp, file);
-    } catch (error) {
-      console.error("Agent activity persistence failed", error);
-      await rm(temp, { force: true }).catch(() => {});
-    }
-  }
-
-  /** Starts a run for text; must be called with the state's serial queue held. */
-  private launch(state: ChatState, text: string): void {
+  /** Starts a run for text. */
+  private launch(text: string): void {
+    const state = this.state;
     state.running = true;
-    void this.runToCompletion(state, text);
+    void this.runToCompletion(text);
   }
 
-  private async runToCompletion(state: ChatState, text: string): Promise<void> {
+  private async runToCompletion(text: string): Promise<void> {
+    const state = this.state;
     try {
-      const worker = await this.spawnWorker(state, text);
+      const worker = await this.spawnWorker(text);
       state.worker = worker;
       const result = await worker.run();
       if (result.signal === null && result.code !== 0) {
@@ -401,24 +354,25 @@ export class AgentManager {
     } catch (error) {
       console.error("Agent run failed", error);
     } finally {
-      await state.serial.run(async () => { this.onRunSettled(state); });
+      await state.serial.run(async () => { this.onRunSettled(); });
     }
   }
-  private async onRunSettled(state: ChatState): Promise<void> {
+
+  private async onRunSettled(): Promise<void> {
+    const state = this.state;
     this.clearInterruptTimers(state);
     this.clearFollowupDebounceTimer(state);
     state.running = false;
     state.worker = undefined;
     state.stopping = false;
-    state.lastActivityAt = this.now();
-    await this.persistActivity(state);
     const next = this.drainInterrupts(state) ?? this.drainFollowups(state);
     if (next === undefined || state.closing || this.shuttingDown) return;
-    this.launch(state, next);
+    this.launch(next);
   }
 
   /** Drain conditions 1–2: abort the active run, or combine and launch when idle. */
-  private fireInterruptDrain(state: ChatState): void {
+  private fireInterruptDrain(): void {
+    const state = this.state;
     this.clearInterruptTimers(state);
     if (state.running) {
       const worker = state.worker;
@@ -428,11 +382,11 @@ export class AgentManager {
       return;
     }
     const combined = this.drainInterrupts(state);
-    if (combined !== undefined) this.launch(state, combined);
+    if (combined !== undefined) this.launch(combined);
   }
 
   /** Combines the entire interrupt queue into one message and empties it. */
-  private drainInterrupts(state: ChatState): string | undefined {
+  private drainInterrupts(state: AgentState): string | undefined {
     if (state.interrupts.length === 0) return undefined;
     const combined = state.interrupts.join("\n");
     state.interrupts.length = 0;
@@ -440,7 +394,7 @@ export class AgentManager {
   }
 
   /** Combines the entire followup queue into one message and empties it. */
-  private drainFollowups(state: ChatState): string | undefined {
+  private drainFollowups(state: AgentState): string | undefined {
     if (state.followups.length === 0) return undefined;
     const combined = state.followups.join("\n");
     state.followups.length = 0;
@@ -448,40 +402,41 @@ export class AgentManager {
   }
 
   /** Followup debounce: idle only, no force cap; delivers combined followups once the agent is idle with no interrupts pending. */
-  private fireFollowupDrain(state: ChatState): void {
+  private fireFollowupDrain(state: AgentState): void {
     this.clearFollowupDebounceTimer(state);
     if (state.running || state.interrupts.length > 0) return;
     const combined = this.drainFollowups(state);
-    if (combined !== undefined) this.launch(state, combined);
+    if (combined !== undefined) this.launch(combined);
   }
 
-  private clearFollowupDebounceTimer(state: ChatState): void {
+  private clearFollowupDebounceTimer(state: AgentState): void {
     if (state.followupDebounceTimer === undefined) return;
     this.clearTimeoutFn(state.followupDebounceTimer);
     state.followupDebounceTimer = undefined;
   }
 
-  private restartFollowupDebounceTimer(state: ChatState): void {
+  private restartFollowupDebounceTimer(state: AgentState): void {
     if (state.followupDebounceTimer !== undefined) this.clearTimeoutFn(state.followupDebounceTimer);
     state.followupDebounceTimer = this.setTimeoutFn(() => this.fireFollowupDrain(state), this.combineDebounceMs);
     state.followupDebounceTimer.unref?.();
   }
 
-  private clearInterruptTimers(state: ChatState): void {
+  private clearInterruptTimers(state: AgentState): void {
     if (state.interruptDebounceTimer !== undefined) this.clearTimeoutFn(state.interruptDebounceTimer);
     if (state.interruptForceTimer !== undefined) this.clearTimeoutFn(state.interruptForceTimer);
     state.interruptDebounceTimer = undefined;
     state.interruptForceTimer = undefined;
   }
 
-  private restartInterruptDebounceTimer(state: ChatState): void {
+  private restartInterruptDebounceTimer(state: AgentState): void {
     if (state.interruptDebounceTimer !== undefined) this.clearTimeoutFn(state.interruptDebounceTimer);
-    state.interruptDebounceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(state), this.combineDebounceMs);
+    state.interruptDebounceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(), this.combineDebounceMs);
     state.interruptDebounceTimer.unref?.();
   }
-  private async spawnWorker(state: ChatState, text: string): Promise<AgentRunWorker> {
-    const workspace = chatPaths(this.config.dataDir, state.chatId).workspace;
-    const { resume, model, thinkingLevel } = await this.runOptions(state, workspace);
+
+  private async spawnWorker(text: string): Promise<AgentRunWorker> {
+    const workspace = workspacePath(this.config.dataDir);
+    const { resume, model, thinkingLevel } = await this.runOptions(workspace);
     return await this.workerFactory({
       workspace,
       appRoot: this.appRoot,
@@ -494,8 +449,8 @@ export class AgentManager {
     });
   }
 
-  /** Resume unless a fresh-start marker exists or the resume window has closed. */
-  private async runOptions(state: ChatState, workspace: string): Promise<{
+  /** Resume unless a fresh-start marker exists or the newest session file is older than the resume window. */
+  private async runOptions(workspace: string): Promise<{
     resume: boolean;
     model?: string;
     thinkingLevel?: string;
@@ -509,7 +464,8 @@ export class AgentManager {
     } catch {
       // No marker: resume normally within the window.
     }
-    const resume = !freshStart && this.now() - state.lastActivityAt <= RESUME_WINDOW_MS;
+    const newest = await newestSessionFile(path.join(workspace, ".pi", "sessions"));
+    const resume = !freshStart && this.now() - (newest?.mtimeMs ?? 0) <= RESUME_WINDOW_MS;
     const settings = await loadUserSettings(workspace);
     const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
     const modelId = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;

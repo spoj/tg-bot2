@@ -7,7 +7,7 @@ import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { CancelRequest, SpawnRequest } from "./request-bus.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
-import { chatPaths, defined, errorMessage, isMissing, numericChatId, openPinnedDirectory, type PinnedDirectory } from "./util.js";
+import { defined, errorMessage, isMissing, workspacePath } from "./util.js";
 
 export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
@@ -38,7 +38,7 @@ export type WorkspaceTasksOptions = {
   /** Receives a completion followup per settled task, quoting the prompt and naming the run directory. */
   agent: Pick<AgentManager, "followup">;
   /** Consumes pending commands from system.jsonl before each settle followup, so task sends order before the completion message. */
-  flush?: { flush(chatId: number, workspace: string): Promise<void> };
+  flush?: { flush(workspace: string): Promise<void> };
   heartbeatIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -48,7 +48,7 @@ export type WorkspaceTasksOptions = {
 
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_TASK_BYTES = 1024 * 1024;
-const MAX_CONCURRENT_TASKS_PER_CHAT = 8;
+const MAX_CONCURRENT_TASKS = 8;
 const TASKS_DIR = path.join(".pi", "tasks");
 const SESSIONS_DIR = "sessions";
 const PROMPT_FILE = "prompt.txt";
@@ -104,7 +104,7 @@ function formatDuration(milliseconds: number): string {
 
 /**
  * Runs agent-spawned background tasks: claims spawn tool calls into host-generated uuid
- * run directories under .pi/tasks/ (up to 8 concurrent per chat; excess calls are retried
+ * run directories under .pi/tasks/ (up to 8 concurrent; excess calls are retried
  * as slots free), records every settlement in system.jsonl, and sends the agent a
  * completion followup quoting the prompt. Cancel tool calls stop a run mid-flight.
  * Every started task settles exactly once — immediately on exit (any signal included),
@@ -119,14 +119,14 @@ export class WorkspaceTasks {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
-  /** Consumes the chat's pending system.jsonl commands before the settle followup; assigned after construction to avoid a construction cycle with the request bus. */
+  /** Consumes pending system.jsonl commands before the settle followup; assigned after construction to avoid a construction cycle with the request bus. */
   flush: WorkspaceTasksOptions["flush"];
   private readonly heartbeatIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
-  private readonly inFlight = new Map<number, InFlightTask[]>();
+  private readonly inFlight: InFlightTask[] = [];
   private readonly pendingSettles = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -188,7 +188,7 @@ export class WorkspaceTasks {
       this.cancelSchedule(this.timer);
       this.timer = undefined;
     }
-    const stops = [...this.inFlight.values()].flat().map(({ worker }) => worker.stop().catch((error) => this.report(error)));
+    const stops = this.inFlight.map(({ worker }) => worker.stop().catch((error) => this.report(error)));
     await Promise.all(stops);
     for (;;) {
       const pending: Promise<void>[] = [];
@@ -199,29 +199,28 @@ export class WorkspaceTasks {
     }
   }
 
-  /** Claims one spawn call; "pending" when the chat is at its concurrency limit. */
-  async handleSpawnRequest(record: SpawnRequest, chatId: number, workspace: string): Promise<"claimed" | "pending"> {
+  /** Claims one spawn call; "pending" when the task slots are at capacity. */
+  async handleSpawnRequest(record: SpawnRequest, workspace: string): Promise<"claimed" | "pending"> {
     const prompt = record.prompt;
     if (prompt.trim().length === 0 || prompt.length > MAX_TASK_BYTES) {
-      await this.settleRejectedSpawn(chatId, workspace, record.runId, prompt);
+      await this.settleRejectedSpawn(workspace, record.runId, prompt);
       return "claimed";
     }
-    const available = MAX_CONCURRENT_TASKS_PER_CHAT - (this.inFlight.get(chatId)?.length ?? 0);
-    if (available <= 0) return "pending";
-    await this.claimAndLaunch(chatId, workspace, record.runId, prompt);
+    if (this.inFlight.length >= MAX_CONCURRENT_TASKS) return "pending";
+    await this.claimAndLaunch(workspace, record.runId, prompt);
     return "claimed";
   }
 
   /** Stops one running task; a command naming an unknown or settled run is a no-op. */
-  async handleCancelRequest(record: CancelRequest, chatId: number, workspace: string): Promise<void> {
-    const entry = this.inFlight.get(chatId)?.find((item) => item.runId === record.runId);
+  async handleCancelRequest(record: CancelRequest, workspace: string): Promise<void> {
+    const entry = this.inFlight.find((item) => item.runId === record.runId);
     if (entry === undefined) return;
     await appendSystemEvent(workspace, { type: "task_cancelled", runId: record.runId });
     await entry.worker.stop();
   }
 
-  /** Records a spawn command with an unusable prompt as claimed then failed, with a followup. */
-  private async settleRejectedSpawn(chatId: number, workspace: string, runId: string, prompt: string): Promise<void> {
+  /** Records a spawn command whose prompt is unusable as claimed then failed, with a followup. */
+  private async settleRejectedSpawn(workspace: string, runId: string, prompt: string): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     const reason = prompt.trim().length === 0
       ? "Task prompt must be a non-empty string"
@@ -231,7 +230,7 @@ export class WorkspaceTasks {
       await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
     }
     await appendSystemEvent(workspace, { type: "task_claimed", runId });
-    await this.settleTask(chatId, workspace, { runId, prompt }, runDirectory, {
+    await this.settleTask(workspace, { runId, prompt }, runDirectory, {
       code: null,
       signal: null,
       stderr: reason,
@@ -240,7 +239,7 @@ export class WorkspaceTasks {
   }
 
   /** Claims one spawn command into a fresh uuid run directory and launches its background run. */
-  private async claimAndLaunch(chatId: number, workspace: string, runId: string, prompt: string): Promise<void> {
+  private async claimAndLaunch(workspace: string, runId: string, prompt: string): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
     await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
@@ -249,7 +248,7 @@ export class WorkspaceTasks {
     try {
       worker = await this.workerFactory({ workspace, runId, prompt });
     } catch (error) {
-      await this.settleTask(chatId, workspace, { runId, prompt }, runDirectory, {
+      await this.settleTask(workspace, { runId, prompt }, runDirectory, {
         code: null,
         signal: null,
         stderr: errorMessage(error),
@@ -257,14 +256,12 @@ export class WorkspaceTasks {
       });
       return;
     }
-    this.launchTask(chatId, workspace, { runId, prompt }, runDirectory, worker);
+    this.launchTask(workspace, { runId, prompt }, runDirectory, worker);
   }
 
-  private launchTask(chatId: number, workspace: string, task: { runId: string; prompt: string }, runDirectory: string, worker: WorkspaceTaskWorker): void {
-    const running = this.inFlight.get(chatId) ?? [];
-    running.push({ worker, runId: task.runId, prompt: task.prompt, startedAt: this.now() });
-    this.inFlight.set(chatId, running);
-    const settle = this.runAndSettle(chatId, workspace, task, runDirectory, worker);
+  private launchTask(workspace: string, task: { runId: string; prompt: string }, runDirectory: string, worker: WorkspaceTaskWorker): void {
+    this.inFlight.push({ worker, runId: task.runId, prompt: task.prompt, startedAt: this.now() });
+    const settle = this.runAndSettle(workspace, task, runDirectory, worker);
     this.pendingSettles.add(settle);
     void settle
       .catch((error) => this.report(error))
@@ -272,7 +269,6 @@ export class WorkspaceTasks {
   }
 
   private async runAndSettle(
-    chatId: number,
     workspace: string,
     task: { runId: string; prompt: string },
     runDirectory: string,
@@ -284,46 +280,18 @@ export class WorkspaceTasks {
     } catch (error) {
       result = { code: null, signal: null, stderr: errorMessage(error), stdout: "" };
     } finally {
-      const running = this.inFlight.get(chatId);
-      if (running) {
-        const next = running.filter((entry) => entry.worker !== worker);
-        if (next.length === 0) this.inFlight.delete(chatId);
-        else this.inFlight.set(chatId, next);
-      }
+      const index = this.inFlight.findIndex((entry) => entry.worker === worker);
+      if (index >= 0) this.inFlight.splice(index, 1);
     }
-    await this.settleTask(chatId, workspace, task, runDirectory, result);
+    await this.settleTask(workspace, task, runDirectory, result);
   }
-
   /**
    * Stamps aborted settles for runs the host left in flight when it died: the only way a
    * run dir can lack result.json at boot is an unsettled host crash. Idempotent — a
    * stamped dir never matches again.
    */
   private async stampAbortedRuns(): Promise<void> {
-    let chatsRoot: PinnedDirectory | undefined;
-    try {
-      chatsRoot = await openPinnedDirectory(path.join(this.dataDir, "chats"));
-      const entries = await readDirEntries(chatsRoot.path);
-      const chats = entries
-        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-        .map((entry) => numericChatId(entry.name))
-        .filter((chatId): chatId is number => chatId !== undefined);
-      for (const chatId of chats) {
-        const workspace = chatPaths(this.dataDir, chatId).workspace;
-        try {
-          await this.stampAbortedChatRuns(workspace);
-        } catch (error) {
-          this.report(error);
-        }
-      }
-    } catch (error) {
-      if (!isMissing(error)) this.report(error);
-    } finally {
-      if (chatsRoot) await chatsRoot.handle.close().catch((error) => this.report(error));
-    }
-  }
-
-  private async stampAbortedChatRuns(workspace: string): Promise<void> {
+    const workspace = workspacePath(this.dataDir);
     let tasksPath: string;
     try {
       tasksPath = await ensureTasksDirectory(workspace);
@@ -365,7 +333,6 @@ export class WorkspaceTasks {
 
   /** Records the outcome, appends the system event, and sends the agent a completion followup. */
   private async settleTask(
-    chatId: number,
     workspace: string,
     task: { runId: string; prompt: string },
     runDirectory: string,
@@ -391,7 +358,7 @@ export class WorkspaceTasks {
     });
     if (this.flush) {
       try {
-        await this.flush.flush(chatId, workspace);
+        await this.flush.flush(workspace);
       } catch (error) {
         this.report(error);
       }
@@ -402,16 +369,15 @@ export class WorkspaceTasks {
         ? `failed (exit ${result.code ?? "unknown"})`
         : `aborted (${result.signal ?? "stopped"})`;
     const message = `Task "${truncate(task.prompt, MAX_QUOTE_LENGTH)}" ${outcome}. Run files: /workspace/.pi/tasks/${task.runId}/`;
-    void this.agent.followup(chatId, message).catch((error) => this.report(error));
+    void this.agent.followup(message).catch((error) => this.report(error));
   }
 
-  /** Sends one status followup per chat with running tasks; silent when everything is idle. */
+  /** Sends one status followup while tasks run; silent when everything is idle. */
   private heartbeat(): void {
-    for (const [chatId, running] of this.inFlight) {
-      const lines = running.map((task) => this.heartbeatLine(task));
-      const message = `Task heartbeat: ${running.length} task(s) running.\n${lines.join("\n")}`;
-      void this.agent.followup(chatId, message).catch((error) => this.report(error));
-    }
+    if (this.inFlight.length === 0) return;
+    const lines = this.inFlight.map((task) => this.heartbeatLine(task));
+    const message = `Task heartbeat: ${this.inFlight.length} task(s) running.\n${lines.join("\n")}`;
+    void this.agent.followup(message).catch((error) => this.report(error));
   }
 
   private heartbeatLine(task: InFlightTask): string {

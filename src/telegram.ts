@@ -6,8 +6,9 @@ import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } from "grammy/types";
 import type { Config } from "./config.js";
 import type { AgentManager, AgentStatus } from "./agent.js";
+import { bootstrapAllowedChat, readAllowedFile, type AllowedChat } from "./allowlist.js";
 import { SerialQueue } from "./queue.js";
-import { appendChatEvent, chatEventLine, type ChatEvent } from "./events.js";
+import { appendChatEvent, appendSystemEvent, chatEventLine, type ChatEvent } from "./events.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
   WorkspaceOutboxSendMediaGroupRequest,
@@ -19,8 +20,7 @@ import type {
   WorkspaceOutboxDispatchResult,
   WorkspaceOutboxFileKind,
 } from "./outbox-protocol.js";
-import { appendJsonl, chatPaths, defined, readJsonl } from "./util.js";
-
+import { appendJsonl, defined, readJsonl, workspacePath } from "./util.js";
 
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
@@ -156,9 +156,9 @@ export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId:
 
 export async function dispatchOutboxRequest(bot: Bot, dataDir: string, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
   switch (request.type) {
-    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: chatPaths(dataDir, chatId).workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
+    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: workspacePath(dataDir), sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
-    case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: chatPaths(dataDir, chatId).workspace, request }) };
+    case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: workspacePath(dataDir), request }) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
     case "send_poll": { const sent = await sendTelegramPoll(bot, chatId, request); try { await recordPollOwner(dataDir, chatId, sent.pollId); } catch (error) { console.error("Failed to record poll ownership", error); } return sent; }
     case "stop_poll": return { messageId: request.message_id, data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
@@ -376,7 +376,7 @@ type AttachmentDirectory = {
   handle: Awaited<ReturnType<typeof open>>;
 };
 
-async function ensureAttachmentDirectory(workspace: string, date: string, messageId: number): Promise<AttachmentDirectory> {
+async function ensureAttachmentDirectory(workspace: string, chatId: number, date: string, messageId: number): Promise<AttachmentDirectory> {
   const expectedWorkspace = path.resolve(workspace);
   try {
     const entry = await lstat(expectedWorkspace);
@@ -392,7 +392,7 @@ async function ensureAttachmentDirectory(workspace: string, date: string, messag
   const root = await realpath(expectedWorkspace);
   if (root !== expectedWorkspace) throw new Error("Attachment workspace is not safe.");
   let directory = root;
-  for (const segment of [ATTACHMENTS_DIR, date, String(messageId)]) {
+  for (const segment of [ATTACHMENTS_DIR, String(chatId), date, String(messageId)]) {
     directory = path.join(directory, segment);
     try {
       await mkdir(directory, { mode: 0o700 });
@@ -598,8 +598,8 @@ async function downloadAttachment(
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
-    const workspace = chatPaths(config.dataDir, chatId).workspace;
-    const attachmentDirectory = await ensureAttachmentDirectory(workspace, date, message.message_id);
+    const workspace = workspacePath(config.dataDir);
+    const attachmentDirectory = await ensureAttachmentDirectory(workspace, chatId, date, message.message_id);
     let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
     let temporary: string | undefined;
     try {
@@ -614,7 +614,7 @@ async function downloadAttachment(
       await verifyAttachmentDirectory(attachmentDirectory);
       return {
         ...common,
-        path: `/workspace/${ATTACHMENTS_DIR}/${date}/${message.message_id}/${filename}`,
+        path: `/workspace/${ATTACHMENTS_DIR}/${chatId}/${date}/${message.message_id}/${filename}`,
       };
     } finally {
       await temporaryHandle?.close().catch(() => {});
@@ -664,26 +664,88 @@ export function formatStatus(state: AgentStatus): string {
   return parts.join(" | ");
 }
 
+type TelegramChatInfo = {
+  id: number;
+  title?: string | undefined;
+  first_name?: string | undefined;
+  last_name?: string | undefined;
+};
+
+function chatTitle(chat: TelegramChatInfo): string | undefined {
+  const title = chat.title?.trim();
+  if (title) return title;
+  const name = [chat.first_name, chat.last_name].filter(Boolean).join(" ").trim();
+  return name || undefined;
+}
+
+async function isChatAllowed(workspace: string, chatId: number): Promise<boolean> {
+  const file = await readAllowedFile(workspace);
+  return file.status === "ready" && file.chats.some((entry) => entry.chat_id === chatId);
+}
+
+/**
+ * The ingress gate: allowed chats pass; a missing allow list bootstraps the very
+ * first chatter; everything else is denied with a chat_denied audit event and no
+ * reply. A malformed allow list fails closed.
+ */
+async function gateChat(workspace: string, chat: TelegramChatInfo): Promise<boolean> {
+  const chatId = chat.id;
+  if (!Number.isSafeInteger(chatId)) return false;
+  const denied = () => appendSystemEvent(workspace, { type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) });
+  const file = await readAllowedFile(workspace);
+  if (file.status === "ready") {
+    if (file.chats.some((entry) => entry.chat_id === chatId)) return true;
+    await denied();
+    return false;
+  }
+  if (file.status === "missing") {
+    const entry: AllowedChat = {
+      chat_id: chatId,
+      ...defined({ title: chatTitle(chat) }),
+      added_by: "bootstrap",
+      added_at: new Date().toISOString(),
+    };
+    const created = await bootstrapAllowedChat(workspace, entry);
+    if (created) {
+      await appendSystemEvent(workspace, {
+        type: "chat_allowed",
+        chat_id: chatId,
+        ...defined({ title: chatTitle(chat) }),
+        added_by: "bootstrap",
+        added_at: entry.added_at,
+      });
+      return true;
+    }
+    // Lost a concurrent bootstrap race; re-read and gate normally.
+    const again = await readAllowedFile(workspace);
+    if (again.status === "ready" && again.chats.some((entry) => entry.chat_id === chatId)) return true;
+  }
+  await denied();
+  return false;
+}
+
 export function createTelegramBot(
   config: Config,
   agents: AgentManager,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
 ): Bot {
   const bot = new Bot(config.token);
+  const workspace = workspacePath(config.dataDir);
 
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
 
-  const wake = (chatId: number, prompt: string): Promise<void> => agents.interrupt(chatId, prompt).catch((error) => {
+  const wake = (prompt: string): Promise<void> => agents.interrupt(prompt).catch((error) => {
     console.error("Telegram wake prompt failed", error);
   });
 
   bot.use(async (ctx, next) => {
-    // grammY's ctx.from omits poll_answer updates; voters arrive in pollAnswer.user.
-    const userId = ctx.from?.id ?? ctx.pollAnswer?.user?.id;
-    if (userId === undefined || !config.allowedUserIds.has(userId)) {
-      if (ctx.chat) await queuedReply(ctx, "Unauthorized.");
+    // poll_answer updates carry no chat; their handler routes and gates them.
+    const chat = ctx.chat;
+    if (!chat) {
+      await next();
       return;
     }
+    if (!(await gateChat(workspace, chat))) return;
     await next();
   });
 
@@ -692,10 +754,9 @@ export function createTelegramBot(
   });
 
   bot.command("status", async (ctx) => {
-    const chatId = ctx.chat.id;
     let state: AgentStatus;
     try {
-      state = await agents.status(chatId);
+      state = await agents.status();
     } catch (error) {
       console.error("Failed to get status", error);
       await queuedReply(ctx, "I could not get the status. Please try again.");
@@ -707,9 +768,9 @@ export function createTelegramBot(
   bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    const event: ChatEvent = { type: "message", message: ctx.message, attachments };
-    const line = await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, event) ?? chatEventLine(event);
-    await wake(chatId, line);
+    const event: ChatEvent = { type: "message", chat_id: chatId, message: ctx.message, attachments };
+    const line = await appendChatEvent(workspace, event) ?? chatEventLine(event);
+    await wake(line);
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
@@ -717,16 +778,18 @@ export function createTelegramBot(
     if (chatId === undefined) return;
     // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
-    const event: ChatEvent = { type: "callback", callback_query: query };
-    const line = await appendChatEvent(chatPaths(config.dataDir, chatId).workspace, event) ?? chatEventLine(event);
-    await wake(chatId, line);
+    const event: ChatEvent = { type: "callback", chat_id: chatId, callback_query: query };
+    const line = await appendChatEvent(workspace, event) ?? chatEventLine(event);
+    await wake(line);
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
     const chatId = await findPollOwnerChat(config.dataDir, answer.poll_id);
     if (chatId === undefined) return;
-    void appendChatEvent(chatPaths(config.dataDir, chatId).workspace, {
+    if (!(await isChatAllowed(workspace, chatId))) return;
+    void appendChatEvent(workspace, {
       type: "poll_answer",
+      chat_id: chatId,
       poll_answer: answer,
     });
   });

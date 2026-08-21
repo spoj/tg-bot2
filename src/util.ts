@@ -53,19 +53,9 @@ export async function requireRealDirectory(candidate: string, label: string, exp
 
 export const TG_BOT_DIR = ".tg-bot";
 
-export function chatPaths(dataDir: string, chatId: number): { workspace: string } {
-  if (!Number.isSafeInteger(chatId)) throw new Error("Telegram chat ID must be a safe integer");
-  return { workspace: path.join(dataDir, "chats", String(chatId), "workspace") };
-}
-
-const CHAT_DIRECTORY = /^-?(?:0|[1-9]\d*)$/u;
-
-/** Maps a numeric directory name to a chat ID, rejecting leading zeros, non-numbers, and unsafe integers. */
-export function numericChatId(name: string): number | undefined {
-  if (!CHAT_DIRECTORY.test(name)) return undefined;
-  const chatId = Number(name);
-  if (!Number.isSafeInteger(chatId) || String(chatId) !== name) return undefined;
-  return chatId;
+/** The one workspace this bot's agent owns: `dataDir/workspace`, mounted at /workspace in every sandbox run. */
+export function workspacePath(dataDir: string): string {
+  return path.join(dataDir, "workspace");
 }
 
 export type PinnedDirectory = {

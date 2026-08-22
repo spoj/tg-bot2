@@ -472,6 +472,11 @@ describe("PiWorker", () => {
       });
       await worker.prompt("hello");
       expect(worker.activity()).toEqual({ at: 42_000, text: "hello" });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("fires onInitialPromptWritten once after the first successful prompt write", async () => {
     const f = await fixture();
     try {

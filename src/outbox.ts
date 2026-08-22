@@ -111,21 +111,11 @@ export class WorkspaceOutbox {
       await this.reject(requestId, chatId, threadId, new Error(`Chat ${chatId} is not on the allow list`), origin);
     }
     let result: WorkspaceOutboxDispatchResult | undefined;
-    let dispatchError: unknown;
-    for (let attempt = 1; attempt <= MAX_OUTBOX_ATTEMPTS; attempt++) {
-      try {
-        result = await this.dispatch(chatId, validated);
-        dispatchError = undefined;
-        break;
-      } catch (error) {
-        dispatchError = error;
-        const retryAfter = retryDelaySeconds(error);
-        if (retryAfter === undefined || attempt === MAX_OUTBOX_ATTEMPTS) break;
-        await sleep(retryAfter * 1000);
-      }
-    }
-    if (dispatchError !== undefined) {
-      await this.reject(requestId, chatId, threadId, dispatchError, origin);
+    try {
+      result = await this.dispatchWithRetry(chatId, validated);
+    } catch (error) {
+      await this.reject(requestId, chatId, threadId, error, origin);
+      throw error; // unreachable; reject throws
     }
     const summary = extractRequestSummary(validated);
     const resolvedThreadId = ("message_thread_id" in validated && typeof validated.message_thread_id === "number")
@@ -158,6 +148,19 @@ export class WorkspaceOutbox {
         summary: summary ? truncate(summary, 200) : undefined,
       }),
     };
+  }
+
+  /** Dispatches with up to MAX_OUTBOX_ATTEMPTS attempts; sleeps retry_after (capped) between 429 retries. */
+  private async dispatchWithRetry(chatId: number, validated: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.dispatch(chatId, validated);
+      } catch (error) {
+        const retryAfter = retryDelaySeconds(error);
+        if (retryAfter === undefined || attempt >= MAX_OUTBOX_ATTEMPTS) throw error;
+        await sleep(retryAfter * 1000);
+      }
+    }
   }
   /** Validates the outbox schema; records outbox_rejected and throws on failure. */
   private async parseValidated(request: Record<string, unknown>, requestId: string, origin: string | undefined): Promise<WorkspaceOutboxRequest> {

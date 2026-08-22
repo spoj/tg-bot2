@@ -6,7 +6,6 @@ import { WorkspaceScheduler } from "./scheduler.js";
 import { HostBridge } from "./host-bridge.js";
 import { WorkspaceTasks } from "./task.js";
 import type { Bot } from "grammy";
-import { HostBrowserManager } from "./browser.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
 import { EVENTS_FILE, WorkspaceEventLog } from "./events.js";
 import { TG_BOT_DIR, botPaths, isMissing } from "./util.js";
@@ -28,7 +27,6 @@ export interface DisposableServices {
   taskBridge: Pick<HostBridge, "stop">;
   tasks: Pick<WorkspaceTasks, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
-  browser?: Pick<HostBrowserManager, "stop">;
 }
 
 export interface BotInstance {
@@ -41,7 +39,6 @@ export interface BotInstance {
   taskBridge: HostBridge;
   tasks: WorkspaceTasks;
   delivery: TelegramDeliveryQueue;
-  browser: HostBrowserManager;
 }
 
 /** Type guard for a record holding a string field; returns the field or "". */
@@ -122,13 +119,6 @@ export async function finishDisposal(services: DisposableServices): Promise<void
   } catch (error) {
     console.error("Telegram delivery drain failed", error);
   }
-  if (services.browser) {
-    try {
-      await services.browser.stop();
-    } catch (error) {
-      console.error("Browser shutdown failed", error);
-    }
-  }
 }
 
 export async function main(): Promise<void> {
@@ -166,7 +156,6 @@ export async function main(): Promise<void> {
       events: eventLog,
       dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, request)),
     });
-    const browserManager = new HostBrowserManager({ workspace, events: eventLog });
     const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
       workspace,
       events: eventLog,
@@ -191,16 +180,15 @@ export async function main(): Promise<void> {
       spawn: (params: Record<string, unknown>) => tasksInstance.spawn(stringField(params, "prompt"), stringField(params, "origin") || undefined),
       cancel: async (params: Record<string, unknown>) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
       steerTask: async (params: Record<string, unknown>) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),
-      startBrowser: async (params: Record<string, unknown>) => ({ ...(await browserManager.startBrowser(stringField(params, "origin") || undefined)) }),
     };
     const bridge: HostBridge = new HostBridge({
       socketPath: path.join(hostSocketDir, "host.sock"),
       handlers: hostHandlers,
     });
-    // Task sandboxes get a capability-restricted socket: send and start_browser only.
+    // Task sandboxes get a capability-restricted socket: send only.
     const taskBridge: HostBridge = new HostBridge({
       socketPath: path.join(hostSocketDir, "host-task.sock"),
-      handlers: { send: hostHandlers.send, startBrowser: hostHandlers.startBrowser },
+      handlers: { send: hostHandlers.send },
     });
     return {
       config: runtimeConfig,
@@ -212,7 +200,6 @@ export async function main(): Promise<void> {
       taskBridge,
       tasks: tasksInstance,
       delivery: deliveryQueue,
-      browser: browserManager,
     };
   }));
 
@@ -269,11 +256,6 @@ export async function main(): Promise<void> {
       if (shuttingDown) {
         await shutdown("startup interrupted");
         return;
-      }
-      try {
-        await instance.browser.cleanupStaleArtifacts();
-      } catch (error) {
-        console.error(`Browser artifact cleanup failed for bot ${instance.config.botId}`, error);
       }
       if (shuttingDown) {
         await shutdown("startup interrupted");

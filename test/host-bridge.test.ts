@@ -2,7 +2,7 @@ import net from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { HostBridge } from "../src/host-bridge.js";
 
 const temporaryDirectories: string[] = [];
@@ -20,13 +20,11 @@ async function fixture(): Promise<{ socketPath: string }> {
 function makeBridge(socketPath: string, overrides: Partial<ConstructorParameters<typeof HostBridge>[0]["handlers"]> = {}): HostBridge {
   return new HostBridge({
     socketPath,
-    browserTimeoutMs: 500,
     handlers: {
       send: async () => ({}),
       spawn: async () => ({ status: "launched", runId: "run-1" }),
       cancel: async () => ({ status: "not-running" }),
       steerTask: async () => ({ status: "delivered" }),
-      startBrowser: async () => ({ status: "started", socketPath: "/s", wsEndpoint: "ws+unix:///s" }),
       ...overrides,
     },
   });
@@ -89,16 +87,13 @@ describe("HostBridge", () => {
     const { socketPath } = await fixture();
     const bridge = new HostBridge({
       socketPath,
-      browserTimeoutMs: 500,
       handlers: {
         send: async () => ({}),
-        startBrowser: async () => ({ status: "started", socketPath: "/s", wsEndpoint: "ws+unix:///s" }),
       },
     });
     await bridge.start();
     try {
       expect(await call(socketPath, "send", { request: { type: "send_message", version: 1, id: "x", text: "hi" }, origin: "123:0" })).toEqual({});
-      expect(await call(socketPath, "start_browser")).toEqual({ status: "started", socketPath: "/s", wsEndpoint: "ws+unix:///s" });
       await expect(call(socketPath, "spawn", { prompt: "work" })).rejects.toThrow("Unknown request type: spawn");
       await expect(call(socketPath, "steer_task", { runId: "run-1", message: "hi" })).rejects.toThrow("Unknown request type: steer_task");
       await expect(call(socketPath, "cancel", { runId: "run-1" })).rejects.toThrow("Unknown request type: cancel");
@@ -107,23 +102,6 @@ describe("HostBridge", () => {
     }
   });
 
-  it("times out start_browser without cancelling the launch", async () => {
-    const { socketPath } = await fixture();
-    let settled = false;
-    const bridge = makeBridge(socketPath, {
-      startBrowser: async () => {
-        await new Promise((resolve) => setTimeout(() => { settled = true; resolve(undefined); }, 1200));
-        return { status: "started", socketPath: "/s", wsEndpoint: "ws+unix:///s" };
-      },
-    });
-    await bridge.start();
-    try {
-      await expect(call(socketPath, "start_browser")).rejects.toThrow("timed out after 500ms");
-      await vi.waitFor(() => expect(settled).toBe(true));
-    } finally {
-      await bridge.stop();
-    }
-  });
 
   it("restarts cleanly over a stale socket file", async () => {
     const { socketPath } = await fixture();

@@ -124,27 +124,6 @@ export type HostEvent =
     /** A scheduled occurrence was retired because its row vanished or changed in schedules.json. */
     type: "schedule_run_cancelled";
     runId: string;
-  }
-  | {
-    /** Browser instance is running and accepting CDP connections on the UNIX socket. */
-    type: "browser_ready";
-    requestId?: string | undefined;
-    origin?: string | undefined;
-    status: "started" | "existing";
-    socketPath: string;
-    wsEndpoint: string;
-  }
-  | {
-    /** Host failed to launch Chrome (binary missing, spawn error, socket error, etc.). */
-    type: "browser_request_failed";
-    requestId: string;
-    origin?: string | undefined;
-    error: string;
-  }
-  | {
-    /** Browser instance terminated and UNIX socket was cleaned up. */
-    type: "browser_closed";
-    reason: "idle_timeout" | "agent_close" | "process_exit" | "host_shutdown";
   };
 
 /** All entries recorded in the host-owned append-only events log. */
@@ -297,7 +276,7 @@ export function eventLine(event: object): string {
 
 /** The EVENTS protocol section of the SYSTEM_PROMPT, derived from {@link BotEvent}. */
 export const EVENTS_PROMPT = `Timeline log /workspace/.tg-bot/events.jsonl is a host-owned, read-only record of inbound wire events and host outcomes in timestamp order ({v:1,t,type,...}).
-Your tool calls (send, spawn, steer_task, cancel, start_browser) execute synchronously against the host and are not logged as commands — only their outcomes appear here.
+Your tool calls (send, spawn, steer_task, cancel) execute synchronously against the host and are not logged as commands — only their outcomes appear here.
 Inbound wire events:
 - message: {type:'message',chat_id,message,attachments} (raw Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
 - edited_message: {type:'edited_message',chat_id,message,attachments} (edited Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
@@ -313,6 +292,5 @@ Host outcomes:
 - schedule_run_scheduled / schedule_run_fired / schedule_run_cancelled: schedule occurrence lifecycle.
 - allowlist_updated: updated allowed chat IDs.
 - chat_denied: inbound message dropped from unallowed chat.
-- browser_ready / browser_request_failed / browser_closed: CDP browser lifecycle.
 When messages arrive from allowed chats, the host interrupts you with the raw event JSON lines.
 `;

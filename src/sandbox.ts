@@ -1,4 +1,4 @@
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, existsSync } from "node:fs";
 import { access, lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -246,10 +246,20 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   if (nodeDir !== "/" && !["/usr", ...runtimePaths].some((prefix) => nodeDir === prefix || nodeDir.startsWith(`${prefix}/`))) {
     args.push("--ro-bind", nodeDir, nodeDir);
   }
+  // DNS/TLS/fonts that Chrome (launched by the agent inside the sandbox) and other
+  // tools need; ro-bound individually so nothing host-private leaks in.
+  const chromeSupportPaths = [
+    "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl", "/etc/pki",
+    "/etc/ca-certificates", "/etc/fonts", "/usr/share/fonts", "/usr/share/fontconfig",
+  ].filter((candidate) => existsSync(candidate));
   args.push(
+    ...chromeSupportPaths.flatMap((entry) => ["--ro-bind", entry, entry]),
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     "--dir", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
+    // Root-level agent scripts resolve harness dependencies (e.g. puppeteer-core)
+    // through the same read-only tree; subdirectory projects keep their own installs.
+    "--ro-bind", nodeModules, "/workspace/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
     ...mountArgs,
     "--bind", workspace, "/workspace",

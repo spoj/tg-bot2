@@ -122,7 +122,7 @@ async function settingsFile(dataDir: string, content: Record<string, unknown>): 
 const INTRO = `You are a persistent personal agent reached through Telegram serving multiple chats concurrently.
 Direct assistant text output is not delivered to Telegram — you must call the send tool with the target chat_id to communicate.
 Your writable workspace is /workspace; runtime/sessions live under /workspace/.pi. Attachments are downloaded to /workspace/attachments/<chat_id>/...
-To automate a browser, call start_browser and connect scripts to ws+unix:///workspace/.browser/cdp.sock.
+To automate a browser, launch Chrome yourself inside your sandbox: /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --user-data-dir=/workspace/.browser/profile & then drive it with puppeteer-core over http://127.0.0.1:9222 (import puppeteer from 'puppeteer-core' resolves anywhere under /workspace). It keeps running between your turns and dies with this session when it idles out.
 Install project extensions with pi install <pkg> -l --approve; project settings live at /workspace/.pi/settings.json.
 `;
 
@@ -522,7 +522,7 @@ it("routes task_settled to the originating chat/topic session and stays silent w
   expect(followup).not.toHaveBeenCalled();
 });
 
-it("leaves send and browser outcomes in the timeline without followups", async () => {
+it("leaves send outcomes in the timeline without followups", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);
   const notifier: AgentNotifier = { followup, interrupt };
@@ -544,20 +544,6 @@ it("leaves send and browser outcomes in the timeline without followups", async (
     chat_id: 829096380,
     message_thread_id: 9534,
     detail: "Bad HTML entity",
-  }, "");
-  await router.onEvent({
-    type: "browser_ready",
-    requestId: "req-1",
-    origin: "829096380:9534",
-    status: "started",
-    socketPath: "/workspace/.browser/cdp.sock",
-    wsEndpoint: "ws+unix:///workspace/.browser/cdp.sock",
-  }, "");
-  await router.onEvent({
-    type: "browser_request_failed",
-    requestId: "req-2",
-    origin: "829096380:9534",
-    error: "no chrome",
   }, "");
 
   expect(followup).not.toHaveBeenCalled();

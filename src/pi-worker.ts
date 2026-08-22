@@ -34,7 +34,7 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   clearInterval?: typeof clearInterval;
 };
 
-export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours: agents (and any subprocesses they keep) run until this inactivity limit
 export const DEFAULT_BUSY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 export const BUSY_WATCHDOG_CHECK_INTERVAL_MS = 15_000; // 15 seconds
 const DEFAULT_STOP_GRACE_MS = 1_000;

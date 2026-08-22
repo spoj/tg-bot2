@@ -4,11 +4,11 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * Host-tools extension: send/spawn/steer_task/cancel/start_browser tools that call
+ * Host-tools extension: send/spawn/steer_task/cancel tools that call
  * the host synchronously over the bridge socket mounted at PI_HOST_SOCKET. The host
  * validates, executes, and records outcomes in its own events log; each tool returns
  * the host's result directly. PI_HOST_TOOLS selects which tools a run exposes
- * (chat runs: send,spawn,steer_task,cancel,start_browser; task runs: send,start_browser).
+ * (chat runs: send,spawn,steer_task,cancel; task runs: send).
  */
 
 const SEND_SCHEMA = Type.Object({
@@ -47,7 +47,6 @@ const SEND_SCHEMA = Type.Object({
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const BROWSER_TIMEOUT_MS = 25_000;
 
 function text(content: string): ToolResult {
   return { content: [{ type: "text", text: content }], details: {} };
@@ -228,21 +227,6 @@ const HOST_TOOLS = {
         if (result.status === "stopped") return text(`Task ${params.runId} is stopping; its settle followup will arrive with aborted status.`);
         if (result.status === "cancelled-queued") return text(`Queued task ${params.runId} was cancelled before it started.`);
         return text(`Task ${params.runId} is not running (settled or unknown); nothing to cancel.`);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-  },
-  start_browser: {
-    label: "Start browser",
-    description: "Request a headless Chrome browser instance. Blocks until Chrome and the socket bridge are ready, then returns the connection handle in the tool result. Write a puppeteer-core script that connects via ws+unix:///workspace/.browser/cdp.sock (import puppeteer from 'puppeteer-core'). The browser is shared across sessions, so end every script with one of: (1) release the tab — await page.close(); await browser.disconnect(); or (2) keep the page state and stop the script — await browser.disconnect(); process.exit(0). NEVER call browser.close(), which kills the shared Chrome and every session's tabs; disconnecting with a live page still attached (no page.close, no process.exit) leaks the tab in the shared browser.",
-    parameters: Type.Object({}),
-    execute: async (): Promise<ToolResult> => {
-      try {
-        const result = await callHost("start_browser", { ...originParam() }, BROWSER_TIMEOUT_MS);
-        const wsEndpoint = typeof result.wsEndpoint === "string" ? result.wsEndpoint : "unknown";
-        const socketPath = typeof result.socketPath === "string" ? result.socketPath : "unknown";
-        return text(`Browser is ready (${result.status === "existing" ? "reused existing" : "started"}). CDP endpoint: ${wsEndpoint} (socket: ${socketPath})`);
       } catch (error) {
         return failure(error);
       }

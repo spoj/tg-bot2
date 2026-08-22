@@ -173,14 +173,12 @@ describe("application startup and shutdown wiring", () => {
         spawn: expect.any(Function),
         cancel: expect.any(Function),
         steerTask: expect.any(Function),
-        startBrowser: expect.any(Function),
       }),
     }));
     expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
       socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host-task.sock"),
       handlers: {
         send: expect.any(Function),
-        startBrowser: expect.any(Function),
       },
     }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({

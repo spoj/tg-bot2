@@ -20,7 +20,6 @@ export type HostBridgeHandlers = {
   spawn: BridgeHandler;
   cancel: BridgeHandler;
   steerTask: BridgeHandler;
-  startBrowser: BridgeHandler;
 };
 
 export type HostBridgeOptions = {
@@ -28,40 +27,12 @@ export type HostBridgeOptions = {
   socketPath: string;
   /** Handlers by request type; a type without a handler is rejected as unknown. */
   handlers: Partial<HostBridgeHandlers>;
-  /** Rejects start_browser after this many milliseconds; the launch itself keeps running. */
-  browserTimeoutMs?: number;
   /** Kills a connection whose request line exceeds this many bytes. */
   maxLineBytes?: number;
   logger?: (error: unknown) => void;
-  setTimeoutFn?: typeof setTimeout;
-  clearTimeoutFn?: typeof clearTimeout;
 };
 
-const DEFAULT_BROWSER_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_LINE_BYTES = 2 * 1024 * 1024;
-
-function withTimeout<T>(
-  promise: Promise<T>,
-  milliseconds: number,
-  message: string,
-  setTimeoutFn: typeof setTimeout,
-  clearTimeoutFn: typeof clearTimeout,
-): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeoutFn(() => reject(new Error(message)), milliseconds);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeoutFn(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeoutFn(timer);
-        reject(error);
-      },
-    );
-  });
-}
 
 /**
  * Agent-to-host RPC bridge over a UNIX socket: agent tools (running inside the
@@ -71,22 +42,16 @@ function withTimeout<T>(
 export class HostBridge {
   private readonly socketPath: string;
   private readonly handlers: Partial<HostBridgeHandlers>;
-  private readonly browserTimeoutMs: number;
   private readonly maxLineBytes: number;
   private readonly logger: (error: unknown) => void;
-  private readonly setTimeoutFn: typeof setTimeout;
-  private readonly clearTimeoutFn: typeof clearTimeout;
   private server: net.Server | undefined;
   private readonly connections = new Set<net.Socket>();
 
   constructor(options: HostBridgeOptions) {
     this.socketPath = options.socketPath;
     this.handlers = options.handlers;
-    this.browserTimeoutMs = options.browserTimeoutMs ?? DEFAULT_BROWSER_TIMEOUT_MS;
     this.maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
     this.logger = options.logger ?? ((error) => console.error("Host bridge error", error));
-    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
-    this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
   }
 
   async start(): Promise<void> {
@@ -170,10 +135,7 @@ export class HostBridge {
       return { id: request.id, ok: false, error: `Unknown request type: ${request.type}` };
     }
     try {
-      const execution = handler(request.params);
-      const result = request.type === "start_browser"
-        ? await withTimeout(execution, this.browserTimeoutMs, `Browser start timed out after ${this.browserTimeoutMs}ms`, this.setTimeoutFn, this.clearTimeoutFn)
-        : await execution;
+      const result = await handler(request.params);
       return { id: request.id, ok: true, result };
     } catch (error) {
       return { id: request.id, ok: false, error: errorMessage(error) };
@@ -186,7 +148,6 @@ export class HostBridge {
       case "spawn": return this.handlers.spawn;
       case "cancel": return this.handlers.cancel;
       case "steer_task": return this.handlers.steerTask;
-      case "start_browser": return this.handlers.startBrowser;
       default: return undefined;
     }
   }

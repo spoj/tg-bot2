@@ -197,7 +197,7 @@ export class WorkspaceTasks {
         ...defined({ bwrapPath: this.bwrapPath }),
         taskRun: true,
         appendSystemPrompt: TASK_RUNNER_PROMPT,
-        hostTools: "send,start_browser",
+        hostTools: "send",
         agentOrigin: `task:${workerOptions.runId}`,
         resume: false,
         sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,

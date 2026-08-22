@@ -149,6 +149,55 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     await rm(root, { recursive: true, force: true });
   }
 });
+it("binds the node binary's parent directory when node is outside the standard mount prefixes", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const bin = path.join(f.root, "bin");
+  const fakeNode = path.join(bin, "node");
+  const previousPath = process.env.PATH;
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await mkdir(bin);
+    await writeFile(fakeNode, "#!/bin/sh\n", { mode: 0o755 });
+    process.env.PATH = bin;
+    const workerArgs = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
+    expect(workerArgs.args).toContain(await realpath(fakeNode));
+    const nodeDir = path.dirname(await realpath(fakeNode));
+    expect(workerArgs.args).toEqual(expect.arrayContaining(["--ro-bind", nodeDir, nodeDir]));
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+it.skipIf(process.execPath !== "/usr/bin/node")("does not add a duplicate node bind when node is under /usr", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const previousPath = process.env.PATH;
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    process.env.PATH = "/usr/bin";
+    const workerArgs = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
+    expect(workerArgs.args).toContain(process.execPath);
+    const nodeDir = path.dirname(process.execPath);
+    const bindPairs: Array<[string, string]> = [];
+    for (let i = 0; i < workerArgs.args.length - 2; i++) {
+      const source = workerArgs.args[i + 1];
+      const destination = workerArgs.args[i + 2];
+      if (workerArgs.args[i] === "--ro-bind" && source !== undefined && destination !== undefined) {
+        bindPairs.push([source, destination]);
+      }
+    }
+    expect(bindPairs).toContainEqual(["/usr", "/usr"]);
+    expect(bindPairs).not.toContainEqual([nodeDir, nodeDir]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
 it("binds appendSystemPrompt read-only to /app/append-system-prompt.md", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");

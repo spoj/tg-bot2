@@ -201,7 +201,7 @@ export class AgentEventRouter {
     if (event.chat_id >= 0) return;
     if (!isBotGroupAdd(event.my_chat_member)) return;
     await this.notifier.followup(
-      `Bot was added to group ${event.chat_id}. To allow it, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`,
+      `Bot was added to group or channel ${event.chat_id}. To allow it, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`,
       { chatId: event.chat_id },
     );
   }

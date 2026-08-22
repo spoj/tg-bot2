@@ -111,6 +111,37 @@ function callHost(type: string, params: Record<string, unknown>, timeoutMs = DEF
   });
 }
 
+type SendChatOrigin = { chatId: number; threadId?: number };
+
+function explicitThreadId(request: Record<string, unknown>): number | undefined {
+  const raw = request.message_thread_id;
+  return typeof raw === "number" && Number.isSafeInteger(raw) ? raw : undefined;
+}
+
+/**
+ * Resolves the send target from an explicit chat_id, falling back to the origin
+ * chat only when chat_id is absent. An explicitly supplied non-safe-integer
+ * chat_id is an error, never a silent default.
+ */
+export function resolveSendTarget(
+  request: Record<string, unknown>,
+  chatOrigin: SendChatOrigin | undefined,
+): { chatId?: number; threadId?: number } | { error: string } {
+  const rawChatId = request.chat_id;
+  if (rawChatId !== undefined) {
+    if (typeof rawChatId !== "number" || !Number.isSafeInteger(rawChatId)) {
+      return { error: `chat_id must be a safe integer (got ${String(rawChatId)})` };
+    }
+    const threadId = explicitThreadId(request);
+    return { chatId: rawChatId, ...(threadId !== undefined ? { threadId } : {}) };
+  }
+  if (chatOrigin === undefined) {
+    return { error: "chat_id is required when calling send from a background task or without an active chat session." };
+  }
+  const threadId = explicitThreadId(request) ?? chatOrigin.threadId;
+  return { chatId: chatOrigin.chatId, ...(threadId !== undefined ? { threadId } : {}) };
+}
+
 function getChatOrigin(): { chatId: number; threadId?: number } | undefined {
   const origin = process.env.PI_AGENT_ORIGIN;
   if (!origin || origin.startsWith("task:") || origin === "default") return undefined;
@@ -135,29 +166,13 @@ const HOST_TOOLS = {
     description: "Send a message, file, media album, location, poll, reaction, edit, or delete to a Telegram chat. Executes synchronously: the host validates, delivers to Telegram, and returns the outcome (messageId/pollId or the failure detail) in the tool result.",
     parameters: SEND_SCHEMA,
     execute: async (request: Record<string, unknown>): Promise<ToolResult> => {
-      const chatOrigin = getChatOrigin();
-      const rawChatId = request.chat_id;
-      let targetChatId: number | undefined;
-      let targetThreadId: number | undefined;
-
-      if (typeof rawChatId === "number" && Number.isSafeInteger(rawChatId)) {
-        targetChatId = rawChatId;
-        if (typeof request.message_thread_id === "number" && Number.isSafeInteger(request.message_thread_id)) {
-          targetThreadId = request.message_thread_id;
-        }
-      } else if (chatOrigin !== undefined) {
-        targetChatId = chatOrigin.chatId;
-        targetThreadId = typeof request.message_thread_id === "number" && Number.isSafeInteger(request.message_thread_id)
-          ? request.message_thread_id
-          : chatOrigin.threadId;
-      } else {
-        return text("FAILED: chat_id is required when calling send from a background task or without an active chat session.");
-      }
+      const target = resolveSendTarget(request, getChatOrigin());
+      if ("error" in target) return text(`FAILED: ${target.error}`);
 
       const finalRequest: Record<string, unknown> = {
         ...request,
-        chat_id: targetChatId,
-        ...(targetThreadId !== undefined ? { message_thread_id: targetThreadId } : {}),
+        chat_id: target.chatId,
+        ...(target.threadId !== undefined ? { message_thread_id: target.threadId } : {}),
       };
       try {
         const result = await callHost("send", { request: finalRequest, ...originParam() });

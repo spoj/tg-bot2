@@ -748,7 +748,7 @@ export function isBotGroupAdd(value: unknown): boolean {
   if (newChatMember === null || typeof newChatMember !== "object" || oldChatMember === null || typeof oldChatMember !== "object") return false;
   const newStatus = "status" in newChatMember ? newChatMember.status : undefined;
   const oldStatus = "status" in oldChatMember ? oldChatMember.status : undefined;
-  return newStatus === "member" && (oldStatus === "left" || oldStatus === "kicked");
+  return (newStatus === "member" || newStatus === "administrator") && (oldStatus === "left" || oldStatus === "kicked");
 }
 
 async function isChatAllowed(workspace: string, chatId: number, events?: WorkspaceEventLog): Promise<boolean> {

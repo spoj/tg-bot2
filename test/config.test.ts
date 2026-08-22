@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { defaultDataDir, loadConfig, parseAuthToken, parseBotId } from "../src/config.js";
 import { botPaths } from "../src/util.js";
@@ -121,6 +121,30 @@ describe("configuration", () => {
         await mkdir(path.join(dataDir, "bots", "123"), { recursive: true });
         await writeFile(path.join(dataDir, "bots", "123", "auth.json"), JSON.stringify({ token: "456:wrong_token" }));
         await expect(loadConfig({ dataDir })).rejects.toThrow("does not match directory name");
+      } finally {
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects symlinked bot directories and still loads real ones", async () => {
+      const dataDir = path.join(os.tmpdir(), `tg-bot2-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      try {
+        await mkdir(path.join(dataDir, "bots"), { recursive: true });
+        const target = path.join(dataDir, "real-bot-100");
+        await mkdir(target);
+        await writeFile(path.join(target, "auth.json"), JSON.stringify({ token: "100:token100" }));
+        await symlink(target, path.join(dataDir, "bots", "100"), "dir");
+
+        await expect(loadConfig({ dataDir })).rejects.toThrow(/bots\/100/);
+        await expect(loadConfig({ dataDir })).rejects.toThrow(/symlink/);
+
+        await rm(path.join(dataDir, "bots", "100"), { force: true });
+        await mkdir(path.join(dataDir, "bots", "100"));
+        await writeFile(path.join(dataDir, "bots", "100", "auth.json"), JSON.stringify({ token: "100:token100" }));
+
+        const config = await loadConfig({ dataDir });
+        expect(config.bots).toHaveLength(1);
+        expect(config.bots[0]?.botDir).toBe(path.join(dataDir, "bots", "100"));
       } finally {
         await rm(dataDir, { recursive: true, force: true });
       }

@@ -85,6 +85,28 @@ describe("HostBridge", () => {
     }
   });
 
+  it("rejects request types whose handlers the bridge does not expose", async () => {
+    const { socketPath } = await fixture();
+    const bridge = new HostBridge({
+      socketPath,
+      browserTimeoutMs: 500,
+      handlers: {
+        send: async () => ({}),
+        startBrowser: async () => ({ status: "started", socketPath: "/s", wsEndpoint: "ws+unix:///s" }),
+      },
+    });
+    await bridge.start();
+    try {
+      expect(await call(socketPath, "send", { request: { type: "send_message", version: 1, id: "x", text: "hi" }, origin: "123:0" })).toEqual({});
+      expect(await call(socketPath, "start_browser")).toEqual({ status: "started", socketPath: "/s", wsEndpoint: "ws+unix:///s" });
+      await expect(call(socketPath, "spawn", { prompt: "work" })).rejects.toThrow("Unknown request type: spawn");
+      await expect(call(socketPath, "steer_task", { runId: "run-1", message: "hi" })).rejects.toThrow("Unknown request type: steer_task");
+      await expect(call(socketPath, "cancel", { runId: "run-1" })).rejects.toThrow("Unknown request type: cancel");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("times out start_browser without cancelling the launch", async () => {
     const { socketPath } = await fixture();
     let settled = false;

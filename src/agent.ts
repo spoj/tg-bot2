@@ -67,6 +67,8 @@ export type AgentWorkerOptions = {
   now?: () => number;
   hostSocketDir?: string;
   hostEventsLog?: string;
+  /** Chat runs dial the full host socket (false); task runs get the restricted one (true). */
+  taskRun?: boolean;
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   setTimeout?: typeof setTimeout;
@@ -565,6 +567,7 @@ export class AgentManager {
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
       hostTools: "send,spawn,steer_task,cancel,start_browser",
+      taskRun: false,
       agentOrigin: conversationKey(chatId, threadId),
       resume,
       spawnProcess: this.spawnProcess,

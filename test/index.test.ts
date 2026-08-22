@@ -59,9 +59,12 @@ const state = vi.hoisted(() => {
       }
     }),
     bridge: vi.fn(class HostBridgeMock {
-      constructor(_options: unknown) {}
+      socketPath: string;
+      constructor(options: { socketPath: string }) {
+        this.socketPath = options.socketPath;
+      }
       start = vi.fn(async () => {});
-      stop = vi.fn(async () => { order.push("bridge.stop"); });
+      stop = vi.fn(async () => { order.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.stop" : "bridge.stop"); });
     }),
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
@@ -173,6 +176,13 @@ describe("application startup and shutdown wiring", () => {
         startBrowser: expect.any(Function),
       }),
     }));
+    expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
+      socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host-task.sock"),
+      handlers: {
+        send: expect.any(Function),
+        startBrowser: expect.any(Function),
+      },
+    }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: [
         "message",
@@ -227,7 +237,7 @@ describe("application startup and shutdown wiring", () => {
 
     state.signalHandlers.SIGTERM?.();
     await vi.waitFor(() => expect(state.order).toEqual([
-      "bot.stop", "agents.beginShutdown", "scheduler.stop", "bridge.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
+      "bot.stop", "agents.beginShutdown", "scheduler.stop", "bridge.stop", "taskBridge.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
     ]));
     expect(process.exitCode).toBeUndefined();
 
@@ -263,7 +273,7 @@ describe("application startup and shutdown wiring", () => {
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledTimes(2));
     expect(state.agentManager).toHaveBeenCalledTimes(2);
     expect(state.scheduler).toHaveBeenCalledTimes(2);
-    expect(state.bridge).toHaveBeenCalledTimes(2);
+    expect(state.bridge).toHaveBeenCalledTimes(4); // host.sock + host-task.sock per bot
     expect(state.tasks).toHaveBeenCalledTimes(2);
 
     state.signalHandlers.SIGINT?.();
@@ -286,6 +296,7 @@ describe("finishDisposal", () => {
         agents: { disposeAll: step("disposeAll") },
         scheduler: { stop: step("scheduler.stop") },
         bridge: { stop: step("bridge.stop") },
+        taskBridge: { stop: step("taskBridge.stop") },
         tasks: { stop: step("tasks.stop") },
         delivery: { drain: step("delivery.drain") },
       },
@@ -298,7 +309,7 @@ describe("finishDisposal", () => {
 
     await finishDisposal(services);
 
-    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "taskBridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
@@ -309,7 +320,7 @@ describe("finishDisposal", () => {
 
     await expect(finishDisposal(services)).resolves.toBeUndefined();
 
-    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "taskBridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });

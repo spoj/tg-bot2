@@ -25,6 +25,7 @@ export interface DisposableServices {
   agents: Pick<AgentManager, "disposeAll">;
   scheduler: Pick<WorkspaceScheduler, "stop">;
   bridge: Pick<HostBridge, "stop">;
+  taskBridge: Pick<HostBridge, "stop">;
   tasks: Pick<WorkspaceTasks, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
   browser?: Pick<HostBrowserManager, "stop">;
@@ -37,6 +38,7 @@ export interface BotInstance {
   agents: AgentManager;
   scheduler: WorkspaceScheduler;
   bridge: HostBridge;
+  taskBridge: HostBridge;
   tasks: WorkspaceTasks;
   delivery: TelegramDeliveryQueue;
   browser: HostBrowserManager;
@@ -94,6 +96,11 @@ export async function finishDisposal(services: DisposableServices): Promise<void
     await services.bridge.stop();
   } catch (error) {
     console.error("Host bridge shutdown failed", error);
+  }
+  try {
+    await services.taskBridge.stop();
+  } catch (error) {
+    console.error("Host task bridge shutdown failed", error);
   }
   try {
     await services.tasks.stop();
@@ -179,15 +186,21 @@ export async function main(): Promise<void> {
         await tasksInstance.spawn(prompt, undefined, runId);
       },
     });
+    const hostHandlers = {
+      send: (params: Record<string, unknown>) => outboxInstance.send(params.request, stringField(params, "origin") || undefined),
+      spawn: (params: Record<string, unknown>) => tasksInstance.spawn(stringField(params, "prompt"), stringField(params, "origin") || undefined),
+      cancel: async (params: Record<string, unknown>) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
+      steerTask: async (params: Record<string, unknown>) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),
+      startBrowser: async (params: Record<string, unknown>) => ({ ...(await browserManager.startBrowser(stringField(params, "origin") || undefined)) }),
+    };
     const bridge: HostBridge = new HostBridge({
       socketPath: path.join(hostSocketDir, "host.sock"),
-      handlers: {
-        send: (params) => outboxInstance.send(params.request, stringField(params, "origin") || undefined),
-        spawn: (params) => tasksInstance.spawn(stringField(params, "prompt"), stringField(params, "origin") || undefined),
-        cancel: async (params) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
-        steerTask: async (params) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),
-        startBrowser: async (params) => ({ ...(await browserManager.startBrowser(stringField(params, "origin") || undefined)) }),
-      },
+      handlers: hostHandlers,
+    });
+    // Task sandboxes get a capability-restricted socket: send and start_browser only.
+    const taskBridge: HostBridge = new HostBridge({
+      socketPath: path.join(hostSocketDir, "host-task.sock"),
+      handlers: { send: hostHandlers.send, startBrowser: hostHandlers.startBrowser },
     });
     return {
       config: runtimeConfig,
@@ -196,6 +209,7 @@ export async function main(): Promise<void> {
       agents: agentManager,
       scheduler: schedulerInstance,
       bridge,
+      taskBridge,
       tasks: tasksInstance,
       delivery: deliveryQueue,
       browser: browserManager,
@@ -247,6 +261,11 @@ export async function main(): Promise<void> {
         return;
       }
       await instance.bridge.start();
+      if (shuttingDown) {
+        await shutdown("startup interrupted");
+        return;
+      }
+      await instance.taskBridge.start();
       if (shuttingDown) {
         await shutdown("startup interrupted");
         return;

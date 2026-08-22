@@ -26,6 +26,8 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   busyTimeoutMs?: number;
   busyTimeoutMessage?: string;
   now?: () => number;
+  /** Invoked once, after the first prompt JSON-RPC write (the worker's initial prompt). */
+  onInitialPromptWritten?: () => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
@@ -137,6 +139,8 @@ export class PiWorker {
   private readonly settledResolvers = new Set<(result: PiRunResult) => void>();
   private reapedCallback: (() => void) | undefined;
   private closing = false;
+  private stopped = false;
+  private initialPromptWritten = false;
 
   constructor(options: PiWorkerOptions) {
     this.options = options;
@@ -231,6 +235,7 @@ export class PiWorker {
         hostTools: this.options.hostTools,
         hostSocketDir: this.options.hostSocketDir,
         hostEventsLog: this.options.hostEventsLog,
+        taskRun: this.options.taskRun,
       }),
     });
 
@@ -278,6 +283,11 @@ export class PiWorker {
         resolve(result);
       });
     });
+
+    if (this.stopped) {
+      // stop() arrived before the spawn finished; never let this run go on.
+      await this.terminateProcess(child);
+    }
 
     // Configure steering mode and follow-up mode to "all" on RPC startup
     this.writeJson({ id: "init-steer", type: "set_steering_mode", mode: "all" });
@@ -331,18 +341,23 @@ export class PiWorker {
 
   async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
     if (!this.isAlive()) {
+      if (this.stopped) return;
       await this.start();
     }
     this.isBusyState = true;
     this.clearIdleTimer();
     this.armBusyWatchdog();
     this.noteActivity(message);
-    this.writeJson({
+    const wrote = this.writeJson({
       id: randomUUID(),
       type: "prompt",
       message,
       ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
     });
+    if (wrote && !this.initialPromptWritten) {
+      this.initialPromptWritten = true;
+      this.options.onInitialPromptWritten?.();
+    }
   }
 
   waitForSettled(): Promise<PiRunResult> {
@@ -383,11 +398,23 @@ export class PiWorker {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     this.clearIdleTimer();
     this.clearBusyWatchdog();
-    const child = this.process;
+    let child = this.process;
+    if (!child) {
+      // Stop arriving while the run is still starting: wait for the spawn, then
+      // terminate it here (otherwise the running prompt would take the task
+      // to completion instead of settling it aborted).
+      await this.startPromise?.catch(() => {});
+      child = this.process;
+    }
     if (!child || !this.isAlive()) return Promise.resolve();
+    await this.terminateProcess(child);
+  }
 
+  /** SIGTERM the process group, escalate to SIGKILL after stopGraceMs, and wait for exit. */
+  private async terminateProcess(child: PiWorkerChildProcess): Promise<void> {
     const done = this.exitPromise ?? Promise.resolve({ code: null, signal: null, stderr: "", stdout: "" });
     this.options.terminateProcessGroup(child, "SIGTERM");
 

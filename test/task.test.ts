@@ -34,6 +34,7 @@ type FakeTask = {
   steer: Mock;
   stop: Mock;
   activity: Mock;
+  onPrompted: Mock;
   resolveRun: (result: PiRunResult) => void;
 };
 
@@ -46,9 +47,46 @@ function fakeWorkerFactory(): { factory: Mock; tasks: FakeTask[] } {
     task.stop = vi.fn(async () => task.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" }));
     task.activity = vi.fn(() => ({ at: 0, text: "" }));
     task.resolveRun = () => {};
-    task.run = () => new Promise<PiRunResult>((resolve) => {
-      task.resolveRun = resolve;
+    task.onPrompted = vi.fn();
+    task.run = () => {
+      // Default fake: the initial prompt is written as soon as the run starts.
+      task.onPrompted.mock.calls[0]?.[0]();
+      return new Promise<PiRunResult>((resolve) => {
+        task.resolveRun = resolve;
+      });
+    };
+    tasks.push(task);
+    return task;
+  });
+  return { factory, tasks };
+}
+
+/** Fake worker whose initial-prompt write happens only when the test calls promptWritten(). */
+type GatedTask = FakeTask & { promptWritten: () => void };
+
+function gatedWorkerFactory(): { factory: Mock; tasks: GatedTask[] } {
+  const tasks: GatedTask[] = [];
+  const factory = vi.fn(async (options: WorkspaceTaskWorkerOptions): Promise<GatedTask> => {
+    const task = {} as GatedTask;
+    task.options = options;
+    task.steer = vi.fn(async () => undefined);
+    task.stop = vi.fn(async () => task.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" }));
+    task.activity = vi.fn(() => ({ at: 0, text: "" }));
+    task.resolveRun = () => {};
+    task.onPrompted = vi.fn();
+    let releaseGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
     });
+    task.promptWritten = () => releaseGate();
+    task.run = () => {
+      void gate.then(() => {
+        task.onPrompted.mock.calls[0]?.[0]();
+      });
+      return new Promise<PiRunResult>((resolve) => {
+        task.resolveRun = resolve;
+      });
+    };
     tasks.push(task);
     return task;
   });
@@ -167,6 +205,71 @@ describe("WorkspaceTasks", () => {
     await expect(service.steer(runId, "use python 3.12")).resolves.toBe("delivered");
     expect(tasks[0]?.steer).toHaveBeenCalledWith("use python 3.12");
     await expect(service.steer("run-unknown", "noop")).resolves.toBe("not-running");
+  });
+
+  it("queues steers arriving before the initial prompt and delivers them in order after it", async () => {
+    const { workspace, eventsLog } = await fixture();
+    const { factory, tasks } = gatedWorkerFactory();
+    const { service } = setupTasks(workspace, eventsLog, factory);
+
+    const { runId } = await service.spawn("initial prompt", "123:0");
+    const task = tasks[0];
+    expect(task).toBeDefined();
+    expect(task?.onPrompted).toHaveBeenCalledOnce();
+
+    await expect(service.steer(runId, "first steer")).resolves.toBe("delivered");
+    await expect(service.steer(runId, "second steer")).resolves.toBe("delivered");
+    expect(task?.steer).not.toHaveBeenCalled();
+
+    task?.promptWritten();
+    await vi.waitFor(() => expect(task?.steer.mock.calls.map((call) => call[0])).toEqual(["first steer", "second steer"]));
+
+    await expect(service.steer(runId, "third steer")).resolves.toBe("delivered");
+    await vi.waitFor(() => expect(task?.steer).toHaveBeenLastCalledWith("third steer"));
+  });
+
+  it("cancels a task before its initial prompt is written and settles it aborted without steering", async () => {
+    const { workspace, eventsLog } = await fixture();
+    const { factory, tasks } = gatedWorkerFactory();
+    const followup = vi.fn(async () => undefined);
+    const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
+
+    const { runId } = await service.spawn("long prompt", "123:0");
+    const task = tasks[0];
+    expect(task?.onPrompted).toHaveBeenCalledOnce();
+
+    await expect(service.steer(runId, "too early")).resolves.toBe("delivered");
+    await expect(service.cancel(runId)).resolves.toBe("stopped");
+    expect(task?.stop).toHaveBeenCalledOnce();
+    expect(task?.steer).not.toHaveBeenCalled();
+
+    // A late prompt-write signal must not flush queued steers into the cancelled run.
+    task?.promptWritten();
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
+    expect(task?.steer).not.toHaveBeenCalled();
+
+    const events = await new WorkspaceEventLog(eventsLog).readAll();
+    expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
+  });
+
+  it("settles a cancelled starting task as aborted even when its prompt write never fires", async () => {
+    const { workspace, eventsLog } = await fixture();
+    const { factory, tasks } = gatedWorkerFactory();
+    const followup = vi.fn(async () => undefined);
+    const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
+
+    const { runId } = await service.spawn("long prompt", "123:0");
+    const task = tasks[0];
+    await expect(service.steer(runId, "too early")).resolves.toBe("delivered");
+    await expect(service.cancel(runId)).resolves.toBe("stopped");
+    expect(task?.steer).not.toHaveBeenCalled();
+
+    // promptWritten() is never called: the cancelled run must still settle aborted.
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
+    expect(task?.steer).not.toHaveBeenCalled();
+    expect((followup.mock.calls as unknown[][])[0]?.[0]).toContain("aborted");
+    const events = await new WorkspaceEventLog(eventsLog).readAll();
+    expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
   });
 
   it("runs up to eight tasks concurrently and queues the rest until slots free", async () => {

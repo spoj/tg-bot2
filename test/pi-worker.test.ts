@@ -472,6 +472,113 @@ describe("PiWorker", () => {
       });
       await worker.prompt("hello");
       expect(worker.activity()).toEqual({ at: 42_000, text: "hello" });
+  it("fires onInitialPromptWritten once after the first successful prompt write", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const onInitialPromptWritten = vi.fn();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+        onInitialPromptWritten,
+      });
+      await worker.prompt("initial prompt");
+      expect(onInitialPromptWritten).toHaveBeenCalledOnce();
+
+      await worker.prompt("steer", "steer");
+      await worker.prompt("follow up", "followUp");
+      expect(onInitialPromptWritten).toHaveBeenCalledOnce();
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        expect.stringContaining('"type":"prompt","message":"initial prompt"'),
+        "utf8",
+      );
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("stop() before start() terminates the spawned process and settles with a signal", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.stop();
+      const starting = worker.start();
+      await vi.waitFor(() => expect(terminate).toHaveBeenCalledWith(child, "SIGTERM"));
+      expect(spawn).toHaveBeenCalledOnce();
+      child.emit("exit", null, "SIGTERM");
+      await starting;
+      const result = await worker.waitForSettled();
+      expect(result.signal).toBe("SIGTERM");
+      expect(result.code).toBeNull();
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not respawn a stopped worker when prompted again", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.start();
+      const stopping = worker.stop();
+      child.emit("exit", null, "SIGTERM");
+      await stopping;
+      await worker.prompt("late steer", "steer");
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(child.stdin.write).not.toHaveBeenCalledWith(
+        expect.stringContaining('"type":"prompt"'),
+        "utf8",
+      );
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("points PI_HOST_SOCKET at host-task.sock for task runs and host.sock otherwise", async () => {
+    const f = await fixture();
+    try {
+      const runDir = path.join(f.root, "run");
+      await mkdir(runDir, { recursive: true });
+
+      const taskFixture = fakeChildFixture();
+      const taskWorker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        hostSocketDir: runDir,
+        taskRun: true,
+        spawnProcess: taskFixture.spawn,
+        terminateProcessGroup: taskFixture.terminate,
+      });
+      await taskWorker.start();
+      const taskArgs = taskFixture.spawn.mock.calls[0]?.[1] ?? [];
+      expect(taskArgs[taskArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/workspace/.host/host-task.sock");
+
+      const chatFixture = fakeChildFixture();
+      const chatWorker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        hostSocketDir: runDir,
+        taskRun: false,
+        spawnProcess: chatFixture.spawn,
+        terminateProcessGroup: chatFixture.terminate,
+      });
+      await chatWorker.start();
+      const chatArgs = chatFixture.spawn.mock.calls[0]?.[1] ?? [];
+      expect(chatArgs[chatArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/workspace/.host/host.sock");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

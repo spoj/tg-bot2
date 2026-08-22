@@ -117,6 +117,17 @@ export class WorkspaceOutbox {
       await this.reject(requestId, chatId, threadId, error, origin);
       throw error; // unreachable; reject throws
     }
+    return await this.recordSent(requestId, chatId, validated, result, origin);
+  }
+
+  /** Persists the outbox_sent terminal event and returns the synchronous send summary. */
+  private async recordSent(
+    requestId: string,
+    chatId: number,
+    validated: WorkspaceOutboxRequest,
+    result: WorkspaceOutboxDispatchResult | undefined,
+    origin: string | undefined,
+  ): Promise<OutboxSendResult> {
     const summary = extractRequestSummary(validated);
     const resolvedThreadId = ("message_thread_id" in validated && typeof validated.message_thread_id === "number")
       ? validated.message_thread_id

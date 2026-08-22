@@ -33,7 +33,6 @@ export type WorkspaceTasksOptions = {
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
-  busyTimeoutMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
   heartbeatIntervalMs?: number;
   /** Host socket dir and events log bind-mounted into task sandboxes. */
@@ -53,9 +52,6 @@ const SESSIONS_DIR = "sessions";
 const PROMPT_FILE = "prompt.txt";
 const OUTPUT_FILE = "output.md";
 const RESULT_FILE = "result.json";
-export const DEFAULT_TASK_BUSY_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
-export const TASK_BUSY_TIMEOUT_MESSAGE =
-  "Interrupted: Operation took over 15 minutes with no progress. If running long-running commands, consider running them in the background, redirecting output to a file, and checking progress periodically.";
 export const TASK_PROMPT_EMPTY_MESSAGE = "Task prompt must be a non-empty string";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 const MAX_QUOTE_LENGTH = 120;
@@ -152,7 +148,6 @@ export class WorkspaceTasks {
   private readonly spawnProcess: PiWorkerSpawn;
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
-  private readonly busyTimeoutMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
   private readonly heartbeatIntervalMs: number;
   private readonly hostSocketDir: string | undefined;
@@ -179,7 +174,6 @@ export class WorkspaceTasks {
     this.spawnProcess = options.spawnProcess;
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
-    this.busyTimeoutMs = options.busyTimeoutMs;
     this.events = options.events;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.hostSocketDir = options.hostSocketDir;
@@ -199,15 +193,12 @@ export class WorkspaceTasks {
         appendSystemPrompt: TASK_RUNNER_PROMPT,
         hostTools: "send",
         agentOrigin: `task:${workerOptions.runId}`,
-        resume: false,
         sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
         idleTimeoutMs: 0,
         spawnProcess: this.spawnProcess,
         terminateProcessGroup: this.terminateProcessGroup,
         ...defined({
           stopGraceMs: this.stopGraceMs,
-          busyTimeoutMs: this.busyTimeoutMs ?? DEFAULT_TASK_BUSY_TIMEOUT_MS,
-          busyTimeoutMessage: TASK_BUSY_TIMEOUT_MESSAGE,
           hostSocketDir: this.hostSocketDir,
           hostEventsLog: this.hostEventsLog,
         }),

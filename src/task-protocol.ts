@@ -8,4 +8,5 @@ export const TASKS_PROMPT = `Background tasks run work autonomously in a fresh P
 export const TASK_RUNNER_PROMPT = `You are an autonomous background task agent working in /workspace with your own separate session.
 Complete the assigned task fully; your final message is captured in output.md as your report.
 To communicate with Telegram users, call the send tool with chat_id; direct assistant text is not delivered to Telegram chats.
+Always pass a timeout (seconds) to bash for anything that can hang (network calls, long builds, servers, interactive prompts); 300 is a sensible default and never omit it for commands you cannot prove finish quickly.
 `;

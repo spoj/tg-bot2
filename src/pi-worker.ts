@@ -23,8 +23,6 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   idleTimeoutMs?: number;
-  busyTimeoutMs?: number;
-  busyTimeoutMessage?: string;
   now?: () => number;
   /** Invoked once, after the first prompt JSON-RPC write (the worker's initial prompt). */
   onInitialPromptWritten?: () => void;
@@ -35,8 +33,6 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
 };
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours: agents (and any subprocesses they keep) run until this inactivity limit
-export const DEFAULT_BUSY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-export const BUSY_WATCHDOG_CHECK_INTERVAL_MS = 15_000; // 15 seconds
 const DEFAULT_STOP_GRACE_MS = 1_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
@@ -118,8 +114,6 @@ export class PiWorker {
   private readonly bwrapPath: string;
   private readonly stopGraceMs: number;
   private readonly idleTimeoutMs: number;
-  private readonly busyTimeoutMs: number;
-  private readonly busyTimeoutMessage: string | undefined;
   private readonly now: () => number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
@@ -130,10 +124,8 @@ export class PiWorker {
   private stderr = "";
   private lastActivityAt = 0;
   private lastActivity = "";
-  private busyEscalations = 0;
   private isBusyState = false;
   private idleTimer: NodeJS.Timeout | undefined;
-  private busyTimer: NodeJS.Timeout | undefined;
   private startPromise: Promise<void> | undefined;
   private exitPromise: Promise<PiRunResult> | undefined;
   private readonly settledResolvers = new Set<(result: PiRunResult) => void>();
@@ -158,12 +150,6 @@ export class PiWorker {
       throw new Error("idleTimeoutMs must be a non-negative integer");
     }
     this.idleTimeoutMs = idleTimeoutMs;
-    const busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
-    if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0) {
-      throw new Error("busyTimeoutMs must be a non-negative integer");
-    }
-    this.busyTimeoutMs = busyTimeoutMs;
-    this.busyTimeoutMessage = options.busyTimeoutMessage;
     this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
@@ -188,9 +174,6 @@ export class PiWorker {
 
   private noteActivity(chunk: string | Buffer): void {
     this.lastActivityAt = this.now();
-    if (this.isBusyState) {
-      this.busyEscalations = 0;
-    }
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     const trimmed = text.trim();
     if (trimmed.length > 0) {
@@ -214,7 +197,6 @@ export class PiWorker {
     this.stderr = "";
     this.lastActivityAt = 0;
     this.lastActivity = "";
-    this.busyEscalations = 0;
     this.isBusyState = false;
     this.closing = false;
 
@@ -228,7 +210,6 @@ export class PiWorker {
       ...defined({
         cliPath: this.options.cliPath,
         appendSystemPrompt: promptFile,
-        resume: this.options.resume,
         sessionDir: this.options.sessionDir,
         model: this.options.model,
         thinkingLevel: this.options.thinkingLevel,
@@ -275,7 +256,6 @@ export class PiWorker {
           this.handleStdoutLine(buffer.trim());
         }
         this.clearIdleTimer();
-        this.clearBusyWatchdog();
         this.isBusyState = false;
         this.process = undefined;
         const result: PiRunResult = { code, signal, stderr: this.stderr, stdout: this.stdout };
@@ -302,10 +282,8 @@ export class PiWorker {
       if (event.type === "agent_start" || event.type === "turn_start") {
         this.isBusyState = true;
         this.clearIdleTimer();
-        this.armBusyWatchdog();
       } else if (event.type === "agent_settled") {
         this.isBusyState = false;
-        this.clearBusyWatchdog();
         this.armIdleTimer();
         this.resolveSettled({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
       }
@@ -334,10 +312,6 @@ export class PiWorker {
     }
   }
 
-  /** Aborts the in-flight turn; false when the RPC channel is not writable. */
-  abort(): boolean {
-    return this.writeJson({ id: randomUUID(), type: "abort" });
-  }
 
   async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
     if (!this.isAlive()) {
@@ -346,7 +320,6 @@ export class PiWorker {
     }
     this.isBusyState = true;
     this.clearIdleTimer();
-    this.armBusyWatchdog();
     this.noteActivity(message);
     const wrote = this.writeJson({
       id: randomUUID(),
@@ -376,7 +349,6 @@ export class PiWorker {
     if (this.closing) return this.exitPromise ? this.exitPromise.then(() => {}) : Promise.resolve();
     this.closing = true;
     this.clearIdleTimer();
-    this.clearBusyWatchdog();
     const child = this.process;
     if (!child || !this.isAlive()) return Promise.resolve();
 
@@ -400,7 +372,6 @@ export class PiWorker {
   async stop(): Promise<void> {
     this.stopped = true;
     this.clearIdleTimer();
-    this.clearBusyWatchdog();
     let child = this.process;
     if (!child) {
       // Stop arriving while the run is still starting: wait for the spawn, then
@@ -450,49 +421,4 @@ export class PiWorker {
     this.reapedCallback?.();
   }
 
-  private armBusyWatchdog(): void {
-    if (this.busyTimeoutMs <= 0 || !Number.isFinite(this.busyTimeoutMs)) return;
-    this.clearBusyWatchdog();
-    const interval = Math.min(BUSY_WATCHDOG_CHECK_INTERVAL_MS, Math.max(100, Math.floor(this.busyTimeoutMs / 2)));
-    this.busyTimer = this.setIntervalFn(() => {
-      void this.checkBusyTimeout();
-    }, interval);
-    this.busyTimer.unref?.();
-  }
-
-  private clearBusyWatchdog(): void {
-    if (this.busyTimer !== undefined) {
-      this.clearIntervalFn(this.busyTimer);
-      this.busyTimer = undefined;
-    }
-  }
-
-  private checkBusyTimeout(): void {
-    if (!this.isBusyState || !this.isAlive()) {
-      this.clearBusyWatchdog();
-      return;
-    }
-    const elapsed = this.now() - this.lastActivityAt;
-    if (elapsed >= this.busyTimeoutMs) {
-      this.handleBusyTimeout();
-    }
-  }
-
-  private handleBusyTimeout(): void {
-    this.busyEscalations += 1;
-    const message = this.busyTimeoutMessage ?? "Interrupted: Operation took too long with no progress.";
-    const escalate = this.busyEscalations > 1;
-    if (escalate && !this.abort()) {
-      this.clearBusyWatchdog();
-      return;
-    }
-    if (!this.writeJson({ id: randomUUID(), type: "prompt", message, streamingBehavior: "steer" })) {
-      // stdin is dead; stop re-arming and let exit detection own cleanup
-      this.clearBusyWatchdog();
-      return;
-    }
-    this.lastActivityAt = this.now();
-    const trimmed = message.trim();
-    this.lastActivity = trimmed.length <= MAX_ACTIVITY_TEXT ? trimmed : `${trimmed.slice(0, MAX_ACTIVITY_TEXT - 1)}…`;
-  }
 }

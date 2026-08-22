@@ -28,7 +28,8 @@ Responsiveness & Multi-Chat Orchestration:
 - Message formatting: Prefer parse_mode: "HTML" (using <b>, <i>, <code>, <pre>, <blockquote>, <a>, bullet points •) over raw markdown so messages render cleanly on Telegram.
 - Forum topics: When conversing in a topic (message_thread_id is present), rename it around message 2-3 to a short descriptive name distinct from the last 10 active topic names in events.jsonl using edit_forum_topic.
 - Allowlist & Status: /workspace/.tg-bot/allowed.json controls allowed chat IDs. /status reports current model, thinking level, and session info. Adjust model/thinking in /workspace/.pi/agent/settings.json.
-- Session continuity: Active sessions resume across runs within 2 hours of inactivity; an admin can /restart to apply settings changes.
+- Session continuity: Each worker starts fresh; past session files under /workspace/.pi/sessions and the events.jsonl timeline are your memory across restarts. An admin can /restart to apply settings changes.
+- Bash timeouts: always pass a timeout (seconds) to bash for anything that can hang (network calls, long builds, servers, interactive prompts). 300 is a sensible default; longer only with justification, and never omit it for commands you cannot prove finish quickly.
 - Context gathering hierarchy:
   1. Thread context: if message_thread_id is present, query events.jsonl filtered by chat_id and message_thread_id (using grep, rq, or jq).
   2. Chat context: if not in a thread or broader context is needed, query events.jsonl filtered by chat_id.
@@ -47,9 +48,6 @@ export type AgentWorker = {
   onReaped(callback: () => void): void;
 };
 
-export const DEFAULT_CHAT_BUSY_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-export const CHAT_BUSY_TIMEOUT_MESSAGE =
-  "Interrupted: Operation took over 2 minutes with no progress. If this task requires long computation or multi-step execution, consider acknowledging the user with the send tool and spawning a background task (spawn tool) to keep the chat loop responsive.";
 
 export type AgentWorkerOptions = {
   workspace: string;
@@ -59,11 +57,8 @@ export type AgentWorkerOptions = {
   appendSystemPrompt?: string;
   hostTools?: string;
   agentOrigin?: string;
-  resume: boolean;
   thinkingLevel?: string;
   idleTimeoutMs?: number;
-  busyTimeoutMs?: number;
-  busyTimeoutMessage?: string;
   now?: () => number;
   hostSocketDir?: string;
   hostEventsLog?: string;
@@ -87,7 +82,6 @@ export type AgentManagerOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   idleTimeoutMs?: number;
-  busyTimeoutMs?: number;
   hostSocketDir?: string;
   hostEventsLog?: string;
   now?: () => number;
@@ -242,7 +236,6 @@ export class AgentEventRouter {
 
 }
 
-const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
 const RESTART_SETTLE_CAP_MS = 30_000;
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
@@ -361,12 +354,6 @@ function conversationKey(chatId?: number, threadId?: number): string {
   return `${chatId}:${threadId ?? 0}`;
 }
 
-function sessionDirectoryPath(workspace: string, chatId?: number, threadId?: number): string {
-  if (chatId === undefined) {
-    return path.join(workspace, ".pi", "sessions");
-  }
-  return path.join(workspace, ".pi", "sessions", String(chatId), String(threadId ?? 0));
-}
 
 export class AgentManager {
   private readonly workspace: string;
@@ -376,7 +363,6 @@ export class AgentManager {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly idleTimeoutMs: number | undefined;
-  private readonly busyTimeoutMs: number | undefined;
   private readonly now: () => number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
@@ -396,7 +382,6 @@ export class AgentManager {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.idleTimeoutMs = options.idleTimeoutMs;
-    this.busyTimeoutMs = options.busyTimeoutMs;
     this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
@@ -534,10 +519,7 @@ export class AgentManager {
     const sessionSubdir = chatId !== undefined
       ? path.join(".pi", "sessions", String(chatId), String(threadId ?? 0))
       : path.join(".pi", "sessions");
-    const sessionDir = sessionDirectoryPath(this.workspace, chatId, threadId);
 
-    const newest = await newestSessionFile(sessionDir);
-    const resume = newest !== undefined && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS;
 
     const settings = await loadUserSettings(this.workspace);
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
@@ -556,8 +538,6 @@ export class AgentManager {
         thinkingLevel,
         stopGraceMs: this.stopGraceMs,
         idleTimeoutMs: this.idleTimeoutMs,
-        busyTimeoutMs: this.busyTimeoutMs ?? DEFAULT_CHAT_BUSY_TIMEOUT_MS,
-        busyTimeoutMessage: CHAT_BUSY_TIMEOUT_MESSAGE,
         hostSocketDir: this.hostSocketDir,
         hostEventsLog: this.hostEventsLog,
         setTimeout: this.setTimeoutFn,
@@ -569,7 +549,6 @@ export class AgentManager {
       hostTools: "send,spawn,steer_task,cancel",
       taskRun: false,
       agentOrigin: conversationKey(chatId, threadId),
-      resume,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,
     };

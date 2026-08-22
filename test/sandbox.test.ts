@@ -130,14 +130,14 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
-    const workerArgs = await buildPiRunBwrapArgs({ workspace: target, appRoot, resume: true, model: "anthropic/claude", thinkingLevel: "high" });
+    const workerArgs = await buildPiRunBwrapArgs({ workspace: target, appRoot, model: "anthropic/claude", thinkingLevel: "high" });
     expect(workerArgs.args).toContain(await realpath(node));
     expect(workerArgs.args).not.toContain("/usr/bin/node");
     expect(workerArgs.args.slice(workerArgs.args.indexOf("--") + 1)).toEqual([
       await realpath(node),
       "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
       "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
-      "--continue", "--model", "anthropic/claude", "--thinking", "high",
+      "--model", "anthropic/claude", "--thinking", "high",
     ]);
     const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });
     expect(result).toEqual({ dataDir: target, bwrapPath: await realpath(bwrap) });

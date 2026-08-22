@@ -41,38 +41,4 @@ integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
     }
   }, 180_000);
 
-  it("resumes across worker lifecycles in the same workspace", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "tg-pi-rpc-resume-"));
-    const workspace = path.join(root, "workspace");
-    await mkdir(workspace, { recursive: true, mode: 0o700 });
-    const appRoot = await realpath(process.cwd());
-    const { bwrapPath } = await checkSandboxEnvironment(path.join(root, "data"));
-
-    try {
-      const first = new PiWorker({
-        workspace,
-        appRoot,
-        bwrapPath,
-        spawnProcess,
-        terminateProcessGroup,
-      });
-      await first.start();
-      expect(first.isAlive()).toBe(true);
-      await first.close();
-
-      const second = new PiWorker({
-        workspace,
-        appRoot,
-        bwrapPath,
-        resume: true,
-        spawnProcess,
-        terminateProcessGroup,
-      });
-      await second.start();
-      expect(second.isAlive()).toBe(true);
-      await second.close();
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  }, 180_000);
 });

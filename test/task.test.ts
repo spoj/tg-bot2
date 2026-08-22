@@ -488,18 +488,4 @@ describe("WorkspaceTasks", () => {
     expect(followup).toHaveBeenCalledTimes(2);
   });
 
-  it("default worker factory configures PiWorker with 15m busy timeout and guidance message", async () => {
-    const { workspace, eventsLog } = await fixture();
-    const events = new WorkspaceEventLog(eventsLog);
-    const service = new WorkspaceTasks({
-      workspace,
-      events,
-      appRoot: process.cwd(),
-      spawnProcess: vi.fn(),
-      terminateProcessGroup: vi.fn(),
-    });
-    const factory = (service as unknown as { workerFactory: (options: { workspace: string; runId: string; prompt: string }) => unknown }).workerFactory;
-    const workerWrapper = factory({ workspace, runId: "test-run", prompt: "do work" });
-    expect(workerWrapper).toBeDefined();
-  });
 });

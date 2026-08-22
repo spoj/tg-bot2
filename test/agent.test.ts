@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi, type Mock } from "vitest";
@@ -132,7 +132,8 @@ Responsiveness & Multi-Chat Orchestration:
 - Message formatting: Prefer parse_mode: "HTML" (using <b>, <i>, <code>, <pre>, <blockquote>, <a>, bullet points •) over raw markdown so messages render cleanly on Telegram.
 - Forum topics: When conversing in a topic (message_thread_id is present), rename it around message 2-3 to a short descriptive name distinct from the last 10 active topic names in events.jsonl using edit_forum_topic.
 - Allowlist & Status: /workspace/.tg-bot/allowed.json controls allowed chat IDs. /status reports current model, thinking level, and session info. Adjust model/thinking in /workspace/.pi/agent/settings.json.
-- Session continuity: Active sessions resume across runs within 2 hours of inactivity; an admin can /restart to apply settings changes.
+- Session continuity: Each worker starts fresh; past session files under /workspace/.pi/sessions and the events.jsonl timeline are your memory across restarts. An admin can /restart to apply settings changes.
+- Bash timeouts: always pass a timeout (seconds) to bash for anything that can hang (network calls, long builds, servers, interactive prompts). 300 is a sensible default; longer only with justification, and never omit it for commands you cannot prove finish quickly.
 - Context gathering hierarchy:
   1. Thread context: if message_thread_id is present, query events.jsonl filtered by chat_id and message_thread_id (using grep, rq, or jq).
   2. Chat context: if not in a thread or broader context is needed, query events.jsonl filtered by chat_id.
@@ -166,10 +167,7 @@ it("followup starts a fresh worker and sends prompt with followUp streaming beha
     await manager.followup("scheduled work");
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
-      resume: false,
       appendSystemPrompt: SYSTEM_PROMPT,
-      busyTimeoutMs: 120_000,
-      busyTimeoutMessage: expect.stringContaining("2 minutes"),
     });
     expect(workers[0]?.prompt).toHaveBeenCalledWith("scheduled work", "followUp");
   });
@@ -213,37 +211,6 @@ it("reaped idle worker triggers fresh worker creation on next message", async ()
   });
 });
 
-it("resumes within the window and starts fresh after it closes", async () => {
-  await withDataDir(async (dataDir) => {
-    const tenHours = 10 * 60 * 60 * 1000;
-    const workspace = path.join(dataDir, "workspace");
-    const sessions = path.join(workspace, ".pi", "sessions");
-    await mkdir(sessions, { recursive: true });
-    const sessionFile = path.join(sessions, "one.jsonl");
-    await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "one" })}\n`, "utf8");
-    // The only session file predates the resume window, so the first run starts fresh.
-    await utimes(sessionFile, new Date(), new Date(tenHours - 3 * 60 * 60 * 1000));
-
-    let now = tenHours;
-    const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => now }));
-    await manager.followup("one");
-    expect(workers[0]?.options.resume).toBe(false);
-
-    // Run one writes its session file at its start time.
-    await utimes(sessionFile, new Date(), new Date(tenHours));
-    workers[0]?.reap();
-
-    now = tenHours + 60_000;
-    await manager.followup("two");
-    expect(workers[1]?.options.resume).toBe(true);
-
-    workers[1]?.reap();
-    now = tenHours + 3 * 60 * 60 * 1000;
-    await manager.followup("three");
-    expect(workers[2]?.options.resume).toBe(false);
-  });
-});
 
 it("restartAll closes active workers and respawns them on the next message", async () => {
   await withDataDir(async (dataDir) => {
@@ -286,29 +253,6 @@ it("passes settings defaults as model and thinking CLI args", async () => {
   });
 });
 
-it("a restart resumes a recent session file and starts fresh after the window closes", async () => {
-  await withDataDir(async (dataDir) => {
-    const workspace = path.join(dataDir, "workspace");
-    const sessions = path.join(workspace, ".pi", "sessions");
-    await mkdir(sessions, { recursive: true });
-    const sessionFile = path.join(sessions, "one.jsonl");
-    await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "one" })}\n`, "utf8");
-
-    const now = 10 * 60 * 60 * 1000;
-    await utimes(sessionFile, new Date(), new Date(now - 60_000));
-
-    const first = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: first.factory, now: () => now }));
-    await manager.followup(".");
-    expect(first.factory.mock.calls[0]?.[0].resume).toBe(true);
-
-    await utimes(sessionFile, new Date(), new Date(now - 3 * 60 * 60 * 1000));
-    const second = fakeWorkerFactory();
-    const secondManager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: second.factory, now: () => now }));
-    await secondManager.followup(".");
-    expect(second.factory.mock.calls[0]?.[0].resume).toBe(false);
-  });
-});
 
 it("status reads the newest session file and settings defaults without spawning", async () => {
   await withDataDir(async (dataDir) => {

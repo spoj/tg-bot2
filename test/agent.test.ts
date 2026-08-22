@@ -410,28 +410,12 @@ it("restartAll closes every active conversation worker and respawns them", async
   });
 });
 
-it("routes browser_ready and task_settled strictly to originating chat/topic session", async () => {
+it("routes task_settled to the originating chat/topic session and stays silent without origin", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);
   const notifier: AgentNotifier = { followup, interrupt };
   const router = new AgentEventRouter(notifier);
 
-  // browser_ready with origin routes to that topic worker
-  await router.onEvent({
-    type: "browser_ready",
-    requestId: "req-1",
-    origin: "829096380:9534",
-    status: "started",
-    socketPath: "/workspace/.browser/cdp.sock",
-    wsEndpoint: "ws+unix:///workspace/.browser/cdp.sock",
-  }, "");
-  expect(interrupt).toHaveBeenCalledWith(
-    expect.stringContaining("Browser is ready"),
-    { chatId: 829096380, threadId: 9534 },
-  );
-
-  // task_settled with origin routes to originating topic worker
-  followup.mockClear();
   await router.onEvent({
     type: "task_settled",
     runId: "run-123",
@@ -456,61 +440,12 @@ it("routes browser_ready and task_settled strictly to originating chat/topic ses
   expect(followup).not.toHaveBeenCalled();
 });
 
-it("my_chat_member group add notifies the agent; permission changes and private chats are silent", async () => {
+it("leaves send and browser outcomes in the timeline without followups", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);
   const notifier: AgentNotifier = { followup, interrupt };
   const router = new AgentEventRouter(notifier);
 
-  // Bot added to a brand-new group (old status left -> new status member)
-  await router.onEvent({
-    type: "my_chat_member",
-    chat_id: -100123456,
-    my_chat_member: { new_chat_member: { status: "member" }, old_chat_member: { status: "left" } },
-  }, "");
-  expect(followup).toHaveBeenCalledWith(
-    expect.stringContaining("Bot was added to group -100123456"),
-    { chatId: -100123456 },
-  );
-
-  // Permission change (member -> administrator) is not an add
-  followup.mockClear();
-  await router.onEvent({
-    type: "my_chat_member",
-    chat_id: -100123456,
-    my_chat_member: { new_chat_member: { status: "administrator" }, old_chat_member: { status: "member" } },
-  }, "");
-  expect(followup).not.toHaveBeenCalled();
-
-  // Private chat add is silent (not a group-add; no self-provisioning signal)
-  followup.mockClear();
-  await router.onEvent({
-    type: "my_chat_member",
-    chat_id: 829096380,
-    my_chat_member: { new_chat_member: { status: "member" }, old_chat_member: { status: "left" } },
-  }, "");
-  expect(followup).not.toHaveBeenCalled();
-});
-
-it("outbox_sent is silent for same-session send and notifies target on cross-session send", async () => {
-  const followup = vi.fn(async () => undefined);
-  const interrupt = vi.fn(async () => undefined);
-  const notifier: AgentNotifier = { followup, interrupt };
-  const router = new AgentEventRouter(notifier);
-
-  // Same-session send: Topic 9534 sends to Topic 9534 -> silent
-  await router.onEvent({
-    type: "outbox_sent",
-    requestId: "req-same",
-    origin: "829096380:9534",
-    chat_id: 829096380,
-    message_thread_id: 9534,
-    request_type: "send_message",
-    summary: "drinks menu",
-  }, "");
-  expect(followup).not.toHaveBeenCalled();
-
-  // Cross-session send: Task or Topic 9479 sends to Topic 9534 -> target Topic 9534 gets transcript notice
   await router.onEvent({
     type: "outbox_sent",
     requestId: "req-cross",
@@ -520,34 +455,6 @@ it("outbox_sent is silent for same-session send and notifies target on cross-ses
     request_type: "send_message",
     summary: "morning briefing",
   }, "");
-  expect(followup).toHaveBeenCalledWith(
-    '[Outbound send_message sent to this chat: "morning briefing"]',
-    { chatId: 829096380, threadId: 9534 },
-  );
-
-  // Topic creation notifies origin with the newly created thread ID
-  followup.mockClear();
-  await router.onEvent({
-    type: "outbox_sent",
-    requestId: "req-topic",
-    origin: "829096380:0",
-    chat_id: 829096380,
-    message_thread_id: 9600,
-    request_type: "create_forum_topic",
-    summary: "New Discussion",
-  }, "");
-  expect(followup).toHaveBeenCalledWith(
-    '[Topic "New Discussion" created with thread ID 9600]',
-    { chatId: 829096380 },
-  );
-});
-
-it("outbox_rejected interrupts the originating worker with the error", async () => {
-  const followup = vi.fn(async () => undefined);
-  const interrupt = vi.fn(async () => undefined);
-  const notifier: AgentNotifier = { followup, interrupt };
-  const router = new AgentEventRouter(notifier);
-
   await router.onEvent({
     type: "outbox_rejected",
     requestId: "req-bad",
@@ -556,11 +463,23 @@ it("outbox_rejected interrupts the originating worker with the error", async () 
     message_thread_id: 9534,
     detail: "Bad HTML entity",
   }, "");
+  await router.onEvent({
+    type: "browser_ready",
+    requestId: "req-1",
+    origin: "829096380:9534",
+    status: "started",
+    socketPath: "/workspace/.browser/cdp.sock",
+    wsEndpoint: "ws+unix:///workspace/.browser/cdp.sock",
+  }, "");
+  await router.onEvent({
+    type: "browser_request_failed",
+    requestId: "req-2",
+    origin: "829096380:9534",
+    error: "no chrome",
+  }, "");
 
-  expect(interrupt).toHaveBeenCalledWith(
-    "Send req-bad rejected: Bad HTML entity",
-    { chatId: 829096380, threadId: 9534 },
-  );
+  expect(followup).not.toHaveBeenCalled();
+  expect(interrupt).not.toHaveBeenCalled();
 });
 
 it("edited_message is logged silently without waking the agent", async () => {

@@ -1,8 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { appendJsonl, closeQuietly, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory, TG_BOT_DIR } from "./util.js";
+import { appendJsonl, readJsonl } from "./util.js";
 import type { Recurrence } from "./schedule-protocol.js";
-
 /**
  * Inbound events and host outcomes in the unified append-only `.tg-bot/events.jsonl` log.
  */
@@ -148,69 +147,31 @@ export type HostEvent =
     reason: "idle_timeout" | "agent_close" | "process_exit" | "host_shutdown";
   };
 
-/**
- * Commands written by agent tools to the unified append-only `.tg-bot/events.jsonl` log.
- */
-export type AgentCommand =
-  | {
-    /** Queued by the send tool; requestId is the tool-minted UUID. */
-    type: "send_request";
-    requestId: string;
-    origin?: string | undefined;
-    request: unknown;
-  }
-  | {
-    /** Queued by the spawn tool; runId is the tool-minted UUID. */
-    type: "spawn_request";
-    runId: string;
-    origin?: string | undefined;
-    prompt: string;
-  }
-  | {
-    /** Queued by the steer_task tool; steerId is the tool-minted UUID. */
-    type: "steer_task_request";
-    steerId: string;
-    runId: string;
-    origin?: string | undefined;
-    message: string;
-  }
-  | {
-    /** Queued by the cancel tool; runId is the target task run ID. */
-    type: "cancel_request";
-    runId: string;
-    origin?: string | undefined;
-  }
-  | {
-    /** Queued by the start_browser tool; requestId is the tool-minted UUID. */
-    type: "browser_requested";
-    requestId: string;
-    origin?: string | undefined;
-  };
+/** All entries recorded in the host-owned append-only events log. */
+export type BotEvent = HostEvent;
 
-/** All entries recorded in the unified append-only `.tg-bot/events.jsonl` log. */
-export type BotEvent = HostEvent | AgentCommand;
-
-/** Envelope added to every JSON line in `.tg-bot/events.jsonl`. */
+/** Envelope added to every JSON line in the host-owned events log. */
 export type LogEntryEnvelope = {
   v: 1;
   t: string;
 };
 
-/** Full serialized record shape in `.tg-bot/events.jsonl`. */
+/** Full serialized record shape in the host-owned events log. */
 export type WorkspaceLogRecord<T = BotEvent> = LogEntryEnvelope & T;
 export const EVENTS_FILE = "events.jsonl";
 
 export type EventListener = (record: WorkspaceLogRecord, rawLine: string) => void | Promise<void>;
 
 /**
- * Durable, file-backed workspace event log and in-memory live pub/sub stream.
- * Abstracts away .tg-bot/events.jsonl persistence, atomic append, and log querying.
+ * Durable, host-owned append-only event log with in-memory live pub/sub.
+ * The file lives outside the agent workspace; the agent only reads it through
+ * a read-only bind mount. Agents never write it — commands arrive via the host bridge.
  */
 export class WorkspaceEventLog {
   private readonly listeners = new Set<EventListener>();
 
   constructor(
-    readonly workspace: string,
+    readonly logPath: string,
     private readonly logger: (error: unknown) => void = (error) => console.error("WorkspaceEventLog error", error),
   ) {}
 
@@ -223,11 +184,11 @@ export class WorkspaceEventLog {
   }
 
   /**
-   * Appends an event to the unified workspace events.jsonl log atomically and broadcasts
-   * it to in-memory subscribers. Resolves to the serialized line or undefined on write failure.
+   * Appends an event to the events log atomically and broadcasts it to in-memory
+   * subscribers. Resolves to the serialized line or undefined on write failure.
    */
   async publish(event: BotEvent): Promise<string | undefined> {
-    const lines = await appendEvents(this.workspace, [event]);
+    const lines = await appendEvents(this.logPath, [event]);
     const line = lines?.[0] ?? eventLine(event);
     let record: WorkspaceLogRecord;
     try {
@@ -253,10 +214,10 @@ export class WorkspaceEventLog {
     return this.publish(event);
   }
 
-  /** Reads all parsed log records from events.jsonl. */
+  /** Reads all parsed log records from the events log. */
   async readAll(): Promise<WorkspaceLogRecord[]> {
     try {
-      const lines = await readJsonl(path.join(this.workspace, TG_BOT_DIR, EVENTS_FILE));
+      const lines = await readJsonl(this.logPath);
       const records: WorkspaceLogRecord[] = [];
       for (const line of lines) {
         if (!line) continue;
@@ -276,13 +237,13 @@ export class WorkspaceEventLog {
   }
 
   /**
-   * Scans events.jsonl in reverse order (newest first) to find the first record matching predicate.
+   * Scans the events log in reverse order (newest first) to find the first record matching predicate.
    */
   async findLast<T extends BotEvent = BotEvent>(
     predicate: (record: WorkspaceLogRecord) => boolean,
   ): Promise<WorkspaceLogRecord<T> | undefined> {
     try {
-      const lines = await readJsonl(path.join(this.workspace, TG_BOT_DIR, EVENTS_FILE));
+      const lines = await readJsonl(this.logPath);
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i];
         if (!line) continue;
@@ -301,48 +262,25 @@ export class WorkspaceEventLog {
     return undefined;
   }
 }
-
-
 /**
- * Appends events to the unified workspace event log. Opens the `.tg-bot` directory
- * with `O_NOFOLLOW` and writes with `O_APPEND` so concurrent writes never corrupt
- * lines and symlink replacements are rejected.
+ * Appends events to the host-owned events log with O_APPEND so concurrent
+ * writes never corrupt lines. The log lives outside the agent workspace.
  */
-export async function appendEvents(workspace: string, events: BotEvent[]): Promise<string[] | undefined> {
-  const directoryPath = path.join(workspace, TG_BOT_DIR);
-  let metadata: PinnedDirectory | undefined;
+export async function appendEvents(logPath: string, events: BotEvent[]): Promise<string[] | undefined> {
   try {
-    metadata = await openPinnedDirectory(directoryPath);
-  } catch (error) {
-    if (!isMissing(error)) {
-      console.error("Pinned metadata directory open failed for events", error);
-      return undefined;
-    }
-    try {
-      await mkdir(directoryPath, { recursive: true, mode: 0o700 });
-      metadata = await openPinnedDirectory(directoryPath);
-    } catch (mkdirError) {
-      console.error("Metadata directory creation failed for events", mkdirError);
-      return undefined;
-    }
-  }
-
-  const lines = events.map(eventLine);
-  const target = path.join(metadata.path, EVENTS_FILE);
-  try {
-    await appendJsonl(target, lines);
+    await mkdir(path.dirname(logPath), { recursive: true, mode: 0o700 });
+    const lines = events.map(eventLine);
+    await appendJsonl(logPath, lines);
     return lines;
   } catch (error) {
     console.error("Failed to append event lines to events.jsonl", error);
     return undefined;
-  } finally {
-    if (metadata) await closeQuietly(metadata.handle);
   }
 }
 
 /** Appends one event; see {@link appendEvents}. Resolves to the written line, or undefined when the append failed. */
-export async function appendEvent(workspace: string, event: BotEvent): Promise<string | undefined> {
-  return (await appendEvents(workspace, [event]))?.[0];
+export async function appendEvent(logPath: string, event: BotEvent): Promise<string | undefined> {
+  return (await appendEvents(logPath, [event]))?.[0];
 }
 
 /** Serializes one event to the exact jsonl line form written by {@link appendEvent}: `{v:1, t:"<ISO-8601>", ...event}`. */
@@ -351,7 +289,8 @@ export function eventLine(event: object): string {
 }
 
 /** The EVENTS protocol section of the SYSTEM_PROMPT, derived from {@link BotEvent}. */
-export const EVENTS_PROMPT = `Timeline log /workspace/.tg-bot/events.jsonl records all inbound wire events, commands, and host outcomes in timestamp order ({v:1,t,type,...}).
+export const EVENTS_PROMPT = `Timeline log /workspace/.tg-bot/events.jsonl is a host-owned, read-only record of inbound wire events and host outcomes in timestamp order ({v:1,t,type,...}).
+Your tool calls (send, spawn, steer_task, cancel, start_browser) execute synchronously against the host and are not logged as commands — only their outcomes appear here.
 Inbound wire events:
 - message: {type:'message',chat_id,message,attachments} (raw Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
 - edited_message: {type:'edited_message',chat_id,message,attachments} (edited Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
@@ -361,7 +300,7 @@ Inbound wire events:
 - my_chat_member: {type:'my_chat_member',chat_id,my_chat_member} (bot membership/permission change in chat)
 - chat_join_request: {type:'chat_join_request',chat_id,chat_join_request} (user join request to chat)
 Host outcomes:
-- outbox_sent / outbox_rejected: reports send delivery; outbox_sent echoes messageId/pollId.
+- outbox_sent / outbox_rejected: records send delivery; outbox_sent echoes messageId/pollId.
 - task_settled: {type:'task_settled',runId,prompt?,status,exitCode,stderr?} when a background task finishes (done, failed, aborted).
 - task_progress: periodic status checkpoint for active background tasks.
 - schedule_run_scheduled / schedule_run_fired / schedule_run_cancelled: schedule occurrence lifecycle.

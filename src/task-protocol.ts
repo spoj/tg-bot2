@@ -1,8 +1,8 @@
 export const TASKS_PROMPT = `Background tasks run work autonomously in a fresh Pi agent while your turn stays free.
-- Spawn: call spawn tool with { prompt: "<complete self-contained prompt>" }. Returns runId.
-- Steer / Cancel: call steer_task { runId, message } to guide mid-flight, or cancel { runId } to abort.
+- Spawn: call spawn tool with { prompt: "<complete self-contained prompt>" }. The host returns the runId synchronously and launches the task immediately (or queues it when all 8 slots are busy; queued tasks start automatically as slots free).
+- Steer / Cancel: call steer_task { runId, message } to guide mid-flight, or cancel { runId } to abort. Both report synchronously whether the task was running.
 - Lifecycle: runs in /workspace/.pi/tasks/<runId>/ (prompt.txt, output.md, sessions/, result.json).
-- Up to 8 tasks run concurrently; excess spawns queue. When a task finishes, the host emits task_settled and delivers a completion followup.
+- When a task finishes, the host emits task_settled in events.jsonl and delivers a completion followup.
 `;
 
 export const TASK_RUNNER_PROMPT = `You are an autonomous background task agent working in /workspace with your own separate session.

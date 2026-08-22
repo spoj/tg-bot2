@@ -1,10 +1,10 @@
-import { lstat, mkdir, opendir, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, opendir, readFile, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
 import type { WorkspaceEventLog } from "./events.js";
 import { PiWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
-import type { CancelRequest, SpawnRequest, SteerTaskRequest } from "./request-bus.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
 import { defined, errorMessage, isMissing } from "./util.js";
 
@@ -12,15 +12,12 @@ export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
   steer(message: string): Promise<void>;
   stop(): Promise<void>;
-  /** When the run last wrote output, and the tail of what it wrote. */
   activity(): { at: number; text: string };
 };
 
 export type WorkspaceTaskWorkerOptions = {
   workspace: string;
-  /** Host-generated uuid identifying this run's directory under .pi/tasks/. */
   runId: string;
-  /** The complete prompt from the spawn call. */
   prompt: string;
 };
 
@@ -28,20 +25,19 @@ export type WorkspaceTaskWorkerFactory = (options: WorkspaceTaskWorkerOptions) =
 
 export type WorkspaceTasksOptions = {
   workspace: string;
+  events: WorkspaceEventLog;
   appRoot: string;
   bwrapPath?: string;
-  /** Process-control seams injected by the composition root; the default worker factory passes them to the Pi run worker. */
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   busyTimeoutMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
-  /** Unified event log for publishing task settlement and progress events. */
-  events: WorkspaceEventLog;
-  /** Consumes pending commands from events.jsonl before each settle followup, so task sends order before the completion message. */
-  flush?: { flush(workspace: string): Promise<void> } | undefined;
-  heartbeatIntervalMs?: number | undefined;
-  now?: (() => number) | undefined;
+  heartbeatIntervalMs?: number;
+  /** Host socket dir and events log bind-mounted into task sandboxes. */
+  hostSocketDir?: string;
+  hostEventsLog?: string;
+  now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   logger?: (error: unknown) => void;
@@ -58,6 +54,7 @@ const RESULT_FILE = "result.json";
 export const DEFAULT_TASK_BUSY_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 export const TASK_BUSY_TIMEOUT_MESSAGE =
   "Interrupted: Operation took over 15 minutes with no progress. If running long-running commands, consider running them in the background, redirecting output to a file, and checking progress periodically.";
+export const TASK_PROMPT_EMPTY_MESSAGE = "Task prompt must be a non-empty string";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 const MAX_QUOTE_LENGTH = 120;
 
@@ -67,6 +64,17 @@ type InFlightTask = {
   origin?: string | undefined;
   prompt: string;
   startedAt: number;
+};
+
+type QueuedSpawn = {
+  runId: string;
+  prompt: string;
+  origin?: string | undefined;
+};
+
+export type SpawnResult = {
+  runId: string;
+  status: "launched" | "queued";
 };
 
 async function readDirEntries(directory: string): Promise<Dirent[]> {
@@ -99,14 +107,35 @@ function truncate(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
 
+function parseSettledResult(raw: string): { status: "done" | "failed" | "aborted"; exitCode: number | null; stderr?: string | undefined } {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      if (record.status === "done" || record.status === "failed") {
+        return {
+          status: record.status,
+          exitCode: typeof record.exitCode === "number" ? record.exitCode : null,
+          ...(typeof record.stderr === "string" && record.stderr.length > 0 ? { stderr: record.stderr } : {}),
+        };
+      }
+    }
+  } catch {
+    // Unparseable result is treated as aborted.
+  }
+  return { status: "aborted", exitCode: null };
+}
 
 /**
- * Runs agent-spawned background tasks: claims spawn tool calls into host-generated uuid
- * run directories under .pi/tasks/ (up to 8 concurrent; excess calls are retried
- * as slots free), records every settlement in events.jsonl, and sends the agent a
- * completion followup quoting the prompt. Cancel tool calls stop a run mid-flight.
- * Every started task settles exactly once — immediately on exit (any signal included),
- * or at the next boot via an aborted stamp when the host itself died mid-run.
+ * Runs agent-spawned background tasks synchronously on demand: the host mints a
+ * uuid runId, creates the run directory under .pi/tasks/, launches a fresh Pi
+ * worker (up to 8 concurrent; excess spawns queue in memory and launch as slots
+ * free), records every settlement in the events log, and sends the agent a
+ * completion followup quoting the prompt. Cancel and steer call in directly and
+ * report their outcome. A run settles exactly once — immediately on exit (any
+ * signal included), or at the next boot when the host reconciles run directories
+ * against the events log (aborted stamp for crash-mid-run, terminal repair for
+ * crash-mid-settle, re-launch for fired schedule occurrences lost mid-fire).
  */
 export class WorkspaceTasks {
   private readonly events: WorkspaceEventLog;
@@ -118,13 +147,15 @@ export class WorkspaceTasks {
   private readonly stopGraceMs: number | undefined;
   private readonly busyTimeoutMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
-  private readonly flush: WorkspaceTasksOptions["flush"];
   private readonly heartbeatIntervalMs: number;
+  private readonly hostSocketDir: string | undefined;
+  private readonly hostEventsLog: string | undefined;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
   private readonly logger: (error: unknown) => void;
   private readonly inFlight: InFlightTask[] = [];
+  private readonly queued: QueuedSpawn[] = [];
   private readonly pendingSettles = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | undefined;
   private startInFlight: Promise<void> | undefined;
@@ -143,8 +174,9 @@ export class WorkspaceTasks {
     this.stopGraceMs = options.stopGraceMs;
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.events = options.events;
-    this.flush = options.flush;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
+    this.hostSocketDir = options.hostSocketDir;
+    this.hostEventsLog = options.hostEventsLog;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
@@ -166,6 +198,8 @@ export class WorkspaceTasks {
           stopGraceMs: this.stopGraceMs,
           busyTimeoutMs: this.busyTimeoutMs ?? DEFAULT_TASK_BUSY_TIMEOUT_MS,
           busyTimeoutMessage: TASK_BUSY_TIMEOUT_MESSAGE,
+          hostSocketDir: this.hostSocketDir,
+          hostEventsLog: this.hostEventsLog,
         }),
       });
       return {
@@ -182,18 +216,19 @@ export class WorkspaceTasks {
       };
     });
   }
+
   async start(): Promise<void> {
     if (this.running) {
       if (this.startInFlight) await this.startInFlight;
       return;
     }
     this.running = true;
-    const initialStamp = this.stampAbortedRuns();
-    this.startInFlight = initialStamp;
+    const initialReconcile = this.reconcileRuns();
+    this.startInFlight = initialReconcile;
     try {
-      await initialStamp;
+      await initialReconcile;
     } finally {
-      if (this.startInFlight === initialStamp) this.startInFlight = undefined;
+      if (this.startInFlight === initialReconcile) this.startInFlight = undefined;
     }
     if (!this.running) return;
     this.timer = this.schedule(() => this.heartbeat(), this.heartbeatIntervalMs);
@@ -202,6 +237,7 @@ export class WorkspaceTasks {
 
   async stop(): Promise<void> {
     this.running = false;
+    this.queued.length = 0;
     if (this.timer !== undefined) {
       this.cancelSchedule(this.timer);
       this.timer = undefined;
@@ -217,48 +253,39 @@ export class WorkspaceTasks {
     }
   }
 
-  /** Claims one spawn call; "pending" when the task slots are at capacity. */
-  async handleSpawnRequest(record: SpawnRequest, workspace: string): Promise<"claimed" | "pending"> {
-    const prompt = record.prompt;
-    if (prompt.trim().length === 0 || prompt.length > MAX_TASK_BYTES) {
-      await this.settleRejectedSpawn(workspace, record.runId, prompt, record.origin);
-      return "claimed";
+  /** Launches a background task for one spawn tool call; queues when all slots are busy. */
+  async spawn(prompt: string, origin?: string | undefined, runId: string = randomUUID()): Promise<SpawnResult> {
+    if (prompt.trim().length === 0) throw new Error(TASK_PROMPT_EMPTY_MESSAGE);
+    if (prompt.length > MAX_TASK_BYTES) throw new Error(`Task prompt exceeds ${MAX_TASK_BYTES} bytes`);
+    if (this.inFlight.length >= MAX_CONCURRENT_TASKS) {
+      this.queued.push({ runId, prompt, origin });
+      return { runId, status: "queued" };
     }
-    if (this.inFlight.length >= MAX_CONCURRENT_TASKS) return "pending";
-    await this.claimAndLaunch(workspace, record.runId, prompt, record.origin);
-    return "claimed";
+    await this.claimAndLaunch(this.workspace, runId, prompt, origin);
+    return { runId, status: "launched" };
   }
 
-  /** Stops one running task; a command naming an unknown or settled run is a no-op. */
-  async handleCancelRequest(record: CancelRequest, _workspace: string): Promise<void> {
-    const entry = this.inFlight.find((item) => item.runId === record.runId);
-    if (entry === undefined) return;
-    await entry.worker.stop();
-  }
-
-  /** Injects a mid-flight steering message into a running task; no-op if task is not in-flight. */
-  async handleSteerRequest(record: SteerTaskRequest, _workspace: string): Promise<void> {
-    const entry = this.inFlight.find((item) => item.runId === record.runId);
-    if (entry === undefined) return;
-    await entry.worker.steer(record.message);
-  }
-
-  /** Records a spawn command whose prompt is unusable as failed, with a followup. */
-  private async settleRejectedSpawn(workspace: string, runId: string, prompt: string, origin?: string | undefined): Promise<void> {
-    const runDirectory = path.join(workspace, TASKS_DIR, runId);
-    const reason = prompt.trim().length === 0
-      ? "Task prompt must be a non-empty string"
-      : `Task prompt exceeds ${MAX_TASK_BYTES} bytes`;
-    await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
-    if (prompt.length > 0) {
-      await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
+  /** Stops one running task or dequeues a queued one; reports what happened. */
+  async cancel(runId: string): Promise<"stopped" | "cancelled-queued" | "not-running"> {
+    const entry = this.inFlight.find((item) => item.runId === runId);
+    if (entry !== undefined) {
+      await entry.worker.stop();
+      return "stopped";
     }
-    await this.settleTask(workspace, { runId, prompt, origin }, runDirectory, {
-      code: null,
-      signal: null,
-      stderr: reason,
-      stdout: "",
-    });
+    const queuedIndex = this.queued.findIndex((item) => item.runId === runId);
+    if (queuedIndex >= 0) {
+      this.queued.splice(queuedIndex, 1);
+      return "cancelled-queued";
+    }
+    return "not-running";
+  }
+
+  /** Injects a mid-flight steering message into a running task. */
+  async steer(runId: string, message: string): Promise<"delivered" | "not-running"> {
+    const entry = this.inFlight.find((item) => item.runId === runId);
+    if (entry === undefined) return "not-running";
+    await entry.worker.steer(message);
+    return "delivered";
   }
 
   /** Launches a background task in a fresh uuid run directory. */
@@ -306,50 +333,107 @@ export class WorkspaceTasks {
       if (index >= 0) this.inFlight.splice(index, 1);
     }
     await this.settleTask(workspace, task, runDirectory, result);
+    if (this.running) {
+      const next = this.queued.shift();
+      if (next !== undefined) {
+        await this.claimAndLaunch(workspace, next.runId, next.prompt, next.origin).catch((error) => this.report(error));
+      }
+    }
   }
+
   /**
-   * Stamps aborted settles for runs the host left in flight when it died: the only way a
-   * run dir can lack result.json at boot is an unsettled host crash. Idempotent — a
-   * stamped dir never matches again.
+   * Reconciles run directories against the events log at boot. The events log is
+   * authoritative for settlement; result.json is agent-writable and only consulted
+   * when the terminal event is missing:
+   * - runId already settled in the log → nothing to do;
+   * - result.json present without a terminal → re-emit the settle event (crash between result write and terminal);
+   * - prompt.txt without result.json → the run died mid-flight: stamp it aborted;
+   * - neither file → leftover empty dir, delete.
+   * Fired schedule occurrences with neither a terminal nor a run directory were
+   * lost between firing and spawning: launch them now.
    */
-  private async stampAbortedRuns(): Promise<void> {
-    const workspace = this.workspace;
+  private async reconcileRuns(): Promise<void> {
+    const records = await this.events.readAll();
+    const settledRunIds = new Set<string>();
+    const firedRuns = new Map<string, string>();
+    for (const record of records) {
+      if (record.type === "task_settled" && typeof record.runId === "string" && record.runId.length > 0) {
+        settledRunIds.add(record.runId);
+      } else if (record.type === "schedule_run_fired" && typeof record.runId === "string" && typeof record.prompt === "string") {
+        firedRuns.set(record.runId, record.prompt);
+      }
+    }
     let tasksPath: string;
     try {
-      tasksPath = await ensureTasksDirectory(workspace);
+      tasksPath = await ensureTasksDirectory(this.workspace);
     } catch (error) {
       this.report(error);
       return;
     }
-    const entries = await readDirEntries(tasksPath);
-    for (const entry of entries) {
+    await this.reconcileRunDirectories(tasksPath, settledRunIds);
+    await this.recoverFiredOccurrences(tasksPath, settledRunIds, firedRuns);
+  }
+
+  private async reconcileRunDirectories(tasksPath: string, settledRunIds: Set<string>): Promise<void> {
+    for (const entry of await readDirEntries(tasksPath)) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      if (settledRunIds.has(entry.name)) continue;
       const runDirectory = path.join(tasksPath, entry.name);
+      let resultRaw: string | undefined;
       try {
-        await lstat(path.join(runDirectory, RESULT_FILE));
+        resultRaw = await readFile(path.join(runDirectory, RESULT_FILE), "utf8");
       } catch (error) {
         if (!isMissing(error)) {
           this.report(error);
           continue;
         }
-        try {
-          await lstat(path.join(runDirectory, PROMPT_FILE));
-        } catch (promptError) {
-          if (isMissing(promptError)) {
-            await rm(runDirectory, { recursive: true, force: true }).catch(() => {});
-            continue;
-          }
-          this.report(promptError);
-          continue;
-        }
-        await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
+      }
+      if (resultRaw !== undefined) {
+        const prompt = await readFile(path.join(runDirectory, PROMPT_FILE), "utf8").catch(() => undefined);
+        const result = parseSettledResult(resultRaw);
         await this.events.emit({
           type: "task_settled",
           runId: entry.name,
-          status: "aborted",
-          exitCode: null,
+          ...(prompt !== undefined ? { prompt } : {}),
+          status: result.status,
+          exitCode: result.exitCode,
+          ...defined({ stderr: result.stderr }),
         });
+        continue;
       }
+      try {
+        await lstat(path.join(runDirectory, PROMPT_FILE));
+      } catch (promptError) {
+        if (isMissing(promptError)) {
+          await rm(runDirectory, { recursive: true, force: true }).catch(() => {});
+          continue;
+        }
+        this.report(promptError);
+        continue;
+      }
+      await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
+      await this.events.emit({
+        type: "task_settled",
+        runId: entry.name,
+        status: "aborted",
+        exitCode: null,
+      });
+    }
+  }
+
+  private async recoverFiredOccurrences(tasksPath: string, settledRunIds: Set<string>, firedRuns: Map<string, string>): Promise<void> {
+    for (const [runId, prompt] of firedRuns) {
+      if (settledRunIds.has(runId)) continue;
+      try {
+        await lstat(path.join(tasksPath, runId));
+        continue;
+      } catch (error) {
+        if (!isMissing(error)) {
+          this.report(error);
+          continue;
+        }
+      }
+      await this.spawn(prompt, undefined, runId).catch((error) => this.report(error));
     }
   }
 
@@ -371,13 +455,6 @@ export class WorkspaceTasks {
       signal: result.signal,
       ...defined({ stderr }),
     }), { encoding: "utf8", mode: 0o600 });
-    if (this.flush) {
-      try {
-        await this.flush.flush(workspace);
-      } catch (error) {
-        this.report(error);
-      }
-    }
     await this.events.emit({
       type: "task_settled",
       runId: task.runId,
@@ -387,6 +464,7 @@ export class WorkspaceTasks {
       ...defined({ origin: task.origin, stderr }),
     });
   }
+
   /** Emits a task_progress event while tasks run; silent when everything is idle. */
   private heartbeat(): void {
     if (this.inFlight.length === 0) return;
@@ -414,6 +492,7 @@ export class WorkspaceTasks {
       void this.events.publish({ type: "task_progress", ...defined({ origin }), tasks }).catch((error) => this.report(error));
     }
   }
+
   private report(error: unknown): void {
     try {
       this.logger(error);

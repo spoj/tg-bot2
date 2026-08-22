@@ -26,7 +26,7 @@ async function writeSchedules(dataDir: string, schedules: unknown): Promise<stri
 }
 
 async function logEvents(dataDir: string): Promise<Array<Record<string, unknown>>> {
-  const filePath = path.join(dataDir, "workspace", ".tg-bot", "events.jsonl");
+  const filePath = path.join(dataDir, "events.jsonl");
   const contents = await readFile(filePath, "utf8").catch(() => "");
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
@@ -45,7 +45,7 @@ function makeScheduler(
   options: Partial<WorkspaceSchedulerOptions> = {},
 ): { scheduler: WorkspaceScheduler; events: WorkspaceEventLog } {
   const defaultWorkspace = path.join(dataDir, "workspace");
-  const defaultEvents = new WorkspaceEventLog(defaultWorkspace);
+  const defaultEvents = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
   const {
     workspace = defaultWorkspace,
     events = defaultEvents,
@@ -151,7 +151,7 @@ describe("WorkspaceScheduler firing", () => {
 describe("WorkspaceScheduler validation", () => {
   it("rejects non-positive or non-timer-safe intervals", () => withDirectory(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
-    const events = new WorkspaceEventLog(workspace);
+    const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
     expect(() => new WorkspaceScheduler({ workspace, events, pollIntervalMs: 0 })).toThrow("positive timer-safe integer");
     expect(() => new WorkspaceScheduler({ workspace, events, pollIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
   }));

@@ -399,10 +399,9 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
   if (!first) throw new Error("Telegram returned an empty media group");
   return first.message_id;
 }
-/** Maps a poll id back to the chat that sent it via events.jsonl. */
-export async function findPollOwnerChat(workspace: string, pollId: string, events?: WorkspaceEventLog): Promise<number | undefined> {
-  const eventLog = events ?? new WorkspaceEventLog(workspace);
-  const record = await eventLog.findLast((entry) => entry.type === "outbox_sent" && "pollId" in entry && entry.pollId === pollId && "chat_id" in entry && typeof entry.chat_id === "number");
+/** Maps a poll id back to the chat that sent it via the host events log. */
+export async function findPollOwnerChat(events: WorkspaceEventLog, pollId: string): Promise<number | undefined> {
+  const record = await events.findLast((entry) => entry.type === "outbox_sent" && "pollId" in entry && entry.pollId === pollId && "chat_id" in entry && typeof entry.chat_id === "number");
   if (record && record.type === "outbox_sent") {
     return record.chat_id;
   }
@@ -863,7 +862,7 @@ export function createTelegramBot(
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
-    const chatId = await findPollOwnerChat(workspace, answer.poll_id);
+    const chatId = await findPollOwnerChat(events, answer.poll_id);
     if (chatId === undefined) return;
     if (!(await isChatAllowed(workspace, chatId, events))) return;
     await events.emit({

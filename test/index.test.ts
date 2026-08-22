@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { deferred } from "./helpers.js";
+const temporaryDirectories: string[] = [];
 
 const state = vi.hoisted(() => {
   const order: string[] = [];
@@ -54,15 +58,13 @@ const state = vi.hoisted(() => {
         this.dispatch = options.dispatch;
       }
     }),
-    requestBus: vi.fn(class WorkspaceRequestBusMock {
+    bridge: vi.fn(class HostBridgeMock {
       constructor(_options: unknown) {}
       start = vi.fn(async () => {});
-      stop = vi.fn(async () => { order.push("requestBus.stop"); });
-      flush = vi.fn(async () => {});
+      stop = vi.fn(async () => { order.push("bridge.stop"); });
     }),
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
-      flush: unknown;
       start = vi.fn(async () => {});
       stop = vi.fn(async () => { order.push("tasks.stop"); });
     }),
@@ -90,21 +92,23 @@ vi.mock("../src/sandbox.js", () => ({
 vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager, AgentEventRouter: state.agentEventRouter }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
 vi.mock("../src/outbox.js", () => ({ WorkspaceOutbox: state.outbox }));
-vi.mock("../src/request-bus.js", () => ({ WorkspaceRequestBus: state.requestBus }));
+vi.mock("../src/host-bridge.js", () => ({ HostBridge: state.bridge }));
 vi.mock("../src/task.js", () => ({ WorkspaceTasks: state.tasks }));
 vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
   dispatchOutboxRequest: state.dispatchOutboxRequest,
   TelegramDeliveryQueue: state.delivery,
 }));
-
 async function importIndex(configure?: () => void): Promise<typeof import("../src/index.js")> {
   state.order.length = 0;
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-index-"));
+  temporaryDirectories.push(dataDir);
+  state.sandbox.dataDir = dataDir;
   state.checkSandboxEnvironment.mockReset().mockResolvedValue(state.sandbox);
   state.agentManager.mockClear();
   state.scheduler.mockClear();
   state.outbox.mockClear();
-  state.requestBus.mockClear();
+  state.bridge.mockClear();
   state.tasks.mockClear();
   state.createTelegramBot.mockClear();
   state.dispatchOutboxRequest.mockClear();
@@ -124,6 +128,12 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   return import("../src/index.js");
 }
 
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+const workspacePath = (): string => path.join(state.sandbox.dataDir, "bots", "123", "workspace");
+
 describe("application startup and shutdown wiring", () => {
   it("passes canonical sandbox paths through every runtime component", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
@@ -133,15 +143,36 @@ describe("application startup and shutdown wiring", () => {
     expect(state.checkSandboxEnvironment).toHaveBeenCalledOnce();
     expect(state.checkSandboxEnvironment).toHaveBeenCalledWith("/requested");
     expect(state.agentManager).toHaveBeenCalledWith(
-      { workspace: "/canonical-data/bots/123/workspace" },
-      expect.objectContaining({ appRoot: expect.any(String), bwrapPath: "/validated/bwrap" }),
+      { workspace: workspacePath() },
+      expect.objectContaining({
+        appRoot: expect.any(String),
+        bwrapPath: "/validated/bwrap",
+        hostSocketDir: path.join(state.sandbox.dataDir, "bots", "123", "run"),
+        hostEventsLog: path.join(state.sandbox.dataDir, "bots", "123", "events.jsonl"),
+      }),
     );
-    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as { workspace: string; events: unknown };
-    expect(schedulerOptions.workspace).toBe("/canonical-data/bots/123/workspace");
+    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; events: unknown; fireTask: unknown }) ?? {};
+    expect(schedulerOptions.workspace).toBe(workspacePath());
     expect(schedulerOptions.events).toBeDefined();
+    expect(typeof schedulerOptions.fireTask).toBe("function");
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), events: expect.any(Object) }));
-    expect(state.requestBus).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace" }));
-    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace", bwrapPath: "/validated/bwrap", events: expect.any(Object) }));
+    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({
+      workspace: workspacePath(),
+      bwrapPath: "/validated/bwrap",
+      events: expect.any(Object),
+      hostSocketDir: expect.any(String),
+      hostEventsLog: expect.any(String),
+    }));
+    expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
+      socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host.sock"),
+      handlers: expect.objectContaining({
+        send: expect.any(Function),
+        spawn: expect.any(Function),
+        cancel: expect.any(Function),
+        steerTask: expect.any(Function),
+        startBrowser: expect.any(Function),
+      }),
+    }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
       allowed_updates: [
         "message",
@@ -155,6 +186,26 @@ describe("application startup and shutdown wiring", () => {
     }));
   });
 
+  it("creates the host-owned events log and run directory before starting services", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+    const hostLog = path.join(state.sandbox.dataDir, "bots", "123", "events.jsonl");
+    expect(await readFile(hostLog, "utf8")).toBe("");
+    expect((await stat(path.join(state.sandbox.dataDir, "bots", "123", "run"))).isDirectory()).toBe(true);
+  });
+
+  it("migrates a legacy workspace events log into the host-owned location", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    const workspace = workspacePath();
+    await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
+    await writeFile(path.join(workspace, ".tg-bot", "events.jsonl"), '{"v":1,"t":"2026-01-01","type":"chat_denied","chat_id":5}\n', "utf8");
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+    const hostLog = path.join(state.sandbox.dataDir, "bots", "123", "events.jsonl");
+    expect(await readFile(hostLog, "utf8")).toContain("chat_denied");
+  });
+
   it("delegates outbox dispatch to dispatchOutboxRequest via the delivery queue", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
     void index.main();
@@ -164,7 +215,7 @@ describe("application startup and shutdown wiring", () => {
     const outbox = state.outbox.mock.instances[0] as { dispatch: (chatId: number, req: unknown) => Promise<unknown> };
     const request = { type: "send_message", version: 1, id: "x", text: "hi" };
     const result = await outbox.dispatch(42, request);
-    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(state.bot, { botDir: "/canonical-data/bots/123", workspace: "/canonical-data/bots/123/workspace" }, 42, request);
+    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(state.bot, expect.objectContaining({ workspace: workspacePath() }), 42, request);
     expect(result).toEqual({ messageId: 7 });
   });
 
@@ -176,7 +227,7 @@ describe("application startup and shutdown wiring", () => {
 
     state.signalHandlers.SIGTERM?.();
     await vi.waitFor(() => expect(state.order).toEqual([
-      "bot.stop", "agents.beginShutdown", "scheduler.stop", "requestBus.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
+      "bot.stop", "agents.beginShutdown", "scheduler.stop", "bridge.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
     ]));
     expect(process.exitCode).toBeUndefined();
 
@@ -212,7 +263,7 @@ describe("application startup and shutdown wiring", () => {
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledTimes(2));
     expect(state.agentManager).toHaveBeenCalledTimes(2);
     expect(state.scheduler).toHaveBeenCalledTimes(2);
-    expect(state.requestBus).toHaveBeenCalledTimes(2);
+    expect(state.bridge).toHaveBeenCalledTimes(2);
     expect(state.tasks).toHaveBeenCalledTimes(2);
 
     state.signalHandlers.SIGINT?.();
@@ -234,7 +285,7 @@ describe("finishDisposal", () => {
       services: {
         agents: { disposeAll: step("disposeAll") },
         scheduler: { stop: step("scheduler.stop") },
-        requestBus: { stop: step("requestBus.stop") },
+        bridge: { stop: step("bridge.stop") },
         tasks: { stop: step("tasks.stop") },
         delivery: { drain: step("delivery.drain") },
       },
@@ -247,7 +298,7 @@ describe("finishDisposal", () => {
 
     await finishDisposal(services);
 
-    expect(calls).toEqual(["scheduler.stop", "requestBus.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
@@ -258,7 +309,7 @@ describe("finishDisposal", () => {
 
     await expect(finishDisposal(services)).resolves.toBeUndefined();
 
-    expect(calls).toEqual(["scheduler.stop", "requestBus.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
+    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
     expect(services.agents.disposeAll).toHaveBeenCalledWith();
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });

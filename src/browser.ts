@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, chmodSync } from "node:fs";
 import { rm, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -85,10 +86,9 @@ export class HostBrowserManager {
     return this.child !== undefined && !this.child.killed && this.server !== undefined && this.server.listening;
   }
 
-  /** Starts Chrome and the socket bridge if not already running, or reuses the existing instance. */
-  async handleStartBrowserRequest(record: { requestId: string; origin?: string | undefined }): Promise<BrowserReadyResult | undefined> {
-    const requestId = record.requestId;
-    const origin = record.origin;
+  /** Starts Chrome and the socket bridge if not already running, or reuses the existing instance. Throws after emitting browser_request_failed. */
+  async startBrowser(origin?: string | undefined): Promise<BrowserReadyResult> {
+    const requestId = randomUUID();
     try {
       if (this.isRunning()) {
         this.touch();
@@ -149,7 +149,7 @@ export class HostBrowserManager {
         error: detail,
         ...defined({ origin }),
       });
-      return undefined;
+      throw new Error(detail);
     }
   }
 

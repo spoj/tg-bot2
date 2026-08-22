@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { EVENTS_FILE, type WorkspaceEventLog } from "./events.js";
+import { type WorkspaceEventLog } from "./events.js";
 import { TG_BOT_DIR, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 
@@ -15,6 +15,8 @@ export type WorkspaceSchedulerOptions = {
   workspace: string;
   /** Unified event log for publishing schedule occurrences and fired events. */
   events: WorkspaceEventLog;
+  /** Launches a task for one fired occurrence; the fired event is written first so boot recovery can resume it. */
+  fireTask?: (runId: string, prompt: string) => Promise<void>;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -177,6 +179,7 @@ function foldScheduleEvent(state: FoldedSchedules, event: Record<string, unknown
 export class WorkspaceScheduler {
   private readonly workspace: string;
   private readonly events: WorkspaceEventLog;
+  private readonly fireTask: WorkspaceSchedulerOptions["fireTask"];
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
@@ -194,6 +197,7 @@ export class WorkspaceScheduler {
     }
     this.workspace = path.resolve(options.workspace);
     this.events = options.events;
+    this.fireTask = options.fireTask;
     this.pollIntervalMs = pollIntervalMs;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
@@ -263,7 +267,7 @@ export class WorkspaceScheduler {
   private async reconcile(workspace: string, metadata: PinnedDirectory, now: number): Promise<void> {
     const rows = await this.readRows(metadata);
     if (rows === undefined) return;
-    const state = foldScheduleEvents(await readJsonl(path.join(metadata.path, EVENTS_FILE)).catch(() => []));
+    const state = foldScheduleEvents(await readJsonl(this.events.logPath).catch(() => []));
     const fileKeys = new Set(rows.map(rowKey));
 
     for (const [key, runId] of state.rowRun) {
@@ -298,6 +302,9 @@ export class WorkspaceScheduler {
       state.firedRows.add(key);
       if (run.recurrence !== null) {
         await this.scheduleRun(state, run, advanceRecurring(run.dueAt, run.recurrence, now));
+      }
+      if (this.fireTask) {
+        await this.fireTask(run.runId, run.prompt).catch((error) => this.report(error));
       }
     }
   }

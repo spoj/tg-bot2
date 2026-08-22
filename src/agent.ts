@@ -64,6 +64,8 @@ export type AgentWorkerOptions = {
   idleTimeoutMs?: number;
   busyTimeoutMs?: number;
   busyTimeoutMessage?: string;
+  hostSocketDir?: string;
+  hostEventsLog?: string;
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   setTimeout?: typeof setTimeout;
@@ -83,6 +85,8 @@ export type AgentManagerOptions = {
   stopGraceMs?: number;
   idleTimeoutMs?: number;
   busyTimeoutMs?: number;
+  hostSocketDir?: string;
+  hostEventsLog?: string;
   now?: () => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -181,25 +185,12 @@ export class AgentEventRouter {
       case "task_progress":
         await this.handleTaskProgress(event);
         break;
-      case "outbox_sent":
-        await this.handleOutboxSent(event);
-        break;
-      case "outbox_rejected":
-        await this.handleOutboxRejected(event);
-        break;
       case "my_chat_member":
         await this.handleMyChatMember(event);
         break;
-      case "browser_ready":
-        await this.handleBrowserReady(event);
-        break;
-      case "browser_request_failed": {
-        const originTarget = originToTarget(event.origin);
-        await this.notifier.interrupt(`Browser request ${event.requestId} failed: ${event.error}`, originTarget);
-        break;
-      }
       default:
-        // other events
+        // Send and browser outcomes reach the agent synchronously through the
+        // tool results; the events remain in the log as timeline history only.
         break;
     }
   }
@@ -228,43 +219,6 @@ export class AgentEventRouter {
     }
   }
 
-  private async handleOutboxSent(event: Extract<BotEvent, { type: "outbox_sent" }>): Promise<void> {
-    const originTarget = originToTarget(event.origin);
-    const target: AgentTarget = {
-      chatId: event.chat_id,
-      ...defined({ threadId: event.message_thread_id }),
-    };
-
-    if (event.request_type === "create_forum_topic" && originTarget && event.message_thread_id !== undefined) {
-      const topicName = event.summary ? ` "${truncate(event.summary, 120)}"` : "";
-      await this.notifier.followup(`[Topic${topicName} created with thread ID ${event.message_thread_id}]`, originTarget);
-    }
-
-    const isSameSession = originTarget !== undefined &&
-      originTarget.chatId === target.chatId &&
-      (originTarget.threadId ?? 0) === (target.threadId ?? 0);
-
-    if (!isSameSession) {
-      const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
-      const typeLabel = event.request_type ?? "message";
-      const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
-      await this.notifier.followup(message, target);
-    }
-  }
-
-  private async handleOutboxRejected(event: Extract<BotEvent, { type: "outbox_rejected" }>): Promise<void> {
-    const originTarget = originToTarget(event.origin);
-    const target: AgentTarget | undefined = originTarget ?? (typeof event.chat_id === "number"
-      ? { chatId: event.chat_id, ...defined({ threadId: event.message_thread_id }) }
-      : undefined);
-    await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, target);
-  }
-
-  private async handleBrowserReady(event: Extract<BotEvent, { type: "browser_ready" }>): Promise<void> {
-    const originTarget = originToTarget(event.origin);
-    const statusLabel = event.status === "started" ? "started" : "reused existing";
-    await this.notifier.interrupt(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`, originTarget);
-  }
   private async handleMessage(event: Extract<BotEvent, { type: "message" }>, rawLine: string): Promise<void> {
     const isPrivate = event.chat_id > 0;
     const botInfo = this.botInfoProvider?.();
@@ -425,10 +379,11 @@ export class AgentManager {
   private readonly setIntervalFn: typeof setInterval | undefined;
   private readonly clearIntervalFn: typeof clearInterval | undefined;
   private readonly workerFactory: AgentWorkerFactory;
+  private readonly hostSocketDir: string | undefined;
+  private readonly hostEventsLog: string | undefined;
   private readonly workers = new Map<string, ConversationWorkerEntry>();
   private readonly events: WorkspaceEventLog | undefined;
   private shuttingDown = false;
-
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
     this.workspace = config.workspace;
     this.appRoot = options.appRoot;
@@ -444,6 +399,8 @@ export class AgentManager {
     this.setIntervalFn = options.setInterval;
     this.clearIntervalFn = options.clearInterval;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
+    this.hostSocketDir = options.hostSocketDir;
+    this.hostEventsLog = options.hostEventsLog;
     this.events = options.events;
   }
 
@@ -584,6 +541,8 @@ export class AgentManager {
         idleTimeoutMs: this.idleTimeoutMs,
         busyTimeoutMs: this.busyTimeoutMs ?? DEFAULT_CHAT_BUSY_TIMEOUT_MS,
         busyTimeoutMessage: CHAT_BUSY_TIMEOUT_MESSAGE,
+        hostSocketDir: this.hostSocketDir,
+        hostEventsLog: this.hostEventsLog,
         setTimeout: this.setTimeoutFn,
         clearTimeout: this.clearTimeoutFn,
         setInterval: this.setIntervalFn,

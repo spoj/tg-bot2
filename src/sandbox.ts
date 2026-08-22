@@ -149,6 +149,10 @@ export type PiRunSandboxPaths = {
   hostTools?: string;
   /** Compact origin identifier (e.g. "chatId:threadId" or "task:runId") passed as PI_AGENT_ORIGIN. */
   agentOrigin?: string;
+  /** Host-owned directory bind-mounted at /workspace/.host; contains the host bridge socket. */
+  hostSocketDir?: string;
+  /** Host-owned events log, read-only bind-mounted over /workspace/.tg-bot/events.jsonl. */
+  hostEventsLog?: string;
 };
 export type PiRunBwrapResult = { args: string[] };
 
@@ -233,10 +237,6 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   for (const runtimePath of [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())]) {
     args.push("--ro-bind", runtimePath, runtimePath);
   }
-  args.push("--dir", "/etc");
-  for (const etcPath of await existing(["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"])) {
-    args.push("--ro-bind", etcPath, etcPath);
-  }
   args.push(
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     "--dir", "/app",
@@ -244,6 +244,13 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
     ...mountArgs,
     "--bind", workspace, "/workspace",
+    ...(paths.hostSocketDir === undefined
+      ? []
+      : ["--bind", await requireRealDirectory(paths.hostSocketDir, "Host socket directory"), "/workspace/.host"]),
+    ...(paths.hostEventsLog === undefined
+      ? []
+      : ["--ro-bind", paths.hostEventsLog, "/workspace/.tg-bot/events.jsonl"]),
+    ...(paths.hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/workspace/.host/host.sock"]),
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",

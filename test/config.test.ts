@@ -22,10 +22,12 @@ describe("configuration", () => {
     expect(() => parseBotId(token)).toThrow();
   });
 
-  it("derives bot directory and workspace paths from safe-integer bot IDs", () => {
+  it("derives bot paths from safe-integer bot IDs", () => {
     expect(botPaths("/data", 123)).toEqual({
       botDir: "/data/bots/123",
       workspace: "/data/bots/123/workspace",
+      eventsLog: "/data/bots/123/events.jsonl",
+      runDir: "/data/bots/123/run",
     });
     expect(() => botPaths("/data", Number.NaN)).toThrow();
   });

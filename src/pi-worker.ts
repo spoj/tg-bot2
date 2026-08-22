@@ -221,6 +221,8 @@ export class PiWorker {
         model: this.options.model,
         thinkingLevel: this.options.thinkingLevel,
         hostTools: this.options.hostTools,
+        hostSocketDir: this.options.hostSocketDir,
+        hostEventsLog: this.options.hostEventsLog,
       }),
     });
 

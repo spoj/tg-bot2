@@ -274,5 +274,5 @@ Request types:
 - edit_message: {chat_id,message_id,text,parse_mode?,reply_markup?}
 - delete_message: {chat_id,message_id}
 - create_forum_topic / edit_forum_topic / close_forum_topic / reopen_forum_topic / delete_forum_topic: {chat_id,name?,message_thread_id?}
-The host validates and delivers each request, appending outbox_sent (echoing messageId/pollId) or outbox_rejected (notified via followup).
+The host validates and delivers each request synchronously, returning the outcome (messageId/pollId or the failure detail) in the tool result and recording outbox_sent (echoing messageId/pollId) or outbox_rejected in events.jsonl.
 `;

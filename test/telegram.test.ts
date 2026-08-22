@@ -75,7 +75,7 @@ function workspaceDir(dataDir: string): string {
   return botPaths(dataDir, 999).workspace;
 }
 async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl"), "utf8").catch(() => "");
+  const content = await readFile(path.join(dataDir, "events.jsonl"), "utf8").catch(() => "");
   const result: Record<string, unknown>[] = [];
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
@@ -130,7 +130,7 @@ async function makeTestBot(
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
   const followup = agents.followup ?? vi.fn(async () => undefined);
-  const events = new WorkspaceEventLog(workspaceDir(dataDir));
+  const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
   const agentAccess = "status" in agents
     ? {
         status: (agents as { status: () => Promise<AgentStatus> }).status,
@@ -173,7 +173,7 @@ async function runAttachmentFixture(
   beforeUpdate?: (bot: Bot) => void,
 ): Promise<Mock> {
   const prompt = vi.fn(async () => undefined);
-  const events = new WorkspaceEventLog(workspaceDir(dataDir));
+  const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
   const router = new AgentEventRouter({ interrupt: prompt, followup: vi.fn(async () => undefined) });
   events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const bot = createTelegramBot({
@@ -1089,7 +1089,7 @@ describe("Telegram chat events", () => {
         message: { message_id: 7, text: "hello" },
         attachments: [],
       });
-      const chatLog = await readFile(path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl"), "utf8");
+      const chatLog = await readFile(path.join(dataDir, "events.jsonl"), "utf8");
       expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
     });
   });
@@ -1563,7 +1563,7 @@ describe("Telegram poll answers", () => {
   it("records a poll answer event for the owning chat without waking", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await appendEvents(workspaceDir(dataDir), [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
+      await appendEvents(path.join(dataDir, "events.jsonl"), [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({
@@ -1590,9 +1590,9 @@ describe("Telegram poll answers", () => {
   it("skips corrupt or non-matching event log lines while resolving owners", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const eventsPath = path.join(workspaceDir(dataDir), ".tg-bot", "events.jsonl");
+      const eventsPath = path.join(dataDir, "events.jsonl");
       await writeFile(eventsPath, "null\nnot json\n{\"type\":\"outbox_sent\",\"pollId\":\"poll-other\",\"chat_id\":42}\n", "utf8");
-      await appendEvents(workspaceDir(dataDir), [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
+      await appendEvents(eventsPath, [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate({

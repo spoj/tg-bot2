@@ -62,10 +62,11 @@ describe("allowlist", () => {
   });
 
   it("emits allowlist_updated only when the chat list changes", async () => {
-    const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const root = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const workspace = path.join(root, "workspace");
     try {
       await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
-      const eventLog = new WorkspaceEventLog(workspace);
+      const eventLog = new WorkspaceEventLog(path.join(root, "events.jsonl"));
 
       // Missing file -> returns null, no event
       expect(await syncAllowlist(workspace, eventLog)).toBeNull();
@@ -89,25 +90,26 @@ describe("allowlist", () => {
       expect(records).toHaveLength(2);
       expect(records[1]).toMatchObject({ type: "allowlist_updated", chats: [10, 20, 30] });
     } finally {
-      await rm(workspace, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
     }
   });
 
   it("seeds from events.jsonl across reboots and does not re-emit if unchanged", async () => {
-    const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const root = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const workspace = path.join(root, "workspace");
     try {
       await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
       await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), JSON.stringify([10, 20]));
 
-      const eventsFile = path.join(workspace, ".tg-bot", "events.jsonl");
-      // Pre-seed events.jsonl with matching allowlist_updated event
-      await writeFile(eventsFile, `${JSON.stringify({ v: 1, t: new Date().toISOString(), type: "allowlist_updated", chats: [10, 20] })}\n`);
+      const eventsFile = path.join(root, "events.jsonl");
+      // Pre-seed the host events log with a matching allowlist_updated event
+      await writeFile(eventsFile, `${JSON.stringify({ v: 1, t: "t", type: "allowlist_updated", chats: [10, 20] })}\n`, "utf8");
 
-      const eventLog = new WorkspaceEventLog(workspace);
+      const eventLog = new WorkspaceEventLog(eventsFile);
       expect(await syncAllowlist(workspace, eventLog)).toEqual([10, 20]);
       expect(await eventLog.readAll()).toHaveLength(1); // Still only the seeded event
     } finally {
-      await rm(workspace, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

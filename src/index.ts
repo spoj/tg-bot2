@@ -3,13 +3,15 @@ import { AgentManager, AgentEventRouter } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { WorkspaceRequestBus } from "./request-bus.js";
+import { HostBridge } from "./host-bridge.js";
 import { WorkspaceTasks } from "./task.js";
 import type { Bot } from "grammy";
 import { HostBrowserManager } from "./browser.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
-import { WorkspaceEventLog } from "./events.js";
-import { botPaths } from "./util.js";
+import { EVENTS_FILE, WorkspaceEventLog } from "./events.js";
+import { TG_BOT_DIR, botPaths, isMissing } from "./util.js";
+import { lstat, mkdir, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
@@ -22,7 +24,7 @@ export function isIntentionalSignalAbort(error: unknown): boolean {
 export interface DisposableServices {
   agents: Pick<AgentManager, "disposeAll">;
   scheduler: Pick<WorkspaceScheduler, "stop">;
-  requestBus: Pick<WorkspaceRequestBus, "stop">;
+  bridge: Pick<HostBridge, "stop">;
   tasks: Pick<WorkspaceTasks, "stop">;
   delivery: Pick<TelegramDeliveryQueue, "drain">;
   browser?: Pick<HostBrowserManager, "stop">;
@@ -34,13 +36,52 @@ export interface BotInstance {
   bot: Bot;
   agents: AgentManager;
   scheduler: WorkspaceScheduler;
-  requestBus: WorkspaceRequestBus;
+  bridge: HostBridge;
   tasks: WorkspaceTasks;
   delivery: TelegramDeliveryQueue;
   browser: HostBrowserManager;
 }
 
-// Stops the scheduler, request bus, and tasks, disposes agents, terminates
+/** Type guard for a record holding a string field; returns the field or "". */
+function stringField(record: Record<string, unknown> | undefined, field: string): string {
+  const value = record?.[field];
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * One-time migration from the legacy agent-writable log location to the
+ * host-owned one (`DATA_DIR/bots/<id>/events.jsonl`). Only regular files are
+ * moved; a planted symlink is ignored. Ensures the host log exists afterwards
+ * so the read-only bind mount into worker sandboxes always has a source.
+ */
+export async function migrateEventsLog(workspace: string, eventsLog: string): Promise<void> {
+  try {
+    await lstat(eventsLog);
+    return;
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+  }
+  const legacy = path.join(workspace, TG_BOT_DIR, EVENTS_FILE);
+  let moved = false;
+  try {
+    const entry = await lstat(legacy);
+    if (entry.isFile() && !entry.isSymbolicLink()) {
+      await mkdir(path.dirname(eventsLog), { recursive: true, mode: 0o700 });
+      await rename(legacy, eventsLog);
+      moved = true;
+    }
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+  }
+  if (!moved) {
+    await mkdir(path.dirname(eventsLog), { recursive: true, mode: 0o700 });
+    await writeFile(eventsLog, "", { encoding: "utf8", mode: 0o600, flag: "ax" }).catch((error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    });
+  }
+}
+
+// Stops the scheduler, bridge, and tasks, disposes agents, terminates
 // sandboxes, and drains the delivery queue. Each step is guarded so a failure
 // in one never skips the rest.
 export async function finishDisposal(services: DisposableServices): Promise<void> {
@@ -50,9 +91,9 @@ export async function finishDisposal(services: DisposableServices): Promise<void
     console.error("Scheduler shutdown failed", error);
   }
   try {
-    await services.requestBus.stop();
+    await services.bridge.stop();
   } catch (error) {
-    console.error("Request bus shutdown failed", error);
+    console.error("Host bridge shutdown failed", error);
   }
   try {
     await services.tasks.stop();
@@ -88,22 +129,31 @@ export async function main(): Promise<void> {
   const sandbox = await checkSandboxEnvironment(config.dataDir);
   const { dataDir, bwrapPath } = sandbox;
 
-  const instances: BotInstance[] = config.bots.map((botConfig) => {
+  const instances: BotInstance[] = await Promise.all(config.bots.map(async (botConfig) => {
     const paths = botPaths(dataDir, botConfig.botId);
     const { workspace } = paths;
     const runtimeConfig = { ...botConfig, dataDir, ...paths };
 
-    const eventLog = new WorkspaceEventLog(workspace);
-    const agentManager = new AgentManager({ workspace }, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup, events: eventLog });
+    await migrateEventsLog(workspace, paths.eventsLog);
+    await mkdir(paths.runDir, { recursive: true, mode: 0o700 });
+    const hostSocketDir = path.resolve(paths.runDir);
+    const hostEventsLog = path.resolve(paths.eventsLog);
+
+    const eventLog = new WorkspaceEventLog(hostEventsLog);
+    const agentManager = new AgentManager({ workspace }, {
+      appRoot: process.cwd(),
+      bwrapPath,
+      spawnProcess,
+      terminateProcessGroup,
+      events: eventLog,
+      hostSocketDir,
+      hostEventsLog,
+    });
     const deliveryQueue = new TelegramDeliveryQueue();
     const bot = createTelegramBot(runtimeConfig, eventLog, deliveryQueue, agentManager);
     const agentRouter = new AgentEventRouter(agentManager, { botInfo: () => bot.botInfo });
     eventLog.subscribe((record, rawLine) => agentRouter.onEvent(record, rawLine));
 
-    const schedulerInstance = new WorkspaceScheduler({
-      workspace,
-      events: eventLog,
-    });
     const outboxInstance = new WorkspaceOutbox({
       workspace,
       events: eventLog,
@@ -113,19 +163,31 @@ export async function main(): Promise<void> {
     const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
       workspace,
       events: eventLog,
-      flush: { flush: (ws: string) => requestBus.flush(ws) },
       appRoot: process.cwd(),
       bwrapPath,
       spawnProcess,
       terminateProcessGroup,
+      hostSocketDir,
+      hostEventsLog,
     });
-    const requestBus: WorkspaceRequestBus = new WorkspaceRequestBus({
+    // The scheduler fires due runs by launching tasks directly; the fired event is
+    // written first, and boot reconciliation relaunches occurrences lost in between.
+    const schedulerInstance = new WorkspaceScheduler({
       workspace,
-      onSend: (record, ws) => outboxInstance.handleSendRequest(record, ws),
-      onSpawn: (record, ws) => tasksInstance.handleSpawnRequest(record, ws),
-      onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
-      onSteerTask: (record, ws) => tasksInstance.handleSteerRequest(record, ws),
-      onStartBrowser: (record) => browserManager.handleStartBrowserRequest(record).then(() => {}),
+      events: eventLog,
+      fireTask: async (runId, prompt) => {
+        await tasksInstance.spawn(prompt, undefined, runId);
+      },
+    });
+    const bridge: HostBridge = new HostBridge({
+      socketPath: path.join(hostSocketDir, "host.sock"),
+      handlers: {
+        send: (params) => outboxInstance.send(params.request, stringField(params, "origin") || undefined),
+        spawn: (params) => tasksInstance.spawn(stringField(params, "prompt"), stringField(params, "origin") || undefined),
+        cancel: async (params) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
+        steerTask: async (params) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),
+        startBrowser: async (params) => ({ ...(await browserManager.startBrowser(stringField(params, "origin") || undefined)) }),
+      },
     });
     return {
       config: runtimeConfig,
@@ -133,12 +195,14 @@ export async function main(): Promise<void> {
       bot,
       agents: agentManager,
       scheduler: schedulerInstance,
-      requestBus,
+      bridge,
       tasks: tasksInstance,
       delivery: deliveryQueue,
       browser: browserManager,
     };
-  });
+  }));
+
+
 
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -182,7 +246,7 @@ export async function main(): Promise<void> {
         await shutdown("startup interrupted");
         return;
       }
-      await instance.requestBus.start();
+      await instance.bridge.start();
       if (shuttingDown) {
         await shutdown("startup interrupted");
         return;

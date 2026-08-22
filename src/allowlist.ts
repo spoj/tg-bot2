@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { errorCode, TG_BOT_DIR } from "./util.js";
-import { WorkspaceEventLog } from "./events.js";
+import { EVENTS_FILE, WorkspaceEventLog } from "./events.js";
 /**
  * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, containing an array of safe integer chat IDs.
  * The host enforces it both ways and emits `allowlist_updated` whenever changes are detected.
@@ -84,8 +84,8 @@ async function lastLoggedAllowlist(eventLog: WorkspaceEventLog): Promise<string 
  */
 export async function syncAllowlist(workspace: string, events?: WorkspaceEventLog): Promise<number[] | null> {
   const file = await readAllowedFile(workspace);
-  const eventLog = events ?? new WorkspaceEventLog(workspace);
-
+  // Host state lives one level above the workspace (DATA_DIR/bots/<id>/events.jsonl).
+  const eventLog = events ?? new WorkspaceEventLog(path.resolve(workspace, "..", EVENTS_FILE));
   if (!lastEmittedAllowlists.has(workspace)) {
     const logged = await lastLoggedAllowlist(eventLog);
     if (logged !== undefined) {

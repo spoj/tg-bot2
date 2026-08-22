@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi, type Mock } from "vitest";
@@ -113,14 +113,14 @@ const OUTRO = `Keep Telegram-facing answers concise unless the user asks for det
 /status is a host command that reports your current model, thinking level, and session summary.
 You own the chat allow list at /workspace/.tg-bot/allowed.json: a JSON array of allowed chat IDs (e.g. [123456789, -1001234567890]). The host enforces it both ways — messages from unlisted chats never reach you (and log chat_denied in events.jsonl), and your sends to unlisted chat_ids are rejected. Edit the file to allow or remove chats; changes take effect immediately.
 Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
-Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, touch /workspace/.tg-bot/new-session (any empty file) and the next run starts fresh.
+Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, call the new_session tool and your next interaction starts fresh.
 Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
 `;
 
 it("composes the SYSTEM_PROMPT from the intro, protocol sections, and outro", () => {
   expect(SYSTEM_PROMPT).toBe(`${INTRO}${OUTBOX_PROMPT}${EVENTS_PROMPT}${SCHEDULES_PROMPT}${TASKS_PROMPT}${OUTRO}`);
   expect(SYSTEM_PROMPT).toContain("/status is a host command");
-  expect(SYSTEM_PROMPT).toContain("new-session");
+  expect(SYSTEM_PROMPT).toContain("new_session tool");
   expect(SYSTEM_PROMPT).not.toContain("/model, /thinking, /status, and /restart");
 });
 
@@ -217,7 +217,7 @@ it("resumes within the window and starts fresh after it closes", async () => {
   });
 });
 
-it("a new-session marker forces a fresh run, closes active worker, and is consumed", async () => {
+it("handleNewSessionRequest forces a fresh run and closes active worker", async () => {
   await withDataDir(async (dataDir) => {
     const tenHours = 10 * 60 * 60 * 1000;
     let now = tenHours;
@@ -226,16 +226,14 @@ it("a new-session marker forces a fresh run, closes active worker, and is consum
     await manager.followup("one");
     expect(workers).toHaveLength(1);
 
-    const marker = path.join(dataDir, "workspace", ".tg-bot", "new-session");
-    await mkdir(path.dirname(marker), { recursive: true });
-    await writeFile(marker, "", "utf8");
+    await manager.handleNewSessionRequest();
+    expect(workers[0]?.close).toHaveBeenCalled();
+
     now = tenHours + 60_000;
 
     await manager.followup("two");
-    expect(workers[0]?.close).toHaveBeenCalled();
     expect(workers).toHaveLength(2);
     expect(workers[1]?.options.resume).toBe(false);
-    await expect(readFile(marker, "utf8")).rejects.toThrow();
   });
 });
 

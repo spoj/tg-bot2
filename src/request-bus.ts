@@ -18,6 +18,8 @@ export type SteerTaskRequest = Extract<AgentCommand, { type: "steer_task_request
 
 /** One browser_requested command: the agent's tool minted requestId. */
 export type StartBrowserRequest = Extract<AgentCommand, { type: "browser_requested" }>;
+/** One new_session_request command to reset conversational context. */
+export type NewSessionRequest = Extract<AgentCommand, { type: "new_session_request" }>;
 /** Consumes one send_request; `resume` means the command was claimed but its dispatch never reached a terminal event. */
 export type SendRequestHandler = (
   record: SendRequest,
@@ -36,6 +38,9 @@ export type SteerTaskRequestHandler = (record: SteerTaskRequest, workspace: stri
 
 /** Consumes one browser_requested command to start Chrome and the socket bridge. */
 export type StartBrowserRequestHandler = (record: StartBrowserRequest, workspace: string) => Promise<void>;
+/** Consumes one new_session_request command to reset the agent session. */
+export type NewSessionRequestHandler = (workspace: string) => Promise<void>;
+
 export type WorkspaceRequestBusOptions = {
   workspace: string;
   onSend: SendRequestHandler;
@@ -43,6 +48,7 @@ export type WorkspaceRequestBusOptions = {
   onCancel: CancelRequestHandler;
   onSteerTask?: SteerTaskRequestHandler;
   onStartBrowser?: StartBrowserRequestHandler;
+  onNewSession?: NewSessionRequestHandler;
   pollIntervalMs?: number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
@@ -69,6 +75,7 @@ type ChatScanState = {
 };
 
 function commandId(type: string, record: Record<string, unknown>): string | undefined {
+  if (type === "new_session_request") return "new_session";
   const id = record[
     type === "send_request" || type === "browser_requested" ? "requestId"
       : type === "steer_task_request" ? "steerId"
@@ -110,6 +117,8 @@ export function parseCommand(line: string): CommandRequest | undefined {
       return { type: "cancel_request", runId: id };
     case "browser_requested":
       return { type: "browser_requested", requestId: id };
+    case "new_session_request":
+      return { type: "new_session_request" };
     default:
       return undefined;
   }
@@ -341,14 +350,14 @@ export class WorkspaceRequestBus {
     }
   }
   private async route(workspace: string, state: ChatScanState, record: CommandRequest): Promise<void> {
-    const id = "requestId" in record ? record.requestId : "steerId" in record ? record.steerId : record.runId;
-    if (state.bootConsumed.has(id)) {
+    const id = "requestId" in record ? record.requestId : "steerId" in record ? record.steerId : "runId" in record ? record.runId : undefined;
+    if (id && state.bootConsumed.has(id)) {
       state.consumed.add(id);
       return;
     }
     switch (record.type) {
       case "send_request":
-        state.consumed.add(id);
+        state.consumed.add(id!);
         await this.invoke(() => this.options.onSend(record, workspace));
         break;
       case "spawn_request": {
@@ -358,19 +367,24 @@ export class WorkspaceRequestBus {
         break;
       }
       case "steer_task_request":
-        state.consumed.add(id);
+        state.consumed.add(id!);
         if (this.options.onSteerTask) {
           await this.invoke(() => this.options.onSteerTask!(record, workspace));
         }
         break;
       case "cancel_request":
-        state.consumed.add(id);
+        state.consumed.add(id!);
         await this.invoke(() => this.options.onCancel(record, workspace));
         break;
       case "browser_requested":
-        state.consumed.add(id);
+        state.consumed.add(id!);
         if (this.options.onStartBrowser) {
           await this.invoke(() => this.options.onStartBrowser!(record, workspace));
+        }
+        break;
+      case "new_session_request":
+        if (this.options.onNewSession) {
+          await this.invoke(() => this.options.onNewSession!(workspace));
         }
         break;
     }

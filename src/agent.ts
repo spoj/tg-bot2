@@ -1,5 +1,4 @@
-import { existsSync } from "node:fs";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
@@ -32,7 +31,7 @@ Install optional project-local extensions with pi install npm:<package> -l --app
 /status is a host command that reports your current model, thinking level, and session summary.
 You own the chat allow list at /workspace/.tg-bot/allowed.json: a JSON array of allowed chat IDs (e.g. [123456789, -1001234567890]). The host enforces it both ways — messages from unlisted chats never reach you (and log chat_denied in events.jsonl), and your sends to unlisted chat_ids are rejected. Edit the file to allow or remove chats; changes take effect immediately.
 Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
-Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, touch /workspace/.tg-bot/new-session (any empty file) and the next run starts fresh.
+Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, call the new_session tool and your next interaction starts fresh.
 Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
 `,
 ].join("");
@@ -206,7 +205,6 @@ export class AgentEventRouter {
 }
 
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
-const NEW_SESSION_MARKER = path.join(TG_BOT_DIR, "new-session");
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
@@ -315,6 +313,7 @@ export class AgentManager {
   private readonly workerFactory: AgentWorkerFactory;
   private readonly serial = new SerialQueue();
   private worker: AgentWorker | undefined;
+  private pendingNewSession = false;
   private shuttingDown = false;
 
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
@@ -353,6 +352,20 @@ export class AgentManager {
       const worker = await this.ensureWorker();
       await worker.prompt(text, "steer");
     });
+  }
+
+  /**
+   * Marks the agent for a session reset. The current turn completes normally,
+   * after which the worker process is closed immediately.
+   */
+  async handleNewSessionRequest(): Promise<void> {
+    this.pendingNewSession = true;
+    void this.serial.run(async () => {
+      if (this.pendingNewSession && this.worker?.isAlive()) {
+        await this.worker.close().catch(() => {});
+        this.worker = undefined;
+      }
+    }).catch(() => {});
   }
 
   async beginShutdown(): Promise<void> {
@@ -400,27 +413,21 @@ export class AgentManager {
   }
 
   private async ensureWorker(): Promise<AgentWorker> {
-    const marker = path.join(this.workspace, NEW_SESSION_MARKER);
-    const markerExists = existsSync(marker);
-
-    if (markerExists && this.worker?.isAlive()) {
-      await this.worker.close().catch(() => {});
-      this.worker = undefined;
-    }
-
-    if (this.worker && this.worker.isAlive()) {
+    if (this.pendingNewSession) {
+      this.pendingNewSession = false;
+      if (this.worker?.isAlive()) {
+        await this.worker.close().catch(() => {});
+        this.worker = undefined;
+      }
+    } else if (this.worker && this.worker.isAlive()) {
       return this.worker;
     }
 
     let resume = false;
-    if (markerExists) {
-      await rm(marker, { force: true }).catch(() => {});
-    } else {
-      const sessionsDirectory = path.join(this.workspace, ".pi", "sessions");
-      const newest = await newestSessionFile(sessionsDirectory);
-      if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
-        resume = true;
-      }
+    const sessionsDirectory = path.join(this.workspace, ".pi", "sessions");
+    const newest = await newestSessionFile(sessionsDirectory);
+    if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
+      resume = true;
     }
 
     const settings = await loadUserSettings(this.workspace);
@@ -442,7 +449,7 @@ export class AgentManager {
         clearTimeout: this.clearTimeoutFn,
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,spawn,steer_task,cancel,start_browser",
+      hostTools: "send,spawn,steer_task,cancel,start_browser,new_session",
       resume,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,

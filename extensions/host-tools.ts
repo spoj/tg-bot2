@@ -130,6 +130,19 @@ const HOST_TOOLS = {
       }
     },
   },
+  new_session: {
+    label: "Start new session",
+    description: "Reset your conversational context so your next interaction starts fresh in a new session. Your current turn will complete normally, after which the host stops the worker process immediately.",
+    parameters: Type.Object({}),
+    execute: (): ToolResult => {
+      try {
+        appendCommand({ type: "new_session_request" });
+        return text("New session requested. Your current turn will complete, and the next user message will start in a fresh session.");
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
 } as const;
 
 export default function hostTools(pi: ExtensionAPI): void {

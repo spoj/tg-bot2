@@ -145,6 +145,10 @@ export type AgentCommand =
     /** Queued by the start_browser tool; requestId is the tool-minted UUID. */
     type: "browser_requested";
     requestId: string;
+  }
+  | {
+    /** Queued by the new_session tool; requests a session reset on the next prompt. */
+    type: "new_session_request";
   };
 
 /** All entries recorded in the unified append-only `.tg-bot/events.jsonl` log. */
@@ -336,6 +340,7 @@ Commands (written by your tools to the same events.jsonl log; the host processes
 - steer_task_request: {v:1,t,type:'steer_task_request',steerId,runId,message} queued by the steer_task tool.
 - cancel_request: {v:1,t,type:'cancel_request',runId} queued by the cancel tool.
 - browser_requested: {v:1,t,type:'browser_requested',requestId} queued by the start_browser tool.
+- new_session_request: {v:1,t,type:'new_session_request'} queued by the new_session tool.
 Outcomes (host-written, exactly one terminal event per command):
 - outbox_sent: {v:1,t,type:'outbox_sent',requestId,chat_id,messageId?,pollId?,data?}
   when Telegram accepts it, whether or not it returned a message id; data is the raw

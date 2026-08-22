@@ -14,7 +14,6 @@ import {
   closeTelegramForumTopic,
   reopenTelegramForumTopic,
   deleteTelegramForumTopic,
-  unpinAllTelegramForumTopicMessages,
   deleteTelegramMessage,
   formatStatus,
   attachmentSource,
@@ -58,7 +57,6 @@ function fakeBot() {
       closeForumTopic: vi.fn(async () => true),
       reopenForumTopic: vi.fn(async () => true),
       deleteForumTopic: vi.fn(async () => true),
-      unpinAllForumTopicMessages: vi.fn(async () => true),
     },
   } as unknown as Bot;
 }
@@ -590,7 +588,7 @@ it("rejects a regular file that grows beyond the upload cap after stat", async (
 
 
 describe("Telegram forum topic management", () => {
-  it("creates, edits, closes, reopens, deletes topics and unpins topic messages", async () => {
+  it("creates, edits, closes, reopens, and deletes topics", async () => {
     const bot = fakeBot();
     const created = await createTelegramForumTopic(bot, -100, { version: 1, type: "create_forum_topic", chat_id: -100, name: "Travel 2026", icon_color: 7322096 });
     expect(created).toEqual({ messageThreadId: 105, data: { message_thread_id: 105, name: "Travel 2026" } });
@@ -606,8 +604,6 @@ describe("Telegram forum topic management", () => {
     expect(await reopenTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
     expect(bot.api.reopenForumTopic).toHaveBeenCalledWith(-100, 105);
 
-    expect(await unpinAllTelegramForumTopicMessages(bot, -100, 105)).toEqual({ messageThreadId: 105 });
-    expect(bot.api.unpinAllForumTopicMessages).toHaveBeenCalledWith(-100, 105);
 
     expect(await deleteTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
     expect(bot.api.deleteForumTopic).toHaveBeenCalledWith(-100, 105);

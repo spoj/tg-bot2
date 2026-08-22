@@ -229,6 +229,10 @@ it("handleNewSessionRequest forces a fresh run and closes active worker", async 
     await manager.followup("one");
     expect(workers).toHaveLength(1);
 
+    const sessions = path.join(dataDir, "workspace", ".pi", "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(path.join(sessions, "recent.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: "recent" })}\n`, "utf8");
+
     await manager.handleNewSessionRequest();
     expect(workers[0]?.close).toHaveBeenCalled();
 

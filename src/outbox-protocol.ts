@@ -163,12 +163,6 @@ export type WorkspaceOutboxDeleteForumTopicRequest = {
   message_thread_id: number;
 };
 
-export type WorkspaceOutboxUnpinAllForumTopicMessagesRequest = {
-  version: 1;
-  type: "unpin_all_forum_topic_messages";
-  chat_id: number;
-  message_thread_id: number;
-};
 
 export type WorkspaceOutboxRequest =
   | WorkspaceOutboxSendFileRequest
@@ -185,7 +179,6 @@ export type WorkspaceOutboxRequest =
   | WorkspaceOutboxCloseForumTopicRequest
   | WorkspaceOutboxReopenForumTopicRequest
   | WorkspaceOutboxDeleteForumTopicRequest
-  | WorkspaceOutboxUnpinAllForumTopicMessagesRequest;
 
 export type WorkspaceOutboxDispatchResult = {
   messageId?: number;
@@ -253,8 +246,7 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
     request.type === "edit_forum_topic" ||
     request.type === "close_forum_topic" ||
     request.type === "reopen_forum_topic" ||
-    request.type === "delete_forum_topic" ||
-    request.type === "unpin_all_forum_topic_messages"
+    request.type === "delete_forum_topic"
   ) {
     if (typeof request.message_thread_id !== "number" || !Number.isSafeInteger(request.message_thread_id)) {
       throw new Error("Outbox request message_thread_id must be a safe integer");
@@ -265,7 +257,7 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
     request.type !== "send_reaction" && request.type !== "edit_message" &&
     request.type !== "delete_message"
   ) {
-    throw new Error("Outbox request type must be send_file, send_media_group, send_message, send_location, send_poll, stop_poll, send_reaction, edit_message, delete_message, create_forum_topic, edit_forum_topic, close_forum_topic, reopen_forum_topic, delete_forum_topic, or unpin_all_forum_topic_messages");
+    throw new Error("Outbox request type must be send_file, send_media_group, send_message, send_location, send_poll, stop_poll, send_reaction, edit_message, delete_message, create_forum_topic, edit_forum_topic, close_forum_topic, reopen_forum_topic, or delete_forum_topic");
   }
   return { ...request, version: 1, type: request.type } as WorkspaceOutboxRequest;
 }
@@ -311,7 +303,6 @@ its id matches the poll_answer events' poll_id and the matching outbox_sent even
 {type:"close_forum_topic",chat_id,message_thread_id} closes a topic.
 {type:"reopen_forum_topic",chat_id,message_thread_id} reopens a closed topic.
 {type:"delete_forum_topic",chat_id,message_thread_id} permanently deletes a topic and its messages.
-{type:"unpin_all_forum_topic_messages",chat_id,message_thread_id} unpins all pinned messages in a topic.
 The send tool records one send_request command (with the requestId it returns to you) in
 .tg-bot/events.jsonl; the host validates and delivers it, appending exactly one
 outbox_sent or outbox_rejected event. outbox_sent echoes messageId/pollId for later

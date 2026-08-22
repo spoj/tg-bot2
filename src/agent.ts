@@ -532,8 +532,10 @@ export class AgentManager {
   }
 
   private async ensureWorker(entry: ConversationWorkerEntry, chatId?: number, threadId?: number): Promise<AgentWorker> {
+    let isReset = false;
     if (entry.pendingNewSession) {
       entry.pendingNewSession = false;
+      isReset = true;
       if (entry.worker?.isAlive()) {
         await entry.worker.close().catch(() => {});
         entry.worker = undefined;
@@ -547,9 +549,11 @@ export class AgentManager {
     const sessionDir = sessionDirectoryPath(this.workspace, chatId, threadId);
 
     let resume = false;
-    const newest = await newestSessionFile(sessionDir);
-    if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
-      resume = true;
+    if (!isReset) {
+      const newest = await newestSessionFile(sessionDir);
+      if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
+        resume = true;
+      }
     }
 
     const settings = await loadUserSettings(this.workspace);

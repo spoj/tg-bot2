@@ -200,11 +200,6 @@ export async function deleteTelegramForumTopic(bot: Bot, chatId: number, message
   return { messageThreadId };
 }
 
-export async function unpinAllTelegramForumTopicMessages(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
-  await bot.api.unpinAllForumTopicMessages(chatId, messageThreadId);
-  return { messageThreadId };
-}
-
 export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; workspace: string }, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
   switch (request.type) {
     case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: paths.workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, messageThreadId: request.message_thread_id, disableNotification: request.disable_notification }) }) };
@@ -224,7 +219,6 @@ export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; w
     case "close_forum_topic": return closeTelegramForumTopic(bot, chatId, request.message_thread_id);
     case "reopen_forum_topic": return reopenTelegramForumTopic(bot, chatId, request.message_thread_id);
     case "delete_forum_topic": return deleteTelegramForumTopic(bot, chatId, request.message_thread_id);
-    case "unpin_all_forum_topic_messages": return unpinAllTelegramForumTopicMessages(bot, chatId, request.message_thread_id);
     default: { const unhandled: never = request; void unhandled; throw new Error("Unhandled outbox request type"); }
   }
 }

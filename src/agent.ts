@@ -98,6 +98,13 @@ export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.floor(milliseconds / 1_000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+}
 
 function formatTaskSettledMessage(event: Extract<BotEvent, { type: "task_settled" }>): string {
   const outcome = event.status === "done"
@@ -107,6 +114,16 @@ function formatTaskSettledMessage(event: Extract<BotEvent, { type: "task_settled
       : "aborted";
   const promptText = event.prompt ? ` "${truncate(event.prompt, 100)}"` : "";
   return `Task${promptText} ${outcome}. Run files: /workspace/.pi/tasks/${event.runId}/`;
+}
+
+function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progress" }>["tasks"]): string {
+  const lines = tasks.map((task) => {
+    const running = formatDuration(task.runningMs);
+    const idle = task.idleMs !== null ? formatDuration(task.idleMs) : "unknown";
+    const snippet = task.lastOutput ? `; last output: "${truncate(task.lastOutput, 120)}"` : "";
+    return `- ${task.runId} "${truncate(task.prompt, 80)}" running ${running}, last activity ${idle} ago${snippet}`;
+  });
+  return `Task heartbeat: ${tasks.length} task(s) running.\n${lines.join("\n")}`;
 }
 
 function formatDeniedChatMessage(event: Extract<BotEvent, { type: "chat_denied" }>): string {
@@ -150,6 +167,11 @@ export class AgentEventRouter {
         break;
       case "task_settled":
         await this.notifier.followup(formatTaskSettledMessage(event));
+        break;
+      case "task_progress":
+        if (event.tasks.length > 0) {
+          await this.notifier.followup(formatTaskProgressMessage(event.tasks));
+        }
         break;
       case "outbox_rejected":
         await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`);

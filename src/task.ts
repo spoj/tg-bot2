@@ -35,10 +35,8 @@ export type WorkspaceTasksOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
-  /** Unified event log for publishing task settlement events. */
+  /** Unified event log for publishing task settlement and progress events. */
   events: WorkspaceEventLog;
-  /** Optional notifier for delivering transient status heartbeats to the agent. */
-  notifier?: { followup(text: string): Promise<void> } | undefined;
   /** Consumes pending commands from events.jsonl before each settle followup, so task sends order before the completion message. */
   flush?: { flush(workspace: string): Promise<void> } | undefined;
   heartbeatIntervalMs?: number | undefined;
@@ -96,13 +94,6 @@ function truncate(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
 
-function formatDuration(milliseconds: number): string {
-  const totalSeconds = Math.floor(milliseconds / 1_000);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
-}
 
 /**
  * Runs agent-spawned background tasks: claims spawn tool calls into host-generated uuid
@@ -122,7 +113,6 @@ export class WorkspaceTasks {
   private readonly stopGraceMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
   private readonly flush: WorkspaceTasksOptions["flush"];
-  private readonly notifier?: { followup(text: string): Promise<void> } | undefined;
   private readonly heartbeatIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
@@ -146,7 +136,6 @@ export class WorkspaceTasks {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.events = options.events;
-    this.notifier = options.notifier;
     this.flush = options.flush;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.now = options.now ?? Date.now;
@@ -386,21 +375,24 @@ export class WorkspaceTasks {
       ...defined({ stderr }),
     });
   }
-
-  /** Sends one status followup while tasks run; silent when everything is idle. */
+  /** Emits a task_progress event while tasks run; silent when everything is idle. */
   private heartbeat(): void {
     if (this.inFlight.length === 0) return;
-    const lines = this.inFlight.map((task) => this.heartbeatLine(task));
-    const message = `Task heartbeat: ${this.inFlight.length} task(s) running.\n${lines.join("\n")}`;
-    void this.notifier?.followup(message).catch((error) => this.report(error));
-  }
-
-  private heartbeatLine(task: InFlightTask): string {
-    const { at, text } = task.worker.activity();
-    const running = formatDuration(Math.max(0, this.now() - task.startedAt));
-    const idle = at > 0 ? formatDuration(Math.max(0, this.now() - at)) : "unknown";
-    const snippet = text.trim().length > 0 ? `; last output: "${truncate(text.trim(), MAX_QUOTE_LENGTH)}"` : "";
-    return `- ${task.runId} "${truncate(task.prompt, 80)}" running ${running}, last activity ${idle} ago${snippet}`;
+    const now = this.now();
+    const tasks = this.inFlight.map((task) => {
+      const { at, text } = task.worker.activity();
+      const runningMs = Math.max(0, now - task.startedAt);
+      const idleMs = at > 0 ? Math.max(0, now - at) : null;
+      const lastOutput = text.trim().length > 0 ? truncate(text.trim(), MAX_QUOTE_LENGTH) : undefined;
+      return {
+        runId: task.runId,
+        prompt: task.prompt,
+        runningMs,
+        idleMs,
+        ...defined({ lastOutput }),
+      };
+    });
+    void this.events.publish({ type: "task_progress", tasks }).catch((error) => this.report(error));
   }
 
   private report(error: unknown): void {

@@ -47,6 +47,17 @@ export type HostEvent =
     stderr?: string | undefined;
   }
   | {
+    /** Periodic progress checkpoint for active background tasks. */
+    type: "task_progress";
+    tasks: Array<{
+      runId: string;
+      prompt: string;
+      runningMs: number;
+      idleMs: number | null;
+      lastOutput?: string | undefined;
+    }>;
+  }
+  | {
     /** Telegram accepted one send_request; `requestId` matches the request's UUID; `data` is the raw Telegram response payload. */
     type: "outbox_sent";
     requestId: string;

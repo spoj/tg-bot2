@@ -113,7 +113,6 @@ export async function main(): Promise<void> {
     const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
       workspace,
       events: eventLog,
-      notifier: agentManager,
       flush: { flush: (ws: string) => requestBus.flush(ws) },
       appRoot: process.cwd(),
       bwrapPath,

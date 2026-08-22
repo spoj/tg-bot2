@@ -79,7 +79,6 @@ function setupTasks(
   const service = new WorkspaceTasks({
     workspace,
     events,
-    notifier,
     appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
@@ -352,7 +351,7 @@ describe("WorkspaceTasks", () => {
     tasks[0]?.activity.mockReturnValue({ at: 45_000, text: "still thinking" });
     now.mockReturnValue(300_000);
     callbacks[0]?.();
-    expect(followup).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(1));
     const message = (followup.mock.calls as unknown[][])[0]?.[0] as string;
     expect(message).toContain("1 task(s) running");
     expect(message).toContain('"heartbeat me"');

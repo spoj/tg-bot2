@@ -329,77 +329,19 @@ export function eventLine(event: object): string {
 }
 
 /** The EVENTS protocol section of the SYSTEM_PROMPT, derived from {@link BotEvent}. */
-export const EVENTS_PROMPT = `You serve multiple Telegram chats. One append-only log lives under /workspace/.tg-bot/events.jsonl
-(one JSON object per line, newest last; every line starts with {v:1,t,...} where t is
-an ISO-8601 timestamp). It is the single timeline of everything: inbound Telegram wire events,
-your host commands, and host outcome events.
+export const EVENTS_PROMPT = `Timeline log /workspace/.tg-bot/events.jsonl records all inbound wire events, commands, and host outcomes in timestamp order ({v:1,t,type,...}).
 Inbound wire events:
-- message: {v:1,t,type:'message',chat_id,message,attachments} where message is the raw
-  Telegram Message object (message_id, date, from, chat, text, caption, location, venue,
-  photo, document, reply_to_message, and any other Bot API Message field) and
-  attachments lists files the host downloaded into
-  /workspace/attachments/<chat_id>/... for you ({type,path,mimeType,originalName} or
-  {type,failure}).
-- callback: {v:1,t,type:'callback',chat_id,callback_query} where callback_query is the
-  raw Telegram CallbackQuery object (id, from, message, chat_instance). data is
-  optional and may instead be game_short_name; logged callbacks are message-backed.
-- poll_answer: {v:1,t,type:'poll_answer',chat_id,poll_answer} where poll_answer is the
-  raw Telegram PollAnswer object (poll_id, user, option_ids).
-Commands (written by your tools to the same events.jsonl log; the host processes each exactly once):
-- send_request: {v:1,t,type:'send_request',requestId,request} queued by the send tool;
-  requestId is the UUID the tool returns to you and request is your request object
-  (including its chat_id).
-- spawn_request: {v:1,t,type:'spawn_request',runId,prompt} queued by the spawn tool;
-  runId is the UUID the tool returns to you.
-- steer_task_request: {v:1,t,type:'steer_task_request',steerId,runId,message} queued by the steer_task tool.
-- cancel_request: {v:1,t,type:'cancel_request',runId} queued by the cancel tool.
-- browser_requested: {v:1,t,type:'browser_requested',requestId} queued by the start_browser tool.
-- new_session_request: {v:1,t,type:'new_session_request',requestId,chat_id?,message_thread_id?} queued by the new_session tool;
-  requestId is the UUID the tool returns to you.
-Outcomes (host-written, exactly one terminal event per command):
-- outbox_sent: {v:1,t,type:'outbox_sent',requestId,chat_id,message_thread_id?,messageId?,pollId?,request_type?,summary?,data?}
-  when Telegram accepts it, whether or not it returned a message id; data is the raw
-  Telegram response payload (for stop_poll it is the final closed Poll).
-- outbox_rejected: {v:1,t,type:'outbox_rejected',requestId,chat_id?,message_thread_id?,detail} reports a
-  rejected send; detail describes the failure.
-- task_settled: {v:1,t,type:'task_settled',runId,prompt?,status,exitCode,stderr?} when a
-  task finishes: status is done, failed, or aborted (aborted means the run was killed
-  via the cancel tool or the host restarted mid-run); stderr carries a bounded failure
-  tail when failed. Run files live under /workspace/.pi/tasks/<runId>/.
-- task_progress: {v:1,t,type:'task_progress',tasks:[{runId,prompt,runningMs,idleMs,lastOutput?},...]}
-  periodic progress checkpoint for active background tasks.
-- schedule_run_scheduled: {v:1,t,type:'schedule_run_scheduled',runId,prompt,start,recurrence,dueAt}
-  when the host materializes one occurrence of a schedules.json row; runId is the
-  host-assigned UUID, prompt/start/recurrence are the row snapshot, dueAt this firing time.
-- schedule_run_fired: {v:1,t,type:'schedule_run_fired',runId,prompt} when that occurrence
-  fired to spawn its background task run.
-- schedule_run_cancelled: {v:1,t,type:'schedule_run_cancelled',runId} when its row was
-  removed or edited before it fired.
-- allowlist_updated: {v:1,t,type:'allowlist_updated',chats:[...]} when the host
-  detects a change to allowed.json, recording the full sorted list of active chat IDs.
-- chat_denied: {v:1,t,type:'chat_denied',chat_id,title?} when a message, button press,
-  or poll vote arrived from a chat your allow list does not include; the host dropped
-  it without interrupting you. Read these to decide whether to allow a chat.
-- browser_ready: {v:1,t,type:'browser_ready',requestId?,status,socketPath,wsEndpoint} when
-  Chrome is running and accepting CDP WebSocket connections on the UNIX domain socket.
-- browser_request_failed: {v:1,t,type:'browser_request_failed',requestId,error} when
-  the host fails to launch Chrome.
-- browser_closed: {v:1,t,type:'browser_closed',reason} when Chrome exits (idle_timeout,
-  agent_close, process_exit, host_shutdown).
-- new_session_scheduled: {v:1,t,type:'new_session_scheduled',requestId,chat_id?,message_thread_id?} when
-  the host schedules the conversation context reset.
-Every send_request is followed by exactly one outbox_sent or outbox_rejected; every
-spawn_request (and cancel) by exactly one task_settled. Query events.jsonl (with grep,
-rq, or jq) for chat history, commands, and host activity using the context hierarchy:
-filter by chat_id and message_thread_id for thread history, by chat_id for chat history,
-or unconstrained for global activity.
-When a user message or button press arrives from an allowed chat, the host interrupts
-you with the exact JSON line it just appended to events.jsonl for that event
-({v:1,t,type,...}); events arriving close together are batched, and you receive one
-combined message holding each of their lines. The full objects are there, nothing is
-summarized. Decide whether that chat needs a response, and answer with the send tool
-using its chat_id.
-Task settlements and send rejections arrive as followup messages describing what
-happened, batched into one combined message delivered after your turn. Send ALL
-Telegram output through the send tool.
+- message: {type:'message',chat_id,message,attachments} (raw Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
+- callback: {type:'callback',chat_id,callback_query} (button press CallbackQuery)
+- poll_answer: {type:'poll_answer',chat_id,poll_answer} (non-anonymous poll vote)
+Host outcomes:
+- outbox_sent / outbox_rejected: reports send delivery; outbox_sent echoes messageId/pollId.
+- task_settled: {type:'task_settled',runId,prompt?,status,exitCode,stderr?} when a background task finishes (done, failed, aborted).
+- task_progress: periodic status checkpoint for active background tasks.
+- schedule_run_scheduled / schedule_run_fired / schedule_run_cancelled: schedule occurrence lifecycle.
+- allowlist_updated: updated allowed chat IDs.
+- chat_denied: inbound message dropped from unallowed chat.
+- browser_ready / browser_request_failed / browser_closed: CDP browser lifecycle.
+- new_session_scheduled: session reset acknowledgment.
+When messages arrive from allowed chats, the host interrupts you with the raw event JSON lines.
 `;

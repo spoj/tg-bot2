@@ -12,14 +12,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  */
 
 const SEND_SCHEMA = Type.Object({
-  chat_id: Type.Number({ description: "The Telegram chat id to send to (from incoming events or allowed list); direct assistant text is not delivered to Telegram" }),
-  message_thread_id: Type.Optional(Type.Number({ description: "Optional Telegram forum topic or message thread ID to send this message into" })),
+  chat_id: Type.Number({ description: "Target Telegram chat ID (from incoming events or allowed list)" }),
+  message_thread_id: Type.Optional(Type.Number({ description: "Optional Telegram forum topic or message thread ID" })),
   type: Type.String({ description: "Request type: send_message, send_file, send_media_group, send_location, send_poll, stop_poll, send_reaction, edit_message, delete_message, create_forum_topic, edit_forum_topic, close_forum_topic, reopen_forum_topic, or delete_forum_topic" }),
   path: Type.Optional(Type.String({ description: "Workspace file path for send_file (relative or /workspace/...)" })),
-  caption: Type.Optional(Type.String()),
-  kind: Type.Optional(Type.String()),
+  caption: Type.Optional(Type.String({ description: "Optional caption for send_file" })),
+  kind: Type.Optional(Type.String({ description: "File kind for send_file: auto, photo, audio, video, voice, or document" })),
   text: Type.Optional(Type.String({ description: "Message text for send_message or edit_message" })),
-  parse_mode: Type.Optional(Type.String({ description: "Optional formatting: 'HTML' or 'MarkdownV2' (omit for plain text)" })),
+  parse_mode: Type.Optional(Type.String({ description: "Formatting parse mode: prefer 'HTML' (supports <b>, <i>, <code>, <pre>, <blockquote>, <u>, <s>, <a>, bullet points •) or 'MarkdownV2'" })),
   entities: Type.Optional(Type.Array(Type.Any())),
   link_preview_options: Type.Optional(Type.Any()),
   reply_markup: Type.Optional(Type.Any()),

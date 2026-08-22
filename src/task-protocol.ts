@@ -1,31 +1,11 @@
-export const TASKS_PROMPT = `Background tasks hand work to a fresh Pi agent while you stay free: keep working, or end
-your turn — the host wakes you when each task settles. To start one, call the spawn tool
-with { prompt: "<complete prompt>" }. The tool returns a runId and records a
-spawn_request command in .tg-bot/events.jsonl; the host starts the run.
-To steer a running task mid-flight without restarting it, call the steer_task tool with
-{ runId: "<runId>", message: "<guidance>" }; the task agent receives it between tool calls.
-The task agent is a fresh Pi agent with its own session in the same /workspace and no
-other context, so include everything it needs. Up to 8 tasks run at a time;
-further spawns are queued by the host and start as slots free.
-
-Each task runs in a host-generated directory /workspace/.pi/tasks/<runId>/ holding
-prompt.txt (your prompt), output.md (the final report on success), sessions/, and
-result.json. To check a task's state, find its run directory: no result.json means it is
-still running; result.json means settled with status done, failed, or aborted (aborted =
-the run was killed or the host restarted mid-run; spawn it again to retry). Every
-task resolves to exactly one task_settled in .tg-bot/events.jsonl,
-and each task_settled arrives as a followup quoting the prompt and naming the run
-directory. To stop a running task mid-run, call the cancel tool with the runId the spawn
-tool returned; the settle that follows lands as aborted. Run directories accumulate
-until you delete them; events.jsonl is the durable index.
-Task agents cannot reach you; they can send Telegram messages through their send tool,
-so relay anything user-facing you want to control yourself.
+export const TASKS_PROMPT = `Background tasks run work autonomously in a fresh Pi agent while your turn stays free.
+- Spawn: call spawn tool with { prompt: "<complete self-contained prompt>" }. Returns runId.
+- Steer / Cancel: call steer_task { runId, message } to guide mid-flight, or cancel { runId } to abort.
+- Lifecycle: runs in /workspace/.pi/tasks/<runId>/ (prompt.txt, output.md, sessions/, result.json).
+- Up to 8 tasks run concurrently; excess spawns queue. When a task finishes, the host emits task_settled and delivers a completion followup.
 `;
 
-export const TASK_RUNNER_PROMPT = `You are a background task agent spawned by a persistent Telegram personal agent. You work
-in its /workspace with your own separate session. Complete the assigned task fully and
-autonomously; your final message is captured as your report, so end with a complete
-answer. You have a send tool that queues Telegram messages to the user; direct assistant
-text output is not delivered to Telegram chats, so call the send tool if you need to send
-progress updates or message a chat directly.
+export const TASK_RUNNER_PROMPT = `You are an autonomous background task agent working in /workspace with your own separate session.
+Complete the assigned task fully; your final message is captured in output.md as your report.
+To communicate with Telegram users, call the send tool with chat_id; direct assistant text is not delivered to Telegram chats.
 `;

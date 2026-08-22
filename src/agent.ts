@@ -41,7 +41,7 @@ export type AgentWorker = {
   isAlive(): boolean;
   isBusy(): boolean;
   prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void>;
-  abort?(): void;
+  waitForSettled(): Promise<unknown>;
   close(): Promise<void>;
   stop(): Promise<void>;
   onReaped(callback: () => void): void;
@@ -64,6 +64,7 @@ export type AgentWorkerOptions = {
   idleTimeoutMs?: number;
   busyTimeoutMs?: number;
   busyTimeoutMessage?: string;
+  now?: () => number;
   hostSocketDir?: string;
   hostEventsLog?: string;
   spawnProcess: PiWorkerSpawn;
@@ -240,6 +241,7 @@ export class AgentEventRouter {
 }
 
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
+const RESTART_SETTLE_CAP_MS = 30_000;
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
@@ -444,21 +446,33 @@ export class AgentManager {
   }
 
   /**
-   * Restarts every conversation worker: each active worker is closed after its current
-   * turn completes, so the next message respawns it with the current settings (resuming
-   * the session while it is still fresh). Used by the host /restart command to apply
-   * settings changes.
+   * Restarts every conversation worker: each active worker first waits for its current
+   * turn to settle (bounded by a hard 30s cap), then is closed, so the next message
+   * respawns it with the current settings while its session is still fresh. A worker
+   * whose close fails stays in the map and exit detection owns its cleanup.
+   * Used by the host /restart command to apply settings changes.
    */
   async restartAll(): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
     await Promise.all(
       [...this.workers.values()].map(async (entry) => {
         await entry.serial.run(async () => {
-          if (entry.worker?.isAlive()) {
-            const worker = entry.worker;
-            entry.worker = undefined;
-            await worker.close().catch(() => {});
+          const worker = entry.worker;
+          if (!worker?.isAlive()) return;
+          await Promise.race([
+            worker.waitForSettled(),
+            new Promise<void>((resolve) => {
+              const timer = this.setTimeoutFn(resolve, RESTART_SETTLE_CAP_MS);
+              timer.unref?.();
+            }),
+          ]);
+          try {
+            await worker.close();
+          } catch (error) {
+            console.error("Agent restart close failed", error);
+            return;
           }
+          entry.worker = undefined;
         });
       }),
     );
@@ -533,6 +547,7 @@ export class AgentManager {
       workspace: this.workspace,
       sessionDir: `/workspace/${sessionSubdir}`,
       appRoot: this.appRoot,
+      now: this.now,
       ...defined({
         bwrapPath: this.bwrapPath,
         model,

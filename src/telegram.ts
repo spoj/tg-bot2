@@ -95,7 +95,11 @@ export function splitTelegramText(text: string, limit = 4000): string[] {
 }
 
 export async function sendTelegramLocation(bot: Bot, chatId: number, request: WorkspaceOutboxSendLocationRequest): Promise<number> {
-  const shared = defined({ reply_to_message_id: request.reply_to_message_id, disable_notification: request.disable_notification });
+  const shared = defined({
+    reply_to_message_id: request.reply_to_message_id,
+    message_thread_id: request.message_thread_id,
+    disable_notification: request.disable_notification,
+  });
   if (request.venue) {
     const extra = Object.keys(shared).length === 0 ? [] : [shared as never];
     const sent = await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address, ...extra);
@@ -109,7 +113,15 @@ export async function sendTelegramLocation(bot: Bot, chatId: number, request: Wo
 }
 
 export async function sendTelegramPoll(bot: Bot, chatId: number, request: WorkspaceOutboxSendPollRequest): Promise<{ messageId: number; pollId: string }> {
-  const options = defined({ is_anonymous: request.is_anonymous, allows_multiple_answers: request.allows_multiple_answers, type: request.poll_type, correct_option_id: request.correct_option_id, reply_to_message_id: request.reply_to_message_id, disable_notification: request.disable_notification });
+  const options = defined({
+    is_anonymous: request.is_anonymous,
+    allows_multiple_answers: request.allows_multiple_answers,
+    type: request.poll_type,
+    correct_option_id: request.correct_option_id,
+    reply_to_message_id: request.reply_to_message_id,
+    message_thread_id: request.message_thread_id,
+    disable_notification: request.disable_notification,
+  });
   const sent = await bot.api.sendPoll(chatId, request.question, request.options, options);
   return { messageId: sent.message_id, pollId: sent.poll.id };
 }
@@ -131,6 +143,7 @@ export async function sendTelegramRichMessage(bot: Bot, chatId: number, request:
       parse_mode: request.parse_mode,
       reply_markup: request.reply_markup as never,
       reply_to_message_id: request.reply_to_message_id,
+      message_thread_id: request.message_thread_id,
       entities: request.entities as never,
       link_preview_options: request.link_preview_options as never,
       disable_notification: request.disable_notification,
@@ -160,7 +173,7 @@ export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId:
 
 export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; workspace: string }, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
   switch (request.type) {
-    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: paths.workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, disableNotification: request.disable_notification }) }) };
+    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: paths.workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, messageThreadId: request.message_thread_id, disableNotification: request.disable_notification }) }) };
     case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
     case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: paths.workspace, request }) };
     case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
@@ -181,9 +194,9 @@ type WorkspaceFileRequest = {
   caption?: string | undefined;
   kind?: WorkspaceOutboxFileKind;
   replyToMessageId?: number | undefined;
+  messageThreadId?: number | undefined;
   disableNotification?: boolean | undefined;
 };
-
 const MAX_PHOTO_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 const EXTENSION_KIND: Record<string, Exclude<WorkspaceOutboxFileKind, "auto" | "voice">> = {
@@ -279,6 +292,7 @@ export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest)
   const options = {
     ...(caption === undefined ? {} : { caption }),
     ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
+    ...(request.messageThreadId === undefined ? {} : { message_thread_id: request.messageThreadId }),
     ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
   };
   let sent: { message_id: number };
@@ -334,6 +348,7 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
   }
   const options = {
     ...(request.request.reply_to_message_id === undefined ? {} : { reply_to_message_id: request.request.reply_to_message_id }),
+    ...(request.request.message_thread_id === undefined ? {} : { message_thread_id: request.request.message_thread_id }),
     ...(request.request.disable_notification === undefined ? {} : { disable_notification: request.request.disable_notification }),
   };
   const sent = await bot.api.sendMediaGroup(chatId, group, options);

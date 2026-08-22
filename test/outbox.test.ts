@@ -201,8 +201,8 @@ describe("WorkspaceOutbox", () => {
     await send(workspace, dispatch, sendRecord("req-2", { type: "send_media_group", chat_id: 42, media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] }), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(interrupt).toHaveBeenCalledTimes(2));
-    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Outbox request media must be an array of 2 to 10 items");
-    expect(interrupt).toHaveBeenCalledWith("Send req-2 rejected: Outbox request media item type must be photo or video");
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Outbox request media must be an array of 2 to 10 items", undefined);
+    expect(interrupt).toHaveBeenCalledWith("Send req-2 rejected: Outbox request media item type must be photo or video", undefined);
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
       { requestId: "req-1", detail: expect.stringContaining("2 to 10 items") },
@@ -225,8 +225,8 @@ describe("WorkspaceOutbox", () => {
       { requestId: "req-3", detail: expect.stringContaining("must be a JSON object") },
     ]);
     await vi.waitFor(() => expect(interrupt).toHaveBeenCalledTimes(3));
-    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Outbox request kind must be auto, photo, audio, video, voice, or document");
-    expect(interrupt).toHaveBeenCalledWith("Send req-3 rejected: Outbox request must be a JSON object");
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Outbox request kind must be auto, photo, audio, video, voice, or document", undefined);
+    expect(interrupt).toHaveBeenCalledWith("Send req-3 rejected: Outbox request must be a JSON object", undefined);
   });
 
   it("discards oversized sends without delivering them", async () => {
@@ -247,7 +247,7 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
     await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup: vi.fn(), interrupt } });
     await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
-    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: upload failed");
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: upload failed", { chatId: 42 });
     const events = await logEvents(workspace);
     expect(events).toMatchObject([
       { type: "outbox_rejected", requestId: "req-1", chat_id: 42, detail: expect.stringContaining("upload failed") },
@@ -347,7 +347,7 @@ describe("WorkspaceOutbox", () => {
     await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
-    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list");
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list", { chatId: 42 });
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
       { requestId: "req-1", chat_id: 42, detail: expect.stringContaining("not on the allow list") },
@@ -376,7 +376,7 @@ describe("WorkspaceOutbox", () => {
     await send(workspace, dispatch, sendRecord("req-1", valid()), { notifier: { followup: vi.fn(), interrupt } });
     expect(dispatch).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
-    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list");
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: Chat 42 is not on the allow list", { chatId: 42 });
     const rejected = (await logEvents(workspace)).filter((event) => event.type === "outbox_rejected");
     expect(rejected).toMatchObject([
       { requestId: "req-1", chat_id: 42, detail: expect.stringContaining("not on the allow list") },

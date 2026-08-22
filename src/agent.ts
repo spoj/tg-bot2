@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
@@ -47,6 +48,7 @@ export type AgentWorker = {
 
 export type AgentWorkerOptions = {
   workspace: string;
+  sessionDir?: string;
   appRoot: string;
   bwrapPath?: string;
   appendSystemPrompt?: string;
@@ -86,12 +88,15 @@ export type AgentStatus = {
   activeTasks?: number;
   activeSchedules?: number;
 };
-
-export type AgentNotifier = {
-  interrupt(text: string): Promise<void>;
-  followup(text: string): Promise<void>;
+export type AgentTarget = {
+  chatId?: number | undefined;
+  threadId?: number | undefined;
 };
 
+export type AgentNotifier = {
+  interrupt(text: string, target?: AgentTarget): Promise<void>;
+  followup(text: string, target?: AgentTarget): Promise<void>;
+};
 export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
 
 function truncate(text: string, maxLength: number): string {
@@ -152,17 +157,11 @@ export class AgentEventRouter {
 
   async onEvent(event: BotEvent, rawLine: string): Promise<void> {
     switch (event.type) {
-      case "message": {
-        const isPrivate = event.chat_id > 0;
-        const botInfo = this.botInfoProvider?.();
-        const msg = event.message as Parameters<typeof isMessageDirectedToBot>[0];
-        if (isPrivate || (msg && isMessageDirectedToBot(msg, botInfo))) {
-          await this.notifier.interrupt(rawLine);
-        }
+      case "message":
+        await this.handleMessage(event, rawLine);
         break;
-      }
       case "callback":
-        await this.notifier.interrupt(rawLine);
+        await this.handleCallback(event, rawLine);
         break;
       case "task_settled":
         await this.notifier.followup(formatTaskSettledMessage(event));
@@ -173,22 +172,14 @@ export class AgentEventRouter {
         }
         break;
       case "outbox_rejected":
-        await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`);
+        await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, typeof event.chat_id === "number" ? { chatId: event.chat_id } : undefined);
         break;
       case "schedule_run_fired":
         await this.notifier.followup(event.prompt);
         break;
-      case "chat_denied": {
-        if (event.chat_id > 0) {
-          const lastTime = this.lastKnockTimes.get(event.chat_id) ?? 0;
-          const current = this.now();
-          if (current - lastTime >= KNOCK_COOLDOWN_MS) {
-            this.lastKnockTimes.set(event.chat_id, current);
-            await this.notifier.followup(formatDeniedChatMessage(event));
-          }
-        }
+      case "chat_denied":
+        await this.handleDeniedChat(event);
         break;
-      }
       case "browser_ready": {
         const statusLabel = event.status === "started" ? "started" : "reused existing";
         await this.notifier.followup(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`);
@@ -200,6 +191,34 @@ export class AgentEventRouter {
       default:
         // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
         break;
+    }
+  }
+
+  private async handleMessage(event: Extract<BotEvent, { type: "message" }>, rawLine: string): Promise<void> {
+    const isPrivate = event.chat_id > 0;
+    const botInfo = this.botInfoProvider?.();
+    const msg = event.message as Parameters<typeof isMessageDirectedToBot>[0];
+    if (isPrivate || (msg && isMessageDirectedToBot(msg, botInfo))) {
+      const threadId = msg && typeof msg === "object" && "message_thread_id" in msg && typeof msg.message_thread_id === "number"
+        ? msg.message_thread_id
+        : undefined;
+      await this.notifier.interrupt(rawLine, { chatId: event.chat_id, threadId });
+    }
+  }
+
+  private async handleCallback(event: Extract<BotEvent, { type: "callback" }>, rawLine: string): Promise<void> {
+    const query = event.callback_query as { message?: { message_thread_id?: number } } | undefined;
+    const threadId = query?.message?.message_thread_id;
+    await this.notifier.interrupt(rawLine, { chatId: event.chat_id, threadId });
+  }
+
+  private async handleDeniedChat(event: Extract<BotEvent, { type: "chat_denied" }>): Promise<void> {
+    if (event.chat_id <= 0) return;
+    const lastTime = this.lastKnockTimes.get(event.chat_id) ?? 0;
+    const current = this.now();
+    if (current - lastTime >= KNOCK_COOLDOWN_MS) {
+      this.lastKnockTimes.set(event.chat_id, current);
+      await this.notifier.followup(formatDeniedChatMessage(event), { chatId: event.chat_id });
     }
   }
 }
@@ -228,7 +247,7 @@ async function readSessionSummary(sessionsDirectory: string): Promise<{
   const newest = await newestSessionFile(sessionsDirectory);
   if (!newest) return undefined;
   try {
-    const raw = await readFile(path.join(sessionsDirectory, newest.name), "utf8");
+    const raw = await readFile(newest.fullPath, "utf8");
     let messageCount = 0;
     let model: { provider: string; id: string } | undefined;
     let thinkingLevel: string | undefined;
@@ -255,19 +274,32 @@ async function readSessionSummary(sessionsDirectory: string): Promise<{
   }
 }
 
-async function newestSessionFile(sessionsDirectory: string): Promise<{ name: string; mtimeMs: number } | undefined> {
-  try {
-    const entries = await readdir(sessionsDirectory, { withFileTypes: true });
-    let newest: { name: string; mtimeMs: number } | undefined;
-    for (const entry of entries) {
-      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".jsonl")) continue;
-      const fileStat = await stat(path.join(sessionsDirectory, entry.name));
-      if (!newest || fileStat.mtimeMs > newest.mtimeMs) newest = { name: entry.name, mtimeMs: fileStat.mtimeMs };
+async function newestSessionFile(sessionsDirectory: string): Promise<{ fullPath: string; name: string; mtimeMs: number } | undefined> {
+  let newest: { fullPath: string; name: string; mtimeMs: number } | undefined;
+  async function walk(dir: string): Promise<void> {
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
     }
-    return newest;
-  } catch {
-    return undefined;
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        try {
+          const fileStat = await stat(fullPath);
+          if (!newest || fileStat.mtimeMs > newest.mtimeMs) {
+            newest = { fullPath, name: entry.name, mtimeMs: fileStat.mtimeMs };
+          }
+        } catch {}
+      }
+    }
   }
+  await walk(sessionsDirectory);
+  return newest;
 }
 
 async function countActiveTasks(workspace: string): Promise<number | undefined> {
@@ -299,6 +331,24 @@ async function countActiveSchedules(workspace: string): Promise<number | undefin
   }
 }
 
+type ConversationWorkerEntry = {
+  worker: AgentWorker | undefined;
+  serial: SerialQueue;
+  pendingNewSession: boolean;
+};
+
+function conversationKey(chatId?: number, threadId?: number): string {
+  if (chatId === undefined) return "default";
+  return `${chatId}:${threadId ?? 0}`;
+}
+
+function sessionDirectoryPath(workspace: string, chatId?: number, threadId?: number): string {
+  if (chatId === undefined) {
+    return path.join(workspace, ".pi", "sessions");
+  }
+  return path.join(workspace, ".pi", "sessions", String(chatId), String(threadId ?? 0));
+}
+
 export class AgentManager {
   private readonly workspace: string;
   private readonly appRoot: string;
@@ -311,9 +361,7 @@ export class AgentManager {
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
   private readonly workerFactory: AgentWorkerFactory;
-  private readonly serial = new SerialQueue();
-  private worker: AgentWorker | undefined;
-  private pendingNewSession = false;
+  private readonly workers = new Map<string, ConversationWorkerEntry>();
   private shuttingDown = false;
 
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
@@ -330,51 +378,71 @@ export class AgentManager {
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
   }
 
+  private getOrCreateEntry(chatId?: number, threadId?: number): ConversationWorkerEntry {
+    const key = conversationKey(chatId, threadId);
+    let entry = this.workers.get(key);
+    if (!entry) {
+      entry = {
+        worker: undefined,
+        serial: new SerialQueue(),
+        pendingNewSession: false,
+      };
+      this.workers.set(key, entry);
+    }
+    return entry;
+  }
+
   /**
-   * Delivers a followup message to the agent using streaming followUp behavior.
+   * Delivers a followup message to the targeted conversation worker using streaming followUp behavior.
    */
-  async followup(text: string): Promise<void> {
+  async followup(text: string, target?: AgentTarget): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-    return this.serial.run(async () => {
+    const entry = this.getOrCreateEntry(target?.chatId, target?.threadId);
+    return entry.serial.run(async () => {
       if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker();
+      const worker = await this.ensureWorker(entry, target?.chatId, target?.threadId);
       await worker.prompt(text, "followUp");
     });
   }
 
   /**
-   * Delivers an interrupt message to the agent using streaming steer behavior.
+   * Delivers an interrupt message to the targeted conversation worker using streaming steer behavior.
    */
-  async interrupt(text: string): Promise<void> {
+  async interrupt(text: string, target?: AgentTarget): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-    return this.serial.run(async () => {
+    const entry = this.getOrCreateEntry(target?.chatId, target?.threadId);
+    return entry.serial.run(async () => {
       if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker();
+      const worker = await this.ensureWorker(entry, target?.chatId, target?.threadId);
       await worker.prompt(text, "steer");
     });
   }
 
   /**
-   * Marks the agent for a session reset. The current turn completes normally,
+   * Marks a conversation session for reset. The current turn completes normally,
    * after which the worker process is closed immediately.
    */
-  async handleNewSessionRequest(): Promise<void> {
-    this.pendingNewSession = true;
-    void this.serial.run(async () => {
-      if (this.pendingNewSession && this.worker?.isAlive()) {
-        await this.worker.close().catch(() => {});
-        this.worker = undefined;
+  async handleNewSessionRequest(target?: AgentTarget): Promise<void> {
+    const entry = this.getOrCreateEntry(target?.chatId, target?.threadId);
+    entry.pendingNewSession = true;
+    void entry.serial.run(async () => {
+      if (entry.pendingNewSession && entry.worker?.isAlive()) {
+        await entry.worker.close().catch(() => {});
+        entry.worker = undefined;
       }
     }).catch(() => {});
   }
 
   async beginShutdown(): Promise<void> {
     this.shuttingDown = true;
-    const worker = this.worker;
-    this.worker = undefined;
-    if (worker) {
-      await worker.close().catch((error) => console.error("Agent shutdown stop failed", error));
-    }
+    const entries = [...this.workers.values()];
+    this.workers.clear();
+    const closes = entries.map((entry) => {
+      const worker = entry.worker;
+      entry.worker = undefined;
+      return worker ? worker.close().catch((error) => console.error("Agent shutdown stop failed", error)) : Promise.resolve();
+    });
+    await Promise.all(closes);
   }
 
   async disposeAll(): Promise<void> {
@@ -412,20 +480,23 @@ export class AgentManager {
     return result;
   }
 
-  private async ensureWorker(): Promise<AgentWorker> {
-    if (this.pendingNewSession) {
-      this.pendingNewSession = false;
-      if (this.worker?.isAlive()) {
-        await this.worker.close().catch(() => {});
-        this.worker = undefined;
+  private async ensureWorker(entry: ConversationWorkerEntry, chatId?: number, threadId?: number): Promise<AgentWorker> {
+    if (entry.pendingNewSession) {
+      entry.pendingNewSession = false;
+      if (entry.worker?.isAlive()) {
+        await entry.worker.close().catch(() => {});
+        entry.worker = undefined;
       }
-    } else if (this.worker && this.worker.isAlive()) {
-      return this.worker;
+    } else if (entry.worker && entry.worker.isAlive()) {
+      return entry.worker;
     }
+    const sessionSubdir = chatId !== undefined
+      ? path.join(".pi", "sessions", String(chatId), String(threadId ?? 0))
+      : path.join(".pi", "sessions");
+    const sessionDir = sessionDirectoryPath(this.workspace, chatId, threadId);
 
     let resume = false;
-    const sessionsDirectory = path.join(this.workspace, ".pi", "sessions");
-    const newest = await newestSessionFile(sessionsDirectory);
+    const newest = await newestSessionFile(sessionDir);
     if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
       resume = true;
     }
@@ -438,6 +509,7 @@ export class AgentManager {
 
     const workerOptions: AgentWorkerOptions = {
       workspace: this.workspace,
+      sessionDir: `/workspace/${sessionSubdir}`,
       appRoot: this.appRoot,
       ...defined({
         bwrapPath: this.bwrapPath,
@@ -457,11 +529,11 @@ export class AgentManager {
 
     const worker = await this.workerFactory(workerOptions);
     worker.onReaped(() => {
-      if (this.worker === worker) {
-        this.worker = undefined;
+      if (entry.worker === worker) {
+        entry.worker = undefined;
       }
     });
-    this.worker = worker;
+    entry.worker = worker;
     return worker;
   }
 }

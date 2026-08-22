@@ -13,6 +13,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const SEND_SCHEMA = Type.Object({
   chat_id: Type.Number({ description: "The Telegram chat id to send to (from incoming events or allowed list); direct assistant text is not delivered to Telegram" }),
+  message_thread_id: Type.Optional(Type.Number({ description: "Optional Telegram forum topic or message thread ID to send this message into" })),
   type: Type.String({ description: "Request type: send_message, send_file, send_media_group, send_location, send_poll, stop_poll, send_reaction, edit_message, or delete_message" }),
   path: Type.Optional(Type.String({ description: "Workspace file path for send_file (relative or /workspace/...)" })),
   caption: Type.Optional(Type.String()),

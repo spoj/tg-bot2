@@ -1149,7 +1149,7 @@ describe("Telegram ingress gate", () => {
       await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
       expect(interrupt).not.toHaveBeenCalled();
       expect(followup).toHaveBeenCalledTimes(1);
-      expect(followup).toHaveBeenCalledWith(expect.stringContaining("Access denied for private chat 999"));
+      expect(followup).toHaveBeenCalledWith(expect.stringContaining("Access denied for private chat 999"), { chatId: 999 });
 
       // Second knock from stranger 999 (rate limited, no extra followup)
       await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);

@@ -10,6 +10,7 @@ type WorkspaceOutboxSendFileRequest = {
   version: 1;
   type: "send_file";
   chat_id: number;
+  message_thread_id?: number;
   path: string;
   caption?: string;
   kind?: WorkspaceOutboxFileKind;
@@ -21,6 +22,7 @@ export type WorkspaceOutboxSendMessageRequest = {
   version: 1;
   type: "send_message";
   chat_id: number;
+  message_thread_id?: number;
   text: string;
   parse_mode?: "HTML" | "MarkdownV2";
   reply_markup?: unknown;
@@ -34,6 +36,7 @@ export type WorkspaceOutboxSendMediaGroupRequest = {
   version: 1;
   type: "send_media_group";
   chat_id: number;
+  message_thread_id?: number;
   /** 2-10 items; each matches Telegram's InputMediaPhoto/InputMediaVideo with a workspace path for `media`. */
   media: Array<{
     type: "photo" | "video";
@@ -56,6 +59,7 @@ export type WorkspaceOutboxSendLocationRequest = {
   version: 1;
   type: "send_location";
   chat_id: number;
+  message_thread_id?: number;
   latitude: number;
   longitude: number;
   horizontal_accuracy?: number;
@@ -70,6 +74,7 @@ export type WorkspaceOutboxSendPollRequest = {
   version: 1;
   type: "send_poll";
   chat_id: number;
+  message_thread_id?: number;
   question: string;
   options: string[];
   is_anonymous?: boolean;
@@ -157,6 +162,9 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
   if (request.version !== 1) throw new Error("Outbox request version must be 1");
   if (typeof request.chat_id !== "number" || !Number.isSafeInteger(request.chat_id)) {
     throw new Error("Outbox request chat_id must be a safe integer");
+  }
+  if (request.message_thread_id !== undefined && (typeof request.message_thread_id !== "number" || !Number.isSafeInteger(request.message_thread_id))) {
+    throw new Error("Outbox request message_thread_id must be a safe integer");
   }
   if (request.type === "send_file") {
     if (typeof request.path !== "string" || request.path.length === 0) {

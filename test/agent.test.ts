@@ -357,3 +357,27 @@ it("beginShutdown stops active workers and rejects later work", async () => {
     await expect(manager.followup("two")).rejects.toThrow("Agent manager is shutting down");
   });
 });
+
+it("manages independent workers and session directories per conversation key", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+
+    await manager.followup("Matthew general", { chatId: 829096380 });
+    expect(workers).toHaveLength(1);
+    expect(workers[0]?.options.sessionDir).toBe("/workspace/.pi/sessions/829096380/0");
+
+    await manager.followup("Daisy general", { chatId: 875253145 });
+    expect(workers).toHaveLength(2);
+    expect(workers[1]?.options.sessionDir).toBe("/workspace/.pi/sessions/875253145/0");
+
+    await manager.followup("Group topic 42", { chatId: -100123456, threadId: 42 });
+    expect(workers).toHaveLength(3);
+    expect(workers[2]?.options.sessionDir).toBe("/workspace/.pi/sessions/-100123456/42");
+
+    // Sending another message to Matthew reuses his active worker
+    await manager.followup("Matthew follow up", { chatId: 829096380 });
+    expect(workers).toHaveLength(3);
+    expect(workers[0]?.prompt).toHaveBeenCalledTimes(2);
+  });
+});

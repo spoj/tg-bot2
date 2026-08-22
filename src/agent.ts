@@ -96,7 +96,6 @@ export type AgentTarget = {
 export type AgentNotifier = {
   interrupt(text: string, target?: AgentTarget): Promise<void>;
   followup(text: string, target?: AgentTarget): Promise<void>;
-  isAlive?(target?: AgentTarget): boolean;
 };
 export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
 
@@ -177,12 +176,10 @@ export class AgentEventRouter {
           chatId: event.chat_id,
           ...defined({ threadId: event.message_thread_id }),
         };
-        if (this.notifier.isAlive?.(target)) {
-          const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
-          const typeLabel = event.request_type ?? "message";
-          const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
-          await this.notifier.followup(message, target);
-        }
+        const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
+        const typeLabel = event.request_type ?? "message";
+        const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
+        await this.notifier.followup(message, target);
         break;
       }
       case "outbox_rejected":
@@ -404,11 +401,6 @@ export class AgentManager {
       this.workers.set(key, entry);
     }
     return entry;
-  }
-  /** Checks whether an active worker is currently running for the conversation target. */
-  isAlive(target?: AgentTarget): boolean {
-    const key = conversationKey(target?.chatId, target?.threadId);
-    return this.workers.get(key)?.worker?.isAlive() === true;
   }
 
   /**

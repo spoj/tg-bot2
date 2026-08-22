@@ -41,10 +41,15 @@ export type AgentWorker = {
   isAlive(): boolean;
   isBusy(): boolean;
   prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void>;
+  abort?(): void;
   close(): Promise<void>;
   stop(): Promise<void>;
   onReaped(callback: () => void): void;
 };
+
+export const DEFAULT_CHAT_BUSY_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+export const CHAT_BUSY_TIMEOUT_MESSAGE =
+  "Interrupted: Operation took over 2 minutes with no progress. If this task requires long computation or multi-step execution, consider acknowledging the user with the send tool and spawning a background task (spawn tool) to keep the chat loop responsive.";
 
 export type AgentWorkerOptions = {
   workspace: string;
@@ -57,11 +62,14 @@ export type AgentWorkerOptions = {
   resume: boolean;
   thinkingLevel?: string;
   idleTimeoutMs?: number;
-  stopGraceMs?: number;
+  busyTimeoutMs?: number;
+  busyTimeoutMessage?: string;
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
 };
 
 export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | Promise<AgentWorker>;
@@ -74,9 +82,12 @@ export type AgentManagerOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   idleTimeoutMs?: number;
+  busyTimeoutMs?: number;
   now?: () => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
   events?: WorkspaceEventLog;
 };
 
@@ -407,9 +418,12 @@ export class AgentManager {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly idleTimeoutMs: number | undefined;
+  private readonly busyTimeoutMs: number | undefined;
   private readonly now: () => number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
+  private readonly setIntervalFn: typeof setInterval | undefined;
+  private readonly clearIntervalFn: typeof clearInterval | undefined;
   private readonly workerFactory: AgentWorkerFactory;
   private readonly workers = new Map<string, ConversationWorkerEntry>();
   private readonly events: WorkspaceEventLog | undefined;
@@ -423,9 +437,12 @@ export class AgentManager {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.idleTimeoutMs = options.idleTimeoutMs;
+    this.busyTimeoutMs = options.busyTimeoutMs;
     this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
+    this.setIntervalFn = options.setInterval;
+    this.clearIntervalFn = options.clearInterval;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
     this.events = options.events;
   }
@@ -565,8 +582,12 @@ export class AgentManager {
         thinkingLevel,
         stopGraceMs: this.stopGraceMs,
         idleTimeoutMs: this.idleTimeoutMs,
+        busyTimeoutMs: this.busyTimeoutMs ?? DEFAULT_CHAT_BUSY_TIMEOUT_MS,
+        busyTimeoutMessage: CHAT_BUSY_TIMEOUT_MESSAGE,
         setTimeout: this.setTimeoutFn,
         clearTimeout: this.clearTimeoutFn,
+        setInterval: this.setIntervalFn,
+        clearInterval: this.clearIntervalFn,
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
       hostTools: "send,spawn,steer_task,cancel,start_browser",

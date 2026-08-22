@@ -330,7 +330,7 @@ export async function appendEvents(workspace: string, events: BotEvent[]): Promi
   const lines = events.map(eventLine);
   const target = path.join(metadata.path, EVENTS_FILE);
   try {
-    await appendJsonl(target, lines.join("\n"));
+    await appendJsonl(target, lines);
     return lines;
   } catch (error) {
     console.error("Failed to append event lines to events.jsonl", error);

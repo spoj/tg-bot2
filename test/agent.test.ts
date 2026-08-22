@@ -144,7 +144,12 @@ it("followup starts a fresh worker and sends prompt with followUp streaming beha
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled work");
     expect(factory).toHaveBeenCalledTimes(1);
-    expect(factory.mock.calls[0]?.[0]).toMatchObject({ resume: false, appendSystemPrompt: SYSTEM_PROMPT });
+    expect(factory.mock.calls[0]?.[0]).toMatchObject({
+      resume: false,
+      appendSystemPrompt: SYSTEM_PROMPT,
+      busyTimeoutMs: 120_000,
+      busyTimeoutMessage: expect.stringContaining("2 minutes"),
+    });
     expect(workers[0]?.prompt).toHaveBeenCalledWith("scheduled work", "followUp");
   });
 });
@@ -556,4 +561,30 @@ it("outbox_rejected interrupts the originating worker with the error", async () 
     "Send req-bad rejected: Bad HTML entity",
     { chatId: 829096380, threadId: 9534 },
   );
+});
+
+it("edited_message is logged silently without waking the agent", async () => {
+  const followup = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => undefined);
+  const notifier: AgentNotifier = { followup, interrupt };
+  const router = new AgentEventRouter(notifier);
+
+  const rawLine = JSON.stringify({
+    v: 1,
+    t: "2026-08-22T00:00:00.000Z",
+    type: "edited_message",
+    chat_id: 829096380,
+    message: { message_id: 10, text: "edited text", message_thread_id: 50 },
+    attachments: [],
+  });
+
+  await router.onEvent({
+    type: "edited_message",
+    chat_id: 829096380,
+    message: { message_id: 10, text: "edited text", message_thread_id: 50 },
+    attachments: [],
+  }, rawLine);
+
+  expect(interrupt).not.toHaveBeenCalled();
+  expect(followup).not.toHaveBeenCalled();
 });

@@ -290,8 +290,77 @@ describe("PiWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+  it("triggers busy watchdog when busy for busyTimeoutMs without progress", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = await fixture();
+      try {
+        const { child, spawn, terminate } = fakeChildFixture();
+        const worker = new PiWorker({
+          workspace: f.workspace,
+          appRoot: f.appRoot,
+          busyTimeoutMs: 1_000,
+          busyTimeoutMessage: "Custom timeout message",
+          spawnProcess: spawn,
+          terminateProcessGroup: terminate,
+        });
+        await worker.start();
+        await worker.prompt("long task");
 
-  it("rejects non-safe stop grace periods and idle timeouts", () => {
+        // Fast-forward past busyTimeoutMs
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        expect(child.stdin.write).toHaveBeenCalledWith(
+          expect.stringContaining('"type":"abort"'),
+          "utf8",
+        );
+        expect(child.stdin.write).toHaveBeenCalledWith(
+          expect.stringContaining('"type":"prompt","message":"Custom timeout message","streamingBehavior":"steer"'),
+          "utf8",
+        );
+      } finally {
+        await rm(f.root, { recursive: true, force: true });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not trigger busy watchdog if activity resets the timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = await fixture();
+      try {
+        const { child, spawn, terminate } = fakeChildFixture();
+        const worker = new PiWorker({
+          workspace: f.workspace,
+          appRoot: f.appRoot,
+          busyTimeoutMs: 1_000,
+          spawnProcess: spawn,
+          terminateProcessGroup: terminate,
+        });
+        await worker.start();
+        await worker.prompt("long task");
+
+        // Advance 600ms, emit stdout progress
+        await vi.advanceTimersByTimeAsync(600);
+        child.stdout.emit("data", "working...\n");
+
+        // Advance another 600ms (total 1200ms, but only 600ms since last activity)
+        await vi.advanceTimersByTimeAsync(600);
+        expect(child.stdin.write).not.toHaveBeenCalledWith(
+          expect.stringContaining('"type":"abort"'),
+          "utf8",
+        );
+      } finally {
+        await rm(f.root, { recursive: true, force: true });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects non-safe stop grace periods, idle timeouts, and busy timeouts", () => {
     expect(() => new PiWorker({
       workspace: "/tmp/ws",
       appRoot: "/tmp/app",
@@ -307,5 +376,13 @@ describe("PiWorker", () => {
       terminateProcessGroup: vi.fn(),
       idleTimeoutMs: -1,
     })).toThrow("idleTimeoutMs must be a non-negative integer");
+
+    expect(() => new PiWorker({
+      workspace: "/tmp/ws",
+      appRoot: "/tmp/app",
+      spawnProcess: vi.fn(),
+      terminateProcessGroup: vi.fn(),
+      busyTimeoutMs: -1,
+    })).toThrow("busyTimeoutMs must be a non-negative integer");
   });
 });

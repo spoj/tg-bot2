@@ -36,7 +36,6 @@ const state = vi.hoisted(() => {
     agentManager: vi.fn(class AgentManagerMock {
       beginShutdown = agents.beginShutdown;
       disposeAll = agents.disposeAll;
-      handleNewSessionRequest = vi.fn(async () => {});
     }),
     agentEventRouter: vi.fn(class AgentEventRouterMock {
       onEvent = vi.fn();

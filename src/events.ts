@@ -146,14 +146,6 @@ export type HostEvent =
     /** Browser instance terminated and UNIX socket was cleaned up. */
     type: "browser_closed";
     reason: "idle_timeout" | "agent_close" | "process_exit" | "host_shutdown";
-  }
-  | {
-    /** Host acknowledged new_session_request; requestId matches the tool UUID. */
-    type: "new_session_scheduled";
-    requestId: string;
-    origin?: string | undefined;
-    chat_id?: number | undefined;
-    message_thread_id?: number | undefined;
   };
 
 /**
@@ -193,14 +185,6 @@ export type AgentCommand =
     type: "browser_requested";
     requestId: string;
     origin?: string | undefined;
-  }
-  | {
-    /** Queued by the new_session tool; requestId is the tool-minted UUID. */
-    type: "new_session_request";
-    requestId: string;
-    origin?: string | undefined;
-    chat_id?: number | undefined;
-    message_thread_id?: number | undefined;
   };
 
 /** All entries recorded in the unified append-only `.tg-bot/events.jsonl` log. */
@@ -384,6 +368,5 @@ Host outcomes:
 - allowlist_updated: updated allowed chat IDs.
 - chat_denied: inbound message dropped from unallowed chat.
 - browser_ready / browser_request_failed / browser_closed: CDP browser lifecycle.
-- new_session_scheduled: session reset acknowledgment.
 When messages arrive from allowed chats, the host interrupts you with the raw event JSON lines.
 `;

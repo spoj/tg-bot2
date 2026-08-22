@@ -184,7 +184,7 @@ const HOST_TOOLS = {
   },
   start_browser: {
     label: "Start browser",
-    description: "Request a headless Chrome browser instance. The host launches Chrome with pipe transport and proxies it to a workspace UNIX domain socket (/workspace/.browser/cdp.sock), then emits a browser_ready event with the connection handle.",
+    description: "Request a headless Chrome browser instance. The host launches Chrome with pipe transport and proxies it to a workspace UNIX domain socket (/workspace/.browser/cdp.sock), then emits a browser_ready event with the connection handle. Write a puppeteer-core script that connects via ws+unix:///workspace/.browser/cdp.sock (import puppeteer from 'puppeteer-core'). The browser is shared across sessions, so end every script with one of: (1) release the tab — await page.close(); await browser.disconnect(); or (2) keep the page state and stop the script — await browser.disconnect(); process.exit(0). NEVER call browser.close(), which kills the shared Chrome and every session's tabs; disconnecting with a live page still attached (no page.close, no process.exit) hangs the node process.",
     parameters: Type.Object({}),
     execute: (): ToolResult => {
       const requestId = randomUUID();
@@ -196,35 +196,6 @@ const HOST_TOOLS = {
           ...(origin ? { origin } : {}),
         });
         return text(`Browser requested (ID: ${requestId}). A browser_ready event will arrive once Chrome and the socket proxy are ready.`);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-  },
-  new_session: {
-    label: "Start new session",
-    description: "Reset your conversational context so your next interaction starts fresh in a new session. Your current turn will complete normally, after which the host stops the worker process immediately.",
-    parameters: Type.Object({
-      chat_id: Type.Optional(Type.Number({ description: "Optional chat ID to reset; omit to reset the current conversation" })),
-      message_thread_id: Type.Optional(Type.Number({ description: "Optional Telegram forum topic or message thread ID to reset" })),
-    }),
-    execute: (params: { chat_id?: number; message_thread_id?: number }): ToolResult => {
-      const requestId = randomUUID();
-      const origin = process.env.PI_AGENT_ORIGIN || undefined;
-      const chatOrigin = getChatOrigin();
-      const targetChatId = typeof params?.chat_id === "number" ? params.chat_id : chatOrigin?.chatId;
-      const targetThreadId = typeof params?.message_thread_id === "number"
-        ? params.message_thread_id
-        : (params?.chat_id === undefined ? chatOrigin?.threadId : undefined);
-      try {
-        appendCommand({
-          type: "new_session_request",
-          requestId,
-          ...(origin ? { origin } : {}),
-          ...(typeof targetChatId === "number" ? { chat_id: targetChatId } : {}),
-          ...(typeof targetThreadId === "number" ? { message_thread_id: targetThreadId } : {}),
-        });
-        return text(`New session requested (ID: ${requestId}). Your current turn will complete, and the next user message will start in a fresh session.`);
       } catch (error) {
         return failure(error);
       }

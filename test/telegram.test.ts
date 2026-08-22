@@ -131,11 +131,17 @@ async function makeTestBot(
   if (recordRequests) sentRequests = [];
   const followup = agents.followup ?? vi.fn(async () => undefined);
   const events = new WorkspaceEventLog(workspaceDir(dataDir));
+  const agentAccess = "status" in agents
+    ? {
+        status: (agents as { status: () => Promise<AgentStatus> }).status,
+        restartAll: vi.fn(async () => undefined),
+      }
+    : undefined;
   const bot = createTelegramBot(
     { token: "999:test-token", botId: 999, dataDir },
     events,
     undefined,
-    "status" in agents ? (agents as { status: () => Promise<AgentStatus> }) : undefined,
+    agentAccess,
   );
   const router = new AgentEventRouter(
     { interrupt: agents.interrupt, followup },
@@ -1277,24 +1283,23 @@ describe("Telegram ingress gate", () => {
     });
   });
 
-  it("notifies agent on first knock from private chat and rate limits repeated knocks", async () => {
+  it("logs chat_denied for unlisted chats and never notifies the agent", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
       const interrupt = vi.fn(async () => undefined);
       const followup = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt, followup });
 
-      // First knock from stranger 999
+      // Knock from stranger 999 is logged, never notifies
       await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
       expect(interrupt).not.toHaveBeenCalled();
-      expect(followup).toHaveBeenCalledTimes(1);
-      expect(followup).toHaveBeenCalledWith(expect.stringContaining("Access denied for private chat 999"), { chatId: 999 });
+      expect(followup).not.toHaveBeenCalled();
 
-      // Second knock from stranger 999 (rate limited, no extra followup)
+      // Repeated knock still silent
       await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
-      expect(followup).toHaveBeenCalledTimes(1);
+      expect(followup).not.toHaveBeenCalled();
 
-      // Knock from unlisted group -500 (silently logged, no followup)
+      // Group knock is also silent
       await bot.handleUpdate({
         update_id: 10,
         message: {
@@ -1305,7 +1310,11 @@ describe("Telegram ingress gate", () => {
           text: "hello",
         },
       } as never);
-      expect(followup).toHaveBeenCalledTimes(1);
+      expect(followup).not.toHaveBeenCalled();
+
+      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      expect(denied).toHaveLength(3);
+      expect(denied.map((event) => event.chat_id)).toEqual([999, 999, -500]);
     });
   });
 

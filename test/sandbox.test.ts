@@ -124,7 +124,7 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     await symlink(target, linked, "dir");
     await mkdir(bin);
     await writeFile(node, "#!/bin/sh\nprintf node\n", { mode: 0o755 });
-    await writeFile(bwrap, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(log)}\ncat >/dev/null\n`, { mode: 0o755 });
+    await writeFile(bwrap, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(log)}\ncat >/dev/null\n`, { mode: 0o755 });
     process.env.PATH = `${bin}${path.delimiter}${previousPath ?? ""}`;
     const appRoot = path.join(root, "app");
     const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");

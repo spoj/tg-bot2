@@ -126,7 +126,6 @@ export async function main(): Promise<void> {
       onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
       onSteerTask: (record, ws) => tasksInstance.handleSteerRequest(record, ws),
       onStartBrowser: (record) => browserManager.handleStartBrowserRequest(record).then(() => {}),
-      onNewSession: (record) => agentManager.handleNewSessionRequest(record),
     });
     return {
       config: runtimeConfig,

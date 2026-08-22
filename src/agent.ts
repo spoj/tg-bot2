@@ -9,7 +9,7 @@ import { OUTBOX_PROMPT } from "./outbox-protocol.js";
 import { EVENTS_PROMPT, WorkspaceEventLog, type BotEvent } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 import { TASKS_PROMPT } from "./task-protocol.js";
-import { isMessageDirectedToBot } from "./telegram.js";
+import { isMessageDirectedToBot, isBotGroupAdd } from "./telegram.js";
 
 export const SYSTEM_PROMPT = [
 `You are a persistent personal agent reached through Telegram serving multiple chats concurrently.
@@ -28,7 +28,7 @@ Responsiveness & Multi-Chat Orchestration:
 - Message formatting: Prefer parse_mode: "HTML" (using <b>, <i>, <code>, <pre>, <blockquote>, <a>, bullet points •) over raw markdown so messages render cleanly on Telegram.
 - Forum topics: When conversing in a topic (message_thread_id is present), rename it around message 2-3 to a short descriptive name distinct from the last 10 active topic names in events.jsonl using edit_forum_topic.
 - Allowlist & Status: /workspace/.tg-bot/allowed.json controls allowed chat IDs. /status reports current model, thinking level, and session info. Adjust model/thinking in /workspace/.pi/agent/settings.json.
-- Session continuity: Active sessions resume across runs within 2 hours of inactivity; call new_session to reset.
+- Session continuity: Active sessions resume across runs within 2 hours of inactivity; an admin can /restart to apply settings changes.
 - Context gathering hierarchy:
   1. Thread context: if message_thread_id is present, query events.jsonl filtered by chat_id and message_thread_id (using grep, rq, or jq).
   2. Chat context: if not in a thread or broader context is needed, query events.jsonl filtered by chat_id.
@@ -98,7 +98,6 @@ export type AgentNotifier = {
   interrupt(text: string, target?: AgentTarget): Promise<void>;
   followup(text: string, target?: AgentTarget): Promise<void>;
 };
-export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
@@ -131,11 +130,6 @@ function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progre
   return `Task heartbeat: ${tasks.length} task(s) running.\n${lines.join("\n")}`;
 }
 
-function formatDeniedChatMessage(event: Extract<BotEvent, { type: "chat_denied" }>): string {
-  const title = event.title ? ` ("${event.title}")` : "";
-  return `Access denied for private chat ${event.chat_id}${title}. To allow, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`;
-}
-
 /**
  * Routes workspace events to agent notifications, applying interaction policy
  * (interrupt vs followup vs ignore) and prompt formatting.
@@ -150,37 +144,16 @@ function originToTarget(origin?: string): AgentTarget | undefined {
   };
 }
 
-function resolveSessionRequestTarget(record?: {
-  origin?: string | undefined;
-  chat_id?: number | undefined;
-  message_thread_id?: number | undefined;
-  chatId?: number | undefined;
-  threadId?: number | undefined;
-}): { chatId?: number | undefined; threadId?: number | undefined } {
-  if (!record) return {};
-  const origin = parseOrigin(record.origin);
-  const originChatId = origin?.kind === "chat" ? origin.chatId : undefined;
-  const originThreadId = origin?.kind === "chat" ? origin.threadId : undefined;
-
-  const chatId = record.chat_id ?? record.chatId ?? originChatId;
-  const explicitThread = record.message_thread_id ?? record.threadId;
-  const threadId = explicitThread ?? (chatId === originChatId ? originThreadId : undefined);
-  return { chatId, threadId };
-}
 export class AgentEventRouter {
-  private readonly lastKnockTimes = new Map<number, number>();
-  private readonly now: () => number;
   private readonly botInfoProvider?: (() => { id: number; username?: string } | undefined) | undefined;
 
   constructor(
     private readonly notifier: AgentNotifier,
     options: {
       botInfo?: () => { id: number; username?: string } | undefined;
-      now?: () => number;
     } = {},
   ) {
     this.botInfoProvider = options.botInfo;
-    this.now = options.now ?? Date.now;
   }
 
   async onEvent(event: BotEvent, rawLine: string): Promise<void> {
@@ -203,8 +176,8 @@ export class AgentEventRouter {
       case "outbox_rejected":
         await this.handleOutboxRejected(event);
         break;
-      case "chat_denied":
-        await this.handleDeniedChat(event);
+      case "my_chat_member":
+        await this.handleMyChatMember(event);
         break;
       case "browser_ready":
         await this.handleBrowserReady(event);
@@ -218,6 +191,16 @@ export class AgentEventRouter {
         // other events
         break;
     }
+  }
+
+  private async handleMyChatMember(event: Extract<BotEvent, { type: "my_chat_member" }>): Promise<void> {
+    // Only surface group adds; private-chat membership is not a self-provisioning signal.
+    if (event.chat_id >= 0) return;
+    if (!isBotGroupAdd(event.my_chat_member)) return;
+    await this.notifier.followup(
+      `Bot was added to group ${event.chat_id}. To allow it, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`,
+      { chatId: event.chat_id },
+    );
   }
 
   private async handleTaskSettled(event: Extract<BotEvent, { type: "task_settled" }>): Promise<void> {
@@ -289,15 +272,6 @@ export class AgentEventRouter {
     await this.notifier.interrupt(rawLine, { chatId: event.chat_id, threadId });
   }
 
-  private async handleDeniedChat(event: Extract<BotEvent, { type: "chat_denied" }>): Promise<void> {
-    if (event.chat_id <= 0) return;
-    const lastTime = this.lastKnockTimes.get(event.chat_id) ?? 0;
-    const current = this.now();
-    if (current - lastTime >= KNOCK_COOLDOWN_MS) {
-      this.lastKnockTimes.set(event.chat_id, current);
-      await this.notifier.followup(formatDeniedChatMessage(event), { chatId: event.chat_id });
-    }
-  }
 }
 
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -411,7 +385,6 @@ async function countActiveSchedules(workspace: string): Promise<number | undefin
 type ConversationWorkerEntry = {
   worker: AgentWorker | undefined;
   serial: SerialQueue;
-  pendingNewSession: boolean;
 };
 
 function conversationKey(chatId?: number, threadId?: number): string {
@@ -464,7 +437,6 @@ export class AgentManager {
       entry = {
         worker: undefined,
         serial: new SerialQueue(),
-        pendingNewSession: false,
       };
       this.workers.set(key, entry);
     }
@@ -498,46 +470,24 @@ export class AgentManager {
   }
 
   /**
-   * Marks a conversation session for reset. The current turn completes normally,
-   * after which the worker process is closed immediately and new_session_scheduled is emitted.
+   * Restarts every conversation worker: each active worker is closed after its current
+   * turn completes, so the next message respawns it with the current settings (resuming
+   * the session while it is still fresh). Used by the host /restart command to apply
+   * settings changes.
    */
-  private scheduleEntryReset(entry: ConversationWorkerEntry): void {
-    entry.pendingNewSession = true;
-    void entry.serial.run(async () => {
-      if (entry.pendingNewSession && entry.worker?.isAlive()) {
-        await entry.worker.close().catch(() => {});
-        entry.worker = undefined;
-      }
-    }).catch(() => {});
-  }
-
-  async handleNewSessionRequest(record?: {
-    requestId?: string | undefined;
-    origin?: string | undefined;
-    chat_id?: number | undefined;
-    message_thread_id?: number | undefined;
-    chatId?: number | undefined;
-    threadId?: number | undefined;
-  }): Promise<void> {
-    const { chatId, threadId } = resolveSessionRequestTarget(record);
-    const requestId = record?.requestId;
-    const origin = record?.origin;
-
-    if (chatId !== undefined) {
-      this.scheduleEntryReset(this.getOrCreateEntry(chatId, threadId));
-    } else {
-      for (const entry of this.workers.values()) {
-        this.scheduleEntryReset(entry);
-      }
-      this.getOrCreateEntry().pendingNewSession = true;
-    }
-    if (requestId) {
-      await this.events?.emit({
-        type: "new_session_scheduled",
-        requestId,
-        ...defined({ origin, chat_id: chatId, message_thread_id: threadId }),
-      });
-    }
+  async restartAll(): Promise<void> {
+    if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+    await Promise.all(
+      [...this.workers.values()].map(async (entry) => {
+        await entry.serial.run(async () => {
+          if (entry.worker?.isAlive()) {
+            const worker = entry.worker;
+            entry.worker = undefined;
+            await worker.close().catch(() => {});
+          }
+        });
+      }),
+    );
   }
 
   async beginShutdown(): Promise<void> {
@@ -588,15 +538,7 @@ export class AgentManager {
   }
 
   private async ensureWorker(entry: ConversationWorkerEntry, chatId?: number, threadId?: number): Promise<AgentWorker> {
-    let isReset = false;
-    if (entry.pendingNewSession) {
-      entry.pendingNewSession = false;
-      isReset = true;
-      if (entry.worker?.isAlive()) {
-        await entry.worker.close().catch(() => {});
-        entry.worker = undefined;
-      }
-    } else if (entry.worker && entry.worker.isAlive()) {
+    if (entry.worker && entry.worker.isAlive()) {
       return entry.worker;
     }
     const sessionSubdir = chatId !== undefined
@@ -604,13 +546,8 @@ export class AgentManager {
       : path.join(".pi", "sessions");
     const sessionDir = sessionDirectoryPath(this.workspace, chatId, threadId);
 
-    let resume = false;
-    if (!isReset) {
-      const newest = await newestSessionFile(sessionDir);
-      if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
-        resume = true;
-      }
-    }
+    const newest = await newestSessionFile(sessionDir);
+    const resume = newest !== undefined && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS;
 
     const settings = await loadUserSettings(this.workspace);
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
@@ -632,7 +569,7 @@ export class AgentManager {
         clearTimeout: this.clearTimeoutFn,
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,spawn,steer_task,cancel,start_browser,new_session",
+      hostTools: "send,spawn,steer_task,cancel,start_browser",
       agentOrigin: conversationKey(chatId, threadId),
       resume,
       spawnProcess: this.spawnProcess,

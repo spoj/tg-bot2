@@ -445,13 +445,25 @@ export async function checkSandboxEnvironment(dataDir: string, options: SandboxO
   try {
     await mkdir(workspace, { recursive: true, mode: 0o700 });
     await mkdir(sessions, { recursive: true, mode: 0o700 });
-    const result = await runSandbox(
+    const nodeResult = await runSandbox(
       { workspace, sessions },
-      { executable: "/bin/bash", args: ["-lc", `${shellQuote(nodePath)} --version && uv --version && rg --version`], timeoutMs: 30_000 },
+      { executable: "/bin/bash", args: ["-lc", `${shellQuote(nodePath)} --version`], timeoutMs: 30_000 },
       { ...options, bwrapPath },
     );
-    if (result.exitCode !== 0 || result.timedOut) {
-      throw new Error(`Sandbox runtime probe failed (${result.exitCode ?? "signal"}): ${result.stderr || result.stdout}`);
+    if (nodeResult.exitCode !== 0 || nodeResult.timedOut) {
+      throw new Error(`Sandbox node probe failed (${nodeResult.exitCode ?? "signal"}): ${nodeResult.stderr || nodeResult.stdout}`);
+    }
+    // uv/rg are checked lazily: warn when missing but never block boot, so the
+    // agent discovers them at use time instead of the whole bot refusing to start.
+    for (const tool of ["uv", "rg"]) {
+      const probe = await runSandbox(
+        { workspace, sessions },
+        { executable: "/bin/bash", args: ["-lc", `command -v ${shellQuote(tool)} >/dev/null 2>&1`], timeoutMs: 30_000 },
+        { ...options, bwrapPath },
+      );
+      if (probe.exitCode !== 0) {
+        console.warn(`Sandbox tool "${tool}" is unavailable; features relying on it may fail at runtime.`);
+      }
     }
   } finally {
     await rm(root, { recursive: true, force: true });

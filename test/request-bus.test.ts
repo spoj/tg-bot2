@@ -69,7 +69,8 @@ describe("parseCommand", () => {
     expect(parseCommand(spawnRequest())).toEqual({ type: "spawn_request", runId: "run-1", prompt: "do it" });
     expect(parseCommand(cancelRequest())).toEqual({ type: "cancel_request", runId: "run-1" });
     expect(parseCommand(steerTaskRequest())).toEqual({ type: "steer_task_request", steerId: "steer-1", runId: "run-1", message: "adjust" });
-    expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-1", origin: "42:0", chat_id: 42 })}\n`)).toEqual({ type: "new_session_request", requestId: "ns-1", origin: "42:0", chat_id: 42 });
+    // A stale new_session_request line from an older events.jsonl is no longer a command.
+    expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-1", chat_id: 42 })}\n`)).toBeUndefined();
     expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "send_request", requestId: "req-1", origin: "42:100", request: { type: "send_message", text: "hi" } })}\n`)).toEqual({ type: "send_request", requestId: "req-1", origin: "42:100", request: { type: "send_message", text: "hi" } });
     expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "schedule_run_fired", runId: "sched-1", prompt: "morning briefing" })}\n`)).toEqual({ type: "spawn_request", runId: "sched-1", prompt: "morning briefing" });
     expect(parseCommand("not json")).toBeUndefined();
@@ -100,6 +101,24 @@ describe("WorkspaceRequestBus", () => {
     expect(onSend).toHaveBeenCalledWith({ type: "send_request", requestId: "req-1", request: { type: "send_message", text: "hi" } }, workspace);
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
+  });
+  it("does not re-dispatch commands consumed at runtime after a partial truncation rescan", async () => {
+    const { workspace } = await fixture();
+    const target = path.join(workspace, ".tg-bot", "events.jsonl");
+    const first = sendRequest("req-1");
+    const second = sendRequest("req-2");
+    await writeFile(target, first + second, "utf8");
+    const onSend = vi.fn<SendRequestHandler>(async () => undefined);
+    const bus = setupBus(workspace, { onSend });
+
+    await bus.poll();
+    expect(onSend).toHaveBeenCalledTimes(2);
+
+    // Agent keeps req-1's line but drops req-2, shrinking the file below the stored offset,
+    // which forces a rescan from the top. req-1 must not be re-dispatched.
+    await truncate(target, Buffer.byteLength(first, "utf8"));
+    await bus.poll();
+    expect(onSend).toHaveBeenCalledTimes(2);
   });
   it("routes schedule_run_fired to onSpawn reusing the schedule runId", async () => {
     const { workspace } = await fixture();
@@ -149,24 +168,6 @@ describe("WorkspaceRequestBus", () => {
 
     await bus.poll();
     expect(onSteerTask).toHaveBeenCalledWith({ type: "steer_task_request", steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
-  });
-
-  it("routes new_session commands and skips completed ones during boot replay", async () => {
-    const { workspace } = await fixture();
-    await writeLog(workspace, [
-      `${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-done" })}\n`,
-      outcome({ type: "new_session_scheduled", requestId: "ns-done" }),
-      `${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-fresh", chat_id: 123 })}\n`,
-    ]);
-    const onNewSession = vi.fn(async () => undefined);
-    const bus = setupBus(workspace, { onNewSession });
-
-    await bus.poll();
-    expect(onNewSession).toHaveBeenCalledTimes(1);
-    expect(onNewSession).toHaveBeenCalledWith(
-      { type: "new_session_request", requestId: "ns-fresh", chat_id: 123 },
-      workspace,
-    );
   });
 
   it("retries pending spawns until a slot frees", async () => {

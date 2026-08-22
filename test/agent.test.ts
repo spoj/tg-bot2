@@ -13,7 +13,7 @@ import {
   type AgentStatus,
 } from "../src/agent.js";
 import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
-import { EVENTS_PROMPT, WorkspaceEventLog } from "../src/events.js";
+import { EVENTS_PROMPT } from "../src/events.js";
 import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
 import { TASKS_PROMPT } from "../src/task-protocol.js";
 
@@ -111,7 +111,7 @@ Responsiveness & Multi-Chat Orchestration:
 - Message formatting: Prefer parse_mode: "HTML" (using <b>, <i>, <code>, <pre>, <blockquote>, <a>, bullet points •) over raw markdown so messages render cleanly on Telegram.
 - Forum topics: When conversing in a topic (message_thread_id is present), rename it around message 2-3 to a short descriptive name distinct from the last 10 active topic names in events.jsonl using edit_forum_topic.
 - Allowlist & Status: /workspace/.tg-bot/allowed.json controls allowed chat IDs. /status reports current model, thinking level, and session info. Adjust model/thinking in /workspace/.pi/agent/settings.json.
-- Session continuity: Active sessions resume across runs within 2 hours of inactivity; call new_session to reset.
+- Session continuity: Active sessions resume across runs within 2 hours of inactivity; an admin can /restart to apply settings changes.
 - Context gathering hierarchy:
   1. Thread context: if message_thread_id is present, query events.jsonl filtered by chat_id and message_thread_id (using grep, rq, or jq).
   2. Chat context: if not in a thread or broader context is needed, query events.jsonl filtered by chat_id.
@@ -122,7 +122,7 @@ Responsiveness & Multi-Chat Orchestration:
 it("composes the SYSTEM_PROMPT from the intro, protocol sections, and outro", () => {
   expect(SYSTEM_PROMPT).toBe(`${INTRO}${OUTBOX_PROMPT}${EVENTS_PROMPT}${SCHEDULES_PROMPT}${TASKS_PROMPT}${OUTRO}`);
   expect(SYSTEM_PROMPT).toContain("/status reports current model");
-  expect(SYSTEM_PROMPT).toContain("new_session");
+  expect(SYSTEM_PROMPT).toContain("/restart to apply settings changes");
   expect(SYSTEM_PROMPT).not.toContain("/model, /thinking, /status, and /restart");
 });
 
@@ -219,7 +219,7 @@ it("resumes within the window and starts fresh after it closes", async () => {
   });
 });
 
-it("handleNewSessionRequest forces a fresh run and closes active worker", async () => {
+it("restartAll closes active workers and respawns them on the next message", async () => {
   await withDataDir(async (dataDir) => {
     const tenHours = 10 * 60 * 60 * 1000;
     let now = tenHours;
@@ -232,14 +232,13 @@ it("handleNewSessionRequest forces a fresh run and closes active worker", async 
     await mkdir(sessions, { recursive: true });
     await writeFile(path.join(sessions, "recent.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: "recent" })}\n`, "utf8");
 
-    await manager.handleNewSessionRequest();
+    await manager.restartAll();
     expect(workers[0]?.close).toHaveBeenCalled();
 
     now = tenHours + 60_000;
 
     await manager.followup("two");
     expect(workers).toHaveLength(2);
-    expect(workers[1]?.options.resume).toBe(false);
   });
 });
 
@@ -388,7 +387,7 @@ it("manages independent workers and session directories per conversation key", a
   });
 });
 
-it("handleNewSessionRequest without target marks all active conversation workers for reset", async () => {
+it("restartAll closes every active conversation worker and respawns them", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
@@ -397,55 +396,12 @@ it("handleNewSessionRequest without target marks all active conversation workers
     await manager.followup("Chat 200 topic 1", { chatId: 200, threadId: 1 });
     expect(workers).toHaveLength(2);
 
-    await manager.handleNewSessionRequest();
+    await manager.restartAll();
     expect(workers[0]?.close).toHaveBeenCalled();
     expect(workers[1]?.close).toHaveBeenCalled();
 
     await manager.followup("Chat 100 next", { chatId: 100 });
     expect(workers).toHaveLength(3);
-    expect(workers[2]?.options.resume).toBe(false);
-  });
-});
-
-it("handleNewSessionRequest with specific target resets only that conversation worker", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
-
-    await manager.followup("Chat 100", { chatId: 100 });
-    await manager.followup("Chat 200", { chatId: 200 });
-    expect(workers).toHaveLength(2);
-
-    await manager.handleNewSessionRequest({ chatId: 100 });
-    expect(workers[0]?.close).toHaveBeenCalled();
-    expect(workers[1]?.close).not.toHaveBeenCalled();
-
-    // Chat 200 still reuses worker
-    await manager.followup("Chat 200 next", { chatId: 200 });
-    expect(workers).toHaveLength(2);
-    expect(workers[1]?.prompt).toHaveBeenCalledTimes(2);
-
-    // Chat 100 gets fresh worker
-    await manager.followup("Chat 100 next", { chatId: 100 });
-    expect(workers).toHaveLength(3);
-  });
-});
-
-it("handleNewSessionRequest emits new_session_scheduled when requestId and events are present", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory } = fakeWorkerFactory();
-    const events = new WorkspaceEventLog(path.join(dataDir, "workspace"));
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, events }));
-
-    await manager.handleNewSessionRequest({ requestId: "ns-123", chat_id: 100, message_thread_id: 5 });
-    const logged = await events.readAll();
-    expect(logged).toHaveLength(1);
-    expect(logged[0]).toMatchObject({
-      type: "new_session_scheduled",
-      requestId: "ns-123",
-      chat_id: 100,
-      message_thread_id: 5,
-    });
   });
 });
 
@@ -491,6 +447,42 @@ it("routes browser_ready and task_settled strictly to originating chat/topic ses
     runId: "run-456",
     status: "done",
     exitCode: 0,
+  }, "");
+  expect(followup).not.toHaveBeenCalled();
+});
+
+it("my_chat_member group add notifies the agent; permission changes and private chats are silent", async () => {
+  const followup = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => undefined);
+  const notifier: AgentNotifier = { followup, interrupt };
+  const router = new AgentEventRouter(notifier);
+
+  // Bot added to a brand-new group (old status left -> new status member)
+  await router.onEvent({
+    type: "my_chat_member",
+    chat_id: -100123456,
+    my_chat_member: { new_chat_member: { status: "member" }, old_chat_member: { status: "left" } },
+  }, "");
+  expect(followup).toHaveBeenCalledWith(
+    expect.stringContaining("Bot was added to group -100123456"),
+    { chatId: -100123456 },
+  );
+
+  // Permission change (member -> administrator) is not an add
+  followup.mockClear();
+  await router.onEvent({
+    type: "my_chat_member",
+    chat_id: -100123456,
+    my_chat_member: { new_chat_member: { status: "administrator" }, old_chat_member: { status: "member" } },
+  }, "");
+  expect(followup).not.toHaveBeenCalled();
+
+  // Private chat add is silent (not a group-add; no self-provisioning signal)
+  followup.mockClear();
+  await router.onEvent({
+    type: "my_chat_member",
+    chat_id: 829096380,
+    my_chat_member: { new_chat_member: { status: "member" }, old_chat_member: { status: "left" } },
   }, "");
   expect(followup).not.toHaveBeenCalled();
 });

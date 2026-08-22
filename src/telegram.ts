@@ -28,6 +28,7 @@ const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
 const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_MEDIA_GROUP_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
 const ATTACHMENTS_DIR = "attachments";
@@ -351,8 +352,13 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
     throw new Error("Workspace is unavailable.");
   }
   const group: Array<InputMediaPhoto | InputMediaVideo> = [];
+  let totalBytes = 0;
   for (const item of request.request.media) {
     const { bytes, resolved } = await workspaceFileInput(workspace, item.media);
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_MEDIA_GROUP_TOTAL_BYTES) {
+      throw new Error(`Media group exceeds the ${MAX_MEDIA_GROUP_TOTAL_BYTES} byte total size limit`);
+    }
     if (item.type === "photo") {
       group.push({
         type: "photo",
@@ -674,6 +680,7 @@ async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<S
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
     { command: "status", description: "Show model, thinking level, and session summary" },
+    { command: "restart", description: "Restart all agents after settings changes" },
     { command: "start", description: "Introduction" },
   ]);
 }
@@ -733,6 +740,18 @@ export function isMessageDirectedToBot(message: Message, botInfo?: { id: number;
   return false;
 }
 
+/** True when a my_chat_member update reflects the bot being added to a chat (not a permission change). */
+export function isBotGroupAdd(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!("new_chat_member" in value) || !("old_chat_member" in value)) return false;
+  const newChatMember = value.new_chat_member;
+  const oldChatMember = value.old_chat_member;
+  if (newChatMember === null || typeof newChatMember !== "object" || oldChatMember === null || typeof oldChatMember !== "object") return false;
+  const newStatus = "status" in newChatMember ? newChatMember.status : undefined;
+  const oldStatus = "status" in oldChatMember ? oldChatMember.status : undefined;
+  return newStatus === "member" && (oldStatus === "left" || oldStatus === "kicked");
+}
+
 async function isChatAllowed(workspace: string, chatId: number, events?: WorkspaceEventLog): Promise<boolean> {
   const allowed = await syncAllowlist(workspace, events);
   return allowed !== null && allowed.includes(chatId);
@@ -758,11 +777,13 @@ async function gateChat(workspace: string, events: WorkspaceEventLog, chat: Tele
   });
   return false;
 }
+type AgentHostAccess = { status(): Promise<AgentStatus>; restartAll(): Promise<void> };
+
 export function createTelegramBot(
   config: Config,
   events: WorkspaceEventLog,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
-  statusProvider?: { status(): Promise<AgentStatus> },
+  agent?: AgentHostAccess,
 ): Bot {
   const bot = new Bot(config.token);
   const { workspace } = botPaths(config.dataDir, config.botId);
@@ -776,6 +797,13 @@ export function createTelegramBot(
       await next();
       return;
     }
+    // A bot added to a brand-new group must reach the agent so it can decide whether to
+    // allow the group, even before the chat is allowlisted. Messages from that group stay
+    // gated until the agent allowlists it.
+    if (chat.id < 0 && ctx.myChatMember && isBotGroupAdd(ctx.myChatMember) && !(await isChatAllowed(workspace, chat.id, events))) {
+      await next();
+      return;
+    }
     if (!(await gateChat(workspace, events, chat))) return;
     await next();
   });
@@ -785,19 +813,34 @@ export function createTelegramBot(
   });
 
   bot.command("status", async (ctx) => {
-    if (!statusProvider) {
+    if (!agent) {
       await queuedReply(ctx, "Status is not available.");
       return;
     }
     let state: AgentStatus;
     try {
-      state = await statusProvider.status();
+      state = await agent.status();
     } catch (error) {
       console.error("Failed to get status", error);
       await queuedReply(ctx, "I could not get the status. Please try again.");
       return;
     }
     await queuedReply(ctx, formatStatus(state));
+  });
+
+  bot.command("restart", async (ctx) => {
+    if (!agent) {
+      await queuedReply(ctx, "Restart is not available.");
+      return;
+    }
+    try {
+      await agent.restartAll();
+    } catch (error) {
+      console.error("Failed to restart agents", error);
+      await queuedReply(ctx, "I could not restart the agents. Please try again.");
+      return;
+    }
+    await queuedReply(ctx, "Restarting all agents. They will resume on the next message.");
   });
 
   bot.on("message", async (ctx) => {

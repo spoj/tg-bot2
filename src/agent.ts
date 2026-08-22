@@ -4,7 +4,7 @@ import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
-import { TG_BOT_DIR, defined } from "./util.js";
+import { TG_BOT_DIR, defined, parseOrigin } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
 import { EVENTS_PROMPT, WorkspaceEventLog, type BotEvent } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
@@ -53,8 +53,8 @@ export type AgentWorkerOptions = {
   bwrapPath?: string;
   appendSystemPrompt?: string;
   hostTools?: string;
+  agentOrigin?: string;
   resume: boolean;
-  model?: string;
   thinkingLevel?: string;
   idleTimeoutMs?: number;
   stopGraceMs?: number;
@@ -140,6 +140,15 @@ function formatDeniedChatMessage(event: Extract<BotEvent, { type: "chat_denied" 
  * Routes workspace events to agent notifications, applying interaction policy
  * (interrupt vs followup vs ignore) and prompt formatting.
  */
+
+function originToTarget(origin?: string): AgentTarget | undefined {
+  const parsed = parseOrigin(origin);
+  if (!parsed || parsed.kind !== "chat") return undefined;
+  return {
+    chatId: parsed.chatId,
+    ...(parsed.threadId > 0 ? { threadId: parsed.threadId } : {}),
+  };
+}
 export class AgentEventRouter {
   private readonly lastKnockTimes = new Map<number, number>();
   private readonly now: () => number;
@@ -164,29 +173,49 @@ export class AgentEventRouter {
       case "callback":
         await this.handleCallback(event, rawLine);
         break;
-      case "task_settled":
-        await this.notifier.followup(formatTaskSettledMessage(event));
-        break;
-      case "task_progress":
-        if (event.tasks.length > 0) {
-          await this.notifier.followup(formatTaskProgressMessage(event.tasks));
+      case "task_settled": {
+        const originTarget = originToTarget(event.origin);
+        if (originTarget) {
+          await this.notifier.followup(formatTaskSettledMessage(event), originTarget);
         }
         break;
+      }
+      case "task_progress": {
+        const originTarget = originToTarget(event.origin);
+        if (originTarget && event.tasks.length > 0) {
+          await this.notifier.followup(formatTaskProgressMessage(event.tasks), originTarget);
+        }
+        break;
+      }
       case "outbox_sent": {
+        const originTarget = originToTarget(event.origin);
         const target: AgentTarget = {
           chatId: event.chat_id,
           ...defined({ threadId: event.message_thread_id }),
         };
-        const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
-        const typeLabel = event.request_type ?? "message";
-        const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
-        await this.notifier.followup(message, target);
+
+        if (event.request_type === "create_forum_topic" && originTarget && event.message_thread_id !== undefined) {
+          const topicName = event.summary ? ` "${truncate(event.summary, 120)}"` : "";
+          await this.notifier.followup(`[Topic${topicName} created with thread ID ${event.message_thread_id}]`, originTarget);
+        }
+
+        const isSameSession = originTarget !== undefined &&
+          originTarget.chatId === target.chatId &&
+          (originTarget.threadId ?? 0) === (target.threadId ?? 0);
+
+        if (!isSameSession) {
+          const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
+          const typeLabel = event.request_type ?? "message";
+          const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
+          await this.notifier.followup(message, target);
+        }
         break;
       }
       case "outbox_rejected": {
-        const target: AgentTarget | undefined = typeof event.chat_id === "number"
+        const originTarget = originToTarget(event.origin);
+        const target: AgentTarget | undefined = originTarget ?? (typeof event.chat_id === "number"
           ? { chatId: event.chat_id, ...defined({ threadId: event.message_thread_id }) }
-          : undefined;
+          : undefined);
         await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, target);
         break;
       }
@@ -194,15 +223,17 @@ export class AgentEventRouter {
         await this.handleDeniedChat(event);
         break;
       case "browser_ready": {
+        const originTarget = originToTarget(event.origin);
         const statusLabel = event.status === "started" ? "started" : "reused existing";
-        await this.notifier.followup(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`);
+        await this.notifier.interrupt(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`, originTarget);
         break;
       }
-      case "browser_request_failed":
-        await this.notifier.followup(`Browser request ${event.requestId} failed: ${event.error}`);
+      case "browser_request_failed": {
+        const originTarget = originToTarget(event.origin);
+        await this.notifier.interrupt(`Browser request ${event.requestId} failed: ${event.error}`, originTarget);
         break;
-      default:
-        // poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
+      }
+        // edited_message, poll_answer, message_reaction, my_chat_member, chat_join_request, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
         break;
     }
   }
@@ -439,14 +470,20 @@ export class AgentManager {
    */
   async handleNewSessionRequest(record?: {
     requestId?: string | undefined;
+    origin?: string | undefined;
     chat_id?: number | undefined;
     message_thread_id?: number | undefined;
     chatId?: number | undefined;
     threadId?: number | undefined;
   }): Promise<void> {
-    const chatId = record?.chat_id ?? record?.chatId;
-    const threadId = record?.message_thread_id ?? record?.threadId;
+    const parsedOrigin = parseOrigin(record?.origin);
+    const originChatId = parsedOrigin && parsedOrigin.kind === "chat" ? parsedOrigin.chatId : undefined;
+    const originThreadId = parsedOrigin && parsedOrigin.kind === "chat" ? parsedOrigin.threadId : undefined;
+
+    const chatId = record?.chat_id ?? record?.chatId ?? originChatId;
+    const threadId = record?.message_thread_id ?? record?.threadId ?? (record?.chat_id === undefined && record?.chatId === undefined ? originThreadId : undefined);
     const requestId = record?.requestId;
+    const origin = record?.origin;
     if (chatId !== undefined) {
       const entry = this.getOrCreateEntry(chatId, threadId);
       entry.pendingNewSession = true;
@@ -473,7 +510,7 @@ export class AgentManager {
       await this.events?.emit({
         type: "new_session_scheduled",
         requestId,
-        ...defined({ chat_id: chatId, message_thread_id: threadId }),
+        ...defined({ origin, chat_id: chatId, message_thread_id: threadId }),
       });
     }
   }
@@ -571,6 +608,7 @@ export class AgentManager {
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
       hostTools: "send,spawn,steer_task,cancel,start_browser,new_session",
+      agentOrigin: conversationKey(chatId, threadId),
       resume,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,

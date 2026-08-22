@@ -411,4 +411,43 @@ describe("WorkspaceOutbox", () => {
       { requestId: "req-1", chat_id: 42, detail: expect.stringContaining("not on the allow list") },
     ]);
   });
+
+  it("preserves origin in outbox_sent and outbox_rejected events", async () => {
+    const { workspace } = await fixture();
+    await allowChat(workspace, 42);
+    const dispatch = vi.fn(async () => ({ messageId: 999 }));
+
+    // Successful send with origin
+    await send(workspace, dispatch, {
+      type: "send_request",
+      requestId: "req-ok",
+      origin: "42:100",
+      request: valid(),
+    });
+
+    // Rejected send with origin
+    await send(workspace, dispatch, {
+      type: "send_request",
+      requestId: "req-fail",
+      origin: "42:100",
+      request: { type: "send_message", chat_id: 999, text: "blocked" },
+    });
+
+    const events = await logEvents(workspace);
+    const sent = events.find((e) => e.requestId === "req-ok");
+    const rejected = events.find((e) => e.requestId === "req-fail");
+
+    expect(sent).toMatchObject({
+      type: "outbox_sent",
+      requestId: "req-ok",
+      origin: "42:100",
+      chat_id: 42,
+    });
+    expect(rejected).toMatchObject({
+      type: "outbox_rejected",
+      requestId: "req-fail",
+      origin: "42:100",
+      chat_id: 999,
+    });
+  });
 });

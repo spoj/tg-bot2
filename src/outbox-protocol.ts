@@ -262,7 +262,7 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
   return { ...request, version: 1, type: request.type } as WorkspaceOutboxRequest;
 }
 
-export const OUTBOX_PROMPT = `To communicate with Telegram users, call the send tool with chat_id and request parameters.
+export const OUTBOX_PROMPT = `To communicate with Telegram users, call the send tool with request parameters (chat_id and message_thread_id default to your current chat/topic for chat agents).
 Request types:
 - send_message: {chat_id,text,message_thread_id?,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?} (prefer parse_mode:"HTML" with <b>, <i>, <code>, <pre>, <blockquote>, <a>, •)
 - send_file: {chat_id,path,message_thread_id?,caption?,kind?,parse_mode?,reply_to_message_id?} (kind: auto, photo, audio, video, voice, document)

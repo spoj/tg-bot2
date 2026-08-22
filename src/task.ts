@@ -60,6 +60,7 @@ const MAX_QUOTE_LENGTH = 120;
 type InFlightTask = {
   worker: WorkspaceTaskWorker;
   runId: string;
+  origin?: string | undefined;
   prompt: string;
   startedAt: number;
 };
@@ -149,6 +150,7 @@ export class WorkspaceTasks {
         ...defined({ bwrapPath: this.bwrapPath }),
         appendSystemPrompt: TASK_RUNNER_PROMPT,
         hostTools: "send,start_browser",
+        agentOrigin: `task:${workerOptions.runId}`,
         resume: false,
         sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
         idleTimeoutMs: 0,
@@ -209,11 +211,11 @@ export class WorkspaceTasks {
   async handleSpawnRequest(record: SpawnRequest, workspace: string): Promise<"claimed" | "pending"> {
     const prompt = record.prompt;
     if (prompt.trim().length === 0 || prompt.length > MAX_TASK_BYTES) {
-      await this.settleRejectedSpawn(workspace, record.runId, prompt);
+      await this.settleRejectedSpawn(workspace, record.runId, prompt, record.origin);
       return "claimed";
     }
     if (this.inFlight.length >= MAX_CONCURRENT_TASKS) return "pending";
-    await this.claimAndLaunch(workspace, record.runId, prompt);
+    await this.claimAndLaunch(workspace, record.runId, prompt, record.origin);
     return "claimed";
   }
 
@@ -232,7 +234,7 @@ export class WorkspaceTasks {
   }
 
   /** Records a spawn command whose prompt is unusable as failed, with a followup. */
-  private async settleRejectedSpawn(workspace: string, runId: string, prompt: string): Promise<void> {
+  private async settleRejectedSpawn(workspace: string, runId: string, prompt: string, origin?: string | undefined): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     const reason = prompt.trim().length === 0
       ? "Task prompt must be a non-empty string"
@@ -241,7 +243,7 @@ export class WorkspaceTasks {
     if (prompt.length > 0) {
       await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
     }
-    await this.settleTask(workspace, { runId, prompt }, runDirectory, {
+    await this.settleTask(workspace, { runId, prompt, origin }, runDirectory, {
       code: null,
       signal: null,
       stderr: reason,
@@ -250,7 +252,7 @@ export class WorkspaceTasks {
   }
 
   /** Launches a background task in a fresh uuid run directory. */
-  private async claimAndLaunch(workspace: string, runId: string, prompt: string): Promise<void> {
+  private async claimAndLaunch(workspace: string, runId: string, prompt: string, origin?: string | undefined): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
     await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
@@ -258,7 +260,7 @@ export class WorkspaceTasks {
     try {
       worker = await this.workerFactory({ workspace, runId, prompt });
     } catch (error) {
-      await this.settleTask(workspace, { runId, prompt }, runDirectory, {
+      await this.settleTask(workspace, { runId, prompt, origin }, runDirectory, {
         code: null,
         signal: null,
         stderr: errorMessage(error),
@@ -266,11 +268,11 @@ export class WorkspaceTasks {
       });
       return;
     }
-    this.launchTask(workspace, { runId, prompt }, runDirectory, worker);
+    this.launchTask(workspace, { runId, prompt, origin }, runDirectory, worker);
   }
 
-  private launchTask(workspace: string, task: { runId: string; prompt: string }, runDirectory: string, worker: WorkspaceTaskWorker): void {
-    this.inFlight.push({ worker, runId: task.runId, prompt: task.prompt, startedAt: this.now() });
+  private launchTask(workspace: string, task: { runId: string; prompt: string; origin?: string | undefined }, runDirectory: string, worker: WorkspaceTaskWorker): void {
+    this.inFlight.push({ worker, runId: task.runId, origin: task.origin, prompt: task.prompt, startedAt: this.now() });
     const settle = this.runAndSettle(workspace, task, runDirectory, worker);
     this.pendingSettles.add(settle);
     void settle
@@ -280,7 +282,7 @@ export class WorkspaceTasks {
 
   private async runAndSettle(
     workspace: string,
-    task: { runId: string; prompt: string },
+    task: { runId: string; prompt: string; origin?: string | undefined },
     runDirectory: string,
     worker: WorkspaceTaskWorker,
   ): Promise<void> {
@@ -344,7 +346,7 @@ export class WorkspaceTasks {
   /** Records the outcome, appends the system event, and sends the agent a completion followup. */
   private async settleTask(
     workspace: string,
-    task: { runId: string; prompt: string },
+    task: { runId: string; prompt: string; origin?: string | undefined },
     runDirectory: string,
     result: PiRunResult,
   ): Promise<void> {
@@ -372,29 +374,36 @@ export class WorkspaceTasks {
       prompt: task.prompt,
       status,
       exitCode: result.code,
-      ...defined({ stderr }),
+      ...defined({ origin: task.origin, stderr }),
     });
   }
   /** Emits a task_progress event while tasks run; silent when everything is idle. */
   private heartbeat(): void {
     if (this.inFlight.length === 0) return;
     const now = this.now();
-    const tasks = this.inFlight.map((task) => {
-      const { at, text } = task.worker.activity();
-      const runningMs = Math.max(0, now - task.startedAt);
-      const idleMs = at > 0 ? Math.max(0, now - at) : null;
-      const lastOutput = text.trim().length > 0 ? truncate(text.trim(), MAX_QUOTE_LENGTH) : undefined;
-      return {
-        runId: task.runId,
-        prompt: task.prompt,
-        runningMs,
-        idleMs,
-        ...defined({ lastOutput }),
-      };
-    });
-    void this.events.publish({ type: "task_progress", tasks }).catch((error) => this.report(error));
+    const byOrigin = new Map<string | undefined, InFlightTask[]>();
+    for (const task of this.inFlight) {
+      const list = byOrigin.get(task.origin) ?? [];
+      list.push(task);
+      byOrigin.set(task.origin, list);
+    }
+    for (const [origin, tasksList] of byOrigin) {
+      const tasks = tasksList.map((task) => {
+        const { at, text } = task.worker.activity();
+        const runningMs = Math.max(0, now - task.startedAt);
+        const idleMs = at > 0 ? Math.max(0, now - at) : null;
+        const lastOutput = text.trim().length > 0 ? truncate(text.trim(), MAX_QUOTE_LENGTH) : undefined;
+        return {
+          runId: task.runId,
+          prompt: task.prompt,
+          runningMs,
+          idleMs,
+          ...defined({ lastOutput }),
+        };
+      });
+      void this.events.publish({ type: "task_progress", ...defined({ origin }), tasks }).catch((error) => this.report(error));
+    }
   }
-
   private report(error: unknown): void {
     try {
       this.logger(error);

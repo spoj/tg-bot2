@@ -15,6 +15,13 @@ export type HostEvent =
     attachments: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }>;
   }
   | {
+    /** An edited user message. `chat_id` is the Telegram chat it arrived from; `message` is the raw Telegram Message object; `attachments` are files the host downloaded into the workspace. */
+    type: "edited_message";
+    chat_id: number;
+    message: unknown;
+    attachments: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }>;
+  }
+  | {
     /** An inline-keyboard button press. `chat_id` is the chat the button's message lives in; `callback_query` is the raw Telegram CallbackQuery object (id, from, message, chat_instance). `data` is optional — game buttons carry `game_short_name` instead; logged callbacks are message-backed. */
     type: "callback";
     chat_id: number;
@@ -25,6 +32,24 @@ export type HostEvent =
     type: "poll_answer";
     chat_id: number;
     poll_answer: unknown;
+  }
+  | {
+    /** A reaction change on a message. `chat_id` is the Telegram chat it arrived from; `message_reaction` is the raw Telegram MessageReactionUpdated object. */
+    type: "message_reaction";
+    chat_id: number;
+    message_reaction: unknown;
+  }
+  | {
+    /** The bot's chat member status/permission changed. `chat_id` is the Telegram chat; `my_chat_member` is the raw Telegram ChatMemberUpdated object. */
+    type: "my_chat_member";
+    chat_id: number;
+    my_chat_member: unknown;
+  }
+  | {
+    /** A user requested to join a chat where the bot has administrator rights. `chat_id` is the Telegram chat; `chat_join_request` is the raw Telegram ChatJoinRequest object. */
+    type: "chat_join_request";
+    chat_id: number;
+    chat_join_request: unknown;
   }
   | {
     /** The allow list of chat IDs was updated or detected on change. `chats` is the complete sorted list of allowed chat IDs. */
@@ -41,6 +66,7 @@ export type HostEvent =
     /** A background task settled. The run's files live under /workspace/.pi/tasks/<runId>/. */
     type: "task_settled";
     runId: string;
+    origin?: string | undefined;
     prompt?: string | undefined;
     status: "done" | "failed" | "aborted";
     exitCode: number | null;
@@ -49,6 +75,7 @@ export type HostEvent =
   | {
     /** Periodic progress checkpoint for active background tasks. */
     type: "task_progress";
+    origin?: string | undefined;
     tasks: Array<{
       runId: string;
       prompt: string;
@@ -61,6 +88,7 @@ export type HostEvent =
     /** Telegram accepted one send_request; `requestId` matches the request's UUID; `data` is the raw Telegram response payload. */
     type: "outbox_sent";
     requestId: string;
+    origin?: string | undefined;
     chat_id: number;
     message_thread_id?: number | undefined;
     messageId?: number | undefined;
@@ -73,6 +101,7 @@ export type HostEvent =
     /** A rejected send_request. `requestId` matches the request's UUID; `detail` describes the failure. */
     type: "outbox_rejected";
     requestId: string;
+    origin?: string | undefined;
     chat_id?: number | undefined;
     message_thread_id?: number | undefined;
     detail: string;
@@ -101,6 +130,7 @@ export type HostEvent =
     /** Browser instance is running and accepting CDP connections on the UNIX socket. */
     type: "browser_ready";
     requestId?: string | undefined;
+    origin?: string | undefined;
     status: "started" | "existing";
     socketPath: string;
     wsEndpoint: string;
@@ -109,6 +139,7 @@ export type HostEvent =
     /** Host failed to launch Chrome (binary missing, spawn error, socket error, etc.). */
     type: "browser_request_failed";
     requestId: string;
+    origin?: string | undefined;
     error: string;
   }
   | {
@@ -120,6 +151,7 @@ export type HostEvent =
     /** Host acknowledged new_session_request; requestId matches the tool UUID. */
     type: "new_session_scheduled";
     requestId: string;
+    origin?: string | undefined;
     chat_id?: number | undefined;
     message_thread_id?: number | undefined;
   };
@@ -132,12 +164,14 @@ export type AgentCommand =
     /** Queued by the send tool; requestId is the tool-minted UUID. */
     type: "send_request";
     requestId: string;
+    origin?: string | undefined;
     request: unknown;
   }
   | {
     /** Queued by the spawn tool; runId is the tool-minted UUID. */
     type: "spawn_request";
     runId: string;
+    origin?: string | undefined;
     prompt: string;
   }
   | {
@@ -145,22 +179,26 @@ export type AgentCommand =
     type: "steer_task_request";
     steerId: string;
     runId: string;
+    origin?: string | undefined;
     message: string;
   }
   | {
     /** Queued by the cancel tool; runId is the target task run ID. */
     type: "cancel_request";
     runId: string;
+    origin?: string | undefined;
   }
   | {
     /** Queued by the start_browser tool; requestId is the tool-minted UUID. */
     type: "browser_requested";
     requestId: string;
+    origin?: string | undefined;
   }
   | {
     /** Queued by the new_session tool; requestId is the tool-minted UUID. */
     type: "new_session_request";
     requestId: string;
+    origin?: string | undefined;
     chat_id?: number | undefined;
     message_thread_id?: number | undefined;
   };
@@ -332,8 +370,12 @@ export function eventLine(event: object): string {
 export const EVENTS_PROMPT = `Timeline log /workspace/.tg-bot/events.jsonl records all inbound wire events, commands, and host outcomes in timestamp order ({v:1,t,type,...}).
 Inbound wire events:
 - message: {type:'message',chat_id,message,attachments} (raw Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
+- edited_message: {type:'edited_message',chat_id,message,attachments} (edited Telegram Message; attachments in /workspace/attachments/<chat_id>/...)
 - callback: {type:'callback',chat_id,callback_query} (button press CallbackQuery)
 - poll_answer: {type:'poll_answer',chat_id,poll_answer} (non-anonymous poll vote)
+- message_reaction: {type:'message_reaction',chat_id,message_reaction} (reaction change on message)
+- my_chat_member: {type:'my_chat_member',chat_id,my_chat_member} (bot membership/permission change in chat)
+- chat_join_request: {type:'chat_join_request',chat_id,chat_join_request} (user join request to chat)
 Host outcomes:
 - outbox_sent / outbox_rejected: reports send delivery; outbox_sent echoes messageId/pollId.
 - task_settled: {type:'task_settled',runId,prompt?,status,exitCode,stderr?} when a background task finishes (done, failed, aborted).

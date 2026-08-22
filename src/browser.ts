@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Writable, Readable } from "node:stream";
 import { WebSocketServer, WebSocket } from "ws";
 import type { WorkspaceEventLog } from "./events.js";
-import { errorMessage } from "./util.js";
+import { defined, errorMessage } from "./util.js";
 import {
   spawnProcess,
   terminatePid,
@@ -62,6 +62,7 @@ export class HostBrowserManager {
   private idleCheckTimer: NodeJS.Timeout | undefined;
   private isStopping = false;
   private pipeBuffer = Buffer.alloc(0);
+  private launchPromise: Promise<BrowserReadyResult> | undefined;
 
   constructor(options: HostBrowserOptions) {
     this.workspace = options.workspace;
@@ -85,8 +86,9 @@ export class HostBrowserManager {
   }
 
   /** Starts Chrome and the socket bridge if not already running, or reuses the existing instance. */
-  async handleStartBrowserRequest(record: { requestId: string }): Promise<BrowserReadyResult | undefined> {
+  async handleStartBrowserRequest(record: { requestId: string; origin?: string | undefined }): Promise<BrowserReadyResult | undefined> {
     const requestId = record.requestId;
+    const origin = record.origin;
     try {
       if (this.isRunning()) {
         this.touch();
@@ -101,18 +103,51 @@ export class HostBrowserManager {
           status: "existing",
           socketPath: this.socketPath,
           wsEndpoint: this.getWsEndpoint(),
+          ...defined({ origin }),
         });
         return result;
       }
 
-      const result = await this.launch(requestId);
-      return result;
+      if (this.launchPromise !== undefined) {
+        await this.launchPromise;
+        const result: BrowserReadyResult = {
+          status: "existing",
+          socketPath: this.socketPath,
+          wsEndpoint: this.getWsEndpoint(),
+        };
+        await this.events?.emit({
+          type: "browser_ready",
+          requestId,
+          status: "existing",
+          socketPath: this.socketPath,
+          wsEndpoint: this.getWsEndpoint(),
+          ...defined({ origin }),
+        });
+        return result;
+      }
+
+      this.launchPromise = this.launch();
+      try {
+        const result = await this.launchPromise;
+        await this.events?.emit({
+          type: "browser_ready",
+          requestId,
+          status: "started",
+          socketPath: this.socketPath,
+          wsEndpoint: this.getWsEndpoint(),
+          ...defined({ origin }),
+        });
+        return result;
+      } finally {
+        this.launchPromise = undefined;
+      }
     } catch (error) {
       const detail = errorMessage(error);
       await this.events?.emit({
         type: "browser_request_failed",
         requestId,
         error: detail,
+        ...defined({ origin }),
       });
       return undefined;
     }
@@ -138,7 +173,7 @@ export class HostBrowserManager {
     }
   }
 
-  private async launch(requestId?: string): Promise<BrowserReadyResult> {
+  private async launch(): Promise<BrowserReadyResult> {
     await this.cleanupStaleArtifacts();
 
     const executablePath = resolveChromeExecutable();
@@ -241,21 +276,11 @@ export class HostBrowserManager {
     }, IDLE_CHECK_INTERVAL_MS);
     this.idleCheckTimer.unref();
 
-    const result: BrowserReadyResult = {
+    return {
       status: "started",
       socketPath: this.socketPath,
       wsEndpoint: this.getWsEndpoint(),
     };
-
-    await this.events?.emit({
-      type: "browser_ready",
-      ...(requestId ? { requestId } : {}),
-      status: "started",
-      socketPath: this.socketPath,
-      wsEndpoint: this.getWsEndpoint(),
-    });
-
-    return result;
   }
 
   private handlePipeData(chunk: Buffer | string): void {

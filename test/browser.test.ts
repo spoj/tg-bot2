@@ -222,4 +222,47 @@ describe("browser automation and lifecycle", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("coalesces concurrent launch requests and preserves origins on browser_ready", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "browser-coalesce-test-"));
+    const emittedEvents: BotEvent[] = [];
+    const eventsMock = {
+      emit: async (event: BotEvent) => {
+        emittedEvents.push(event);
+      },
+    } as unknown as WorkspaceEventLog;
+
+    const hostBrowser = new HostBrowserManager({
+      workspace: root,
+      events: eventsMock,
+    });
+
+    try {
+      // Concurrent requests from Topic 9534 and Topic 9479
+      const req1 = hostBrowser.handleStartBrowserRequest({ requestId: "req-1", origin: "829096380:9534" });
+      const req2 = hostBrowser.handleStartBrowserRequest({ requestId: "req-2", origin: "829096380:9479" });
+
+      const [res1, res2] = await Promise.all([req1, req2]);
+      expect(res1).toBeDefined();
+      expect(res2).toBeDefined();
+      expect(res1?.socketPath).toBe(res2?.socketPath);
+
+      expect(emittedEvents).toHaveLength(2);
+      expect(emittedEvents[0]).toMatchObject({
+        type: "browser_ready",
+        requestId: "req-1",
+        origin: "829096380:9534",
+        status: "started",
+      });
+      expect(emittedEvents[1]).toMatchObject({
+        type: "browser_ready",
+        requestId: "req-2",
+        origin: "829096380:9479",
+        status: "existing",
+      });
+    } finally {
+      await hostBrowser.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

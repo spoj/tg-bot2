@@ -202,7 +202,15 @@ export async function main(): Promise<void> {
     await Promise.all(
       instances.map((instance) =>
         instance.bot.start({
-          allowed_updates: ["message", "callback_query", "poll_answer"],
+          allowed_updates: [
+            "message",
+            "edited_message",
+            "callback_query",
+            "poll_answer",
+            "message_reaction",
+            "my_chat_member",
+            "chat_join_request",
+          ],
           onStart: (info) => {
             console.log(`Telegram bot @${info.username} (id: ${instance.config.botId}) started`);
             void registerBotCommands(instance.bot).catch((error) =>

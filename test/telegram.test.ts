@@ -1088,6 +1088,112 @@ describe("Telegram chat events", () => {
     });
   });
 
+  it("logs an edited message event silently without waking the agent", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate({
+        update_id: 2,
+        edited_message: {
+          message_id: 7,
+          date: 1_700_000_000,
+          edit_date: 1_700_000_050,
+          chat: { id: 42, type: "private" },
+          from: { id: 42, is_bot: false, first_name: "Test" },
+          text: "hello edited",
+        },
+      } as never);
+      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "edited_message"));
+      expect(events.find((event) => event.type === "edited_message")).toMatchObject({
+        type: "edited_message",
+        chat_id: 42,
+        message: { message_id: 7, text: "hello edited", edit_date: 1_700_000_050 },
+        attachments: [],
+      });
+      expect(prompt).not.toHaveBeenCalled();
+    });
+  });
+
+  it("logs a message_reaction event silently without waking the agent", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate({
+        update_id: 3,
+        message_reaction: {
+          chat: { id: 42, type: "private" },
+          message_id: 7,
+          user: { id: 42, is_bot: false, first_name: "Test" },
+          date: 1_700_000_000,
+          old_reaction: [],
+          new_reaction: [{ type: "emoji", emoji: "👍" }],
+        },
+      } as never);
+      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message_reaction"));
+      expect(events.find((event) => event.type === "message_reaction")).toMatchObject({
+        type: "message_reaction",
+        chat_id: 42,
+        message_reaction: {
+          message_id: 7,
+          new_reaction: [{ type: "emoji", emoji: "👍" }],
+        },
+      });
+      expect(prompt).not.toHaveBeenCalled();
+    });
+  });
+
+  it("logs a my_chat_member event silently without waking the agent", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate({
+        update_id: 4,
+        my_chat_member: {
+          chat: { id: 42, type: "group", title: "Test Group" },
+          from: { id: 42, is_bot: false, first_name: "Admin" },
+          date: 1_700_000_000,
+          old_chat_member: { status: "member", user: { id: 999, is_bot: true, first_name: "Bot" } },
+          new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
+        },
+      } as never);
+      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "my_chat_member"));
+      expect(events.find((event) => event.type === "my_chat_member")).toMatchObject({
+        type: "my_chat_member",
+        chat_id: 42,
+        my_chat_member: {
+          new_chat_member: { status: "administrator" },
+        },
+      });
+      expect(prompt).not.toHaveBeenCalled();
+    });
+  });
+
+  it("logs a chat_join_request event silently without waking the agent", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate({
+        update_id: 5,
+        chat_join_request: {
+          chat: { id: 42, type: "supergroup", title: "Test Supergroup" },
+          from: { id: 123, is_bot: false, first_name: "NewUser" },
+          user_chat_id: 123,
+          date: 1_700_000_000,
+        },
+      } as never);
+      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "chat_join_request"));
+      expect(events.find((event) => event.type === "chat_join_request")).toMatchObject({
+        type: "chat_join_request",
+        chat_id: 42,
+        chat_join_request: {
+          user_chat_id: 123,
+          from: { id: 123, first_name: "NewUser" },
+        },
+      });
+      expect(prompt).not.toHaveBeenCalled();
+    });
+  });
+
   it("does not hang or follow a FIFO planted at the events file path", async () => {
     await withWorkspace(async (workspace) => {
       const eventsDir = path.join(workspace, ".tg-bot");

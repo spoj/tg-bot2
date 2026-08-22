@@ -147,6 +147,8 @@ export type PiRunSandboxPaths = {
   thinkingLevel?: string;
   /** Comma-separated host tool names exposed via the mounted host-tools extension and PI_HOST_TOOLS. */
   hostTools?: string;
+  /** Compact origin identifier (e.g. "chatId:threadId" or "task:runId") passed as PI_AGENT_ORIGIN. */
+  agentOrigin?: string;
 };
 export type PiRunBwrapResult = { args: string[] };
 
@@ -252,6 +254,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
     "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
+    ...(paths.agentOrigin === undefined ? [] : ["--setenv", "PI_AGENT_ORIGIN", paths.agentOrigin]),
   );
   const piArgs = [
     "--mode", "rpc",

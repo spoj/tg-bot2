@@ -68,19 +68,19 @@ export class WorkspaceOutbox {
   async handleSendRequest(record: SendRequest, _workspace = this.workspace): Promise<void> {
     const rawThreadId = extractRawThreadId(record.request);
     if (record.request === null || typeof record.request !== "object" || Array.isArray(record.request)) {
-      await this.recordRejection(record.requestId, undefined, undefined, new Error("Outbox request must be a JSON object"));
+      await this.recordRejection(record.requestId, undefined, undefined, new Error("Outbox request must be a JSON object"), record.origin);
       return;
     }
     const raw = JSON.stringify(record.request);
     if (raw.length > MAX_REQUEST_BYTES) {
-      await this.recordRejection(record.requestId, undefined, rawThreadId, new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`));
+      await this.recordRejection(record.requestId, undefined, rawThreadId, new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`), record.origin);
       return;
     }
     let request: WorkspaceOutboxRequest;
     try {
       request = validateRequest({ ...record.request, version: 1 });
     } catch (error) {
-      await this.recordRejection(record.requestId, undefined, rawThreadId, error);
+      await this.recordRejection(record.requestId, undefined, rawThreadId, error, record.origin);
       return;
     }
     const chatId = request.chat_id;
@@ -89,14 +89,14 @@ export class WorkspaceOutbox {
       : rawThreadId;
     const allowed = await readAllowedFile(this.workspace);
     if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) {
-      await this.recordRejection(record.requestId, chatId, threadId, new Error(`Chat ${chatId} is not on the allow list`));
+      await this.recordRejection(record.requestId, chatId, threadId, new Error(`Chat ${chatId} is not on the allow list`), record.origin);
       return;
     }
     let result: WorkspaceOutboxDispatchResult | undefined;
     try {
       result = await this.dispatch(chatId, request);
     } catch (error) {
-      await this.recordRejection(record.requestId, chatId, threadId, error);
+      await this.recordRejection(record.requestId, chatId, threadId, error, record.origin);
       return;
     }
     const summary = extractRequestSummary(request);
@@ -109,6 +109,7 @@ export class WorkspaceOutbox {
       requestId: record.requestId,
       chat_id: chatId,
       ...defined({
+        origin: record.origin,
         message_thread_id: resolvedThreadId,
         messageId: result?.messageId,
         pollId: result?.pollId,
@@ -120,11 +121,11 @@ export class WorkspaceOutbox {
   }
 
   /** Emits outbox_rejected to WorkspaceEventLog, which logs to events.jsonl and notifies subscribers. */
-  private async recordRejection(requestId: string, chatId: number | undefined, threadId: number | undefined, error: unknown): Promise<void> {
+  private async recordRejection(requestId: string, chatId: number | undefined, threadId: number | undefined, error: unknown, origin?: string | undefined): Promise<void> {
     await this.events.emit({
       type: "outbox_rejected",
       requestId,
-      ...defined({ chat_id: chatId, message_thread_id: threadId }),
+      ...defined({ origin, chat_id: chatId, message_thread_id: threadId }),
       detail: errorMessage(error),
     });
   }

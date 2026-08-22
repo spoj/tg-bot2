@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi, type Mock } from "vitest";
 import {
+  AgentEventRouter,
   AgentManager,
   loadUserSettings,
   SYSTEM_PROMPT,
+  type AgentNotifier,
   type AgentWorker,
   type AgentWorkerOptions,
   type AgentStatus,
@@ -445,4 +447,121 @@ it("handleNewSessionRequest emits new_session_scheduled when requestId and event
       message_thread_id: 5,
     });
   });
+});
+
+it("routes browser_ready and task_settled strictly to originating chat/topic session", async () => {
+  const followup = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => undefined);
+  const notifier: AgentNotifier = { followup, interrupt };
+  const router = new AgentEventRouter(notifier);
+
+  // browser_ready with origin routes to that topic worker
+  await router.onEvent({
+    type: "browser_ready",
+    requestId: "req-1",
+    origin: "829096380:9534",
+    status: "started",
+    socketPath: "/workspace/.browser/cdp.sock",
+    wsEndpoint: "ws+unix:///workspace/.browser/cdp.sock",
+  }, "");
+  expect(interrupt).toHaveBeenCalledWith(
+    expect.stringContaining("Browser is ready"),
+    { chatId: 829096380, threadId: 9534 },
+  );
+
+  // task_settled with origin routes to originating topic worker
+  followup.mockClear();
+  await router.onEvent({
+    type: "task_settled",
+    runId: "run-123",
+    origin: "829096380:9534",
+    prompt: "check menu",
+    status: "done",
+    exitCode: 0,
+  }, "");
+  expect(followup).toHaveBeenCalledWith(
+    expect.stringContaining('Task "check menu" finished'),
+    { chatId: 829096380, threadId: 9534 },
+  );
+
+  // task_settled without origin (e.g. scheduler task) is silent
+  followup.mockClear();
+  await router.onEvent({
+    type: "task_settled",
+    runId: "run-456",
+    status: "done",
+    exitCode: 0,
+  }, "");
+  expect(followup).not.toHaveBeenCalled();
+});
+
+it("outbox_sent is silent for same-session send and notifies target on cross-session send", async () => {
+  const followup = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => undefined);
+  const notifier: AgentNotifier = { followup, interrupt };
+  const router = new AgentEventRouter(notifier);
+
+  // Same-session send: Topic 9534 sends to Topic 9534 -> silent
+  await router.onEvent({
+    type: "outbox_sent",
+    requestId: "req-same",
+    origin: "829096380:9534",
+    chat_id: 829096380,
+    message_thread_id: 9534,
+    request_type: "send_message",
+    summary: "drinks menu",
+  }, "");
+  expect(followup).not.toHaveBeenCalled();
+
+  // Cross-session send: Task or Topic 9479 sends to Topic 9534 -> target Topic 9534 gets transcript notice
+  await router.onEvent({
+    type: "outbox_sent",
+    requestId: "req-cross",
+    origin: "task:run-999",
+    chat_id: 829096380,
+    message_thread_id: 9534,
+    request_type: "send_message",
+    summary: "morning briefing",
+  }, "");
+  expect(followup).toHaveBeenCalledWith(
+    '[Outbound send_message sent to this chat: "morning briefing"]',
+    { chatId: 829096380, threadId: 9534 },
+  );
+
+  // Topic creation notifies origin with the newly created thread ID
+  followup.mockClear();
+  await router.onEvent({
+    type: "outbox_sent",
+    requestId: "req-topic",
+    origin: "829096380:0",
+    chat_id: 829096380,
+    message_thread_id: 9600,
+    request_type: "create_forum_topic",
+    summary: "New Discussion",
+  }, "");
+  expect(followup).toHaveBeenCalledWith(
+    '[Topic "New Discussion" created with thread ID 9600]',
+    { chatId: 829096380 },
+  );
+});
+
+it("outbox_rejected interrupts the originating worker with the error", async () => {
+  const followup = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => undefined);
+  const notifier: AgentNotifier = { followup, interrupt };
+  const router = new AgentEventRouter(notifier);
+
+  await router.onEvent({
+    type: "outbox_rejected",
+    requestId: "req-bad",
+    origin: "829096380:9534",
+    chat_id: 829096380,
+    message_thread_id: 9534,
+    detail: "Bad HTML entity",
+  }, "");
+
+  expect(interrupt).toHaveBeenCalledWith(
+    "Send req-bad rejected: Bad HTML entity",
+    { chatId: 829096380, threadId: 9534 },
+  );
 });

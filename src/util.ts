@@ -166,3 +166,32 @@ async function readJsonlLines(handle: FileHandle, size: number): Promise<string[
   }
   return buffer.subarray(0, bytesRead).toString("utf8").split("\n").filter(Boolean);
 }
+
+export type AgentOrigin =
+  | { kind: "chat"; chatId: number; threadId: number }
+  | { kind: "task"; runId: string };
+
+export function parseOrigin(origin?: string): AgentOrigin | undefined {
+  if (typeof origin !== "string" || !origin) return undefined;
+  if (origin.startsWith("task:")) {
+    const runId = origin.slice(5).trim();
+    return runId ? { kind: "task", runId } : undefined;
+  }
+  const parts = origin.split(":");
+  if (parts.length !== 2) return undefined;
+  const chatId = Number(parts[0]);
+  const threadId = Number(parts[1]);
+  if (!Number.isSafeInteger(chatId) || !Number.isSafeInteger(threadId)) return undefined;
+  return { kind: "chat", chatId, threadId };
+}
+
+export function formatOrigin(target: { chatId?: number; threadId?: number } | { runId: string }): string {
+  if ("runId" in target && typeof target.runId === "string") {
+    return `task:${target.runId}`;
+  }
+  const chatTarget = target as { chatId?: number; threadId?: number };
+  if (typeof chatTarget.chatId === "number") {
+    return `${chatTarget.chatId}:${chatTarget.threadId ?? 0}`;
+  }
+  return "default";
+}

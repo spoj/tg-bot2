@@ -23,8 +23,8 @@ async function fixture(): Promise<{ dataDir: string; workspace: string }> {
   return { dataDir, workspace };
 }
 
-function spawnRecord(runId: string, prompt: string): SpawnRequest {
-  return { type: "spawn_request", runId, prompt };
+function spawnRecord(runId: string, prompt: string, origin = "123:0"): SpawnRequest {
+  return { type: "spawn_request", runId, prompt, origin };
 }
 function cancelRecord(runId: string): CancelRequest {
   return { type: "cancel_request", runId };
@@ -117,7 +117,7 @@ describe("WorkspaceTasks", () => {
     expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "done", exitCode: 0 },
     ]);
-    expect(followup).toHaveBeenCalledWith(`Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/run-1/`, { chatId: 123 });
   });
 
   it("truncates long prompts in the completion followup", async () => {
@@ -149,7 +149,7 @@ describe("WorkspaceTasks", () => {
     expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "failed", exitCode: 3, stderr: "boom" },
     ]);
-    expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/run-1/`, { chatId: 123 });
   });
 
   it("reports a worker that fails to spawn as a failed task", async () => {
@@ -194,7 +194,7 @@ describe("WorkspaceTasks", () => {
     expect(await service.handleSpawnRequest(spawnRecord("run-big", "x".repeat(1024 * 1024 + 1)), workspace)).toBe("claimed");
     expect(factory).not.toHaveBeenCalled();
     expect(followup).toHaveBeenCalledTimes(2);
-    expect(followup).toHaveBeenNthCalledWith(1, expect.stringContaining('Task "   " failed (exit unknown). Run files: /workspace/.pi/tasks/run-empty/'));
+    expect(followup).toHaveBeenNthCalledWith(1, expect.stringContaining('Task "   " failed (exit unknown). Run files: /workspace/.pi/tasks/run-empty/'), { chatId: 123 });
     const events = await logEvents(workspace);
     expect(events.filter((event) => event.type === "task_settled")).toHaveLength(2);
   });
@@ -236,7 +236,7 @@ describe("WorkspaceTasks", () => {
     expect(await logEvents(workspace)).toMatchObject([
       { type: "task_settled", runId: "run-1", status: "aborted" },
     ]);
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/run-1/`, { chatId: 123 });
   });
 
   it("cancels a running task mid-run and settles as aborted", async () => {
@@ -321,7 +321,7 @@ describe("WorkspaceTasks", () => {
 
     const runDir = path.join(workspace, ".pi", "tasks", "run-1");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted" });
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/run-1/`);
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/run-1/`, { chatId: 123 });
   });
 
   it("sends a heartbeat followup while tasks run and stays silent when idle", async () => {

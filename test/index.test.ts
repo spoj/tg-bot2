@@ -144,7 +144,15 @@ describe("application startup and shutdown wiring", () => {
     expect(state.requestBus).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace" }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({ workspace: "/canonical-data/bots/123/workspace", bwrapPath: "/validated/bwrap", events: expect.any(Object) }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
-      allowed_updates: ["message", "callback_query", "poll_answer"],
+      allowed_updates: [
+        "message",
+        "edited_message",
+        "callback_query",
+        "poll_answer",
+        "message_reaction",
+        "my_chat_member",
+        "chat_join_request",
+      ],
     }));
   });
 

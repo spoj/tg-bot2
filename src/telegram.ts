@@ -660,7 +660,8 @@ async function downloadAttachment(
 }
 
 async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<SavedAttachment[]> {
-  const message = ctx.message!;
+  const message = ctx.msg;
+  if (!message) return [];
   const source = attachmentSource(message);
   return source
     ? [await downloadAttachment(bot, config, ctx.chat!.id, message, source)]
@@ -804,6 +805,11 @@ export function createTelegramBot(
     const attachments = await prepareMessage(bot, config, ctx);
     await events.publish({ type: "message", chat_id: chatId, message: ctx.message, attachments });
   });
+  bot.on("edited_message", async (ctx) => {
+    const chatId = ctx.chat.id;
+    const attachments = await prepareMessage(bot, config, ctx);
+    await events.publish({ type: "edited_message", chat_id: chatId, message: ctx.editedMessage, attachments });
+  });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
@@ -822,6 +828,24 @@ export function createTelegramBot(
       chat_id: chatId,
       poll_answer: answer,
     });
+  });
+  bot.on("message_reaction", async (ctx) => {
+    const reaction = ctx.messageReaction;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    await events.publish({ type: "message_reaction", chat_id: chatId, message_reaction: reaction });
+  });
+  bot.on("my_chat_member", async (ctx) => {
+    const member = ctx.myChatMember;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    await events.publish({ type: "my_chat_member", chat_id: chatId, my_chat_member: member });
+  });
+  bot.on("chat_join_request", async (ctx) => {
+    const request = ctx.chatJoinRequest;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    await events.publish({ type: "chat_join_request", chat_id: chatId, chat_join_request: request });
   });
 
   bot.catch((error) => {

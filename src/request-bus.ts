@@ -101,30 +101,32 @@ export function parseCommand(line: string): CommandRequest | undefined {
   const typed = record as Record<string, unknown>;
   const id = commandId(typed.type as string, typed);
   if (id === undefined) return undefined;
+  const origin = typeof typed.origin === "string" && typed.origin.length > 0 ? typed.origin : undefined;
   switch (typed.type) {
     case "send_request":
-      return { type: "send_request", requestId: id, request: typed.request };
+      return { type: "send_request", requestId: id, request: typed.request, ...defined({ origin }) };
     case "spawn_request":
     case "schedule_run_fired": {
       const prompt = typed.prompt;
-      return typeof prompt === "string" ? { type: "spawn_request", runId: id, prompt } : undefined;
+      return typeof prompt === "string" ? { type: "spawn_request", runId: id, prompt, ...defined({ origin }) } : undefined;
     }
     case "steer_task_request": {
       const runId = typed.runId;
       const message = typed.message;
       return typeof runId === "string" && typeof message === "string" && runId.length > 0
-        ? { type: "steer_task_request", steerId: id, runId, message }
+        ? { type: "steer_task_request", steerId: id, runId, message, ...defined({ origin }) }
         : undefined;
     }
     case "cancel_request":
-      return { type: "cancel_request", runId: id };
+      return { type: "cancel_request", runId: id, ...defined({ origin }) };
     case "browser_requested":
-      return { type: "browser_requested", requestId: id };
+      return { type: "browser_requested", requestId: id, ...defined({ origin }) };
     case "new_session_request":
       return {
         type: "new_session_request",
         requestId: id,
         ...defined({
+          origin,
           chat_id: safeInteger(typed.chat_id),
           message_thread_id: safeInteger(typed.message_thread_id),
         }),

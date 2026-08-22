@@ -21,7 +21,10 @@ type FakeWorker = AgentWorker & {
   options: AgentWorkerOptions;
   prompts: Array<{ message: string; streamingBehavior?: "steer" | "followUp" }>;
   reap: () => void;
+  settle: () => void;
+  settleHold: (hold: boolean) => void;
   prompt: Mock<(message: string, streamingBehavior?: "steer" | "followUp") => Promise<void>>;
+  waitForSettled: Mock<() => Promise<unknown>>;
   close: Mock<() => Promise<void>>;
   stop: Mock<() => Promise<void>>;
 };
@@ -40,6 +43,19 @@ function fakeWorkerFactory(): {
       prompts.push({ message, ...(streamingBehavior !== undefined ? { streamingBehavior } : {}) });
       busy = true;
     });
+    let settleHold = false;
+    let settleWaiters: Array<() => void> = [];
+    const waitForSettled = vi.fn(async (): Promise<unknown> => {
+      if (!busy || !settleHold) return undefined;
+      await new Promise<void>((resolve) => {
+        settleWaiters.push(resolve);
+      });
+    });
+    const settle = () => {
+      busy = false;
+      for (const resolve of settleWaiters) resolve();
+      settleWaiters = [];
+    };
     const close = vi.fn(async () => {
       alive = false;
       busy = false;
@@ -60,9 +76,14 @@ function fakeWorkerFactory(): {
       options,
       prompts,
       reap,
+      settle,
+      settleHold: (hold: boolean) => {
+        settleHold = hold;
+      },
       isAlive: () => alive,
       isBusy: () => busy,
       prompt,
+      waitForSettled,
       close,
       stop,
       onReaped,
@@ -407,6 +428,67 @@ it("restartAll closes every active conversation worker and respawns them", async
 
     await manager.followup("Chat 100 next", { chatId: 100 });
     expect(workers).toHaveLength(3);
+  });
+});
+
+it("restartAll waits for a busy worker's turn to settle before closing it", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    await manager.followup("do work");
+    expect(workers).toHaveLength(1);
+    workers[0]?.settleHold(true);
+
+    const restart = manager.restartAll();
+    await vi.waitFor(() => expect(workers[0]?.waitForSettled).toHaveBeenCalled());
+    expect(workers[0]?.close).not.toHaveBeenCalled();
+
+    workers[0]?.settle();
+    await restart;
+    expect(workers[0]?.close).toHaveBeenCalledOnce();
+  });
+});
+
+it("restartAll closes a never-settling busy worker after the settle cap", async () => {
+  vi.useFakeTimers();
+  try {
+    await withDataDir(async (dataDir) => {
+      const { factory, workers } = fakeWorkerFactory();
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+      await manager.followup("never settles");
+      workers[0]?.settleHold(true);
+
+      const restart = manager.restartAll();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await restart;
+      expect(workers[0]?.close).toHaveBeenCalledOnce();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("restartAll keeps the entry when close rejects so exit detection can clean up", async () => {
+  await withDataDir(async (dataDir) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { factory, workers } = fakeWorkerFactory();
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+      await manager.followup("one");
+      expect(workers).toHaveLength(1);
+      workers[0]?.close.mockRejectedValue(new Error("close boom"));
+
+      await expect(manager.restartAll()).resolves.toBeUndefined();
+      expect(workers[0]?.close).toHaveBeenCalledOnce();
+      expect(errorSpy).toHaveBeenCalledWith("Agent restart close failed", expect.any(Error));
+
+      // The entry still owns the worker: the next message reuses it instead of respawning
+      await manager.followup("two");
+      expect(workers).toHaveLength(1);
+      expect(workers[0]?.prompt).toHaveBeenCalledWith("two", "followUp");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 

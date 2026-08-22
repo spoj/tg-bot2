@@ -137,11 +137,20 @@ const HOST_TOOLS = {
   new_session: {
     label: "Start new session",
     description: "Reset your conversational context so your next interaction starts fresh in a new session. Your current turn will complete normally, after which the host stops the worker process immediately.",
-    parameters: Type.Object({}),
-    execute: (): ToolResult => {
+    parameters: Type.Object({
+      chat_id: Type.Optional(Type.Number({ description: "Optional chat ID to reset; omit to reset the current conversation" })),
+      message_thread_id: Type.Optional(Type.Number({ description: "Optional Telegram forum topic or message thread ID to reset" })),
+    }),
+    execute: (params: { chat_id?: number; message_thread_id?: number }): ToolResult => {
+      const requestId = randomUUID();
       try {
-        appendCommand({ type: "new_session_request" });
-        return text("New session requested. Your current turn will complete, and the next user message will start in a fresh session.");
+        appendCommand({
+          type: "new_session_request",
+          requestId,
+          ...(typeof params?.chat_id === "number" ? { chat_id: params.chat_id } : {}),
+          ...(typeof params?.message_thread_id === "number" ? { message_thread_id: params.message_thread_id } : {}),
+        });
+        return text(`New session requested (ID: ${requestId}). Your current turn will complete, and the next user message will start in a fresh session.`);
       } catch (error) {
         return failure(error);
       }

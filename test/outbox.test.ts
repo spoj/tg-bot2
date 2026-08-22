@@ -269,6 +269,20 @@ describe("WorkspaceOutbox", () => {
     ]);
   });
 
+  it("preserves message_thread_id in outbox_rejected and notifies targeted topic worker", async () => {
+    const { workspace } = await fixture();
+    await allowChat(workspace, 42);
+    const interrupt = vi.fn(async () => undefined);
+    const dispatch = vi.fn(async () => { throw new Error("topic upload failed"); });
+    await send(workspace, dispatch, sendRecord("req-1", { ...valid(), message_thread_id: 1234 }), { notifier: { followup: vi.fn(), interrupt } });
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+    expect(interrupt).toHaveBeenCalledWith("Send req-1 rejected: topic upload failed", { chatId: 42, threadId: 1234 });
+    const events = await logEvents(workspace);
+    expect(events).toMatchObject([
+      { type: "outbox_rejected", requestId: "req-1", chat_id: 42, message_thread_id: 1234, detail: expect.stringContaining("topic upload failed") },
+    ]);
+  });
+
   it("dispatches an empty reaction array to remove a reaction", async () => {
     const { workspace } = await fixture();
     await allowChat(workspace, 42);

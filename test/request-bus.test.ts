@@ -69,7 +69,7 @@ describe("parseCommand", () => {
     expect(parseCommand(spawnRequest())).toEqual({ type: "spawn_request", runId: "run-1", prompt: "do it" });
     expect(parseCommand(cancelRequest())).toEqual({ type: "cancel_request", runId: "run-1" });
     expect(parseCommand(steerTaskRequest())).toEqual({ type: "steer_task_request", steerId: "steer-1", runId: "run-1", message: "adjust" });
-    expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "new_session_request" })}\n`)).toEqual({ type: "new_session_request" });
+    expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-1", chat_id: 42 })}\n`)).toEqual({ type: "new_session_request", requestId: "ns-1", chat_id: 42 });
     expect(parseCommand("not json")).toBeUndefined();
     expect(parseCommand(outcome({ type: "task_settled", runId: "run-1", status: "done", exitCode: 0 }))).toBeUndefined();
     expect(parseCommand(outcome({ type: "outbox_sent", requestId: "req-1" }))).toBeUndefined();
@@ -137,14 +137,22 @@ describe("WorkspaceRequestBus", () => {
     expect(onSteerTask).toHaveBeenCalledWith({ type: "steer_task_request", steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
   });
 
-  it("routes new_session commands to onNewSession", async () => {
+  it("routes new_session commands and skips completed ones during boot replay", async () => {
     const { workspace } = await fixture();
-    await writeLog(workspace, [`${JSON.stringify({ v: 1, t: "t", type: "new_session_request" })}\n`]);
+    await writeLog(workspace, [
+      `${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-done" })}\n`,
+      outcome({ type: "new_session_scheduled", requestId: "ns-done" }),
+      `${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-fresh", chat_id: 123 })}\n`,
+    ]);
     const onNewSession = vi.fn(async () => undefined);
     const bus = setupBus(workspace, { onNewSession });
 
     await bus.poll();
-    expect(onNewSession).toHaveBeenCalledWith(workspace);
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(onNewSession).toHaveBeenCalledWith(
+      { type: "new_session_request", requestId: "ns-fresh", chat_id: 123 },
+      workspace,
+    );
   });
 
   it("retries pending spawns until a slot frees", async () => {

@@ -277,25 +277,25 @@ request object requires chat_id: the numeric Telegram chat to send to — the ch
 chat event you are answering, or any other chat on your allow list
 (/workspace/.tg-bot/allowed.json). The host rejects sends to chats that are not allowed.
 Request types:
-{type:"send_file",chat_id,path,caption?,kind?,reply_to_message_id?,disable_notification?}
+{type:"send_file",chat_id,path,message_thread_id?,caption?,kind?,reply_to_message_id?,disable_notification?}
 sends the file at path (relative to /workspace or an absolute /workspace/... path)
 with an optional caption; kind is "auto" (default: images are sent as photos,
 audio as audio, video as video, other files as documents, and images over 10 MB
 as documents) or an explicit "photo", "audio", "video", "voice", or "document".
-{type:"send_media_group",chat_id,media,reply_to_message_id?,disable_notification?}
+{type:"send_media_group",chat_id,media,message_thread_id?,reply_to_message_id?,disable_notification?}
 sends an album: media is an array of 2-10 items, each {type:"photo"|"video",media,caption?,parse_mode?,caption_entities?,show_caption_above_media?,has_spoiler?,width?,height?,duration?,supports_streaming?} where
 media is the workspace path and type picks InputMediaPhoto or InputMediaVideo. The
 matching send event's messageId is the first message of the album.
-{type:"send_message",chat_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
+{type:"send_message",chat_id,text,message_thread_id?,parse_mode?,entities?,link_preview_options?,reply_markup?,reply_to_message_id?,disable_notification?}
 sends a text message, where parse_mode is "HTML" or "MarkdownV2" (omit for
 plain text; parse_mode and entities are mutually exclusive), entities is a list of {type,offset,length} message
 entities, link_preview_options is a Telegram LinkPreviewOptions object,
 reply_markup is Telegram reply-markup JSON such as an inline_keyboard button
 list, reply_to_message_id targets an earlier message, and
 disable_notification sends silently.
-{type:"send_location",chat_id,latitude,longitude,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
+{type:"send_location",chat_id,latitude,longitude,message_thread_id?,horizontal_accuracy?,heading?,live_period?,venue?,reply_to_message_id?,disable_notification?}
 sends a location pin (venue {title,address} sends a named venue instead).
-{type:"send_poll",chat_id,question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
+{type:"send_poll",chat_id,question,options,message_thread_id?,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
 poll_answer event in events.jsonl; the matching outbox_sent event in events.jsonl

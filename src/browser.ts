@@ -214,6 +214,8 @@ export class HostBrowserManager {
         }
       });
 
+      ws.on("error", () => {});
+
       ws.on("close", () => {
         this.activeSockets.delete(ws);
       });
@@ -223,6 +225,7 @@ export class HostBrowserManager {
       server.once("error", reject);
       server.listen(this.socketPath, () => {
         server.removeListener("error", reject);
+        server.on("error", () => {});
         try {
           chmodSync(this.socketPath, 0o600);
         } catch {

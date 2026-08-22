@@ -1,7 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
-import { TG_BOT_DIR, isMissing, readJsonl } from "./util.js";
+import { TG_BOT_DIR, defined, isMissing, readJsonl } from "./util.js";
 import { EVENTS_FILE, type AgentCommand } from "./events.js";
 
 /** One send_request command: the agent's tool minted requestId and the raw request object. */
@@ -39,7 +39,7 @@ export type SteerTaskRequestHandler = (record: SteerTaskRequest, workspace: stri
 /** Consumes one browser_requested command to start Chrome and the socket bridge. */
 export type StartBrowserRequestHandler = (record: StartBrowserRequest, workspace: string) => Promise<void>;
 /** Consumes one new_session_request command to reset the agent session. */
-export type NewSessionRequestHandler = (workspace: string) => Promise<void>;
+export type NewSessionRequestHandler = (record: NewSessionRequest, workspace: string) => Promise<void>;
 
 export type WorkspaceRequestBusOptions = {
   workspace: string;
@@ -74,16 +74,18 @@ type ChatScanState = {
   booted: boolean;
 };
 
+function safeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
+}
+
 function commandId(type: string, record: Record<string, unknown>): string | undefined {
-  if (type === "new_session_request") return "new_session";
   const id = record[
-    type === "send_request" || type === "browser_requested" ? "requestId"
+    type === "send_request" || type === "browser_requested" || type === "new_session_request" ? "requestId"
       : type === "steer_task_request" ? "steerId"
         : "runId"
   ];
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
-
 export type CommandRequest = AgentCommand;
 
 /** Parses one events.jsonl line into a command record; undefined for outcomes, junk, or malformed commands. */
@@ -118,7 +120,14 @@ export function parseCommand(line: string): CommandRequest | undefined {
     case "browser_requested":
       return { type: "browser_requested", requestId: id };
     case "new_session_request":
-      return { type: "new_session_request" };
+      return {
+        type: "new_session_request",
+        requestId: id,
+        ...defined({
+          chat_id: safeInteger(typed.chat_id),
+          message_thread_id: safeInteger(typed.message_thread_id),
+        }),
+      };
     default:
       return undefined;
   }
@@ -272,7 +281,6 @@ export class WorkspaceRequestBus {
     };
     this.state = state;
     await this.loadBootState(workspace, state);
-    state.booted = true;
     return state;
   }
 
@@ -303,7 +311,8 @@ export class WorkspaceRequestBus {
         typed.type === "outbox_rejected" ||
         typed.type === "task_settled" ||
         typed.type === "browser_ready" ||
-        typed.type === "browser_request_failed"
+        typed.type === "browser_request_failed" ||
+        typed.type === "new_session_scheduled"
       ) {
         state.bootConsumed.add(id);
       }
@@ -383,8 +392,9 @@ export class WorkspaceRequestBus {
         }
         break;
       case "new_session_request":
+        state.consumed.add(id!);
         if (this.options.onNewSession) {
-          await this.invoke(() => this.options.onNewSession!(workspace));
+          await this.invoke(() => this.options.onNewSession!(record, workspace));
         }
         break;
     }

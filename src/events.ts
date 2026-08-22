@@ -74,6 +74,7 @@ export type HostEvent =
     type: "outbox_rejected";
     requestId: string;
     chat_id?: number | undefined;
+    message_thread_id?: number | undefined;
     detail: string;
   }
   | {
@@ -114,6 +115,13 @@ export type HostEvent =
     /** Browser instance terminated and UNIX socket was cleaned up. */
     type: "browser_closed";
     reason: "idle_timeout" | "agent_close" | "process_exit" | "host_shutdown";
+  }
+  | {
+    /** Host acknowledged new_session_request; requestId matches the tool UUID. */
+    type: "new_session_scheduled";
+    requestId: string;
+    chat_id?: number | undefined;
+    message_thread_id?: number | undefined;
   };
 
 /**
@@ -150,8 +158,11 @@ export type AgentCommand =
     requestId: string;
   }
   | {
-    /** Queued by the new_session tool; requests a session reset on the next prompt. */
+    /** Queued by the new_session tool; requestId is the tool-minted UUID. */
     type: "new_session_request";
+    requestId: string;
+    chat_id?: number | undefined;
+    message_thread_id?: number | undefined;
   };
 
 /** All entries recorded in the unified append-only `.tg-bot/events.jsonl` log. */
@@ -343,17 +354,20 @@ Commands (written by your tools to the same events.jsonl log; the host processes
 - steer_task_request: {v:1,t,type:'steer_task_request',steerId,runId,message} queued by the steer_task tool.
 - cancel_request: {v:1,t,type:'cancel_request',runId} queued by the cancel tool.
 - browser_requested: {v:1,t,type:'browser_requested',requestId} queued by the start_browser tool.
-- new_session_request: {v:1,t,type:'new_session_request'} queued by the new_session tool.
+- new_session_request: {v:1,t,type:'new_session_request',requestId,chat_id?,message_thread_id?} queued by the new_session tool;
+  requestId is the UUID the tool returns to you.
 Outcomes (host-written, exactly one terminal event per command):
-- outbox_sent: {v:1,t,type:'outbox_sent',requestId,chat_id,messageId?,pollId?,data?}
+- outbox_sent: {v:1,t,type:'outbox_sent',requestId,chat_id,message_thread_id?,messageId?,pollId?,request_type?,summary?,data?}
   when Telegram accepts it, whether or not it returned a message id; data is the raw
   Telegram response payload (for stop_poll it is the final closed Poll).
-- outbox_rejected: {v:1,t,type:'outbox_rejected',requestId,chat_id?,detail} reports a
+- outbox_rejected: {v:1,t,type:'outbox_rejected',requestId,chat_id?,message_thread_id?,detail} reports a
   rejected send; detail describes the failure.
 - task_settled: {v:1,t,type:'task_settled',runId,prompt?,status,exitCode,stderr?} when a
   task finishes: status is done, failed, or aborted (aborted means the run was killed
   via the cancel tool or the host restarted mid-run); stderr carries a bounded failure
   tail when failed. Run files live under /workspace/.pi/tasks/<runId>/.
+- task_progress: {v:1,t,type:'task_progress',tasks:[{runId,prompt,runningMs,idleMs,lastOutput?},...]}
+  periodic progress checkpoint for active background tasks.
 - schedule_run_scheduled: {v:1,t,type:'schedule_run_scheduled',runId,prompt,start,recurrence,dueAt}
   when the host materializes one occurrence of a schedules.json row; runId is the
   host-assigned UUID, prompt/start/recurrence are the row snapshot, dueAt this firing time.
@@ -371,6 +385,8 @@ Outcomes (host-written, exactly one terminal event per command):
   the host fails to launch Chrome.
 - browser_closed: {v:1,t,type:'browser_closed',reason} when Chrome exits (idle_timeout,
   agent_close, process_exit, host_shutdown).
+- new_session_scheduled: {v:1,t,type:'new_session_scheduled',requestId,chat_id?,message_thread_id?} when
+  the host schedules the conversation context reset.
 Every send_request is followed by exactly one outbox_sent or outbox_rejected; every
 spawn_request (and cancel) by exactly one task_settled. Grep events.jsonl for chat
 history, commands, and host activity.

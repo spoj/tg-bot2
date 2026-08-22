@@ -94,7 +94,7 @@ export async function main(): Promise<void> {
     const runtimeConfig = { ...botConfig, dataDir, ...paths };
 
     const eventLog = new WorkspaceEventLog(workspace);
-    const agentManager = new AgentManager({ workspace }, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup });
+    const agentManager = new AgentManager({ workspace }, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup, events: eventLog });
     const deliveryQueue = new TelegramDeliveryQueue();
     const bot = createTelegramBot(runtimeConfig, eventLog, deliveryQueue, agentManager);
     const agentRouter = new AgentEventRouter(agentManager, { botInfo: () => bot.botInfo });
@@ -126,7 +126,7 @@ export async function main(): Promise<void> {
       onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
       onSteerTask: (record, ws) => tasksInstance.handleSteerRequest(record, ws),
       onStartBrowser: (record) => browserManager.handleStartBrowserRequest(record).then(() => {}),
-      onNewSession: () => agentManager.handleNewSessionRequest(),
+      onNewSession: (record) => agentManager.handleNewSessionRequest(record),
     });
     return {
       config: runtimeConfig,

@@ -743,21 +743,6 @@ async function isChatAllowed(workspace: string, chatId: number, events?: Workspa
   return allowed !== null && allowed.includes(chatId);
 }
 
-export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
-
-export async function shouldNotifyKnock(workspace: string, chatId: number, now = Date.now(), events?: WorkspaceEventLog): Promise<boolean> {
-  if (chatId <= 0) return false;
-  const eventLog = events ?? new WorkspaceEventLog(workspace);
-  const record = await eventLog.findLast((entry) => entry.type === "chat_denied" && "chat_id" in entry && entry.chat_id === chatId && typeof entry.t === "string");
-  if (record && typeof record.t === "string") {
-    const lastTime = new Date(record.t).getTime();
-    if (!Number.isNaN(lastTime) && now - lastTime < KNOCK_COOLDOWN_MS) {
-      return false;
-    }
-  }
-  return true;
-}
-
 /**
  * The ingress gate: allowed chats pass; everything else is denied with a chat_denied
  * audit event and no reply. A missing or malformed allow list fails closed.

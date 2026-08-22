@@ -36,6 +36,16 @@ function extractRequestSummary(request: WorkspaceOutboxRequest): string | undefi
       return undefined;
   }
 }
+
+function extractRawThreadId(request: unknown): number | undefined {
+  if (request !== null && typeof request === "object" && !Array.isArray(request)) {
+    const threadId = (request as Record<string, unknown>).message_thread_id;
+    if (typeof threadId === "number" && Number.isSafeInteger(threadId)) {
+      return threadId;
+    }
+  }
+  return undefined;
+}
 /**
  * Delivers send_request commands to Telegram: validates the request against the outbox
  * schema, checks its chat_id against the agent's allow list (the egress gate),
@@ -56,37 +66,41 @@ export class WorkspaceOutbox {
   }
 
   async handleSendRequest(record: SendRequest, _workspace = this.workspace): Promise<void> {
+    const rawThreadId = extractRawThreadId(record.request);
     if (record.request === null || typeof record.request !== "object" || Array.isArray(record.request)) {
-      await this.recordRejection(record.requestId, undefined, new Error("Outbox request must be a JSON object"));
+      await this.recordRejection(record.requestId, undefined, undefined, new Error("Outbox request must be a JSON object"));
       return;
     }
     const raw = JSON.stringify(record.request);
     if (raw.length > MAX_REQUEST_BYTES) {
-      await this.recordRejection(record.requestId, undefined, new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`));
+      await this.recordRejection(record.requestId, undefined, rawThreadId, new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`));
       return;
     }
     let request: WorkspaceOutboxRequest;
     try {
       request = validateRequest({ ...record.request, version: 1 });
     } catch (error) {
-      await this.recordRejection(record.requestId, undefined, error);
+      await this.recordRejection(record.requestId, undefined, rawThreadId, error);
       return;
     }
     const chatId = request.chat_id;
+    const threadId = ("message_thread_id" in request && typeof request.message_thread_id === "number")
+      ? request.message_thread_id
+      : rawThreadId;
     const allowed = await readAllowedFile(this.workspace);
     if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) {
-      await this.recordRejection(record.requestId, chatId, new Error(`Chat ${chatId} is not on the allow list`));
+      await this.recordRejection(record.requestId, chatId, threadId, new Error(`Chat ${chatId} is not on the allow list`));
       return;
     }
     let result: WorkspaceOutboxDispatchResult | undefined;
     try {
       result = await this.dispatch(chatId, request);
     } catch (error) {
-      await this.recordRejection(record.requestId, chatId, error);
+      await this.recordRejection(record.requestId, chatId, threadId, error);
       return;
     }
     const summary = extractRequestSummary(request);
-    const threadId = ("message_thread_id" in request && typeof request.message_thread_id === "number")
+    const resolvedThreadId = ("message_thread_id" in request && typeof request.message_thread_id === "number")
       ? request.message_thread_id
       : result?.messageThreadId;
 
@@ -95,7 +109,7 @@ export class WorkspaceOutbox {
       requestId: record.requestId,
       chat_id: chatId,
       ...defined({
-        message_thread_id: threadId,
+        message_thread_id: resolvedThreadId,
         messageId: result?.messageId,
         pollId: result?.pollId,
         request_type: request.type,
@@ -106,11 +120,11 @@ export class WorkspaceOutbox {
   }
 
   /** Emits outbox_rejected to WorkspaceEventLog, which logs to events.jsonl and notifies subscribers. */
-  private async recordRejection(requestId: string, chatId: number | undefined, error: unknown): Promise<void> {
+  private async recordRejection(requestId: string, chatId: number | undefined, threadId: number | undefined, error: unknown): Promise<void> {
     await this.events.emit({
       type: "outbox_rejected",
       requestId,
-      ...defined({ chat_id: chatId }),
+      ...defined({ chat_id: chatId, message_thread_id: threadId }),
       detail: errorMessage(error),
     });
   }

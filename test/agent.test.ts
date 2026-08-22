@@ -11,7 +11,7 @@ import {
   type AgentStatus,
 } from "../src/agent.js";
 import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
-import { EVENTS_PROMPT } from "../src/events.js";
+import { EVENTS_PROMPT, WorkspaceEventLog } from "../src/events.js";
 import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
 import { TASKS_PROMPT } from "../src/task-protocol.js";
 
@@ -382,5 +382,66 @@ it("manages independent workers and session directories per conversation key", a
     await manager.followup("Matthew follow up", { chatId: 829096380 });
     expect(workers).toHaveLength(3);
     expect(workers[0]?.prompt).toHaveBeenCalledTimes(2);
+  });
+});
+
+it("handleNewSessionRequest without target marks all active conversation workers for reset", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+
+    await manager.followup("Chat 100", { chatId: 100 });
+    await manager.followup("Chat 200 topic 1", { chatId: 200, threadId: 1 });
+    expect(workers).toHaveLength(2);
+
+    await manager.handleNewSessionRequest();
+    expect(workers[0]?.close).toHaveBeenCalled();
+    expect(workers[1]?.close).toHaveBeenCalled();
+
+    await manager.followup("Chat 100 next", { chatId: 100 });
+    expect(workers).toHaveLength(3);
+    expect(workers[2]?.options.resume).toBe(false);
+  });
+});
+
+it("handleNewSessionRequest with specific target resets only that conversation worker", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+
+    await manager.followup("Chat 100", { chatId: 100 });
+    await manager.followup("Chat 200", { chatId: 200 });
+    expect(workers).toHaveLength(2);
+
+    await manager.handleNewSessionRequest({ chatId: 100 });
+    expect(workers[0]?.close).toHaveBeenCalled();
+    expect(workers[1]?.close).not.toHaveBeenCalled();
+
+    // Chat 200 still reuses worker
+    await manager.followup("Chat 200 next", { chatId: 200 });
+    expect(workers).toHaveLength(2);
+    expect(workers[1]?.prompt).toHaveBeenCalledTimes(2);
+
+    // Chat 100 gets fresh worker
+    await manager.followup("Chat 100 next", { chatId: 100 });
+    expect(workers).toHaveLength(3);
+  });
+});
+
+it("handleNewSessionRequest emits new_session_scheduled when requestId and events are present", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory } = fakeWorkerFactory();
+    const events = new WorkspaceEventLog(path.join(dataDir, "workspace"));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, events }));
+
+    await manager.handleNewSessionRequest({ requestId: "ns-123", chat_id: 100, message_thread_id: 5 });
+    const logged = await events.readAll();
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      type: "new_session_scheduled",
+      requestId: "ns-123",
+      chat_id: 100,
+      message_thread_id: 5,
+    });
   });
 });

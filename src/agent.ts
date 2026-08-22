@@ -6,7 +6,7 @@ import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
 import { TG_BOT_DIR, defined } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
-import { EVENTS_PROMPT, type BotEvent } from "./events.js";
+import { EVENTS_PROMPT, WorkspaceEventLog, type BotEvent } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 import { TASKS_PROMPT } from "./task-protocol.js";
 import { isMessageDirectedToBot } from "./telegram.js";
@@ -80,6 +80,7 @@ export type AgentManagerOptions = {
   now?: () => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
+  events?: WorkspaceEventLog;
 };
 
 export type AgentStatus = {
@@ -185,9 +186,13 @@ export class AgentEventRouter {
         await this.notifier.followup(message, target);
         break;
       }
-      case "outbox_rejected":
-        await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, typeof event.chat_id === "number" ? { chatId: event.chat_id } : undefined);
+      case "outbox_rejected": {
+        const target: AgentTarget | undefined = typeof event.chat_id === "number"
+          ? { chatId: event.chat_id, ...defined({ threadId: event.message_thread_id }) }
+          : undefined;
+        await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, target);
         break;
+      }
       case "schedule_run_fired":
         await this.notifier.followup(event.prompt);
         break;
@@ -203,7 +208,7 @@ export class AgentEventRouter {
         await this.notifier.followup(`Browser request ${event.requestId} failed: ${event.error}`);
         break;
       default:
-        // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
+        // poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
         break;
     }
   }
@@ -376,6 +381,7 @@ export class AgentManager {
   private readonly clearTimeoutFn: typeof clearTimeout;
   private readonly workerFactory: AgentWorkerFactory;
   private readonly workers = new Map<string, ConversationWorkerEntry>();
+  private readonly events: WorkspaceEventLog | undefined;
   private shuttingDown = false;
 
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
@@ -390,6 +396,7 @@ export class AgentManager {
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
+    this.events = options.events;
   }
 
   private getOrCreateEntry(chatId?: number, threadId?: number): ConversationWorkerEntry {
@@ -434,17 +441,47 @@ export class AgentManager {
 
   /**
    * Marks a conversation session for reset. The current turn completes normally,
-   * after which the worker process is closed immediately.
+   * after which the worker process is closed immediately and new_session_scheduled is emitted.
    */
-  async handleNewSessionRequest(target?: AgentTarget): Promise<void> {
-    const entry = this.getOrCreateEntry(target?.chatId, target?.threadId);
-    entry.pendingNewSession = true;
-    void entry.serial.run(async () => {
-      if (entry.pendingNewSession && entry.worker?.isAlive()) {
-        await entry.worker.close().catch(() => {});
-        entry.worker = undefined;
+  async handleNewSessionRequest(record?: {
+    requestId?: string | undefined;
+    chat_id?: number | undefined;
+    message_thread_id?: number | undefined;
+    chatId?: number | undefined;
+    threadId?: number | undefined;
+  }): Promise<void> {
+    const chatId = record?.chat_id ?? record?.chatId;
+    const threadId = record?.message_thread_id ?? record?.threadId;
+    const requestId = record?.requestId;
+    if (chatId !== undefined) {
+      const entry = this.getOrCreateEntry(chatId, threadId);
+      entry.pendingNewSession = true;
+      void entry.serial.run(async () => {
+        if (entry.pendingNewSession && entry.worker?.isAlive()) {
+          await entry.worker.close().catch(() => {});
+          entry.worker = undefined;
+        }
+      }).catch(() => {});
+    } else {
+      for (const entry of this.workers.values()) {
+        entry.pendingNewSession = true;
+        void entry.serial.run(async () => {
+          if (entry.pendingNewSession && entry.worker?.isAlive()) {
+            await entry.worker.close().catch(() => {});
+            entry.worker = undefined;
+          }
+        }).catch(() => {});
       }
-    }).catch(() => {});
+      const defaultEntry = this.getOrCreateEntry();
+      defaultEntry.pendingNewSession = true;
+    }
+    if (requestId) {
+      await this.events?.emit({
+        type: "new_session_scheduled",
+        requestId,
+        ...defined({ chat_id: chatId, message_thread_id: threadId }),
+      });
+    }
   }
 
   async beginShutdown(): Promise<void> {

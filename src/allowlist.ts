@@ -1,6 +1,7 @@
-import { readFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { open } from "node:fs/promises";
 import path from "node:path";
-import { errorCode, TG_BOT_DIR } from "./util.js";
+import { errorCode, readFileBounded, TG_BOT_DIR } from "./util.js";
 import { EVENTS_FILE, WorkspaceEventLog } from "./events.js";
 /**
  * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, containing an array of safe integer chat IDs.
@@ -12,20 +13,45 @@ export type AllowedFile =
   | { status: "ready"; chats: number[] };
 
 const ALLOWED_FILE = "allowed.json";
+const ALLOWED_FILE_MAX_BYTES = 1024 * 1024;
 
 export function allowedFilePath(workspace: string): string {
   return path.join(workspace, TG_BOT_DIR, ALLOWED_FILE);
 }
 
-/** Reads the allow list. Missing and malformed files are distinct states (both fail closed). */
+/**
+ * Reads the allow list. Missing and malformed files are distinct states (both fail closed).
+ * The file is opened O_NOFOLLOW|O_NONBLOCK and must be a regular file of at most 1 MiB,
+ * so a symlink, FIFO, or oversized file fails closed as malformed instead of blocking
+ * or following an agent-controlled redirect.
+ */
 export async function readAllowedFile(workspace: string): Promise<AllowedFile> {
-  let raw: string;
+  const filePath = allowedFilePath(workspace);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    raw = await readFile(allowedFilePath(workspace), "utf8");
+    handle = await open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
   } catch (error) {
     if (errorCode(error) === "ENOENT") return { status: "missing" };
     console.error("Failed to read allowed.json", error);
     return { status: "malformed" };
+  }
+  let raw: string;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      console.error("Malformed allowed.json: not a regular file");
+      return { status: "malformed" };
+    }
+    if (stat.size > ALLOWED_FILE_MAX_BYTES) {
+      console.error(`Malformed allowed.json: exceeds ${ALLOWED_FILE_MAX_BYTES} bytes`);
+      return { status: "malformed" };
+    }
+    raw = (await readFileBounded(handle, ALLOWED_FILE_MAX_BYTES)).toString("utf8");
+  } catch (error) {
+    console.error("Failed to read allowed.json", error);
+    return { status: "malformed" };
+  } finally {
+    if (handle) await handle.close().catch(() => {});
   }
   let parsed: unknown;
   try {

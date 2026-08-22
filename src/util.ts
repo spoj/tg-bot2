@@ -103,10 +103,32 @@ export async function openPinnedDirectory(directory: string, expectedRealPath?: 
 const DIRECTORY = fsConstants.O_DIRECTORY;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
+const READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Reads a file handle to EOF in fixed-size chunks, never allocating more than
+ * one chunk at a time. Throws once the total read exceeds `capBytes`, so an
+ * oversized or growing store cannot OOM the host.
+ */
+export async function readFileBounded(handle: FileHandle, capBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    const result = await handle.read(chunk, 0, chunk.length, null);
+    if (result.bytesRead === 0) break;
+    total += result.bytesRead;
+    if (total > capBytes) throw new Error(`File exceeds ${capBytes} byte cap`);
+    chunks.push(chunk.subarray(0, result.bytesRead));
+  }
+  return Buffer.concat(chunks, total);
+}
 
 /**
  * Appends one or more serialized records to a JSONL store (filePath). A symlink planted
- * at the path is unlinked and the open retried (ELOOP defense).
+ * at the path is unlinked and the open retried (ELOOP defense). Writes loop until the
+ * whole payload is on disk; zero write progress throws instead of reporting success
+ * with a partial record.
  */
 export async function appendJsonl(
   filePath: string,
@@ -119,11 +141,20 @@ export async function appendJsonl(
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
-    await handle.write(payload, 0, payload.length, null);
+    let written = 0;
+    while (written < payload.length) {
+      const result = await handle.write(payload, written, payload.length - written, null);
+      if (result.bytesWritten === 0) {
+        throw new Error(`JSONL store accepted only ${written} of ${payload.length} bytes`);
+      }
+      written += result.bytesWritten;
+    }
   } finally {
     await handle.close().catch(() => {});
   }
 }
+
+const JSONL_READ_CAP_BYTES = 256 * 1024 * 1024;
 
 /**
  * Reads every line of a JSONL store (filePath), dropping a possible partial first
@@ -136,7 +167,7 @@ export async function readJsonl(
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
-    return await readJsonlLines(handle, stat.size);
+    return await readJsonlLines(handle);
   } finally {
     await handle.close().catch(() => {});
   }
@@ -157,16 +188,10 @@ async function openJsonlAppend(filePath: string): Promise<FileHandle> {
   }
 }
 
-/** Reads every line of a store, dropping a possible partial final line. */
-async function readJsonlLines(handle: FileHandle, size: number): Promise<string[]> {
-  const buffer = Buffer.allocUnsafe(size);
-  let bytesRead = 0;
-  while (bytesRead < size) {
-    const result = await handle.read(buffer, bytesRead, size - bytesRead, bytesRead);
-    if (result.bytesRead === 0) break;
-    bytesRead += result.bytesRead;
-  }
-  return buffer.subarray(0, bytesRead).toString("utf8").split("\n").filter(Boolean);
+/** Reads every line of a store in bounded chunks, dropping a possible partial final line. */
+async function readJsonlLines(handle: FileHandle): Promise<string[]> {
+  const contents = await readFileBounded(handle, JSONL_READ_CAP_BYTES);
+  return contents.toString("utf8").split("\n").filter(Boolean);
 }
 
 export type AgentOrigin =

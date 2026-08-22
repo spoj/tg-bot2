@@ -3,7 +3,7 @@ import { open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { type WorkspaceEventLog } from "./events.js";
-import { TG_BOT_DIR, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
+import { TG_BOT_DIR, isMissing, openPinnedDirectory, readFileBounded, readJsonl, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 
 type ScheduleFile = {
@@ -46,9 +46,10 @@ const HOUR_MS = 60 * 60 * 1_000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
-const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW;
+const READ_FILE = fsConstants.O_RDONLY | NO_FOLLOW | fsConstants.O_NONBLOCK;
 const SCHEDULES_FILE = "schedules.json";
 const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
+const MAX_SCHEDULES_FILE_BYTES = 1024 * 1024;
 const UTC_ISO = /Z$/u;
 
 function isUtcIso(value: unknown): value is string {
@@ -104,14 +105,11 @@ async function closeQuietly(handle: Awaited<ReturnType<typeof open>>): Promise<v
 
 async function readSchedulesFile(handle: Awaited<ReturnType<typeof open>>): Promise<string> {
   const stat = await handle.stat();
-  const buffer = Buffer.allocUnsafe(stat.size);
-  let bytesRead = 0;
-  while (bytesRead < stat.size) {
-    const result = await handle.read(buffer, bytesRead, stat.size - bytesRead, null);
-    if (result.bytesRead === 0) break;
-    bytesRead += result.bytesRead;
+  if (!stat.isFile()) throw new Error("schedules.json is not a regular file");
+  if (stat.size > MAX_SCHEDULES_FILE_BYTES) {
+    throw new Error(`schedules.json exceeds ${MAX_SCHEDULES_FILE_BYTES} bytes`);
   }
-  return buffer.subarray(0, bytesRead).toString("utf8");
+  return (await readFileBounded(handle, MAX_SCHEDULES_FILE_BYTES)).toString("utf8");
 }
 
 /** Replays schedule events into the folded state: open runs, per-row open mapping, fired rows, and last due times. */
@@ -267,7 +265,17 @@ export class WorkspaceScheduler {
   private async reconcile(workspace: string, metadata: PinnedDirectory, now: number): Promise<void> {
     const rows = await this.readRows(metadata);
     if (rows === undefined) return;
-    const state = foldScheduleEvents(await readJsonl(this.events.logPath).catch(() => []));
+    let lines: string[];
+    try {
+      lines = await readJsonl(this.events.logPath);
+    } catch (error) {
+      if (!isMissing(error)) {
+        this.report(new Error("Could not read events log", { cause: error }));
+        return;
+      }
+      lines = [];
+    }
+    const state = foldScheduleEvents(lines);
     const fileKeys = new Set(rows.map(rowKey));
 
     for (const [key, runId] of state.rowRun) {
@@ -295,7 +303,11 @@ export class WorkspaceScheduler {
 
     for (const run of due) {
       if (!state.open.has(run.runId)) continue;
-      await this.events.emit({ type: "schedule_run_fired", runId: run.runId, prompt: run.prompt });
+      const emitted = await this.events.emit({ type: "schedule_run_fired", runId: run.runId, prompt: run.prompt });
+      if (emitted === undefined) {
+        this.report(new Error(`Could not persist schedule_run_fired for run ${run.runId}; not firing`));
+        continue;
+      }
       state.open.delete(run.runId);
       const key = rowKey(run);
       if (state.rowRun.get(key) === run.runId) state.rowRun.delete(key);
@@ -311,7 +323,7 @@ export class WorkspaceScheduler {
 
   private async scheduleRun(state: FoldedSchedules, row: { prompt: string; start: string; recurrence: Recurrence | null }, dueAt: string): Promise<void> {
     const run: OpenRun = { runId: randomUUID(), prompt: row.prompt, start: row.start, recurrence: row.recurrence, dueAt };
-    await this.events.emit({
+    const emitted = await this.events.emit({
       type: "schedule_run_scheduled",
       runId: run.runId,
       prompt: run.prompt,
@@ -319,6 +331,10 @@ export class WorkspaceScheduler {
       recurrence: run.recurrence,
       dueAt: run.dueAt,
     });
+    if (emitted === undefined) {
+      this.report(new Error(`Could not persist schedule_run_scheduled for run ${run.runId}; not scheduling`));
+      return;
+    }
     const key = rowKey(run);
     const displaced = state.rowRun.get(key);
     if (displaced !== undefined) state.open.delete(displaced);
@@ -334,8 +350,6 @@ export class WorkspaceScheduler {
     let raw: string;
     try {
       handle = await open(filePath, READ_FILE);
-      const stat = await handle.stat();
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("schedules.json is not a regular file");
       raw = await readSchedulesFile(handle);
     } catch (error) {
       if (!isMissing(error)) this.report(new Error("Could not read schedules", { cause: error }));

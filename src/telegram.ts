@@ -6,9 +6,9 @@ import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } from "grammy/types";
 import type { Config } from "./config.js";
 import type { AgentStatus } from "./agent.js";
-import { EVENTS_FILE, type EventSink } from "./events.js";
+import { WorkspaceEventLog } from "./events.js";
 import { syncAllowlist } from "./allowlist.js";
-import { TG_BOT_DIR, botPaths, defined, readJsonl } from "./util.js";
+import { botPaths, defined } from "./util.js";
 import { SerialQueue } from "./queue.js";
 import type {
   WorkspaceOutboxSendMessageRequest,
@@ -342,31 +342,11 @@ export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number
   return first.message_id;
 }
 /** Maps a poll id back to the chat that sent it via events.jsonl. */
-export async function findPollOwnerChat(workspace: string, pollId: string): Promise<number | undefined> {
-  let lines: string[];
-  try {
-    lines = await readJsonl(path.join(workspace, TG_BOT_DIR, EVENTS_FILE));
-  } catch {
-    return undefined;
-  }
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (!line) continue;
-    let record: unknown;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (
-      record !== null &&
-      typeof record === "object" &&
-      (record as Record<string, unknown>).type === "outbox_sent" &&
-      (record as Record<string, unknown>).pollId === pollId &&
-      typeof (record as Record<string, unknown>).chat_id === "number"
-    ) {
-      return (record as Record<string, unknown>).chat_id as number;
-    }
+export async function findPollOwnerChat(workspace: string, pollId: string, events?: WorkspaceEventLog): Promise<number | undefined> {
+  const eventLog = events ?? new WorkspaceEventLog(workspace);
+  const record = await eventLog.findLast((entry) => entry.type === "outbox_sent" && "pollId" in entry && entry.pollId === pollId && "chat_id" in entry && typeof entry.chat_id === "number");
+  if (record && record.type === "outbox_sent") {
+    return record.chat_id;
   }
   return undefined;
 }
@@ -700,31 +680,22 @@ export function isMessageDirectedToBot(message: Message, botInfo?: { id: number;
   return false;
 }
 
-async function isChatAllowed(workspace: string, chatId: number, events?: EventSink): Promise<boolean> {
+async function isChatAllowed(workspace: string, chatId: number, events?: WorkspaceEventLog): Promise<boolean> {
   const allowed = await syncAllowlist(workspace, events);
   return allowed !== null && allowed.includes(chatId);
 }
 
 export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
 
-export async function shouldNotifyKnock(workspace: string, chatId: number, now = Date.now()): Promise<boolean> {
+export async function shouldNotifyKnock(workspace: string, chatId: number, now = Date.now(), events?: WorkspaceEventLog): Promise<boolean> {
   if (chatId <= 0) return false;
-  try {
-    const lines = await readJsonl(path.join(workspace, TG_BOT_DIR, EVENTS_FILE));
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i];
-      if (!line) continue;
-      const parsed = JSON.parse(line) as Record<string, unknown>;
-      if (parsed.type === "chat_denied" && parsed.chat_id === chatId && typeof parsed.t === "string") {
-        const lastTime = new Date(parsed.t).getTime();
-        if (!Number.isNaN(lastTime) && now - lastTime < KNOCK_COOLDOWN_MS) {
-          return false;
-        }
-        break;
-      }
+  const eventLog = events ?? new WorkspaceEventLog(workspace);
+  const record = await eventLog.findLast((entry) => entry.type === "chat_denied" && "chat_id" in entry && entry.chat_id === chatId && typeof entry.t === "string");
+  if (record && typeof record.t === "string") {
+    const lastTime = new Date(record.t).getTime();
+    if (!Number.isNaN(lastTime) && now - lastTime < KNOCK_COOLDOWN_MS) {
+      return false;
     }
-  } catch {
-    // Missing or unreadable events.jsonl
   }
   return true;
 }
@@ -733,7 +704,7 @@ export async function shouldNotifyKnock(workspace: string, chatId: number, now =
  * The ingress gate: allowed chats pass; everything else is denied with a chat_denied
  * audit event and no reply. A missing or malformed allow list fails closed.
  */
-async function gateChat(workspace: string, events: EventSink, chat: TelegramChatInfo): Promise<boolean> {
+async function gateChat(workspace: string, events: WorkspaceEventLog, chat: TelegramChatInfo): Promise<boolean> {
   const chatId = chat.id;
   if (!Number.isSafeInteger(chatId)) return false;
 
@@ -742,16 +713,16 @@ async function gateChat(workspace: string, events: EventSink, chat: TelegramChat
     return true;
   }
 
-  const notify = await shouldNotifyKnock(workspace, chatId);
-  await events.emit(
-    { type: "chat_denied", chat_id: chatId, ...defined({ title: chatTitle(chat) }) },
-    { notify },
-  );
+  await events.publish({
+    type: "chat_denied",
+    chat_id: chatId,
+    ...defined({ title: chatTitle(chat) }),
+  });
   return false;
 }
 export function createTelegramBot(
   config: Config,
-  events: EventSink,
+  events: WorkspaceEventLog,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
   statusProvider?: { status(): Promise<AgentStatus> },
 ): Bot {
@@ -794,9 +765,7 @@ export function createTelegramBot(
   bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    const isPrivate = ctx.chat.type === "private" || chatId > 0;
-    const notify = isPrivate || isMessageDirectedToBot(ctx.message, bot.botInfo);
-    await events.emit({ type: "message", chat_id: chatId, message: ctx.message, attachments }, { notify });
+    await events.publish({ type: "message", chat_id: chatId, message: ctx.message, attachments });
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;

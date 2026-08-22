@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceOutbox, type WorkspaceOutboxOptions } from "../src/outbox.js";
-import { EventSink, type EventNotifier } from "../src/events.js";
+import { WorkspaceEventLog } from "../src/events.js";
+import { AgentEventRouter, type AgentNotifier } from "../src/agent.js";
 import type { WorkspaceOutboxDispatcher, WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
 import type { SendRequest } from "../src/request-bus.js";
 
@@ -35,9 +36,13 @@ async function logEvents(workspace: string): Promise<Array<Record<string, unknow
 function setupOutbox(
   workspace: string,
   dispatch: WorkspaceOutboxDispatcher,
-  options: Partial<WorkspaceOutboxOptions> & { notifier?: EventNotifier } = {},
-): { outbox: WorkspaceOutbox; events: EventSink } {
-  const events = new EventSink(workspace, options.notifier ?? { followup: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined) });
+  options: Partial<WorkspaceOutboxOptions> & { notifier?: AgentNotifier } = {},
+): { outbox: WorkspaceOutbox; events: WorkspaceEventLog } {
+  const events = new WorkspaceEventLog(workspace);
+  if (options.notifier) {
+    const router = new AgentEventRouter(options.notifier);
+    events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
+  }
   const outbox = new WorkspaceOutbox({
     workspace,
     dispatch,
@@ -55,14 +60,14 @@ const valid = (filePath = "/workspace/report.txt") => ({
 });
 
 function sendRecord(requestId: string, request: unknown): SendRequest {
-  return { requestId, request };
+  return { type: "send_request", requestId, request };
 }
 
 async function send(
   workspace: string,
   dispatch: WorkspaceOutboxDispatcher,
   record: SendRequest,
-  options: Partial<WorkspaceOutboxOptions> & { notifier?: EventNotifier } = {},
+  options: Partial<WorkspaceOutboxOptions> & { notifier?: AgentNotifier } = {},
 ): Promise<void> {
   await setupOutbox(workspace, dispatch, options).outbox.handleSendRequest(record, workspace);
 }

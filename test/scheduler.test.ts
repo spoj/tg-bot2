@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { WorkspaceScheduler, type WorkspaceSchedulerOptions } from "../src/scheduler.js";
-import { EventSink } from "../src/events.js";
+import { WorkspaceEventLog } from "../src/events.js";
+import { AgentEventRouter } from "../src/agent.js";
 import { defined } from "../src/util.js";
 import type { ScheduleRow } from "../src/schedule-protocol.js";
 
@@ -43,12 +44,14 @@ async function withDirectory(test: (dataDir: string) => Promise<void>): Promise<
 function makeScheduler(
   dataDir: string,
   options: Partial<WorkspaceSchedulerOptions> & { followup?: (text: string) => Promise<void> } = {},
-): { scheduler: WorkspaceScheduler; events: EventSink } {
+): { scheduler: WorkspaceScheduler; events: WorkspaceEventLog } {
   const defaultWorkspace = path.join(dataDir, "workspace");
-  const defaultEvents = new EventSink(defaultWorkspace, {
+  const defaultEvents = new WorkspaceEventLog(defaultWorkspace);
+  const router = new AgentEventRouter({
     followup: options.followup ?? vi.fn(async () => undefined),
     interrupt: vi.fn(async () => undefined),
   });
+  defaultEvents.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const {
     workspace = defaultWorkspace,
     events = defaultEvents,
@@ -157,7 +160,7 @@ describe("WorkspaceScheduler firing", () => {
 describe("WorkspaceScheduler validation", () => {
   it("rejects non-positive or non-timer-safe intervals", () => withDirectory(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
-    const events = new EventSink(workspace);
+    const events = new WorkspaceEventLog(workspace);
     expect(() => new WorkspaceScheduler({ workspace, events, pollIntervalMs: 0 })).toThrow("positive timer-safe integer");
     expect(() => new WorkspaceScheduler({ workspace, events, pollIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
   }));

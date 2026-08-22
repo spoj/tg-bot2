@@ -2,35 +2,22 @@ import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
 import { TG_BOT_DIR, isMissing, readJsonl } from "./util.js";
-import { EVENTS_FILE } from "./events.js";
+import { EVENTS_FILE, type AgentCommand } from "./events.js";
 
 /** One send_request command: the agent's tool minted requestId and the raw request object. */
-export type SendRequest = {
-  requestId: string;
-  request: unknown;
-};
+export type SendRequest = Extract<AgentCommand, { type: "send_request" }>;
 
 /** One spawn_request command: the agent's tool minted runId and the complete prompt. */
-export type SpawnRequest = {
-  runId: string;
-  prompt: string;
-};
+export type SpawnRequest = Extract<AgentCommand, { type: "spawn_request" }>;
 
 /** One cancel_request command: the runId of a previously spawned task. */
-export type CancelRequest = {
-  runId: string;
-};
+export type CancelRequest = Extract<AgentCommand, { type: "cancel_request" }>;
+
 /** One steer_task_request command: the agent's tool minted steerId, target runId, and steering message. */
-export type SteerTaskRequest = {
-  steerId: string;
-  runId: string;
-  message: string;
-};
+export type SteerTaskRequest = Extract<AgentCommand, { type: "steer_task_request" }>;
 
 /** One browser_requested command: the agent's tool minted requestId. */
-export type StartBrowserRequest = {
-  requestId: string;
-};
+export type StartBrowserRequest = Extract<AgentCommand, { type: "browser_requested" }>;
 /** Consumes one send_request; `resume` means the command was claimed but its dispatch never reached a terminal event. */
 export type SendRequestHandler = (
   record: SendRequest,
@@ -68,13 +55,13 @@ const EVENTS_LOG = path.join(TG_BOT_DIR, EVENTS_FILE);
 const MAX_RECORD_BYTES = 8 * 1024 * 1024;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 type ChatScanState = {
-  /** Byte offset into system.jsonl; the log is append-only, so offsets are stable for a process lifetime. */
+  /** Byte offset into events.jsonl; the log is append-only, so offsets are stable for a process lifetime. */
   offset: number;
   /** Trailing fragment of a record still being written. */
   partial: string;
   /** Commands routed this lifetime, by UUID. */
   consumed: Set<string>;
-  /** UUIDs already terminated in system.jsonl; never re-routed. */
+  /** UUIDs already terminated in events.jsonl; never re-routed. */
   bootConsumed: Set<string>;
   /** Spawn commands awaiting a free slot. */
   pending: SpawnRequest[];
@@ -90,9 +77,9 @@ function commandId(type: string, record: Record<string, unknown>): string | unde
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-export type CommandRequest = SendRequest | SpawnRequest | SteerTaskRequest | CancelRequest | StartBrowserRequest;
+export type CommandRequest = AgentCommand;
 
-/** Parses one system.jsonl line into a command record; undefined for outcomes, junk, or malformed commands. */
+/** Parses one events.jsonl line into a command record; undefined for outcomes, junk, or malformed commands. */
 export function parseCommand(line: string): CommandRequest | undefined {
   if (line.length > MAX_RECORD_BYTES) return undefined;
   let record: unknown;
@@ -105,20 +92,27 @@ export function parseCommand(line: string): CommandRequest | undefined {
   const typed = record as Record<string, unknown>;
   const id = commandId(typed.type as string, typed);
   if (id === undefined) return undefined;
-  if (typed.type === "send_request") return { requestId: id, request: typed.request };
-  if (typed.type === "spawn_request") {
-    const prompt = typed.prompt;
-    return typeof prompt === "string" ? { runId: id, prompt } : undefined;
+  switch (typed.type) {
+    case "send_request":
+      return { type: "send_request", requestId: id, request: typed.request };
+    case "spawn_request": {
+      const prompt = typed.prompt;
+      return typeof prompt === "string" ? { type: "spawn_request", runId: id, prompt } : undefined;
+    }
+    case "steer_task_request": {
+      const runId = typed.runId;
+      const message = typed.message;
+      return typeof runId === "string" && typeof message === "string" && runId.length > 0
+        ? { type: "steer_task_request", steerId: id, runId, message }
+        : undefined;
+    }
+    case "cancel_request":
+      return { type: "cancel_request", runId: id };
+    case "browser_requested":
+      return { type: "browser_requested", requestId: id };
+    default:
+      return undefined;
   }
-  if (typed.type === "steer_task_request") {
-    const runId = typed.runId;
-    const message = typed.message;
-    return typeof runId === "string" && typeof message === "string" && runId.length > 0
-      ? { steerId: id, runId, message }
-      : undefined;
-  }
-  if (typed.type === "cancel_request") return { runId: id };
-  if (typed.type === "browser_requested") return { requestId: id };
 }
 
 
@@ -129,7 +123,7 @@ async function readTail(filePath: string, offset: number): Promise<{ text: strin
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) return { text: "", nextOffset: offset };
-    // The agent can truncate anything in its workspace, including system.jsonl.
+    // The agent can truncate anything in its workspace, including events.jsonl.
     // A size below the stored offset means the file was truncated: rescan from the
     // top; the claim fold keeps already-consumed commands deduped.
     const start = stat.size < offset ? 0 : offset;
@@ -174,7 +168,7 @@ export function splitRecords(text: string): { lines: string[]; partial: string }
 }
 
 /**
- * Consumes agent commands from the shared system.jsonl: tails the append-only log,
+ * Consumes agent commands from the shared events.jsonl: tails the append-only log,
  * extracts send_request/spawn_request/cancel_request records, dedupes against the
  * claim events in the same log, and routes each command to its handler exactly once.
  * Boot replay re-dispatches open outbox claims (claimed without a terminal event);
@@ -273,7 +267,7 @@ export class WorkspaceRequestBus {
     return state;
   }
 
-  /** Rebuilds terminal outcome state from system.jsonl so boot replay skips completed commands. */
+  /** Rebuilds terminal outcome state from events.jsonl so boot replay skips completed commands. */
   private async loadBootState(workspace: string, state: ChatScanState): Promise<void> {
     let lines: string[];
     try {
@@ -352,38 +346,34 @@ export class WorkspaceRequestBus {
       state.consumed.add(id);
       return;
     }
-    if ("request" in record) {
-      // send_request
-      state.consumed.add(id);
-      await this.invoke(() => this.options.onSend(record, workspace));
-      return;
-    }
-    if ("prompt" in record) {
-      // spawn_request
-      const result = await this.invokeSpawn(workspace, record);
-      if (result === "claimed") state.consumed.add(record.runId);
-      else state.pending.push(record);
-      return;
-    }
-    if ("steerId" in record) {
-      // steer_task_request
-      state.consumed.add(id);
-      if (this.options.onSteerTask) {
-        await this.invoke(() => this.options.onSteerTask!(record, workspace));
+    switch (record.type) {
+      case "send_request":
+        state.consumed.add(id);
+        await this.invoke(() => this.options.onSend(record, workspace));
+        break;
+      case "spawn_request": {
+        const result = await this.invokeSpawn(workspace, record);
+        if (result === "claimed") state.consumed.add(record.runId);
+        else state.pending.push(record);
+        break;
       }
-      return;
+      case "steer_task_request":
+        state.consumed.add(id);
+        if (this.options.onSteerTask) {
+          await this.invoke(() => this.options.onSteerTask!(record, workspace));
+        }
+        break;
+      case "cancel_request":
+        state.consumed.add(id);
+        await this.invoke(() => this.options.onCancel(record, workspace));
+        break;
+      case "browser_requested":
+        state.consumed.add(id);
+        if (this.options.onStartBrowser) {
+          await this.invoke(() => this.options.onStartBrowser!(record, workspace));
+        }
+        break;
     }
-    if ("requestId" in record) {
-      // browser_requested
-      state.consumed.add(id);
-      if (this.options.onStartBrowser) {
-        await this.invoke(() => this.options.onStartBrowser!(record, workspace));
-      }
-      return;
-    }
-    // cancel_request
-    state.consumed.add(id);
-    await this.invoke(() => this.options.onCancel(record, workspace));
   }
 
   private async invoke(operation: () => Promise<void>): Promise<void> {

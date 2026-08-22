@@ -4,7 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import type { Writable, Readable } from "node:stream";
 import { WebSocketServer, WebSocket } from "ws";
-import type { EventSink } from "./events.js";
+import type { WorkspaceEventLog } from "./events.js";
 import { errorMessage } from "./util.js";
 import {
   spawnProcess,
@@ -16,7 +16,7 @@ import {
 
 export interface HostBrowserOptions {
   workspace: string;
-  events?: EventSink | undefined;
+  events?: WorkspaceEventLog | undefined;
   idleTimeoutMs?: number | undefined;
   spawnProcess?: PiWorkerSpawn | undefined;
 }
@@ -49,7 +49,7 @@ export interface BrowserReadyResult {
 
 export class HostBrowserManager {
   private readonly workspace: string;
-  private readonly events: EventSink | undefined;
+  private readonly events: WorkspaceEventLog | undefined;
   private readonly idleTimeoutMs: number;
   private readonly spawn: PiWorkerSpawn;
   private readonly socketPath: string;

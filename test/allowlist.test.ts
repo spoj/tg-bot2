@@ -3,7 +3,7 @@ import path from "node:path";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { readAllowedFile, syncAllowlist } from "../src/allowlist.js";
-import { EventSink } from "../src/events.js";
+import { WorkspaceEventLog } from "../src/events.js";
 
 describe("allowlist", () => {
   it("parses a bare array of chat IDs", async () => {
@@ -65,33 +65,29 @@ describe("allowlist", () => {
     const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     try {
       await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
-      const events: Record<string, unknown>[] = [];
-      const fakeEvents = {
-        emit: (event: Record<string, unknown>) => {
-          events.push(event);
-          return Promise.resolve();
-        },
-      } as unknown as EventSink;
+      const eventLog = new WorkspaceEventLog(workspace);
 
       // Missing file -> returns null, no event
-      expect(await syncAllowlist(workspace, fakeEvents)).toBeNull();
-      expect(events).toHaveLength(0);
+      expect(await syncAllowlist(workspace, eventLog)).toBeNull();
+      expect(await eventLog.readAll()).toHaveLength(0);
 
       // Create file -> emits allowlist_updated
       await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), JSON.stringify([10, 20]));
-      expect(await syncAllowlist(workspace, fakeEvents)).toEqual([10, 20]);
-      expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({ type: "allowlist_updated", chats: [10, 20] });
+      expect(await syncAllowlist(workspace, eventLog)).toEqual([10, 20]);
+      let records = await eventLog.readAll();
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ type: "allowlist_updated", chats: [10, 20] });
 
       // Call again with same content -> no duplicate event
-      expect(await syncAllowlist(workspace, fakeEvents)).toEqual([10, 20]);
-      expect(events).toHaveLength(1);
+      expect(await syncAllowlist(workspace, eventLog)).toEqual([10, 20]);
+      expect(await eventLog.readAll()).toHaveLength(1);
 
       // Update content -> emits allowlist_updated
       await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), JSON.stringify([10, 20, 30]));
-      expect(await syncAllowlist(workspace, fakeEvents)).toEqual([10, 20, 30]);
-      expect(events).toHaveLength(2);
-      expect(events[1]).toMatchObject({ type: "allowlist_updated", chats: [10, 20, 30] });
+      expect(await syncAllowlist(workspace, eventLog)).toEqual([10, 20, 30]);
+      records = await eventLog.readAll();
+      expect(records).toHaveLength(2);
+      expect(records[1]).toMatchObject({ type: "allowlist_updated", chats: [10, 20, 30] });
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
@@ -107,16 +103,9 @@ describe("allowlist", () => {
       // Pre-seed events.jsonl with matching allowlist_updated event
       await writeFile(eventsFile, `${JSON.stringify({ v: 1, t: new Date().toISOString(), type: "allowlist_updated", chats: [10, 20] })}\n`);
 
-      const events: Record<string, unknown>[] = [];
-      const fakeEvents = {
-        emit: (event: Record<string, unknown>) => {
-          events.push(event);
-          return Promise.resolve();
-        },
-      } as unknown as EventSink;
-
-      expect(await syncAllowlist(workspace, fakeEvents)).toEqual([10, 20]);
-      expect(events).toHaveLength(0); // No event emitted because log already has [10, 20]
+      const eventLog = new WorkspaceEventLog(workspace);
+      expect(await syncAllowlist(workspace, eventLog)).toEqual([10, 20]);
+      expect(await eventLog.readAll()).toHaveLength(1); // Still only the seeded event
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }

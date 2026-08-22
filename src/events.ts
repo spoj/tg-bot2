@@ -1,13 +1,12 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { appendJsonl, closeQuietly, isMissing, openPinnedDirectory, type PinnedDirectory, TG_BOT_DIR } from "./util.js";
+import { appendJsonl, closeQuietly, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory, TG_BOT_DIR } from "./util.js";
 import type { Recurrence } from "./schedule-protocol.js";
 
 /**
- * One event in the unified append-only `.tg-bot/events.jsonl` log: inbound Telegram
- * messages, agent commands, host terminal outcomes, schedules, and allow-list audits.
+ * Inbound events and host outcomes in the unified append-only `.tg-bot/events.jsonl` log.
  */
-export type BotEvent =
+export type HostEvent =
   | {
     /** A user message (text, media, location, venue, …). `chat_id` is the Telegram chat it arrived from; `message` is the raw Telegram Message object; `attachments` are files the host downloaded into the workspace. */
     type: "message";
@@ -84,11 +83,6 @@ export type BotEvent =
     runId: string;
   }
   | {
-    /** Agent requested a browser instance via start_browser. */
-    type: "browser_requested";
-    requestId: string;
-  }
-  | {
     /** Browser instance is running and accepting CDP connections on the UNIX socket. */
     type: "browser_ready";
     requestId?: string | undefined;
@@ -108,91 +102,155 @@ export type BotEvent =
     reason: "idle_timeout" | "agent_close" | "process_exit" | "host_shutdown";
   };
 
-export const EVENTS_FILE = "events.jsonl";
+/**
+ * Commands written by agent tools to the unified append-only `.tg-bot/events.jsonl` log.
+ */
+export type AgentCommand =
+  | {
+    /** Queued by the send tool; requestId is the tool-minted UUID. */
+    type: "send_request";
+    requestId: string;
+    request: unknown;
+  }
+  | {
+    /** Queued by the spawn tool; runId is the tool-minted UUID. */
+    type: "spawn_request";
+    runId: string;
+    prompt: string;
+  }
+  | {
+    /** Queued by the steer_task tool; steerId is the tool-minted UUID. */
+    type: "steer_task_request";
+    steerId: string;
+    runId: string;
+    message: string;
+  }
+  | {
+    /** Queued by the cancel tool; runId is the target task run ID. */
+    type: "cancel_request";
+    runId: string;
+  }
+  | {
+    /** Queued by the start_browser tool; requestId is the tool-minted UUID. */
+    type: "browser_requested";
+    requestId: string;
+  };
 
-export type EventNotifier = {
-  interrupt(text: string): Promise<void>;
-  followup(text: string): Promise<void>;
+/** All entries recorded in the unified append-only `.tg-bot/events.jsonl` log. */
+export type BotEvent = HostEvent | AgentCommand;
+
+/** Envelope added to every JSON line in `.tg-bot/events.jsonl`. */
+export type LogEntryEnvelope = {
+  v: 1;
+  t: string;
 };
 
-function truncate(text: string, maxLength: number): string {
-  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
-}
+/** Full serialized record shape in `.tg-bot/events.jsonl`. */
+export type WorkspaceLogRecord<T = BotEvent> = LogEntryEnvelope & T;
+export const EVENTS_FILE = "events.jsonl";
+
+export type EventListener = (record: WorkspaceLogRecord, rawLine: string) => void | Promise<void>;
 
 /**
- * The single event sink for the entire host: appends every event to `.tg-bot/events.jsonl`
- * atomically, and routes agent notifications (interrupt or followup) based on event type.
+ * Durable, file-backed workspace event log and in-memory live pub/sub stream.
+ * Abstracts away .tg-bot/events.jsonl persistence, atomic append, and log querying.
  */
-export class EventSink {
+export class WorkspaceEventLog {
+  private readonly listeners = new Set<EventListener>();
+
   constructor(
-    private readonly workspace: string,
-    private readonly notifier?: EventNotifier,
-    private readonly logger: (error: unknown) => void = (error) => console.error("EventSink notification error", error),
+    readonly workspace: string,
+    private readonly logger: (error: unknown) => void = (error) => console.error("WorkspaceEventLog error", error),
   ) {}
 
-  async emit(event: BotEvent, options?: { notify?: boolean }): Promise<string | undefined> {
+  /** Subscribes an in-memory listener to live published events. Returns an unsubscribe callback. */
+  subscribe(listener: EventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Appends an event to the unified workspace events.jsonl log atomically and broadcasts
+   * it to in-memory subscribers. Resolves to the serialized line or undefined on write failure.
+   */
+  async publish(event: BotEvent): Promise<string | undefined> {
     const lines = await appendEvents(this.workspace, [event]);
     const line = lines?.[0] ?? eventLine(event);
-    const shouldNotify = options?.notify ?? true;
-    if (this.notifier && shouldNotify) {
+    let record: WorkspaceLogRecord;
+    try {
+      record = JSON.parse(line) as WorkspaceLogRecord;
+    } catch {
+      record = { v: 1, t: new Date().toISOString(), ...event } as WorkspaceLogRecord;
+    }
+    for (const listener of this.listeners) {
       try {
-        await this.notify(event, line);
+        const res = listener(record, line);
+        if (res && typeof res.catch === "function") {
+          res.catch((error) => this.logger(error));
+        }
       } catch (error) {
         this.logger(error);
       }
     }
     return lines?.[0];
   }
-  /** Delivers a transient followup to the agent without appending to events.jsonl (e.g. heartbeat pings). */
-  async followup(text: string): Promise<void> {
-    await this.notifier?.followup(text);
+
+  /** Emits an event (alias for publish). */
+  async emit(event: BotEvent): Promise<string | undefined> {
+    return this.publish(event);
   }
 
-  private async notify(event: BotEvent, line: string): Promise<void> {
-    switch (event.type) {
-      case "message":
-      case "callback":
-        await this.notifier!.interrupt(line);
-        break;
-      case "task_settled": {
-        const outcome = event.status === "done"
-          ? "finished"
-          : event.status === "failed"
-            ? `failed (exit ${event.exitCode ?? "unknown"})`
-            : "aborted";
-        const promptText = event.prompt ? ` "${truncate(event.prompt, 100)}"` : "";
-        const message = `Task${promptText} ${outcome}. Run files: /workspace/.pi/tasks/${event.runId}/`;
-        await this.notifier!.followup(message);
-        break;
-      }
-      case "outbox_rejected":
-        await this.notifier!.interrupt(`Send ${event.requestId} rejected: ${event.detail}`);
-        break;
-      case "schedule_run_fired":
-        await this.notifier!.followup(event.prompt);
-        break;
-      case "chat_denied": {
-        if (event.chat_id > 0) {
-          const title = event.title ? ` ("${event.title}")` : "";
-          const message = `Access denied for private chat ${event.chat_id}${title}. To allow, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`;
-          await this.notifier!.followup(message);
+  /** Reads all parsed log records from events.jsonl. */
+  async readAll(): Promise<WorkspaceLogRecord[]> {
+    try {
+      const lines = await readJsonl(path.join(this.workspace, TG_BOT_DIR, EVENTS_FILE));
+      const records: WorkspaceLogRecord[] = [];
+      for (const line of lines) {
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as WorkspaceLogRecord;
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+            records.push(parsed);
+          }
+        } catch {
+          continue;
         }
-        break;
       }
-      case "browser_ready": {
-        const statusLabel = event.status === "started" ? "started" : "reused existing";
-        await this.notifier!.followup(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`);
-        break;
-      }
-      case "browser_request_failed":
-        await this.notifier!.followup(`Browser request ${event.requestId} failed: ${event.error}`);
-        break;
-      default:
-        // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_requested, browser_closed
-        break;
+      return records;
+    } catch {
+      return [];
     }
   }
+
+  /**
+   * Scans events.jsonl in reverse order (newest first) to find the first record matching predicate.
+   */
+  async findLast<T extends BotEvent = BotEvent>(
+    predicate: (record: WorkspaceLogRecord) => boolean,
+  ): Promise<WorkspaceLogRecord<T> | undefined> {
+    try {
+      const lines = await readJsonl(path.join(this.workspace, TG_BOT_DIR, EVENTS_FILE));
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as WorkspaceLogRecord;
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && predicate(parsed)) {
+            return parsed as unknown as WorkspaceLogRecord<T>;
+          }
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      // File missing or unreadable
+    }
+    return undefined;
+  }
 }
+
 
 /**
  * Appends events to the unified workspace event log. Opens the `.tg-bot` directory

@@ -65,10 +65,10 @@ async function writeLog(workspace: string, lines: string[]): Promise<void> {
 
 describe("parseCommand", () => {
   it("parses well-formed commands and rejects outcomes and junk", () => {
-    expect(parseCommand(sendRequest())).toEqual({ requestId: "req-1", request: { type: "send_message", text: "hi" } });
-    expect(parseCommand(spawnRequest())).toEqual({ runId: "run-1", prompt: "do it" });
-    expect(parseCommand(cancelRequest())).toEqual({ runId: "run-1" });
-    expect(parseCommand(steerTaskRequest())).toEqual({ steerId: "steer-1", runId: "run-1", message: "adjust" });
+    expect(parseCommand(sendRequest())).toEqual({ type: "send_request", requestId: "req-1", request: { type: "send_message", text: "hi" } });
+    expect(parseCommand(spawnRequest())).toEqual({ type: "spawn_request", runId: "run-1", prompt: "do it" });
+    expect(parseCommand(cancelRequest())).toEqual({ type: "cancel_request", runId: "run-1" });
+    expect(parseCommand(steerTaskRequest())).toEqual({ type: "steer_task_request", steerId: "steer-1", runId: "run-1", message: "adjust" });
     expect(parseCommand("not json")).toBeUndefined();
     expect(parseCommand(outcome({ type: "task_settled", runId: "run-1", status: "done", exitCode: 0 }))).toBeUndefined();
     expect(parseCommand(outcome({ type: "outbox_sent", requestId: "req-1" }))).toBeUndefined();
@@ -94,7 +94,7 @@ describe("WorkspaceRequestBus", () => {
     const bus = setupBus(workspace, { onSend });
 
     await bus.poll();
-    expect(onSend).toHaveBeenCalledWith({ requestId: "req-1", request: { type: "send_message", text: "hi" } }, workspace);
+    expect(onSend).toHaveBeenCalledWith({ type: "send_request", requestId: "req-1", request: { type: "send_message", text: "hi" } }, workspace);
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
   });
@@ -122,9 +122,9 @@ describe("WorkspaceRequestBus", () => {
     expect(onSend.mock.calls.map(([record]) => record.requestId)).toEqual(["req-fresh"]);
     expect(onSend).toHaveBeenCalledWith(expect.objectContaining({ requestId: "req-fresh" }), workspace);
     expect(onSpawn).toHaveBeenCalledTimes(1);
-    expect(onSpawn).toHaveBeenCalledWith({ runId: "run-fresh", prompt: "do it" }, workspace);
+    expect(onSpawn).toHaveBeenCalledWith({ type: "spawn_request", runId: "run-fresh", prompt: "do it" }, workspace);
     expect(onCancel).toHaveBeenCalledTimes(1);
-    expect(onCancel).toHaveBeenCalledWith({ runId: "run-cancel-fresh" }, workspace);
+    expect(onCancel).toHaveBeenCalledWith({ type: "cancel_request", runId: "run-cancel-fresh" }, workspace);
   });
   it("routes steer_task commands to onSteerTask", async () => {
     const { workspace } = await fixture();
@@ -133,7 +133,7 @@ describe("WorkspaceRequestBus", () => {
     const bus = setupBus(workspace, { onSteerTask });
 
     await bus.poll();
-    expect(onSteerTask).toHaveBeenCalledWith({ steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
+    expect(onSteerTask).toHaveBeenCalledWith({ type: "steer_task_request", steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
   });
 
   it("retries pending spawns until a slot frees", async () => {

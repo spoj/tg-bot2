@@ -6,9 +6,10 @@ import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
 import { TG_BOT_DIR, defined } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
-import { EVENTS_PROMPT } from "./events.js";
+import { EVENTS_PROMPT, type BotEvent } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 import { TASKS_PROMPT } from "./task-protocol.js";
+import { isMessageDirectedToBot } from "./telegram.js";
 
 export const SYSTEM_PROMPT = [
 `You are a persistent personal agent reached through Telegram. You serve several
@@ -86,6 +87,101 @@ export type AgentStatus = {
   activeTasks?: number;
   activeSchedules?: number;
 };
+
+export type AgentNotifier = {
+  interrupt(text: string): Promise<void>;
+  followup(text: string): Promise<void>;
+};
+
+export const KNOCK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown per unknown chat
+
+function truncate(text: string, maxLength: number): string {
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
+}
+
+function formatTaskSettledMessage(event: Extract<BotEvent, { type: "task_settled" }>): string {
+  const outcome = event.status === "done"
+    ? "finished"
+    : event.status === "failed"
+      ? `failed (exit ${event.exitCode ?? "unknown"})`
+      : "aborted";
+  const promptText = event.prompt ? ` "${truncate(event.prompt, 100)}"` : "";
+  return `Task${promptText} ${outcome}. Run files: /workspace/.pi/tasks/${event.runId}/`;
+}
+
+function formatDeniedChatMessage(event: Extract<BotEvent, { type: "chat_denied" }>): string {
+  const title = event.title ? ` ("${event.title}")` : "";
+  return `Access denied for private chat ${event.chat_id}${title}. To allow, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`;
+}
+
+/**
+ * Routes workspace events to agent notifications, applying interaction policy
+ * (interrupt vs followup vs ignore) and prompt formatting.
+ */
+export class AgentEventRouter {
+  private readonly lastKnockTimes = new Map<number, number>();
+  private readonly now: () => number;
+  private readonly botInfoProvider?: (() => { id: number; username?: string } | undefined) | undefined;
+
+  constructor(
+    private readonly notifier: AgentNotifier,
+    options: {
+      botInfo?: () => { id: number; username?: string } | undefined;
+      now?: () => number;
+    } = {},
+  ) {
+    this.botInfoProvider = options.botInfo;
+    this.now = options.now ?? Date.now;
+  }
+
+  async onEvent(event: BotEvent, rawLine: string): Promise<void> {
+    switch (event.type) {
+      case "message": {
+        const isPrivate = event.chat_id > 0;
+        const botInfo = this.botInfoProvider?.();
+        const msg = event.message as Parameters<typeof isMessageDirectedToBot>[0];
+        if (isPrivate || (msg && isMessageDirectedToBot(msg, botInfo))) {
+          await this.notifier.interrupt(rawLine);
+        }
+        break;
+      }
+      case "callback":
+        await this.notifier.interrupt(rawLine);
+        break;
+      case "task_settled":
+        await this.notifier.followup(formatTaskSettledMessage(event));
+        break;
+      case "outbox_rejected":
+        await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`);
+        break;
+      case "schedule_run_fired":
+        await this.notifier.followup(event.prompt);
+        break;
+      case "chat_denied": {
+        if (event.chat_id > 0) {
+          const lastTime = this.lastKnockTimes.get(event.chat_id) ?? 0;
+          const current = this.now();
+          if (current - lastTime >= KNOCK_COOLDOWN_MS) {
+            this.lastKnockTimes.set(event.chat_id, current);
+            await this.notifier.followup(formatDeniedChatMessage(event));
+          }
+        }
+        break;
+      }
+      case "browser_ready": {
+        const statusLabel = event.status === "started" ? "started" : "reused existing";
+        await this.notifier.followup(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`);
+        break;
+      }
+      case "browser_request_failed":
+        await this.notifier.followup(`Browser request ${event.requestId} failed: ${event.error}`);
+        break;
+      default:
+        // outbox_sent, poll_answer, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
+        break;
+    }
+  }
+}
 
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
 const NEW_SESSION_MARKER = path.join(TG_BOT_DIR, "new-session");

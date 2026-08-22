@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { WorkspaceTasks, type WorkspaceTaskWorkerOptions, type WorkspaceTasksOptions } from "../src/task.js";
-import { EventSink, type EventNotifier } from "../src/events.js";
+import { WorkspaceEventLog } from "../src/events.js";
+import { AgentEventRouter, type AgentNotifier } from "../src/agent.js";
 import type { PiRunResult } from "../src/pi-worker.js";
 import type { CancelRequest, SpawnRequest } from "../src/request-bus.js";
 
@@ -23,10 +24,10 @@ async function fixture(): Promise<{ dataDir: string; workspace: string }> {
 }
 
 function spawnRecord(runId: string, prompt: string): SpawnRequest {
-  return { runId, prompt };
+  return { type: "spawn_request", runId, prompt };
 }
 function cancelRecord(runId: string): CancelRequest {
-  return { runId };
+  return { type: "cancel_request", runId };
 }
 
 async function logEvents(workspace: string): Promise<Array<Record<string, unknown>>> {
@@ -69,12 +70,16 @@ const success = (stdout = "final report"): PiRunResult => ({ code: 0, signal: nu
 function setupTasks(
   workspace: string,
   factory: Mock,
-  options: Partial<WorkspaceTasksOptions> & { notifier?: EventNotifier } = {},
-): { service: WorkspaceTasks; events: EventSink } {
-  const events = new EventSink(workspace, options.notifier ?? { followup: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined) });
+  options: Partial<WorkspaceTasksOptions> & { notifier?: AgentNotifier } = {},
+): { service: WorkspaceTasks; events: WorkspaceEventLog } {
+  const events = new WorkspaceEventLog(workspace);
+  const notifier = options.notifier ?? { followup: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined) };
+  const router = new AgentEventRouter(notifier);
+  events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const service = new WorkspaceTasks({
     workspace,
     events,
+    notifier,
     appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
@@ -172,11 +177,11 @@ describe("WorkspaceTasks", () => {
     await service.handleSpawnRequest(spawnRecord("run-1", "initial prompt"), workspace);
     expect(tasks).toHaveLength(1);
 
-    await service.handleSteerRequest({ steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
+    await service.handleSteerRequest({ type: "steer_task_request", steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
     expect(tasks[0]?.steer).toHaveBeenCalledWith("use python 3.12");
 
     // Steering an unknown task is a safe no-op
-    await expect(service.handleSteerRequest({ steerId: "s-2", runId: "run-unknown", message: "noop" }, workspace))
+    await expect(service.handleSteerRequest({ type: "steer_task_request", steerId: "s-2", runId: "run-unknown", message: "noop" }, workspace))
       .resolves.toBeUndefined();
   });
 

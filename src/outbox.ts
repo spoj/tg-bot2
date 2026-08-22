@@ -1,5 +1,5 @@
 import { readAllowedFile } from "./allowlist.js";
-import type { EventSink } from "./events.js";
+import type { WorkspaceEventLog } from "./events.js";
 import { defined, errorMessage } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatcher, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 import type { SendRequest } from "./request-bus.js";
@@ -9,8 +9,8 @@ export type WorkspaceOutboxOptions = {
   workspace: string;
   /** Sends one validated request to Telegram and returns the response identifiers. */
   dispatch: WorkspaceOutboxDispatcher;
-  /** Unified event sink for outbox outcomes. */
-  events: EventSink;
+  /** Unified event log for publishing outbox outcomes. */
+  events: WorkspaceEventLog;
   logger?: (error: unknown) => void;
 };
 
@@ -19,13 +19,13 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 /**
  * Delivers send_request commands to Telegram: validates the request against the outbox
  * schema, checks its chat_id against the agent's allow list (the egress gate),
- * dispatches, and emits exactly one terminal event to EventSink: outbox_sent or
+ * dispatches, and emits exactly one terminal event to WorkspaceEventLog: outbox_sent or
  * outbox_rejected.
  */
 export class WorkspaceOutbox {
   private readonly workspace: string;
   private readonly dispatch: WorkspaceOutboxDispatcher;
-  private readonly events: EventSink;
+  private readonly events: WorkspaceEventLog;
   private readonly logger: (error: unknown) => void;
 
   constructor(options: WorkspaceOutboxOptions) {
@@ -73,7 +73,7 @@ export class WorkspaceOutbox {
     });
   }
 
-  /** Emits outbox_rejected to EventSink, which logs to events.jsonl and notifies the agent. */
+  /** Emits outbox_rejected to WorkspaceEventLog, which logs to events.jsonl and notifies subscribers. */
   private async recordRejection(requestId: string, chatId: number | undefined, error: unknown): Promise<void> {
     await this.events.emit({
       type: "outbox_rejected",

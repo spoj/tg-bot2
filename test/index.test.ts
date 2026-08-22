@@ -37,6 +37,9 @@ const state = vi.hoisted(() => {
       beginShutdown = agents.beginShutdown;
       disposeAll = agents.disposeAll;
     }),
+    agentEventRouter: vi.fn(class AgentEventRouterMock {
+      onEvent = vi.fn();
+    }),
     scheduler: vi.fn(class WorkspaceSchedulerMock {
       options: unknown;
       constructor(options: unknown) {
@@ -84,7 +87,7 @@ vi.mock("../src/sandbox.js", () => ({
   terminateActiveSandboxes: state.terminateActiveSandboxes,
   terminateProcessGroup: state.terminateProcessGroup,
 }));
-vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager }));
+vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager, AgentEventRouter: state.agentEventRouter }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
 vi.mock("../src/outbox.js", () => ({ WorkspaceOutbox: state.outbox }));
 vi.mock("../src/request-bus.js", () => ({ WorkspaceRequestBus: state.requestBus }));

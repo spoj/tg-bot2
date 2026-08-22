@@ -23,8 +23,8 @@ import {
   stopTelegramPoll,
   TelegramDeliveryQueue,
 } from "../src/telegram.js";
-import type { AgentStatus } from "../src/agent.js";
-import { appendEvents, EventSink } from "../src/events.js";
+import { AgentEventRouter, type AgentStatus } from "../src/agent.js";
+import { appendEvents, WorkspaceEventLog } from "../src/events.js";
 import { botPaths } from "../src/util.js";
 import { isMessageDirectedToBot } from "../src/telegram.js";
 import { resetAllowlistCache } from "../src/allowlist.js";
@@ -120,13 +120,18 @@ async function makeTestBot(
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
   const followup = agents.followup ?? vi.fn(async () => undefined);
-  const events = new EventSink(workspaceDir(dataDir), { interrupt: agents.interrupt, followup });
+  const events = new WorkspaceEventLog(workspaceDir(dataDir));
   const bot = createTelegramBot(
     { token: "999:test-token", botId: 999, dataDir },
     events,
     undefined,
     "status" in agents ? (agents as { status: () => Promise<AgentStatus> }) : undefined,
   );
+  const router = new AgentEventRouter(
+    { interrupt: agents.interrupt, followup },
+    { botInfo: () => (bot as unknown as { botInfo?: { id: number; username?: string } }).botInfo },
+  );
+  events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   (bot as unknown as { botInfo: unknown }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
   const fakeFetch: typeof fetch = async (input, init) => {
     if (recordRequests) {
@@ -152,7 +157,9 @@ async function runAttachmentFixture(
   beforeUpdate?: (bot: Bot) => void,
 ): Promise<Mock> {
   const prompt = vi.fn(async () => undefined);
-  const events = new EventSink(workspaceDir(dataDir), { interrupt: prompt, followup: vi.fn(async () => undefined) });
+  const events = new WorkspaceEventLog(workspaceDir(dataDir));
+  const router = new AgentEventRouter({ interrupt: prompt, followup: vi.fn(async () => undefined) });
+  events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const bot = createTelegramBot({
     token: "999:test-token",
     botId: 999,

@@ -223,16 +223,16 @@ sends a location pin (venue {title,address} sends a named venue instead).
 {type:"send_poll",chat_id,question,options,is_anonymous?,allows_multiple_answers?,poll_type?,correct_option_id?,reply_to_message_id?,disable_notification?}
 sends a poll: options has 2-10 choices, poll_type is "regular" or "quiz" (quiz
 requires correct_option_id). Set is_anonymous:false to receive each vote as a
-poll_answer event in chat.jsonl; the matching outbox_sent event in system.jsonl
+poll_answer event in events.jsonl; the matching outbox_sent event in events.jsonl
 records pollId.
 {type:"stop_poll",chat_id,message_id,reply_markup?} closes a poll early. Telegram's
-final closed Poll arrives as the data field of the matching outbox_sent event in system.jsonl;
+final closed Poll arrives as the data field of the matching outbox_sent event in events.jsonl;
 its id matches the poll_answer events' poll_id and the matching outbox_sent event's pollId.
-{type:"send_reaction",chat_id,message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message (from a message event in chat.jsonl or an outbox_sent event in system.jsonl).
-{type:"edit_message",chat_id,message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message from outbox_sent in system.jsonl).
-{type:"delete_message",chat_id,message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message from outbox_sent in system.jsonl).
+{type:"send_reaction",chat_id,message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message (from a message event or an outbox_sent event in events.jsonl).
+{type:"edit_message",chat_id,message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message from outbox_sent in events.jsonl).
+{type:"delete_message",chat_id,message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message from outbox_sent in events.jsonl).
 The send tool records one send_request command (with the requestId it returns to you) in
-.tg-bot/system.jsonl; the host validates and delivers it, appending exactly one
+.tg-bot/events.jsonl; the host validates and delivers it, appending exactly one
 outbox_sent or outbox_rejected event. outbox_sent echoes messageId/pollId for later
 edits, reactions, or deletes. A rejected send arrives as a followup naming the requestId
 and the rejection detail — fix and resend.

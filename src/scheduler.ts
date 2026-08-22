@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { EVENTS_FILE, type EventSink } from "./events.js";
+import { EVENTS_FILE, type WorkspaceEventLog } from "./events.js";
 import { TG_BOT_DIR, isMissing, openPinnedDirectory, readJsonl, type PinnedDirectory } from "./util.js";
 import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 
@@ -13,8 +13,8 @@ type ScheduleFile = {
 
 export type WorkspaceSchedulerOptions = {
   workspace: string;
-  /** Unified event sink for schedule occurrences and fired prompt followups. */
-  events: EventSink;
+  /** Unified event log for publishing schedule occurrences and fired events. */
+  events: WorkspaceEventLog;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -176,7 +176,7 @@ function foldScheduleEvent(state: FoldedSchedules, event: Record<string, unknown
  */
 export class WorkspaceScheduler {
   private readonly workspace: string;
-  private readonly events: EventSink;
+  private readonly events: WorkspaceEventLog;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;

@@ -1,7 +1,7 @@
 import { lstat, mkdir, opendir, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
-import type { EventSink } from "./events.js";
+import type { WorkspaceEventLog } from "./events.js";
 import { PiWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import type { CancelRequest, SpawnRequest, SteerTaskRequest } from "./request-bus.js";
@@ -35,12 +35,14 @@ export type WorkspaceTasksOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
-  /** Unified event sink for task settlements and heartbeat followups. */
-  events: EventSink;
-  /** Consumes pending commands from system.jsonl before each settle followup, so task sends order before the completion message. */
-  flush?: { flush(workspace: string): Promise<void> };
-  heartbeatIntervalMs?: number;
-  now?: () => number;
+  /** Unified event log for publishing task settlement events. */
+  events: WorkspaceEventLog;
+  /** Optional notifier for delivering transient status heartbeats to the agent. */
+  notifier?: { followup(text: string): Promise<void> } | undefined;
+  /** Consumes pending commands from events.jsonl before each settle followup, so task sends order before the completion message. */
+  flush?: { flush(workspace: string): Promise<void> } | undefined;
+  heartbeatIntervalMs?: number | undefined;
+  now?: (() => number) | undefined;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   logger?: (error: unknown) => void;
@@ -111,7 +113,7 @@ function formatDuration(milliseconds: number): string {
  * or at the next boot via an aborted stamp when the host itself died mid-run.
  */
 export class WorkspaceTasks {
-  private readonly events: EventSink;
+  private readonly events: WorkspaceEventLog;
   private readonly workspace: string;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
@@ -119,8 +121,8 @@ export class WorkspaceTasks {
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
-  /** Consumes pending system.jsonl commands before the settle followup; assigned after construction to avoid a construction cycle with the request bus. */
-  flush: WorkspaceTasksOptions["flush"];
+  private readonly flush: WorkspaceTasksOptions["flush"];
+  private readonly notifier?: { followup(text: string): Promise<void> } | undefined;
   private readonly heartbeatIntervalMs: number;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
@@ -144,6 +146,7 @@ export class WorkspaceTasks {
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
     this.events = options.events;
+    this.notifier = options.notifier;
     this.flush = options.flush;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.now = options.now ?? Date.now;
@@ -389,7 +392,7 @@ export class WorkspaceTasks {
     if (this.inFlight.length === 0) return;
     const lines = this.inFlight.map((task) => this.heartbeatLine(task));
     const message = `Task heartbeat: ${this.inFlight.length} task(s) running.\n${lines.join("\n")}`;
-    void this.events.followup(message).catch((error) => this.report(error));
+    void this.notifier?.followup(message).catch((error) => this.report(error));
   }
 
   private heartbeatLine(task: InFlightTask): string {

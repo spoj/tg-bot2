@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import hostTools from "../extensions/host-tools.js";
 import { HostBrowserManager, resolveChromeExecutable } from "../src/browser.js";
-import { EventSink, type BotEvent } from "../src/events.js";
+import { WorkspaceEventLog, type BotEvent } from "../src/events.js";
 import { WorkspaceRequestBus, parseCommand } from "../src/request-bus.js";
 
 describe("browser automation and lifecycle", () => {
@@ -79,7 +79,7 @@ describe("browser automation and lifecycle", () => {
         emittedEvents.push(event);
         return undefined;
       },
-    } as unknown as EventSink;
+    } as unknown as WorkspaceEventLog;
 
     const hostBrowser = new HostBrowserManager({
       workspace: root,
@@ -138,7 +138,7 @@ describe("browser automation and lifecycle", () => {
         emittedEvents.push(event);
         return undefined;
       },
-    } as unknown as EventSink;
+    } as unknown as WorkspaceEventLog;
 
     const fakeSpawn = (() => {
       throw new Error("Simulated spawn failure");
@@ -206,7 +206,7 @@ describe("browser automation and lifecycle", () => {
     try {
       // 1. Parse command directly
       const cmd = parseCommand(JSON.stringify({ type: "browser_requested", requestId: "test-req-1" }));
-      expect(cmd).toEqual({ requestId: "test-req-1" });
+      expect(cmd).toEqual({ type: "browser_requested", requestId: "test-req-1" });
 
       // 2. Append command to events.jsonl
       await writeFile(

@@ -1,5 +1,5 @@
 import { loadConfig, type BotConfig } from "./config.js";
-import { AgentManager } from "./agent.js";
+import { AgentManager, AgentEventRouter } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
@@ -8,7 +8,7 @@ import { WorkspaceTasks } from "./task.js";
 import type { Bot } from "grammy";
 import { HostBrowserManager } from "./browser.js";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
-import { EventSink } from "./events.js";
+import { WorkspaceEventLog } from "./events.js";
 import { botPaths } from "./util.js";
 import { pathToFileURL } from "node:url";
 
@@ -93,29 +93,34 @@ export async function main(): Promise<void> {
     const { workspace } = paths;
     const runtimeConfig = { ...botConfig, dataDir, ...paths };
 
+    const eventLog = new WorkspaceEventLog(workspace);
     const agentManager = new AgentManager({ workspace }, { appRoot: process.cwd(), bwrapPath, spawnProcess, terminateProcessGroup });
-    const eventSink = new EventSink(workspace, agentManager);
     const deliveryQueue = new TelegramDeliveryQueue();
-    const bot = createTelegramBot(runtimeConfig, eventSink, deliveryQueue, agentManager);
+    const bot = createTelegramBot(runtimeConfig, eventLog, deliveryQueue, agentManager);
+    const agentRouter = new AgentEventRouter(agentManager, { botInfo: () => bot.botInfo });
+    eventLog.subscribe((record, rawLine) => agentRouter.onEvent(record, rawLine));
+
     const schedulerInstance = new WorkspaceScheduler({
       workspace,
-      events: eventSink,
+      events: eventLog,
     });
     const outboxInstance = new WorkspaceOutbox({
       workspace,
-      events: eventSink,
+      events: eventLog,
       dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, request)),
     });
-    const tasksInstance = new WorkspaceTasks({
+    const browserManager = new HostBrowserManager({ workspace, events: eventLog });
+    const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
       workspace,
-      events: eventSink,
+      events: eventLog,
+      notifier: agentManager,
+      flush: { flush: (ws: string) => requestBus.flush(ws) },
       appRoot: process.cwd(),
       bwrapPath,
       spawnProcess,
       terminateProcessGroup,
     });
-    const browserManager = new HostBrowserManager({ workspace, events: eventSink });
-    const requestBus = new WorkspaceRequestBus({
+    const requestBus: WorkspaceRequestBus = new WorkspaceRequestBus({
       workspace,
       onSend: (record, ws) => outboxInstance.handleSendRequest(record, ws),
       onSpawn: (record, ws) => tasksInstance.handleSpawnRequest(record, ws),
@@ -123,7 +128,6 @@ export async function main(): Promise<void> {
       onSteerTask: (record, ws) => tasksInstance.handleSteerRequest(record, ws),
       onStartBrowser: (record) => browserManager.handleStartBrowserRequest(record).then(() => {}),
     });
-    tasksInstance.flush = requestBus;
     return {
       config: runtimeConfig,
       paths,

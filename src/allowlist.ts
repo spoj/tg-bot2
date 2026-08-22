@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { errorCode, readJsonl, TG_BOT_DIR } from "./util.js";
-import { EVENTS_FILE, type EventSink } from "./events.js";
+import { errorCode, TG_BOT_DIR } from "./util.js";
+import { WorkspaceEventLog } from "./events.js";
 /**
  * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, containing an array of safe integer chat IDs.
  * The host enforces it both ways and emits `allowlist_updated` whenever changes are detected.
@@ -70,19 +70,10 @@ export function resetAllowlistCache(workspace?: string): void {
   else lastEmittedAllowlists.clear();
 }
 
-async function lastLoggedAllowlist(workspace: string): Promise<string | undefined> {
-  try {
-    const lines = await readJsonl(path.join(workspace, TG_BOT_DIR, EVENTS_FILE));
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i];
-      if (!line) continue;
-      const parsed = JSON.parse(line) as Record<string, unknown>;
-      if (parsed.type === "allowlist_updated" && Array.isArray(parsed.chats)) {
-        return JSON.stringify(parsed.chats);
-      }
-    }
-  } catch {
-    // Missing or empty file
+async function lastLoggedAllowlist(eventLog: WorkspaceEventLog): Promise<string | undefined> {
+  const record = await eventLog.findLast((entry) => entry.type === "allowlist_updated" && "chats" in entry && Array.isArray(entry.chats));
+  if (record && record.type === "allowlist_updated") {
+    return JSON.stringify(record.chats);
   }
   return undefined;
 }
@@ -91,16 +82,16 @@ async function lastLoggedAllowlist(workspace: string): Promise<string | undefine
  * Synchronizes the allow list: reads `allowed.json`, compares against the in-memory cache
  * (seeded once from `events.jsonl` on first check after boot), and emits `allowlist_updated` if changed.
  */
-export async function syncAllowlist(workspace: string, events?: EventSink): Promise<number[] | null> {
+export async function syncAllowlist(workspace: string, events?: WorkspaceEventLog): Promise<number[] | null> {
   const file = await readAllowedFile(workspace);
+  const eventLog = events ?? new WorkspaceEventLog(workspace);
 
   if (!lastEmittedAllowlists.has(workspace)) {
-    const logged = await lastLoggedAllowlist(workspace);
+    const logged = await lastLoggedAllowlist(eventLog);
     if (logged !== undefined) {
       lastEmittedAllowlists.set(workspace, logged);
     }
   }
-
   if (file.status !== "ready") {
     if (lastEmittedAllowlists.has(workspace)) {
       lastEmittedAllowlists.delete(workspace);

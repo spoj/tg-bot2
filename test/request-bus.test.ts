@@ -70,6 +70,7 @@ describe("parseCommand", () => {
     expect(parseCommand(cancelRequest())).toEqual({ type: "cancel_request", runId: "run-1" });
     expect(parseCommand(steerTaskRequest())).toEqual({ type: "steer_task_request", steerId: "steer-1", runId: "run-1", message: "adjust" });
     expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "new_session_request", requestId: "ns-1", chat_id: 42 })}\n`)).toEqual({ type: "new_session_request", requestId: "ns-1", chat_id: 42 });
+    expect(parseCommand(`${JSON.stringify({ v: 1, t: "t", type: "schedule_run_fired", runId: "sched-1", prompt: "morning briefing" })}\n`)).toEqual({ type: "spawn_request", runId: "sched-1", prompt: "morning briefing" });
     expect(parseCommand("not json")).toBeUndefined();
     expect(parseCommand(outcome({ type: "task_settled", runId: "run-1", status: "done", exitCode: 0 }))).toBeUndefined();
     expect(parseCommand(outcome({ type: "outbox_sent", requestId: "req-1" }))).toBeUndefined();
@@ -99,6 +100,18 @@ describe("WorkspaceRequestBus", () => {
     await bus.poll();
     expect(onSend).toHaveBeenCalledTimes(1);
   });
+  it("routes schedule_run_fired to onSpawn reusing the schedule runId", async () => {
+    const { workspace } = await fixture();
+    await writeLog(workspace, [
+      `${JSON.stringify({ v: 1, t: "t", type: "schedule_run_fired", runId: "sched-run-42", prompt: "daily report" })}\n`,
+    ]);
+    const onSpawn = vi.fn<SpawnRequestHandler>(async () => "claimed");
+    const bus = setupBus(workspace, { onSpawn });
+
+    await bus.poll();
+    expect(onSpawn).toHaveBeenCalledWith({ type: "spawn_request", runId: "sched-run-42", prompt: "daily report" }, workspace);
+  });
+
 
   it("boot replay skips terminal sends and tasks, and routes fresh ones", async () => {
     const { workspace } = await fixture();

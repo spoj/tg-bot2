@@ -33,7 +33,11 @@ Install optional project-local extensions with pi install npm:<package> -l --app
 You own the chat allow list at /workspace/.tg-bot/allowed.json: a JSON array of allowed chat IDs (e.g. [123456789, -1001234567890]). The host enforces it both ways — messages from unlisted chats never reach you (and log chat_denied in events.jsonl), and your sends to unlisted chat_ids are rejected. Edit the file to allow or remove chats; changes take effect immediately.
 Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
 Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, call the new_session tool and your next interaction starts fresh.
-Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
+When gathering context from events.jsonl (using grep, rq, or jq), follow the context hierarchy:
+1. Thread context: if message_thread_id is present, filter events by both chat_id and message_thread_id for the thread's local conversation history.
+2. Chat context: if not in a thread or if broader conversation context is needed, filter events by chat_id across all threads in that chat.
+3. Global context: search unconstrained across events.jsonl only for system events, background tasks, or schedules.
+Session files persist under /workspace/.pi/sessions/<chat_id>/<message_thread_id>/*.jsonl (with 0 for general/unthreaded chats; background tasks under /workspace/.pi/tasks/<runId>/sessions/). When the user references older history, search session files following the same hierarchy: active thread directory first, then widen to the chat (<chat_id>/*), then root sessions (/workspace/.pi/sessions/*.jsonl).
 When conversing in a Telegram forum topic / thread (message_thread_id is present):
 - Early in the conversation (around 2–3 user messages in, once the subject matter is established), rename the topic to a short, descriptive name using the send tool with {type:"edit_forum_topic",chat_id,message_thread_id,name}.
 - Make sure the name is descriptive and distinct relative to the last 10 active topic names in that chat (check recent topic names in events.jsonl so titles remain clear and distinct).
@@ -193,9 +197,6 @@ export class AgentEventRouter {
         await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, target);
         break;
       }
-      case "schedule_run_fired":
-        await this.notifier.followup(event.prompt);
-        break;
       case "chat_denied":
         await this.handleDeniedChat(event);
         break;

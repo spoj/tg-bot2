@@ -371,7 +371,8 @@ Outcomes (host-written, exactly one terminal event per command):
 - schedule_run_scheduled: {v:1,t,type:'schedule_run_scheduled',runId,prompt,start,recurrence,dueAt}
   when the host materializes one occurrence of a schedules.json row; runId is the
   host-assigned UUID, prompt/start/recurrence are the row snapshot, dueAt this firing time.
-- schedule_run_fired: {v:1,t,type:'schedule_run_fired',runId,prompt} when that occurrence ran.
+- schedule_run_fired: {v:1,t,type:'schedule_run_fired',runId,prompt} when that occurrence
+  fired to spawn its background task run.
 - schedule_run_cancelled: {v:1,t,type:'schedule_run_cancelled',runId} when its row was
   removed or edited before it fired.
 - allowlist_updated: {v:1,t,type:'allowlist_updated',chats:[...]} when the host
@@ -388,8 +389,10 @@ Outcomes (host-written, exactly one terminal event per command):
 - new_session_scheduled: {v:1,t,type:'new_session_scheduled',requestId,chat_id?,message_thread_id?} when
   the host schedules the conversation context reset.
 Every send_request is followed by exactly one outbox_sent or outbox_rejected; every
-spawn_request (and cancel) by exactly one task_settled. Grep events.jsonl for chat
-history, commands, and host activity.
+spawn_request (and cancel) by exactly one task_settled. Query events.jsonl (with grep,
+rq, or jq) for chat history, commands, and host activity using the context hierarchy:
+filter by chat_id and message_thread_id for thread history, by chat_id for chat history,
+or unconstrained for global activity.
 When a user message or button press arrives from an allowed chat, the host interrupts
 you with the exact JSON line it just appended to events.jsonl for that event
 ({v:1,t,type,...}); events arriving close together are batched, and you receive one

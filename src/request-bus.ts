@@ -104,7 +104,8 @@ export function parseCommand(line: string): CommandRequest | undefined {
   switch (typed.type) {
     case "send_request":
       return { type: "send_request", requestId: id, request: typed.request };
-    case "spawn_request": {
+    case "spawn_request":
+    case "schedule_run_fired": {
       const prompt = typed.prompt;
       return typeof prompt === "string" ? { type: "spawn_request", runId: id, prompt } : undefined;
     }

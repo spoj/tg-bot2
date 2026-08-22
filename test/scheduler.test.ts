@@ -4,7 +4,6 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { WorkspaceScheduler, type WorkspaceSchedulerOptions } from "../src/scheduler.js";
 import { WorkspaceEventLog } from "../src/events.js";
-import { AgentEventRouter } from "../src/agent.js";
 import { defined } from "../src/util.js";
 import type { ScheduleRow } from "../src/schedule-protocol.js";
 
@@ -43,20 +42,14 @@ async function withDirectory(test: (dataDir: string) => Promise<void>): Promise<
 
 function makeScheduler(
   dataDir: string,
-  options: Partial<WorkspaceSchedulerOptions> & { followup?: (text: string) => Promise<void> } = {},
+  options: Partial<WorkspaceSchedulerOptions> = {},
 ): { scheduler: WorkspaceScheduler; events: WorkspaceEventLog } {
   const defaultWorkspace = path.join(dataDir, "workspace");
   const defaultEvents = new WorkspaceEventLog(defaultWorkspace);
-  const router = new AgentEventRouter({
-    followup: options.followup ?? vi.fn(async () => undefined),
-    interrupt: vi.fn(async () => undefined),
-  });
-  defaultEvents.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const {
     workspace = defaultWorkspace,
     events = defaultEvents,
     now = () => NOW,
-    followup: _f,
     ...rest
   } = options;
   const scheduler = new WorkspaceScheduler({
@@ -83,12 +76,10 @@ function fakeInterval() {
 describe("WorkspaceScheduler firing", () => {
   it("fires a due schedule and appends schedule_run_fired to events.jsonl", () => withDirectory(async (dataDir) => {
     await writeSchedules(dataDir, [row()]);
-    const followup = vi.fn(async () => undefined);
-    const { scheduler } = makeScheduler(dataDir, { followup });
+    const { scheduler } = makeScheduler(dataDir);
 
     await scheduler.poll(NOW);
 
-    expect(followup).toHaveBeenCalledWith("water the plants");
     const events = await logEvents(dataDir);
     expect(events).toMatchObject([
       { type: "schedule_run_scheduled", prompt: "water the plants" },
@@ -98,16 +89,16 @@ describe("WorkspaceScheduler firing", () => {
 
   it("advances a recurring schedule after firing", () => withDirectory(async (dataDir) => {
     await writeSchedules(dataDir, [row({ recurrence: "daily", start: "2026-01-10T12:00:00.000Z" })]);
-    const followup = vi.fn(async () => undefined);
-    const { scheduler } = makeScheduler(dataDir, { followup });
+    const { scheduler } = makeScheduler(dataDir);
 
     await scheduler.poll(NOW);
-    expect(followup).toHaveBeenCalledTimes(1);
 
     const events = await logEvents(dataDir);
     const scheduled = events.filter((e) => e.type === "schedule_run_scheduled");
     expect(scheduled).toHaveLength(2);
     expect(scheduled[1]).toMatchObject({ dueAt: "2026-01-11T12:00:00.000Z" });
+    const fired = events.filter((e) => e.type === "schedule_run_fired");
+    expect(fired).toHaveLength(1);
   }));
 
   it("cancels runs whose row vanished from schedules.json", () => withDirectory(async (dataDir) => {
@@ -145,15 +136,15 @@ describe("WorkspaceScheduler firing", () => {
 
   it("recovers state from events.jsonl at boot without duplicate runs", () => withDirectory(async (dataDir) => {
     await writeSchedules(dataDir, [row()]);
-    const followup1 = vi.fn(async () => undefined);
-    const { scheduler: scheduler1 } = makeScheduler(dataDir, { followup: followup1 });
+    const { scheduler: scheduler1 } = makeScheduler(dataDir);
     await scheduler1.poll(NOW);
-    expect(followup1).toHaveBeenCalledTimes(1);
+    const events1 = await logEvents(dataDir);
+    expect(events1.filter((e) => e.type === "schedule_run_fired")).toHaveLength(1);
 
-    const followup2 = vi.fn(async () => undefined);
-    const { scheduler: scheduler2 } = makeScheduler(dataDir, { followup: followup2 });
+    const { scheduler: scheduler2 } = makeScheduler(dataDir);
     await scheduler2.poll(NOW);
-    expect(followup2).not.toHaveBeenCalled();
+    const events2 = await logEvents(dataDir);
+    expect(events2.filter((e) => e.type === "schedule_run_fired")).toHaveLength(1);
   }));
 });
 

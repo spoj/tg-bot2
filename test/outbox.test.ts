@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { setTimeout as realSetTimeout } from "node:timers";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -50,8 +51,25 @@ async function send(
   dispatch: WorkspaceOutboxDispatcher,
   request: unknown,
   origin?: string,
+  options: Partial<WorkspaceOutboxOptions> = {},
 ): Promise<OutboxSendResult> {
-  return setupOutbox(workspace, eventsLog, dispatch).outbox.send(request, origin);
+  return setupOutbox(workspace, eventsLog, dispatch, options).outbox.send(request, origin);
+}
+
+function rateLimitError(retryAfter: number): Error {
+  return Object.assign(new Error(`Too Many Requests: retry after ${retryAfter}`), {
+    error_code: 429,
+    parameters: { retry_after: retryAfter },
+  });
+}
+
+/** Yields to the real event loop until the fake clock has a pending retry timer. */
+async function waitForRetryTimer(): Promise<void> {
+  for (let attempts = 0; attempts < 500; attempts++) {
+    if (vi.getTimerCount() > 0) return;
+    await new Promise((resolve) => realSetTimeout(resolve, 1));
+  }
+  throw new Error("Timed out waiting for a retry timer to be scheduled");
 }
 
 const valid = (filePath = "/workspace/report.txt") => ({
@@ -246,6 +264,7 @@ describe("WorkspaceOutbox", () => {
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
     await expect(send(workspace, eventsLog, dispatch, valid(), "42:0")).rejects.toThrow("upload failed");
+    expect(dispatch).toHaveBeenCalledTimes(1);
     const events = await logEvents(eventsLog);
     expect(events).toMatchObject([
       { type: "outbox_rejected", chat_id: 42, origin: "42:0", detail: expect.stringContaining("upload failed") },
@@ -410,5 +429,107 @@ describe("WorkspaceOutbox", () => {
       origin: "42:100",
       chat_id: 999,
     });
+  });
+
+  it("retries on 429 and emits a single outbox_sent once a retry succeeds", async () => {
+    const { workspace, eventsLog } = await fixture();
+    await allowChat(workspace, 42);
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn<WorkspaceOutboxDispatcher>()
+        .mockRejectedValueOnce(rateLimitError(5))
+        .mockRejectedValueOnce(rateLimitError(1))
+        .mockResolvedValueOnce({ messageId: 9001 });
+      const pending = send(workspace, eventsLog, dispatch, valid());
+      await waitForRetryTimer();
+      await vi.advanceTimersByTimeAsync(5_100);
+      await waitForRetryTimer();
+      await vi.advanceTimersByTimeAsync(1_100);
+      await expect(pending).resolves.toMatchObject({ messageId: 9001, request_type: "send_file" });
+      expect(dispatch).toHaveBeenCalledTimes(3);
+      const events = await logEvents(eventsLog);
+      expect(events.filter((e) => e.type === "outbox_sent")).toHaveLength(1);
+      expect(events.filter((e) => e.type === "outbox_rejected")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records exactly one outbox_rejected when every attempt is rate-limited", async () => {
+    const { workspace, eventsLog } = await fixture();
+    await allowChat(workspace, 42);
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn<WorkspaceOutboxDispatcher>().mockRejectedValue(rateLimitError(5));
+      const pending = send(workspace, eventsLog, dispatch, valid());
+      await waitForRetryTimer();
+      await vi.advanceTimersByTimeAsync(5_100);
+      await waitForRetryTimer();
+      await vi.advanceTimersByTimeAsync(5_100);
+      await expect(pending).rejects.toThrow("Too Many Requests");
+      expect(dispatch).toHaveBeenCalledTimes(3);
+      const events = await logEvents(eventsLog);
+      expect(events.filter((e) => e.type === "outbox_rejected")).toHaveLength(1);
+      expect(events.filter((e) => e.type === "outbox_sent")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps the retry_after backoff at 60 seconds per retry", async () => {
+    const { workspace, eventsLog } = await fixture();
+    await allowChat(workspace, 42);
+    vi.useFakeTimers();
+    try {
+      const delays: number[] = [];
+      const fakeSetTimeout = globalThis.setTimeout;
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler, ms?: number) => {
+        if (ms !== undefined) delays.push(ms);
+        return fakeSetTimeout(callback, ms);
+      }) as typeof setTimeout);
+      const dispatch = vi.fn<WorkspaceOutboxDispatcher>().mockRejectedValue(rateLimitError(300));
+      const pending = send(workspace, eventsLog, dispatch, valid());
+      await waitForRetryTimer();
+      await vi.advanceTimersByTimeAsync(61_000);
+      await waitForRetryTimer();
+      await vi.advanceTimersByTimeAsync(61_000);
+      await expect(pending).rejects.toThrow("Too Many Requests");
+      expect(dispatch).toHaveBeenCalledTimes(3);
+      expect(delays).toEqual([60_000, 60_000]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("logs loudly when outbox_sent cannot be persisted but still returns the outcome", async () => {
+    const { workspace, dataDir } = await fixture();
+    await allowChat(workspace, 42);
+    const blocked = path.join(dataDir, "blocked");
+    await writeFile(blocked, "not a directory", "utf8");
+    const errors: unknown[] = [];
+    const dispatch = vi.fn(async () => ({ messageId: 9001 }));
+
+    const result = await send(workspace, path.join(blocked, "events.jsonl"), dispatch, valid(), undefined, {
+      logger: (e: unknown) => errors.push(e),
+    });
+
+    expect(result).toMatchObject({ messageId: 9001 });
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain("Could not persist outbox_sent");
+  });
+
+  it("logs loudly when outbox_rejected cannot be persisted", async () => {
+    const { workspace, dataDir } = await fixture();
+    await allowChat(workspace, 42);
+    const blocked = path.join(dataDir, "blocked");
+    await writeFile(blocked, "not a directory", "utf8");
+    const errors: unknown[] = [];
+
+    await expect(send(workspace, path.join(blocked, "events.jsonl"), vi.fn(async () => { throw new Error("upload failed"); }), valid(), "42:0", {
+      logger: (e: unknown) => errors.push(e),
+    })).rejects.toThrow("upload failed");
+
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain("Could not persist outbox_rejected");
   });
 });

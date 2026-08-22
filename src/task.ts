@@ -455,7 +455,7 @@ export class WorkspaceTasks {
       signal: result.signal,
       ...defined({ stderr }),
     }), { encoding: "utf8", mode: 0o600 });
-    await this.events.emit({
+    const emitted = await this.events.emit({
       type: "task_settled",
       runId: task.runId,
       prompt: task.prompt,
@@ -463,6 +463,9 @@ export class WorkspaceTasks {
       exitCode: result.code,
       ...defined({ origin: task.origin, stderr }),
     });
+    if (emitted === undefined) {
+      this.report(new Error(`Could not persist task_settled for run ${task.runId}`));
+    }
   }
 
   /** Emits a task_progress event while tasks run; silent when everything is idle. */

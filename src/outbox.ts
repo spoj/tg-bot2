@@ -48,16 +48,35 @@ function extractRawThreadId(request: unknown): number | undefined {
 }
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
+const MAX_OUTBOX_ATTEMPTS = 3;
+const MAX_RETRY_AFTER_SECONDS = 60;
 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
+
+/** Retry delay in seconds for a Telegram 429 (rate limit) error, capped at 60s; undefined for non-429 errors. */
+function retryDelaySeconds(error: unknown): number | undefined {
+  if (error === null || typeof error !== "object") return undefined;
+  const candidate = error as { error_code?: unknown; parameters?: { retry_after?: unknown } };
+  if (candidate.error_code !== 429 || typeof candidate.parameters !== "object" || candidate.parameters === null) return undefined;
+  const retryAfter = candidate.parameters.retry_after;
+  if (typeof retryAfter !== "number" || !Number.isFinite(retryAfter) || retryAfter <= 0) return undefined;
+  return Math.min(retryAfter, MAX_RETRY_AFTER_SECONDS);
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
 /**
  * Delivers send tool calls to Telegram synchronously: validates the request
  * against the outbox schema, checks its chat_id against the agent's allow list
- * (the egress gate), dispatches, records exactly one terminal event
- * (outbox_sent or outbox_rejected) in the events log, and returns the outcome
- * to the caller. Failures throw with the rejection detail.
+ * (the egress gate), dispatches (retrying Telegram 429 rate limits with a capped
+ * retry_after backoff, up to MAX_OUTBOX_ATTEMPTS attempts), records exactly one
+ * terminal event (outbox_sent or outbox_rejected) in the events log, and returns
+ * the outcome to the caller. Failures throw with the rejection detail.
  */
 export class WorkspaceOutbox {
   private readonly workspace: string;
@@ -92,16 +111,27 @@ export class WorkspaceOutbox {
       await this.reject(requestId, chatId, threadId, new Error(`Chat ${chatId} is not on the allow list`), origin);
     }
     let result: WorkspaceOutboxDispatchResult | undefined;
-    try {
-      result = await this.dispatch(chatId, validated);
-    } catch (error) {
-      await this.reject(requestId, chatId, threadId, error, origin);
+    let dispatchError: unknown;
+    for (let attempt = 1; attempt <= MAX_OUTBOX_ATTEMPTS; attempt++) {
+      try {
+        result = await this.dispatch(chatId, validated);
+        dispatchError = undefined;
+        break;
+      } catch (error) {
+        dispatchError = error;
+        const retryAfter = retryDelaySeconds(error);
+        if (retryAfter === undefined || attempt === MAX_OUTBOX_ATTEMPTS) break;
+        await sleep(retryAfter * 1000);
+      }
+    }
+    if (dispatchError !== undefined) {
+      await this.reject(requestId, chatId, threadId, dispatchError, origin);
     }
     const summary = extractRequestSummary(validated);
     const resolvedThreadId = ("message_thread_id" in validated && typeof validated.message_thread_id === "number")
       ? validated.message_thread_id
       : result?.messageThreadId;
-    await this.events.emit({
+    const emitted = await this.events.emit({
       type: "outbox_sent",
       requestId,
       chat_id: chatId,
@@ -115,6 +145,9 @@ export class WorkspaceOutbox {
         data: result?.data,
       }),
     });
+    if (emitted === undefined) {
+      this.logger(new Error(`Could not persist outbox_sent for request ${requestId}`));
+    }
     return {
       requestId,
       request_type: validated.type,
@@ -151,8 +184,9 @@ export class WorkspaceOutbox {
 
   /** Emits outbox_rejected to the events log. */
   private async recordRejection(requestId: string, chatId: number | undefined, threadId: number | undefined, error: unknown, origin?: string | undefined): Promise<void> {
+    let emitted: string | undefined;
     try {
-      await this.events.emit({
+      emitted = await this.events.emit({
         type: "outbox_rejected",
         requestId,
         detail: errorMessage(error),
@@ -160,6 +194,10 @@ export class WorkspaceOutbox {
       });
     } catch (emitError) {
       this.logger(emitError);
+      return;
+    }
+    if (emitted === undefined) {
+      this.logger(new Error(`Could not persist outbox_rejected for request ${requestId}`));
     }
   }
 }

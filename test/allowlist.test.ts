@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { readAllowedFile, syncAllowlist } from "../src/allowlist.js";
 import { WorkspaceEventLog } from "../src/events.js";
@@ -110,6 +111,44 @@ describe("allowlist", () => {
       expect(await eventLog.readAll()).toHaveLength(1); // Still only the seeded event
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed as malformed on a FIFO at allowed.json without blocking", async () => {
+    const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
+      execFileSync("mkfifo", [path.join(workspace, ".tg-bot", "allowed.json")]);
+
+      expect(await readAllowedFile(workspace)).toEqual({ status: "malformed" });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed as malformed on a symlinked allowed.json without following it", async () => {
+    const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
+      await symlink("/etc/passwd", path.join(workspace, ".tg-bot", "allowed.json"));
+
+      expect(await readAllowedFile(workspace)).toEqual({ status: "malformed" });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed as malformed on an oversized allowed.json", async () => {
+    const workspace = path.join(os.tmpdir(), `allow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
+      const filePath = path.join(workspace, ".tg-bot", "allowed.json");
+      await writeFile(filePath, JSON.stringify([10]));
+      await truncate(filePath, 1024 * 1024 + 1);
+
+      expect(await readAllowedFile(workspace)).toEqual({ status: "malformed" });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 });

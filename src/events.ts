@@ -185,11 +185,14 @@ export class WorkspaceEventLog {
 
   /**
    * Appends an event to the events log atomically and broadcasts it to in-memory
-   * subscribers. Resolves to the serialized line or undefined on write failure.
+   * subscribers. Resolves to the serialized line, or undefined when the append
+   * failed — in which case listeners are NOT notified, so an in-memory terminal
+   * outcome can never outlive a failed persistence.
    */
   async publish(event: BotEvent): Promise<string | undefined> {
     const lines = await appendEvents(this.logPath, [event]);
-    const line = lines?.[0] ?? eventLine(event);
+    if (lines === undefined) return undefined;
+    const line = lines[0] as string;
     let record: WorkspaceLogRecord;
     try {
       record = JSON.parse(line) as WorkspaceLogRecord;
@@ -206,7 +209,7 @@ export class WorkspaceEventLog {
         this.logger(error);
       }
     }
-    return lines?.[0];
+    return line;
   }
 
   /** Emits an event (alias for publish). */
@@ -214,26 +217,28 @@ export class WorkspaceEventLog {
     return this.publish(event);
   }
 
-  /** Reads all parsed log records from the events log. */
+  /** Reads all parsed log records from the events log. Read failures are logged, never silently treated as an empty log. */
   async readAll(): Promise<WorkspaceLogRecord[]> {
+    let lines: string[];
     try {
-      const lines = await readJsonl(this.logPath);
-      const records: WorkspaceLogRecord[] = [];
-      for (const line of lines) {
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line) as WorkspaceLogRecord;
-          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-            records.push(parsed);
-          }
-        } catch {
-          continue;
-        }
-      }
-      return records;
-    } catch {
+      lines = await readJsonl(this.logPath);
+    } catch (error) {
+      this.logger(error);
       return [];
     }
+    const records: WorkspaceLogRecord[] = [];
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as WorkspaceLogRecord;
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          records.push(parsed);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return records;
   }
 
   /**
@@ -242,22 +247,24 @@ export class WorkspaceEventLog {
   async findLast<T extends BotEvent = BotEvent>(
     predicate: (record: WorkspaceLogRecord) => boolean,
   ): Promise<WorkspaceLogRecord<T> | undefined> {
+    let lines: string[];
     try {
-      const lines = await readJsonl(this.logPath);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i];
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line) as WorkspaceLogRecord;
-          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && predicate(parsed)) {
-            return parsed as unknown as WorkspaceLogRecord<T>;
-          }
-        } catch {
-          continue;
+      lines = await readJsonl(this.logPath);
+    } catch (error) {
+      this.logger(error);
+      return undefined;
+    }
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as WorkspaceLogRecord;
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && predicate(parsed)) {
+          return parsed as unknown as WorkspaceLogRecord<T>;
         }
+      } catch {
+        continue;
       }
-    } catch {
-      // File missing or unreadable
     }
     return undefined;
   }

@@ -1,7 +1,8 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceScheduler, type WorkspaceSchedulerOptions } from "../src/scheduler.js";
 import { WorkspaceEventLog } from "../src/events.js";
 import { defined } from "../src/util.js";
@@ -72,6 +73,10 @@ function fakeInterval() {
     clearIntervalMock: vi.fn(),
   };
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("WorkspaceScheduler firing", () => {
   it("fires a due schedule and appends schedule_run_fired to events.jsonl", () => withDirectory(async (dataDir) => {
@@ -166,6 +171,66 @@ describe("WorkspaceScheduler validation", () => {
     await scheduler.poll(NOW);
     expect(errors).toHaveLength(1);
     expect((errors[0] as Error).message).toContain("Malformed schedules");
+  }));
+});
+
+describe("WorkspaceScheduler durability", () => {
+  it("reports a FIFO at schedules.json instead of blocking on it", () => withDirectory(async (dataDir) => {
+    const metadata = path.join(dataDir, "workspace", ".tg-bot");
+    await mkdir(metadata, { recursive: true });
+    execFileSync("mkfifo", [path.join(metadata, "schedules.json")]);
+    const errors: unknown[] = [];
+    const { scheduler } = makeScheduler(dataDir, { logger: (e: unknown) => errors.push(e) });
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain("Could not read schedules");
+    expect(await logEvents(dataDir)).toHaveLength(0);
+  }));
+
+  it("reports an oversized schedules.json as an explicit error", () => withDirectory(async (dataDir) => {
+    const filePath = await writeSchedules(dataDir, []);
+    await truncate(filePath, 1024 * 1024 + 1);
+    const errors: unknown[] = [];
+    const { scheduler } = makeScheduler(dataDir, { logger: (e: unknown) => errors.push(e) });
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain("Could not read schedules");
+    expect((errors[0] as { cause?: { message?: string } }).cause?.message).toContain("exceeds");
+    expect(await logEvents(dataDir)).toHaveLength(0);
+  }));
+
+  it("does not schedule a run whose schedule_run_scheduled did not persist", () => withDirectory(async (dataDir) => {
+    await writeSchedules(dataDir, [row()]);
+    const errors: unknown[] = [];
+    const fireTask = vi.fn(async () => {});
+    const { scheduler, events } = makeScheduler(dataDir, { fireTask, logger: (e: unknown) => errors.push(e) });
+    vi.spyOn(events, "emit").mockResolvedValue(undefined);
+
+    await scheduler.poll(NOW);
+
+    expect(fireTask).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain("Could not persist schedule_run_scheduled");
+    expect(await logEvents(dataDir)).toHaveLength(0);
+  }));
+
+  it("does not launch the task when schedule_run_fired did not persist", () => withDirectory(async (dataDir) => {
+    await writeSchedules(dataDir, [row()]);
+    const errors: unknown[] = [];
+    const fireTask = vi.fn(async () => {});
+    const { scheduler, events } = makeScheduler(dataDir, { fireTask, logger: (e: unknown) => errors.push(e) });
+    const emitSpy = vi.spyOn(events, "emit");
+    emitSpy.mockImplementationOnce(async () => "scheduled-line").mockImplementationOnce(async () => undefined);
+
+    await scheduler.poll(NOW);
+
+    expect(fireTask).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain("Could not persist schedule_run_fired");
   }));
 });
 

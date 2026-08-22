@@ -115,6 +115,9 @@ You own the chat allow list at /workspace/.tg-bot/allowed.json: a JSON array of 
 Choose your model and thinking level by editing /workspace/.pi/agent/settings.json (defaultProvider, defaultModel, defaultThinkingLevel); new values apply from your next run. Edit the file atomically because a malformed settings file breaks the next run.
 Your session resumes across runs for up to two hours of inactivity; after a longer gap the next run starts fresh. To reset your context deliberately, call the new_session tool and your next interaction starts fresh.
 Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
+When conversing in a Telegram forum topic / thread (message_thread_id is present):
+- Early in the conversation (around 2–3 user messages in, once the subject matter is established), rename the topic to a short, descriptive name using the send tool with {type:"edit_forum_topic",chat_id,message_thread_id,name}.
+- Make sure the name is descriptive and distinct relative to the last 10 active topic names in that chat (check recent topic names in events.jsonl so titles remain clear and distinct).
 `;
 
 it("composes the SYSTEM_PROMPT from the intro, protocol sections, and outro", () => {

@@ -306,6 +306,12 @@ its id matches the poll_answer events' poll_id and the matching outbox_sent even
 {type:"send_reaction",chat_id,message_id,reaction} sets a Telegram reaction on any message in the chat (long-press style, e.g. a thumbs up on the user's message): reaction is an array of 1-3 {type:"emoji",emoji} or {type:"custom_emoji",custom_emoji_id} entries; [] removes your reaction. message_id is the numeric messageId of the target message (from a message event or an outbox_sent event in events.jsonl).
 {type:"edit_message",chat_id,message_id,text,parse_mode?,entities?,link_preview_options?,reply_markup?} edits one of your earlier messages (text is required; reply_markup and link_preview_options are optional additions; message_id is the numeric messageId of that message from outbox_sent in events.jsonl).
 {type:"delete_message",chat_id,message_id} deletes one of your earlier messages (message_id is the numeric messageId of that message from outbox_sent in events.jsonl).
+{type:"create_forum_topic",chat_id,name,icon_color?,icon_custom_emoji_id?} creates a forum topic in a supergroup; outbox_sent returns message_thread_id.
+{type:"edit_forum_topic",chat_id,message_thread_id,name?,icon_custom_emoji_id?} renames a topic or updates its icon.
+{type:"close_forum_topic",chat_id,message_thread_id} closes a topic.
+{type:"reopen_forum_topic",chat_id,message_thread_id} reopens a closed topic.
+{type:"delete_forum_topic",chat_id,message_thread_id} permanently deletes a topic and its messages.
+{type:"unpin_all_forum_topic_messages",chat_id,message_thread_id} unpins all pinned messages in a topic.
 The send tool records one send_request command (with the requestId it returns to you) in
 .tg-bot/events.jsonl; the host validates and delivers it, appending exactly one
 outbox_sent or outbox_rejected event. outbox_sent echoes messageId/pollId for later

@@ -185,6 +185,7 @@ export class WorkspaceTasks {
       const worker = new PiWorker({
         workspace: workerOptions.workspace,
         appRoot: this.appRoot,
+        now: this.now,
         ...defined({ bwrapPath: this.bwrapPath }),
         appendSystemPrompt: TASK_RUNNER_PROMPT,
         hostTools: "send,start_browser",

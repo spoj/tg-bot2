@@ -25,6 +25,7 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   idleTimeoutMs?: number;
   busyTimeoutMs?: number;
   busyTimeoutMessage?: string;
+  now?: () => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
@@ -117,6 +118,7 @@ export class PiWorker {
   private readonly idleTimeoutMs: number;
   private readonly busyTimeoutMs: number;
   private readonly busyTimeoutMessage: string | undefined;
+  private readonly now: () => number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
   private readonly setIntervalFn: typeof setInterval;
@@ -126,6 +128,7 @@ export class PiWorker {
   private stderr = "";
   private lastActivityAt = 0;
   private lastActivity = "";
+  private busyEscalations = 0;
   private isBusyState = false;
   private idleTimer: NodeJS.Timeout | undefined;
   private busyTimer: NodeJS.Timeout | undefined;
@@ -157,6 +160,7 @@ export class PiWorker {
     }
     this.busyTimeoutMs = busyTimeoutMs;
     this.busyTimeoutMessage = options.busyTimeoutMessage;
+    this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
     this.setIntervalFn = options.setInterval ?? setInterval;
@@ -179,7 +183,10 @@ export class PiWorker {
   }
 
   private noteActivity(chunk: string | Buffer): void {
-    this.lastActivityAt = Date.now();
+    this.lastActivityAt = this.now();
+    if (this.isBusyState) {
+      this.busyEscalations = 0;
+    }
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     const trimmed = text.trim();
     if (trimmed.length > 0) {
@@ -203,6 +210,7 @@ export class PiWorker {
     this.stderr = "";
     this.lastActivityAt = 0;
     this.lastActivity = "";
+    this.busyEscalations = 0;
     this.isBusyState = false;
     this.closing = false;
 
@@ -304,18 +312,21 @@ export class PiWorker {
     }
   }
 
-  private writeJson(obj: unknown): void {
+  private writeJson(obj: unknown): boolean {
     const stdin = this.process?.stdin;
-    if (!stdin || stdin.destroyed || !stdin.writable) return;
+    if (!stdin || stdin.destroyed || !stdin.writable) return false;
     try {
       stdin.write(JSON.stringify(obj) + "\n", "utf8");
+      return true;
     } catch {
       // Write failure on closing stream
+      return false;
     }
   }
 
-  abort(): void {
-    this.writeJson({ id: randomUUID(), type: "abort" });
+  /** Aborts the in-flight turn; false when the RPC channel is not writable. */
+  abort(): boolean {
+    return this.writeJson({ id: randomUUID(), type: "abort" });
   }
 
   async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
@@ -434,22 +445,27 @@ export class PiWorker {
       this.clearBusyWatchdog();
       return;
     }
-    const elapsed = Date.now() - this.lastActivityAt;
+    const elapsed = this.now() - this.lastActivityAt;
     if (elapsed >= this.busyTimeoutMs) {
       this.handleBusyTimeout();
     }
   }
 
   private handleBusyTimeout(): void {
-    this.abort();
-    this.lastActivityAt = Date.now();
+    this.busyEscalations += 1;
     const message = this.busyTimeoutMessage ?? "Interrupted: Operation took too long with no progress.";
-    this.noteActivity(message);
-    this.writeJson({
-      id: randomUUID(),
-      type: "prompt",
-      message,
-      streamingBehavior: "steer",
-    });
+    const escalate = this.busyEscalations > 1;
+    if (escalate && !this.abort()) {
+      this.clearBusyWatchdog();
+      return;
+    }
+    if (!this.writeJson({ id: randomUUID(), type: "prompt", message, streamingBehavior: "steer" })) {
+      // stdin is dead; stop re-arming and let exit detection own cleanup
+      this.clearBusyWatchdog();
+      return;
+    }
+    this.lastActivityAt = this.now();
+    const trimmed = message.trim();
+    this.lastActivity = trimmed.length <= MAX_ACTIVITY_TEXT ? trimmed : `${trimmed.slice(0, MAX_ACTIVITY_TEXT - 1)}…`;
   }
 }

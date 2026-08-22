@@ -103,6 +103,21 @@ describe("WorkspaceOutbox", () => {
     ]);
   });
 
+  it("dispatches create_forum_topic and close_forum_topic requests", async () => {
+    const { workspace } = await fixture();
+    await allowChat(workspace, -100);
+    const dispatch = vi.fn(async () => ({ messageThreadId: 105, data: { message_thread_id: 105, name: "Japan 2026" } }));
+    await send(workspace, dispatch, sendRecord("req-1", { type: "create_forum_topic", chat_id: -100, name: "Japan 2026" }));
+    expect(dispatch).toHaveBeenCalledWith(-100, { version: 1, type: "create_forum_topic", chat_id: -100, name: "Japan 2026" });
+    expect(await logEvents(workspace)).toMatchObject([
+      { type: "outbox_sent", requestId: "req-1", chat_id: -100, message_thread_id: 105, summary: "Japan 2026" },
+    ]);
+
+    const closeDispatch = vi.fn(async () => ({ messageThreadId: 105 }));
+    await send(workspace, closeDispatch, sendRecord("req-2", { type: "close_forum_topic", chat_id: -100, message_thread_id: 105 }));
+    expect(closeDispatch).toHaveBeenCalledWith(-100, { version: 1, type: "close_forum_topic", chat_id: -100, message_thread_id: 105 });
+  });
+
   it("forwards send_message requests without host-side semantic validation", async () => {
     const { workspace } = await fixture();
     await allowChat(workspace, 42);

@@ -9,6 +9,12 @@ import { tmpdir } from "node:os";
 import { GrammyError, type Bot } from "grammy";
 import {
   createTelegramBot,
+  createTelegramForumTopic,
+  editTelegramForumTopic,
+  closeTelegramForumTopic,
+  reopenTelegramForumTopic,
+  deleteTelegramForumTopic,
+  unpinAllTelegramForumTopicMessages,
   deleteTelegramMessage,
   formatStatus,
   attachmentSource,
@@ -47,6 +53,12 @@ function fakeBot() {
       sendVoice: vi.fn(async () => ({ message_id: 123 })),
       setMessageReaction: vi.fn(async () => true),
       stopPoll: vi.fn(async () => ({ id: "poll-9", question: "Q", options: [], total_voter_count: 0, is_closed: true })),
+      createForumTopic: vi.fn(async (_chatId: number, name: string) => ({ message_thread_id: 105, name })),
+      editForumTopic: vi.fn(async () => true),
+      closeForumTopic: vi.fn(async () => true),
+      reopenForumTopic: vi.fn(async () => true),
+      deleteForumTopic: vi.fn(async () => true),
+      unpinAllForumTopicMessages: vi.fn(async () => true),
     },
   } as unknown as Bot;
 }
@@ -576,6 +588,31 @@ it("rejects a regular file that grows beyond the upload cap after stat", async (
   });
 });
 
+
+describe("Telegram forum topic management", () => {
+  it("creates, edits, closes, reopens, deletes topics and unpins topic messages", async () => {
+    const bot = fakeBot();
+    const created = await createTelegramForumTopic(bot, -100, { version: 1, type: "create_forum_topic", chat_id: -100, name: "Travel 2026", icon_color: 7322096 });
+    expect(created).toEqual({ messageThreadId: 105, data: { message_thread_id: 105, name: "Travel 2026" } });
+    expect(bot.api.createForumTopic).toHaveBeenCalledWith(-100, "Travel 2026", { icon_color: 7322096 });
+
+    const edited = await editTelegramForumTopic(bot, -100, { version: 1, type: "edit_forum_topic", chat_id: -100, message_thread_id: 105, name: "Japan 2026" });
+    expect(edited).toEqual({ messageThreadId: 105 });
+    expect(bot.api.editForumTopic).toHaveBeenCalledWith(-100, 105, { name: "Japan 2026" });
+
+    expect(await closeTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
+    expect(bot.api.closeForumTopic).toHaveBeenCalledWith(-100, 105);
+
+    expect(await reopenTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
+    expect(bot.api.reopenForumTopic).toHaveBeenCalledWith(-100, 105);
+
+    expect(await unpinAllTelegramForumTopicMessages(bot, -100, 105)).toEqual({ messageThreadId: 105 });
+    expect(bot.api.unpinAllForumTopicMessages).toHaveBeenCalledWith(-100, 105);
+
+    expect(await deleteTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
+    expect(bot.api.deleteForumTopic).toHaveBeenCalledWith(-100, 105);
+  });
+});
 
 describe("Telegram attachment downloads", () => {
   it("bounds a stalled Telegram getFile call with the attachment deadline", async () => {

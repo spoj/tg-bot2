@@ -16,6 +16,8 @@ import type {
   WorkspaceOutboxSendLocationRequest,
   WorkspaceOutboxSendPollRequest,
   WorkspaceOutboxEditMessageRequest,
+  WorkspaceOutboxCreateForumTopicRequest,
+  WorkspaceOutboxEditForumTopicRequest,
   WorkspaceOutboxReaction,
   WorkspaceOutboxRequest,
   WorkspaceOutboxDispatchResult,
@@ -171,6 +173,38 @@ export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId:
   await bot.api.deleteMessage(chatId, messageId);
 }
 
+export async function createTelegramForumTopic(bot: Bot, chatId: number, request: WorkspaceOutboxCreateForumTopicRequest): Promise<{ messageThreadId: number; data: unknown }> {
+  const options = defined({ icon_color: request.icon_color as never, icon_custom_emoji_id: request.icon_custom_emoji_id });
+  const topic = await bot.api.createForumTopic(chatId, request.name, options);
+  return { messageThreadId: topic.message_thread_id, data: topic };
+}
+
+export async function editTelegramForumTopic(bot: Bot, chatId: number, request: WorkspaceOutboxEditForumTopicRequest): Promise<{ messageThreadId: number }> {
+  const options = defined({ name: request.name, icon_custom_emoji_id: request.icon_custom_emoji_id });
+  await bot.api.editForumTopic(chatId, request.message_thread_id, options);
+  return { messageThreadId: request.message_thread_id };
+}
+
+export async function closeTelegramForumTopic(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
+  await bot.api.closeForumTopic(chatId, messageThreadId);
+  return { messageThreadId };
+}
+
+export async function reopenTelegramForumTopic(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
+  await bot.api.reopenForumTopic(chatId, messageThreadId);
+  return { messageThreadId };
+}
+
+export async function deleteTelegramForumTopic(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
+  await bot.api.deleteForumTopic(chatId, messageThreadId);
+  return { messageThreadId };
+}
+
+export async function unpinAllTelegramForumTopicMessages(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
+  await bot.api.unpinAllForumTopicMessages(chatId, messageThreadId);
+  return { messageThreadId };
+}
+
 export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; workspace: string }, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
   switch (request.type) {
     case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: paths.workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, messageThreadId: request.message_thread_id, disableNotification: request.disable_notification }) }) };
@@ -182,6 +216,15 @@ export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; w
     case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return undefined;
     case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
     case "delete_message": await deleteTelegramMessage(bot, chatId, request.message_id); return undefined;
+    case "create_forum_topic": {
+      const created = await createTelegramForumTopic(bot, chatId, request);
+      return { messageThreadId: created.messageThreadId, data: created.data };
+    }
+    case "edit_forum_topic": return editTelegramForumTopic(bot, chatId, request);
+    case "close_forum_topic": return closeTelegramForumTopic(bot, chatId, request.message_thread_id);
+    case "reopen_forum_topic": return reopenTelegramForumTopic(bot, chatId, request.message_thread_id);
+    case "delete_forum_topic": return deleteTelegramForumTopic(bot, chatId, request.message_thread_id);
+    case "unpin_all_forum_topic_messages": return unpinAllTelegramForumTopicMessages(bot, chatId, request.message_thread_id);
     default: { const unhandled: never = request; void unhandled; throw new Error("Unhandled outbox request type"); }
   }
 }

@@ -62,8 +62,11 @@ export type HostEvent =
     type: "outbox_sent";
     requestId: string;
     chat_id: number;
+    message_thread_id?: number | undefined;
     messageId?: number | undefined;
     pollId?: string | undefined;
+    request_type?: string | undefined;
+    summary?: string | undefined;
     data?: unknown;
   }
   | {

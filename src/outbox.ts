@@ -16,6 +16,26 @@ export type WorkspaceOutboxOptions = {
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
+function truncate(text: string, maxLength: number): string {
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
+}
+
+function extractRequestSummary(request: WorkspaceOutboxRequest): string | undefined {
+  switch (request.type) {
+    case "send_message":
+    case "edit_message":
+      return request.text;
+    case "send_file":
+      return request.caption ?? request.path;
+    case "send_poll":
+      return request.question;
+    case "create_forum_topic":
+    case "edit_forum_topic":
+      return request.name;
+    default:
+      return undefined;
+  }
+}
 /**
  * Delivers send_request commands to Telegram: validates the request against the outbox
  * schema, checks its chat_id against the agent's allow list (the egress gate),
@@ -65,11 +85,23 @@ export class WorkspaceOutbox {
       await this.recordRejection(record.requestId, chatId, error);
       return;
     }
+    const summary = extractRequestSummary(request);
+    const threadId = ("message_thread_id" in request && typeof request.message_thread_id === "number")
+      ? request.message_thread_id
+      : result?.messageThreadId;
+
     await this.events.emit({
       type: "outbox_sent",
       requestId: record.requestId,
       chat_id: chatId,
-      ...defined({ messageId: result?.messageId, pollId: result?.pollId, data: result?.data }),
+      ...defined({
+        message_thread_id: threadId,
+        messageId: result?.messageId,
+        pollId: result?.pollId,
+        request_type: request.type,
+        summary: summary ? truncate(summary, 200) : undefined,
+        data: result?.data,
+      }),
     });
   }
 

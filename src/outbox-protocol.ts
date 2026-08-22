@@ -124,6 +124,52 @@ type WorkspaceOutboxDeleteMessageRequest = {
   message_id: number;
 };
 
+export type WorkspaceOutboxCreateForumTopicRequest = {
+  version: 1;
+  type: "create_forum_topic";
+  chat_id: number;
+  name: string;
+  icon_color?: number;
+  icon_custom_emoji_id?: string;
+};
+
+export type WorkspaceOutboxEditForumTopicRequest = {
+  version: 1;
+  type: "edit_forum_topic";
+  chat_id: number;
+  message_thread_id: number;
+  name?: string;
+  icon_custom_emoji_id?: string;
+};
+
+export type WorkspaceOutboxCloseForumTopicRequest = {
+  version: 1;
+  type: "close_forum_topic";
+  chat_id: number;
+  message_thread_id: number;
+};
+
+export type WorkspaceOutboxReopenForumTopicRequest = {
+  version: 1;
+  type: "reopen_forum_topic";
+  chat_id: number;
+  message_thread_id: number;
+};
+
+export type WorkspaceOutboxDeleteForumTopicRequest = {
+  version: 1;
+  type: "delete_forum_topic";
+  chat_id: number;
+  message_thread_id: number;
+};
+
+export type WorkspaceOutboxUnpinAllForumTopicMessagesRequest = {
+  version: 1;
+  type: "unpin_all_forum_topic_messages";
+  chat_id: number;
+  message_thread_id: number;
+};
+
 export type WorkspaceOutboxRequest =
   | WorkspaceOutboxSendFileRequest
   | WorkspaceOutboxSendMessageRequest
@@ -133,11 +179,18 @@ export type WorkspaceOutboxRequest =
   | WorkspaceOutboxStopPollRequest
   | WorkspaceOutboxSendReactionRequest
   | WorkspaceOutboxEditMessageRequest
-  | WorkspaceOutboxDeleteMessageRequest;
+  | WorkspaceOutboxDeleteMessageRequest
+  | WorkspaceOutboxCreateForumTopicRequest
+  | WorkspaceOutboxEditForumTopicRequest
+  | WorkspaceOutboxCloseForumTopicRequest
+  | WorkspaceOutboxReopenForumTopicRequest
+  | WorkspaceOutboxDeleteForumTopicRequest
+  | WorkspaceOutboxUnpinAllForumTopicMessagesRequest;
 
 export type WorkspaceOutboxDispatchResult = {
   messageId?: number;
   pollId?: string;
+  messageThreadId?: number;
   data?: unknown;
 };
 
@@ -192,13 +245,27 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
         throw new Error("Outbox request media item path must be a non-empty string");
       }
     }
+  } else if (request.type === "create_forum_topic") {
+    if (typeof request.name !== "string" || request.name.trim().length === 0) {
+      throw new Error("Outbox request name must be a non-empty string");
+    }
+  } else if (
+    request.type === "edit_forum_topic" ||
+    request.type === "close_forum_topic" ||
+    request.type === "reopen_forum_topic" ||
+    request.type === "delete_forum_topic" ||
+    request.type === "unpin_all_forum_topic_messages"
+  ) {
+    if (typeof request.message_thread_id !== "number" || !Number.isSafeInteger(request.message_thread_id)) {
+      throw new Error("Outbox request message_thread_id must be a safe integer");
+    }
   } else if (
     request.type !== "send_message" && request.type !== "send_location" &&
     request.type !== "send_poll" && request.type !== "stop_poll" &&
     request.type !== "send_reaction" && request.type !== "edit_message" &&
     request.type !== "delete_message"
   ) {
-    throw new Error("Outbox request type must be send_file, send_media_group, send_message, send_location, send_poll, stop_poll, send_reaction, edit_message, or delete_message");
+    throw new Error("Outbox request type must be send_file, send_media_group, send_message, send_location, send_poll, stop_poll, send_reaction, edit_message, delete_message, create_forum_topic, edit_forum_topic, close_forum_topic, reopen_forum_topic, delete_forum_topic, or unpin_all_forum_topic_messages");
   }
   return { ...request, version: 1, type: request.type } as WorkspaceOutboxRequest;
 }

@@ -151,6 +151,8 @@ export type PiRunSandboxPaths = {
   agentOrigin?: string;
   /** Host-owned directory bind-mounted at /workspace/.host; contains the host bridge socket. */
   hostSocketDir?: string;
+  /** Task runs dial the capability-restricted task bridge socket instead of the full one. */
+  taskRun?: boolean;
   /** Host-owned events log, read-only bind-mounted over /workspace/.tg-bot/events.jsonl. */
   hostEventsLog?: string;
 };
@@ -250,7 +252,9 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     ...(paths.hostEventsLog === undefined
       ? []
       : ["--ro-bind", paths.hostEventsLog, "/workspace/.tg-bot/events.jsonl"]),
-    ...(paths.hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/workspace/.host/host.sock"]),
+    ...(paths.hostSocketDir === undefined
+      ? []
+      : ["--setenv", "PI_HOST_SOCKET", paths.taskRun ? "/workspace/.host/host-task.sock" : "/workspace/.host/host.sock"]),
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",

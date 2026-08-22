@@ -25,6 +25,8 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   idleTimeoutMs?: number;
   busyTimeoutMs?: number;
   busyTimeoutMessage?: string;
+  /** Invoked once, after the first prompt JSON-RPC write (the worker's initial prompt). */
+  onInitialPromptWritten?: () => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
@@ -134,6 +136,8 @@ export class PiWorker {
   private readonly settledResolvers = new Set<(result: PiRunResult) => void>();
   private reapedCallback: (() => void) | undefined;
   private closing = false;
+  private stopped = false;
+  private initialPromptWritten = false;
 
   constructor(options: PiWorkerOptions) {
     this.options = options;
@@ -223,6 +227,7 @@ export class PiWorker {
         hostTools: this.options.hostTools,
         hostSocketDir: this.options.hostSocketDir,
         hostEventsLog: this.options.hostEventsLog,
+        taskRun: this.options.taskRun,
       }),
     });
 
@@ -304,13 +309,15 @@ export class PiWorker {
     }
   }
 
-  private writeJson(obj: unknown): void {
+  private writeJson(obj: unknown): boolean {
     const stdin = this.process?.stdin;
-    if (!stdin || stdin.destroyed || !stdin.writable) return;
+    if (!stdin || stdin.destroyed || !stdin.writable) return false;
     try {
       stdin.write(JSON.stringify(obj) + "\n", "utf8");
+      return true;
     } catch {
       // Write failure on closing stream
+      return false;
     }
   }
 
@@ -320,18 +327,23 @@ export class PiWorker {
 
   async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
     if (!this.isAlive()) {
+      if (this.stopped) return;
       await this.start();
     }
     this.isBusyState = true;
     this.clearIdleTimer();
     this.armBusyWatchdog();
     this.noteActivity(message);
-    this.writeJson({
+    const wrote = this.writeJson({
       id: randomUUID(),
       type: "prompt",
       message,
       ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
     });
+    if (wrote && !this.initialPromptWritten) {
+      this.initialPromptWritten = true;
+      this.options.onInitialPromptWritten?.();
+    }
   }
 
   waitForSettled(): Promise<PiRunResult> {
@@ -372,6 +384,7 @@ export class PiWorker {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     this.clearIdleTimer();
     this.clearBusyWatchdog();
     const child = this.process;

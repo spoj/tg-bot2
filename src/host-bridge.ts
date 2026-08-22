@@ -26,7 +26,8 @@ export type HostBridgeHandlers = {
 export type HostBridgeOptions = {
   /** Absolute path of the UNIX socket the agent tools dial. */
   socketPath: string;
-  handlers: HostBridgeHandlers;
+  /** Handlers by request type; a type without a handler is rejected as unknown. */
+  handlers: Partial<HostBridgeHandlers>;
   /** Rejects start_browser after this many milliseconds; the launch itself keeps running. */
   browserTimeoutMs?: number;
   /** Kills a connection whose request line exceeds this many bytes. */
@@ -69,7 +70,7 @@ function withTimeout<T>(
  */
 export class HostBridge {
   private readonly socketPath: string;
-  private readonly handlers: HostBridgeHandlers;
+  private readonly handlers: Partial<HostBridgeHandlers>;
   private readonly browserTimeoutMs: number;
   private readonly maxLineBytes: number;
   private readonly logger: (error: unknown) => void;

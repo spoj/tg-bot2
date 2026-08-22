@@ -13,6 +13,8 @@ export type WorkspaceTaskWorker = {
   steer(message: string): Promise<void>;
   stop(): Promise<void>;
   activity(): { at: number; text: string };
+  /** Registers the callback fired once the initial prompt has been written to the worker. */
+  onPrompted(callback: () => void): void;
 };
 
 export type WorkspaceTaskWorkerOptions = {
@@ -64,6 +66,11 @@ type InFlightTask = {
   origin?: string | undefined;
   prompt: string;
   startedAt: number;
+  /** "starting" until the worker has written its initial prompt; steers queue meanwhile. */
+  status: "starting" | "running";
+  pendingSteers: string[];
+  /** Set when cancel arrives before the run was prompted; suppresses the pending-steer flush. */
+  cancelled: boolean;
 };
 
 type QueuedSpawn = {
@@ -182,10 +189,12 @@ export class WorkspaceTasks {
     this.cancelSchedule = options.clearInterval ?? clearInterval;
     this.logger = options.logger ?? ((error) => console.error("Workspace task error", error));
     this.workerFactory = options.workerFactory ?? ((workerOptions) => {
+      let onPrompted: (() => void) | undefined;
       const worker = new PiWorker({
         workspace: workerOptions.workspace,
         appRoot: this.appRoot,
         ...defined({ bwrapPath: this.bwrapPath }),
+        taskRun: true,
         appendSystemPrompt: TASK_RUNNER_PROMPT,
         hostTools: "send,start_browser",
         agentOrigin: `task:${workerOptions.runId}`,
@@ -201,6 +210,7 @@ export class WorkspaceTasks {
           hostSocketDir: this.hostSocketDir,
           hostEventsLog: this.hostEventsLog,
         }),
+        onInitialPromptWritten: () => onPrompted?.(),
       });
       return {
         run: async () => {
@@ -213,6 +223,9 @@ export class WorkspaceTasks {
         steer: (message: string) => worker.prompt(message, "steer"),
         stop: () => worker.stop(),
         activity: () => worker.activity(),
+        onPrompted: (callback: () => void) => {
+          onPrompted = callback;
+        },
       };
     });
   }
@@ -269,6 +282,7 @@ export class WorkspaceTasks {
   async cancel(runId: string): Promise<"stopped" | "cancelled-queued" | "not-running"> {
     const entry = this.inFlight.find((item) => item.runId === runId);
     if (entry !== undefined) {
+      entry.cancelled = true;
       await entry.worker.stop();
       return "stopped";
     }
@@ -280,10 +294,14 @@ export class WorkspaceTasks {
     return "not-running";
   }
 
-  /** Injects a mid-flight steering message into a running task. */
+  /** Injects a mid-flight steering message into a running task; queues it until the initial prompt is written. */
   async steer(runId: string, message: string): Promise<"delivered" | "not-running"> {
     const entry = this.inFlight.find((item) => item.runId === runId);
     if (entry === undefined) return "not-running";
+    if (entry.status === "starting") {
+      entry.pendingSteers.push(message);
+      return "delivered";
+    }
     await entry.worker.steer(message);
     return "delivered";
   }
@@ -309,7 +327,31 @@ export class WorkspaceTasks {
   }
 
   private launchTask(workspace: string, task: { runId: string; prompt: string; origin?: string | undefined }, runDirectory: string, worker: WorkspaceTaskWorker): void {
-    this.inFlight.push({ worker, runId: task.runId, origin: task.origin, prompt: task.prompt, startedAt: this.now() });
+    const entry: InFlightTask = {
+      worker,
+      runId: task.runId,
+      origin: task.origin,
+      prompt: task.prompt,
+      startedAt: this.now(),
+      status: "starting",
+      pendingSteers: [],
+      cancelled: false,
+    };
+    this.inFlight.push(entry);
+    worker.onPrompted(() => {
+      entry.status = "running";
+      if (entry.cancelled) return;
+      const pending = entry.pendingSteers.splice(0);
+      void (async () => {
+        for (const message of pending) {
+          try {
+            await entry.worker.steer(message);
+          } catch (error) {
+            this.report(error);
+          }
+        }
+      })();
+    });
     const settle = this.runAndSettle(workspace, task, runDirectory, worker);
     this.pendingSettles.add(settle);
     void settle

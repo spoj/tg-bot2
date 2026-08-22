@@ -264,6 +264,7 @@ Commands (written by your tools to the same events.jsonl log; the host processes
   (including its chat_id).
 - spawn_request: {v:1,t,type:'spawn_request',runId,prompt} queued by the spawn tool;
   runId is the UUID the tool returns to you.
+- steer_task_request: {v:1,t,type:'steer_task_request',steerId,runId,message} queued by the steer_task tool.
 - cancel_request: {v:1,t,type:'cancel_request',runId} queued by the cancel tool.
 - browser_requested: {v:1,t,type:'browser_requested',requestId} queued by the start_browser tool.
 Outcomes (host-written, exactly one terminal event per command):

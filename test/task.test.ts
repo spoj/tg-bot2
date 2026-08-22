@@ -41,6 +41,7 @@ async function readJson(filePath: string): Promise<Record<string, unknown>> {
 type FakeTask = {
   options: WorkspaceTaskWorkerOptions;
   resolveRun: (result: PiRunResult) => void;
+  steer: Mock<(message: string) => Promise<void>>;
   stop: Mock;
   activity: Mock;
 };
@@ -53,11 +54,12 @@ function fakeWorkerFactory() {
     const task: FakeTask = {
       options,
       resolveRun,
+      steer: vi.fn(async () => undefined),
       stop: vi.fn(async () => { resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" }); }),
       activity: vi.fn(() => ({ at: 0, text: "" })),
     };
     tasks.push(task);
-    return { run: () => run, stop: task.stop, activity: task.activity };
+    return { run: () => run, steer: task.steer, stop: task.stop, activity: task.activity };
   });
   return { factory, tasks };
 }
@@ -160,6 +162,22 @@ describe("WorkspaceTasks", () => {
       { type: "task_settled", runId: "run-1", status: "failed", stderr: "bwrap missing" },
     ]);
     expect(followup).toHaveBeenCalledOnce();
+  });
+
+  it("steers a running task through handleSteerRequest and ignores unknown tasks", async () => {
+    const { workspace } = await fixture();
+    const { factory, tasks } = fakeWorkerFactory();
+    const { service } = setupTasks(workspace, factory);
+
+    await service.handleSpawnRequest(spawnRecord("run-1", "initial prompt"), workspace);
+    expect(tasks).toHaveLength(1);
+
+    await service.handleSteerRequest({ steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
+    expect(tasks[0]?.steer).toHaveBeenCalledWith("use python 3.12");
+
+    // Steering an unknown task is a safe no-op
+    await expect(service.handleSteerRequest({ steerId: "s-2", runId: "run-unknown", message: "noop" }, workspace))
+      .resolves.toBeUndefined();
   });
 
   it("settles an empty or oversized prompt as failed without spawning", async () => {

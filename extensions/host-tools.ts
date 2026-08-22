@@ -86,6 +86,23 @@ const HOST_TOOLS = {
       }
     },
   },
+  steer_task: {
+    label: "Steer background task",
+    description: "Send mid-flight steering instructions to a running background task. The task agent receives your guidance between tool calls without restarting.",
+    parameters: Type.Object({
+      runId: Type.String({ description: "The task run UUID returned by the spawn tool" }),
+      message: Type.String({ description: "Steering instruction or clarification to inject into the task agent" }),
+    }),
+    execute: (params: { runId: string; message: string }): ToolResult => {
+      const steerId = randomUUID();
+      try {
+        appendCommand({ type: "steer_task_request", steerId, runId: params.runId, message: params.message });
+        return text(`Steering instruction sent to task ${params.runId}.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
   cancel: {
     label: "Cancel background task",
     description: "Stop a running background task by the runId returned by the spawn tool. The task is aborted and its settle followup arrives with aborted status.",

@@ -1,6 +1,7 @@
+import { existsSync } from "node:fs";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
+import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
 import { TG_BOT_DIR, defined } from "./util.js";
@@ -34,9 +35,14 @@ Your session resumes across runs for up to two hours of inactivity; after a long
 Older conversations persist under /workspace/.pi/sessions/*.jsonl — read/grep them when the user references history.
 `,
 ].join("");
-export type AgentRunWorker = {
-  run(): Promise<PiRunResult>;
+
+export type AgentWorker = {
+  isAlive(): boolean;
+  isBusy(): boolean;
+  prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void>;
+  close(): Promise<void>;
   stop(): Promise<void>;
+  onReaped(callback: () => void): void;
 };
 
 export type AgentWorkerOptions = {
@@ -44,29 +50,29 @@ export type AgentWorkerOptions = {
   appRoot: string;
   bwrapPath?: string;
   appendSystemPrompt?: string;
-  /** Comma-separated host tool names exposed to the run (send, spawn, cancel). */
   hostTools?: string;
-  message: string;
   resume: boolean;
   model?: string;
   thinkingLevel?: string;
+  idleTimeoutMs?: number;
+  stopGraceMs?: number;
+  spawnProcess: PiWorkerSpawn;
+  terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 };
 
-export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentRunWorker | Promise<AgentRunWorker>;
+export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | Promise<AgentWorker>;
 
 export type AgentManagerOptions = {
   appRoot: string;
   bwrapPath?: string;
   workerFactory?: AgentWorkerFactory;
-  /** Process-control seams injected by the composition root; the default worker factory passes them to the Pi run worker. */
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
+  idleTimeoutMs?: number;
   now?: () => number;
-  /** Quiet window with no new input before a queue drains and combines; shared debounce for interrupts and followups. 0 drains immediately. */
-  combineDebounceMs?: number;
-  /** Hard cap on a burst: the active run is stopped this long after the first interrupt even if interrupts keep arriving. */
-  interruptForceDrainMs?: number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
 };
@@ -81,25 +87,8 @@ export type AgentStatus = {
   activeSchedules?: number;
 };
 
-type AgentState = {
-  serial: SerialQueue;
-  worker: AgentRunWorker | undefined;
-  running: boolean;
-  followups: string[];
-  interrupts: string[];
-  closing: boolean;
-  interruptDebounceTimer: NodeJS.Timeout | undefined;
-  interruptForceTimer: NodeJS.Timeout | undefined;
-  followupDebounceTimer: NodeJS.Timeout | undefined;
-  stopping: boolean;
-};
-
-const COMBINE_DEBOUNCE_MS = 2_000;
-const INTERRUPT_FORCE_DRAIN_MS = 15_000;
-const MAX_TIMER_MS = 2_147_483_647;
 const RESUME_WINDOW_MS = 2 * 60 * 60 * 1000;
 const NEW_SESSION_MARKER = path.join(TG_BOT_DIR, "new-session");
-
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
@@ -113,6 +102,7 @@ export async function loadUserSettings(workspace: string): Promise<Record<string
     return {};
   }
 }
+
 async function readSessionSummary(sessionsDirectory: string): Promise<{
   messageCount: number;
   model: { provider: string; id: string } | undefined;
@@ -178,7 +168,6 @@ async function countActiveTasks(workspace: string): Promise<number | undefined> 
     }
     return activeTasks;
   } catch {
-    // .pi/tasks directory absent or unreadable
     return undefined;
   }
 }
@@ -190,107 +179,77 @@ async function countActiveSchedules(workspace: string): Promise<number | undefin
     if (!Array.isArray(parsedSchedules.schedules)) return undefined;
     return parsedSchedules.schedules.length;
   } catch {
-    // schedules.json absent or invalid
     return undefined;
   }
 }
 
 export class AgentManager {
   private readonly workspace: string;
-  private readonly state: AgentState;
-  private readonly workerFactory: AgentWorkerFactory;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
   private readonly spawnProcess: PiWorkerSpawn;
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   private readonly stopGraceMs: number | undefined;
+  private readonly idleTimeoutMs: number | undefined;
   private readonly now: () => number;
-  private readonly combineDebounceMs: number;
-  private readonly interruptForceDrainMs: number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
+  private readonly workerFactory: AgentWorkerFactory;
+  private readonly serial = new SerialQueue();
+  private worker: AgentWorker | undefined;
   private shuttingDown = false;
 
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
-    this.workspace = path.resolve(config.workspace);
-    this.appRoot = path.resolve(options.appRoot);
+    this.workspace = config.workspace;
+    this.appRoot = options.appRoot;
     this.bwrapPath = options.bwrapPath;
     this.spawnProcess = options.spawnProcess;
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
+    this.idleTimeoutMs = options.idleTimeoutMs;
     this.now = options.now ?? Date.now;
-    const debounceMs = options.combineDebounceMs ?? COMBINE_DEBOUNCE_MS;
-    const forceMs = options.interruptForceDrainMs ?? INTERRUPT_FORCE_DRAIN_MS;
-    if (!Number.isSafeInteger(debounceMs) || debounceMs < 0 || debounceMs > MAX_TIMER_MS) {
-      throw new Error("Combine debounce window must be a non-negative timer-safe integer");
-    }
-    if (!Number.isSafeInteger(forceMs) || forceMs < 0 || forceMs > MAX_TIMER_MS || forceMs < debounceMs) {
-      throw new Error("Interrupt force drain window must be a timer-safe integer at least the debounce window");
-    }
-    this.combineDebounceMs = debounceMs;
-    this.interruptForceDrainMs = forceMs;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
-    this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRunWorker({
-      ...workerOptions,
-      spawnProcess: this.spawnProcess,
-      terminateProcessGroup: this.terminateProcessGroup,
-      ...defined({ stopGraceMs: this.stopGraceMs }),
-    }));
-    this.state = {
-      serial: new SerialQueue(),
-      worker: undefined,
-      running: false,
-      followups: [],
-      interrupts: [],
-      closing: false,
-      interruptDebounceTimer: undefined,
-      interruptForceTimer: undefined,
-      followupDebounceTimer: undefined,
-      stopping: false,
-    };
+    this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
   }
 
   /**
-   * Queues a followup — a note to deliver after the current work. Followups never
-   * abort a run: they wait until the run settles with no interrupts pending, or
-   * until the agent is idle, and are then combined into one message. Idle
-   * followups wait out the debounce window to batch; there is no force drain.
+   * Delivers a followup message to the agent using streaming followUp behavior.
    */
-  followup(text: string): Promise<void> {
-    if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
-    const state = this.state;
-    return state.serial.run(async () => {
-      if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
-      state.followups.push(text);
-      if (state.running || state.interrupts.length > 0) return;
-      this.restartFollowupDebounceTimer(state);
-    });
-  }
-  /**
-   * Queues an interrupt. The queue drains — aborting the active run (or just
-   * launching when idle) and delivering every queued interrupt as one combined
-   * message — when no interrupt has arrived for the debounce window, when the
-   * oldest queued interrupt has waited the force-drain window, or when the
-   * active run settles. Queued followups are preserved behind interrupts.
-   */
-  interrupt(text: string): Promise<void> {
-    if (this.shuttingDown) return Promise.reject(new Error("Agent manager is shutting down"));
-    const state = this.state;
-    return state.serial.run(async () => {
-      if (state.closing || this.shuttingDown) throw new Error("Agent manager is shutting down");
-      state.interrupts.push(text);
-      this.clearFollowupDebounceTimer(state);
-      if (state.stopping) return;
-      if (state.interruptForceTimer === undefined) {
-        state.interruptForceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(), this.interruptForceDrainMs);
-        state.interruptForceTimer.unref?.();
-      }
-      this.restartInterruptDebounceTimer(state);
+  async followup(text: string): Promise<void> {
+    if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+    return this.serial.run(async () => {
+      if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+      const worker = await this.ensureWorker();
+      await worker.prompt(text, "followUp");
     });
   }
 
-  /** File-based session summary; never spawns a worker. */
+  /**
+   * Delivers an interrupt message to the agent using streaming steer behavior.
+   */
+  async interrupt(text: string): Promise<void> {
+    if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+    return this.serial.run(async () => {
+      if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+      const worker = await this.ensureWorker();
+      await worker.prompt(text, "steer");
+    });
+  }
+
+  async beginShutdown(): Promise<void> {
+    this.shuttingDown = true;
+    const worker = this.worker;
+    this.worker = undefined;
+    if (worker) {
+      await worker.close().catch((error) => console.error("Agent shutdown stop failed", error));
+    }
+  }
+
+  async disposeAll(): Promise<void> {
+    await this.beginShutdown();
+  }
+
   async status(): Promise<AgentStatus> {
     const workspace = this.workspace;
     const settings = await loadUserSettings(workspace);
@@ -322,158 +281,62 @@ export class AgentManager {
     return result;
   }
 
-  /** Synchronous gate: terminates the active run. */
-  beginShutdown(): Promise<void> {
-    this.shuttingDown = true;
-    const state = this.state;
-    this.clearInterruptTimers(state);
-    this.clearFollowupDebounceTimer(state);
-    const worker = state.worker;
-    const stops = worker === undefined
-      ? []
-      : [worker.stop().catch((error) => console.error("Agent shutdown stop failed", error))];
-    return Promise.allSettled(stops).then(() => {});
-  }
+  private async ensureWorker(): Promise<AgentWorker> {
+    const marker = path.join(this.workspace, NEW_SESSION_MARKER);
+    const markerExists = existsSync(marker);
 
-  async disposeAll(): Promise<void> {
-    await this.beginShutdown();
-  }
+    if (markerExists && this.worker?.isAlive()) {
+      await this.worker.close().catch(() => {});
+      this.worker = undefined;
+    }
 
-  /** Starts a run for text. */
-  private launch(text: string): void {
-    const state = this.state;
-    state.running = true;
-    void this.runToCompletion(text);
-  }
+    if (this.worker && this.worker.isAlive()) {
+      return this.worker;
+    }
 
-  private async runToCompletion(text: string): Promise<void> {
-    const state = this.state;
-    try {
-      const worker = await this.spawnWorker(text);
-      state.worker = worker;
-      const result = await worker.run();
-      if (result.signal === null && result.code !== 0) {
-        console.error(`Agent run failed (exit ${result.code ?? "unknown"}): ${result.stderr}`);
+    let resume = false;
+    if (markerExists) {
+      await rm(marker, { force: true }).catch(() => {});
+    } else {
+      const sessionsDirectory = path.join(this.workspace, ".pi", "sessions");
+      const newest = await newestSessionFile(sessionsDirectory);
+      if (newest && (this.now() - newest.mtimeMs) <= RESUME_WINDOW_MS) {
+        resume = true;
       }
-    } catch (error) {
-      console.error("Agent run failed", error);
-    } finally {
-      await state.serial.run(async () => { this.onRunSettled(); });
     }
-  }
 
-  private async onRunSettled(): Promise<void> {
-    const state = this.state;
-    this.clearInterruptTimers(state);
-    this.clearFollowupDebounceTimer(state);
-    state.running = false;
-    state.worker = undefined;
-    state.stopping = false;
-    const next = this.drainInterrupts(state) ?? this.drainFollowups(state);
-    if (next === undefined || state.closing || this.shuttingDown) return;
-    this.launch(next);
-  }
-
-  /** Drain conditions 1–2: abort the active run, or combine and launch when idle. */
-  private fireInterruptDrain(): void {
-    const state = this.state;
-    this.clearInterruptTimers(state);
-    if (state.running) {
-      const worker = state.worker;
-      if (!worker) return;
-      state.stopping = true;
-      void worker.stop().catch((error) => console.error("Agent interrupt failed", error));
-      return;
-    }
-    const combined = this.drainInterrupts(state);
-    if (combined !== undefined) this.launch(combined);
-  }
-
-  /** Combines the entire interrupt queue into one message and empties it. */
-  private drainInterrupts(state: AgentState): string | undefined {
-    if (state.interrupts.length === 0) return undefined;
-    const combined = state.interrupts.join("\n");
-    state.interrupts.length = 0;
-    return combined;
-  }
-
-  /** Combines the entire followup queue into one message and empties it. */
-  private drainFollowups(state: AgentState): string | undefined {
-    if (state.followups.length === 0) return undefined;
-    const combined = state.followups.join("\n");
-    state.followups.length = 0;
-    return combined;
-  }
-
-  /** Followup debounce: idle only, no force cap; delivers combined followups once the agent is idle with no interrupts pending. */
-  private fireFollowupDrain(state: AgentState): void {
-    this.clearFollowupDebounceTimer(state);
-    if (state.running || state.interrupts.length > 0) return;
-    const combined = this.drainFollowups(state);
-    if (combined !== undefined) this.launch(combined);
-  }
-
-  private clearFollowupDebounceTimer(state: AgentState): void {
-    if (state.followupDebounceTimer === undefined) return;
-    this.clearTimeoutFn(state.followupDebounceTimer);
-    state.followupDebounceTimer = undefined;
-  }
-
-  private restartFollowupDebounceTimer(state: AgentState): void {
-    if (state.followupDebounceTimer !== undefined) this.clearTimeoutFn(state.followupDebounceTimer);
-    state.followupDebounceTimer = this.setTimeoutFn(() => this.fireFollowupDrain(state), this.combineDebounceMs);
-    state.followupDebounceTimer.unref?.();
-  }
-
-  private clearInterruptTimers(state: AgentState): void {
-    if (state.interruptDebounceTimer !== undefined) this.clearTimeoutFn(state.interruptDebounceTimer);
-    if (state.interruptForceTimer !== undefined) this.clearTimeoutFn(state.interruptForceTimer);
-    state.interruptDebounceTimer = undefined;
-    state.interruptForceTimer = undefined;
-  }
-
-  private restartInterruptDebounceTimer(state: AgentState): void {
-    if (state.interruptDebounceTimer !== undefined) this.clearTimeoutFn(state.interruptDebounceTimer);
-    state.interruptDebounceTimer = this.setTimeoutFn(() => this.fireInterruptDrain(), this.combineDebounceMs);
-    state.interruptDebounceTimer.unref?.();
-  }
-  private async spawnWorker(text: string): Promise<AgentRunWorker> {
-    const workspace = this.workspace;
-    const { resume, model, thinkingLevel } = await this.runOptions(workspace);
-    return await this.workerFactory({
-      workspace,
-      appRoot: this.appRoot,
-      ...defined({ bwrapPath: this.bwrapPath }),
-      appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,spawn,cancel,start_browser",
-      message: text,
-      resume,
-      ...defined({ model, thinkingLevel }),
-    });
-  }
-
-  /** Resume unless a fresh-start marker exists or the newest session file is older than the resume window. */
-  private async runOptions(workspace: string): Promise<{
-    resume: boolean;
-    model?: string;
-    thinkingLevel?: string;
-  }> {
-    const marker = path.join(workspace, NEW_SESSION_MARKER);
-    let freshStart = false;
-    try {
-      await stat(marker);
-      freshStart = true;
-      await rm(marker, { force: true });
-    } catch {
-      // No marker: resume normally within the window.
-    }
-    const newest = await newestSessionFile(path.join(workspace, ".pi", "sessions"));
-    const resume = !freshStart && this.now() - (newest?.mtimeMs ?? 0) <= RESUME_WINDOW_MS;
-    const settings = await loadUserSettings(workspace);
-    const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
-    const modelId = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
-    const model = provider && modelId ? `${provider}/${modelId}` : undefined;
+    const settings = await loadUserSettings(this.workspace);
+    const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
+    const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
+    const model = settingsProvider && settingsModel ? `${settingsProvider}/${settingsModel}` : undefined;
     const thinkingLevel = typeof settings.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined;
-    return { resume, ...defined({ model, thinkingLevel }) };
+
+    const workerOptions: AgentWorkerOptions = {
+      workspace: this.workspace,
+      appRoot: this.appRoot,
+      ...defined({
+        bwrapPath: this.bwrapPath,
+        model,
+        thinkingLevel,
+        stopGraceMs: this.stopGraceMs,
+        idleTimeoutMs: this.idleTimeoutMs,
+        setTimeout: this.setTimeoutFn,
+        clearTimeout: this.clearTimeoutFn,
+      }),
+      appendSystemPrompt: SYSTEM_PROMPT,
+      hostTools: "send,spawn,steer_task,cancel,start_browser",
+      resume,
+      spawnProcess: this.spawnProcess,
+      terminateProcessGroup: this.terminateProcessGroup,
+    };
+
+    const worker = await this.workerFactory(workerOptions);
+    worker.onReaped(() => {
+      if (this.worker === worker) {
+        this.worker = undefined;
+      }
+    });
+    this.worker = worker;
+    return worker;
   }
 }

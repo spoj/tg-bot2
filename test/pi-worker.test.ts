@@ -3,10 +3,15 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, type Mock } from "vitest";
-import { PiRunWorker } from "../src/pi-worker.js";
+import { PiWorker } from "../src/pi-worker.js";
 import type { PiWorkerChildProcess } from "../src/sandbox.js";
 
-type FakeStdin = EventEmitter & { end: Mock<(chunk?: string, encoding?: string) => void> };
+type FakeStdin = EventEmitter & {
+  end: Mock<(chunk?: string, encoding?: string) => void>;
+  write: Mock<(chunk: string, encoding?: string) => boolean>;
+  writable: boolean;
+  destroyed: boolean;
+};
 
 class FakeChild extends EventEmitter {
   exitCode: number | null = null;
@@ -26,6 +31,9 @@ type ChildFixture = {
 function fakeChildFixture(): ChildFixture {
   const child = new FakeChild();
   child.stdin.end = vi.fn(() => {});
+  child.stdin.write = vi.fn(() => true);
+  child.stdin.writable = true;
+  child.stdin.destroyed = false;
   const spawn = vi.fn((_executable: string, _args: string[], _options: unknown) => child as unknown as PiWorkerChildProcess);
   const terminate = vi.fn((_child: PiWorkerChildProcess, _signal: NodeJS.Signals) => {});
   return { child, spawn, terminate };
@@ -42,148 +50,138 @@ async function fixture(): Promise<{ root: string; workspace: string; appRoot: st
   return { root, workspace, appRoot };
 }
 
-describe("PiRunWorker", () => {
-  it("spawns bwrap with the one-shot profile and feeds the message on stdin", async () => {
+describe("PiWorker", () => {
+  it("spawns bwrap with --mode rpc and configures steering and followup modes to all", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiRunWorker({
+      const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
-        message: "hello world",
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
       });
-      const done = worker.run();
-      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      await worker.start();
+      expect(spawn).toHaveBeenCalledOnce();
       const [, , options] = spawn.mock.calls[0] ?? [];
       const args = spawn.mock.calls[0]?.[1] ?? [];
       expect(options).toEqual({ detached: true, env: {}, stdio: ["pipe", "pipe", "pipe"] });
-      expect(args).toContain("--print");
+      expect(args).toContain("--mode");
+      expect(args).toContain("rpc");
       expect(args).toContain("--session-dir");
       expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/sessions");
-      expect(child.stdin.end).toHaveBeenCalledWith("hello world", "utf8");
-      child.emit("exit", 0, null);
-      await expect(done).resolves.toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
-    } finally {
-      await rm(f.root, { recursive: true, force: true });
-    }
-  });
-  it("passes a custom session directory to the CLI", async () => {
-    const f = await fixture();
-    try {
-      const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiRunWorker({
-        workspace: f.workspace,
-        appRoot: f.appRoot,
-        message: "delegated work",
-        sessionDir: "/workspace/.pi/subagents/alpha/sessions",
-        spawnProcess: spawn,
-        terminateProcessGroup: terminate,
-      });
-      const done = worker.run();
-      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-      const args = spawn.mock.calls[0]?.[1] ?? [];
-      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/subagents/alpha/sessions");
-      child.emit("exit", 0, null);
-      await expect(done).resolves.toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
-    } finally {
-      await rm(f.root, { recursive: true, force: true });
-    }
-  });
-  it("writes appendSystemPrompt to a prompt file and mounts it read-only", async () => {
-    const f = await fixture();
-    try {
-      const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiRunWorker({
-        workspace: f.workspace,
-        appRoot: f.appRoot,
-        message: "hello",
-        appendSystemPrompt: "custom system prompt",
-        spawnProcess: spawn,
-        terminateProcessGroup: terminate,
-      });
-      const done = worker.run();
-      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-      const args = spawn.mock.calls[0]?.[1] ?? [];
-      expect(args).toContain("--append-system-prompt");
-      expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("/app/append-system-prompt.md");
-      expect(args).toContain("/app/append-system-prompt.md");
-      child.emit("exit", 0, null);
-      await expect(done).resolves.toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
+
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        expect.stringContaining('"type":"set_steering_mode","mode":"all"'),
+        "utf8",
+      );
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        expect.stringContaining('"type":"set_follow_up_mode","mode":"all"'),
+        "utf8",
+      );
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }
   });
 
-  it("captures bounded stdout and stderr into the run result", async () => {
+  it("prompt sends a prompt command with streamingBehavior and touches activity", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiRunWorker({
+      const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
-        message: ".",
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
       });
-      const done = worker.run();
-      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-      child.stdout.emit("data", Buffer.from("out-"));
-      child.stderr.emit("data", Buffer.from("err-"));
-      child.stdout.emit("data", "tail");
-      child.stderr.emit("data", "tail2");
-      child.emit("exit", 1, null);
-      await expect(done).resolves.toEqual({ code: 1, signal: null, stderr: "err-tail2", stdout: "out-tail" });
+      await worker.prompt("hello world", "steer");
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        expect.stringContaining('"type":"prompt","message":"hello world","streamingBehavior":"steer"'),
+        "utf8",
+      );
+      expect(worker.isBusy()).toBe(true);
+      expect(worker.activity().text).toBe("hello world");
+
+      await worker.prompt("later task", "followUp");
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        expect.stringContaining('"type":"prompt","message":"later task","streamingBehavior":"followUp"'),
+        "utf8",
+      );
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }
   });
 
-  it("rejects a second concurrent run", async () => {
+  it("tracks isBusy state across agent_start and agent_settled events", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiRunWorker({
+      const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
-        message: ".",
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
       });
-      const done = worker.run();
-      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-      await expect(worker.run()).rejects.toThrow("already running");
-      child.emit("exit", 0, null);
-      await done;
+      await worker.start();
+      expect(worker.isBusy()).toBe(false);
+
+      child.stdout.emit("data", `${JSON.stringify({ type: "agent_start" })}\n`);
+      expect(worker.isBusy()).toBe(true);
+
+      child.stdout.emit("data", `${JSON.stringify({ type: "agent_settled" })}\n`);
+      expect(worker.isBusy()).toBe(false);
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }
   });
 
-  it("stop() escalates SIGTERM to SIGKILL after the grace period", async () => {
+  it("waitForSettled resolves when agent_settled event is emitted", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.prompt("do work");
+      const settled = worker.waitForSettled();
+
+      child.stdout.emit("data", "output chunk\n");
+      child.stdout.emit("data", `${JSON.stringify({ type: "agent_settled" })}\n`);
+
+      const result = await settled;
+      expect(result.stdout).toContain("output chunk");
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("reaps the idle worker after idleTimeoutMs", async () => {
     vi.useFakeTimers();
     try {
       const f = await fixture();
       try {
         const { child, spawn, terminate } = fakeChildFixture();
-        const worker = new PiRunWorker({
+        const reaped = vi.fn();
+        const worker = new PiWorker({
           workspace: f.workspace,
           appRoot: f.appRoot,
-          message: ".",
+          idleTimeoutMs: 1_000,
           spawnProcess: spawn,
           terminateProcessGroup: terminate,
-          stopGraceMs: 250,
         });
-        const done = worker.run();
-        await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-        const stopping = worker.stop();
-        expect(terminate).toHaveBeenCalledWith(child, "SIGTERM");
-        await vi.advanceTimersByTimeAsync(250);
-        expect(terminate).toHaveBeenCalledWith(child, "SIGKILL");
-        child.emit("exit", null, "SIGKILL");
-        await stopping;
-        await expect(done).resolves.toEqual({ code: null, signal: "SIGKILL", stderr: "", stdout: "" });
+        worker.onReaped(reaped);
+        await worker.start();
+
+        expect(worker.isAlive()).toBe(true);
+        const closing = vi.advanceTimersByTimeAsync(1_000);
+        await vi.waitFor(() => expect(child.stdin.end).toHaveBeenCalled());
+        child.emit("exit", 0, null);
+        await closing;
+        await vi.waitFor(() => expect(reaped).toHaveBeenCalledOnce());
+        expect(worker.isAlive()).toBe(false);
       } finally {
         await rm(f.root, { recursive: true, force: true });
       }
@@ -192,54 +190,120 @@ describe("PiRunWorker", () => {
     }
   });
 
-  it("stop() resolves immediately for an already-exited child", async () => {
+  it("close() performs orderly shutdown with fallback SIGKILL", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = await fixture();
+      try {
+        const { child, spawn, terminate } = fakeChildFixture();
+        const worker = new PiWorker({
+          workspace: f.workspace,
+          appRoot: f.appRoot,
+          spawnProcess: spawn,
+          terminateProcessGroup: terminate,
+          stopGraceMs: 250,
+        });
+        await worker.start();
+        const closing = worker.close();
+        expect(child.stdin.end).toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(250);
+        expect(terminate).toHaveBeenCalledWith(child, "SIGKILL");
+
+        child.emit("exit", 0, null);
+        await closing;
+      } finally {
+        await rm(f.root, { recursive: true, force: true });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop() terminates process group with SIGTERM then SIGKILL", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = await fixture();
+      try {
+        const { child, spawn, terminate } = fakeChildFixture();
+        const worker = new PiWorker({
+          workspace: f.workspace,
+          appRoot: f.appRoot,
+          spawnProcess: spawn,
+          terminateProcessGroup: terminate,
+          stopGraceMs: 250,
+        });
+        await worker.start();
+        const stopping = worker.stop();
+        expect(terminate).toHaveBeenCalledWith(child, "SIGTERM");
+
+        await vi.advanceTimersByTimeAsync(250);
+        expect(terminate).toHaveBeenCalledWith(child, "SIGKILL");
+
+        child.emit("exit", null, "SIGKILL");
+        await stopping;
+      } finally {
+        await rm(f.root, { recursive: true, force: true });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes a custom session directory to the CLI", async () => {
     const f = await fixture();
     try {
-      const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiRunWorker({
+      const { spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
-        message: ".",
+        sessionDir: "/workspace/.pi/subagents/alpha/sessions",
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
       });
-      const done = worker.run();
-      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-      child.exitCode = 0;
-      child.emit("exit", 0, null);
-      await done;
-      await expect(worker.stop()).resolves.toBeUndefined();
-      expect(terminate).not.toHaveBeenCalled();
+      await worker.start();
+      const args = spawn.mock.calls[0]?.[1] ?? [];
+      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/subagents/alpha/sessions");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }
   });
 
-  it("rejects when bwrap spawning fails", async () => {
+  it("writes appendSystemPrompt to a prompt file and mounts it read-only", async () => {
     const f = await fixture();
     try {
-      const spawn = vi.fn(() => { throw new Error("no bwrap"); });
-      const worker = new PiRunWorker({
+      const { spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
-        message: ".",
+        appendSystemPrompt: "custom system prompt",
         spawnProcess: spawn,
-        terminateProcessGroup: vi.fn(),
+        terminateProcessGroup: terminate,
       });
-      await expect(worker.run()).rejects.toThrow("spawn failed");
+      await worker.start();
+      const args = spawn.mock.calls[0]?.[1] ?? [];
+      expect(args).toContain("--append-system-prompt");
+      expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("/app/append-system-prompt.md");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }
   });
 
-  it("rejects non-safe stop grace periods", () => {
-    expect(() => new PiRunWorker({
+  it("rejects non-safe stop grace periods and idle timeouts", () => {
+    expect(() => new PiWorker({
       workspace: "/tmp/ws",
       appRoot: "/tmp/app",
-      message: ".",
       spawnProcess: vi.fn(),
       terminateProcessGroup: vi.fn(),
       stopGraceMs: -1,
     })).toThrow("stopGraceMs must be a non-negative integer");
+
+    expect(() => new PiWorker({
+      workspace: "/tmp/ws",
+      appRoot: "/tmp/app",
+      spawnProcess: vi.fn(),
+      terminateProcessGroup: vi.fn(),
+      idleTimeoutMs: -1,
+    })).toThrow("idleTimeoutMs must be a non-negative integer");
   });
 });

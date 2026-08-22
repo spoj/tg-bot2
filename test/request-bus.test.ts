@@ -9,6 +9,7 @@ import {
   type CancelRequestHandler,
   type SendRequestHandler,
   type SpawnRequestHandler,
+  type SteerTaskRequestHandler,
   type WorkspaceRequestBusOptions,
 } from "../src/request-bus.js";
 
@@ -52,6 +53,10 @@ function cancelRequest(runId = "run-1"): string {
   return `${JSON.stringify({ v: 1, t: "t", type: "cancel_request", runId })}\n`;
 }
 
+function steerTaskRequest(steerId = "steer-1", runId = "run-1", message = "adjust"): string {
+  return `${JSON.stringify({ v: 1, t: "t", type: "steer_task_request", steerId, runId, message })}\n`;
+}
+
 const outcome = (record: Record<string, unknown>): string => `${JSON.stringify({ v: 1, t: "t", ...record })}\n`;
 
 async function writeLog(workspace: string, lines: string[]): Promise<void> {
@@ -63,6 +68,7 @@ describe("parseCommand", () => {
     expect(parseCommand(sendRequest())).toEqual({ requestId: "req-1", request: { type: "send_message", text: "hi" } });
     expect(parseCommand(spawnRequest())).toEqual({ runId: "run-1", prompt: "do it" });
     expect(parseCommand(cancelRequest())).toEqual({ runId: "run-1" });
+    expect(parseCommand(steerTaskRequest())).toEqual({ steerId: "steer-1", runId: "run-1", message: "adjust" });
     expect(parseCommand("not json")).toBeUndefined();
     expect(parseCommand(outcome({ type: "task_settled", runId: "run-1", status: "done", exitCode: 0 }))).toBeUndefined();
     expect(parseCommand(outcome({ type: "outbox_sent", requestId: "req-1" }))).toBeUndefined();
@@ -119,6 +125,15 @@ describe("WorkspaceRequestBus", () => {
     expect(onSpawn).toHaveBeenCalledWith({ runId: "run-fresh", prompt: "do it" }, workspace);
     expect(onCancel).toHaveBeenCalledTimes(1);
     expect(onCancel).toHaveBeenCalledWith({ runId: "run-cancel-fresh" }, workspace);
+  });
+  it("routes steer_task commands to onSteerTask", async () => {
+    const { workspace } = await fixture();
+    await writeLog(workspace, [steerTaskRequest("s-1", "run-1", "use python 3.12")]);
+    const onSteerTask = vi.fn<SteerTaskRequestHandler>(async () => undefined);
+    const bus = setupBus(workspace, { onSteerTask });
+
+    await bus.poll();
+    expect(onSteerTask).toHaveBeenCalledWith({ steerId: "s-1", runId: "run-1", message: "use python 3.12" }, workspace);
   });
 
   it("retries pending spawns until a slot frees", async () => {

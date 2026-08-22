@@ -120,6 +120,7 @@ export async function main(): Promise<void> {
       onSend: (record, ws) => outboxInstance.handleSendRequest(record, ws),
       onSpawn: (record, ws) => tasksInstance.handleSpawnRequest(record, ws),
       onCancel: (record, ws) => tasksInstance.handleCancelRequest(record, ws),
+      onSteerTask: (record, ws) => tasksInstance.handleSteerRequest(record, ws),
       onStartBrowser: (record) => browserManager.handleStartBrowserRequest(record).then(() => {}),
     });
     tasksInstance.flush = requestBus;

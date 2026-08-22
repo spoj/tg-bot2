@@ -254,7 +254,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
   );
   const piArgs = [
-    "--print",
+    "--mode", "rpc",
     "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
     "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),

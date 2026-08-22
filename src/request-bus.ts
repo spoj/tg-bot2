@@ -20,6 +20,12 @@ export type SpawnRequest = {
 export type CancelRequest = {
   runId: string;
 };
+/** One steer_task_request command: the agent's tool minted steerId, target runId, and steering message. */
+export type SteerTaskRequest = {
+  steerId: string;
+  runId: string;
+  message: string;
+};
 
 /** One browser_requested command: the agent's tool minted requestId. */
 export type StartBrowserRequest = {
@@ -38,15 +44,17 @@ export type SpawnRequestHandler = (
 
 /** Consumes one cancel_request; a command naming an unknown or settled run is a no-op. */
 export type CancelRequestHandler = (record: CancelRequest, workspace: string) => Promise<void>;
+/** Consumes one steer_task_request; a command naming an unknown or settled run is a no-op. */
+export type SteerTaskRequestHandler = (record: SteerTaskRequest, workspace: string) => Promise<void>;
 
 /** Consumes one browser_requested command to start Chrome and the socket bridge. */
 export type StartBrowserRequestHandler = (record: StartBrowserRequest, workspace: string) => Promise<void>;
-
 export type WorkspaceRequestBusOptions = {
   workspace: string;
   onSend: SendRequestHandler;
   onSpawn: SpawnRequestHandler;
   onCancel: CancelRequestHandler;
+  onSteerTask?: SteerTaskRequestHandler;
   onStartBrowser?: StartBrowserRequestHandler;
   pollIntervalMs?: number;
   setInterval?: typeof setInterval;
@@ -74,11 +82,15 @@ type ChatScanState = {
 };
 
 function commandId(type: string, record: Record<string, unknown>): string | undefined {
-  const id = record[type === "send_request" || type === "browser_requested" ? "requestId" : "runId"];
+  const id = record[
+    type === "send_request" || type === "browser_requested" ? "requestId"
+      : type === "steer_task_request" ? "steerId"
+        : "runId"
+  ];
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-export type CommandRequest = SendRequest | SpawnRequest | CancelRequest | StartBrowserRequest;
+export type CommandRequest = SendRequest | SpawnRequest | SteerTaskRequest | CancelRequest | StartBrowserRequest;
 
 /** Parses one system.jsonl line into a command record; undefined for outcomes, junk, or malformed commands. */
 export function parseCommand(line: string): CommandRequest | undefined {
@@ -98,9 +110,15 @@ export function parseCommand(line: string): CommandRequest | undefined {
     const prompt = typed.prompt;
     return typeof prompt === "string" ? { runId: id, prompt } : undefined;
   }
+  if (typed.type === "steer_task_request") {
+    const runId = typed.runId;
+    const message = typed.message;
+    return typeof runId === "string" && typeof message === "string" && runId.length > 0
+      ? { steerId: id, runId, message }
+      : undefined;
+  }
   if (typed.type === "cancel_request") return { runId: id };
   if (typed.type === "browser_requested") return { requestId: id };
-  return undefined;
 }
 
 
@@ -329,8 +347,7 @@ export class WorkspaceRequestBus {
     }
   }
   private async route(workspace: string, state: ChatScanState, record: CommandRequest): Promise<void> {
-    const id = "requestId" in record ? record.requestId : record.runId;
-    if (state.consumed.has(id)) return;
+    const id = "requestId" in record ? record.requestId : "steerId" in record ? record.steerId : record.runId;
     if (state.bootConsumed.has(id)) {
       state.consumed.add(id);
       return;
@@ -346,6 +363,14 @@ export class WorkspaceRequestBus {
       const result = await this.invokeSpawn(workspace, record);
       if (result === "claimed") state.consumed.add(record.runId);
       else state.pending.push(record);
+      return;
+    }
+    if ("steerId" in record) {
+      // steer_task_request
+      state.consumed.add(id);
+      if (this.options.onSteerTask) {
+        await this.invoke(() => this.options.onSteerTask!(record, workspace));
+      }
       return;
     }
     if ("requestId" in record) {

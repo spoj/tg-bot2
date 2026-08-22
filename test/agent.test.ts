@@ -6,7 +6,7 @@ import {
   AgentManager,
   loadUserSettings,
   SYSTEM_PROMPT,
-  type AgentRunWorker,
+  type AgentWorker,
   type AgentWorkerOptions,
   type AgentStatus,
 } from "../src/agent.js";
@@ -14,51 +14,62 @@ import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
 import { EVENTS_PROMPT } from "../src/events.js";
 import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
 import { TASKS_PROMPT } from "../src/task-protocol.js";
-import { deferred } from "./helpers.js";
 
-type RunResult = { code: number | null; signal: NodeJS.Signals | null; stderr: string; stdout: string };
-
-type FakeRun = {
-  worker: AgentRunWorker & { options: AgentWorkerOptions };
-  resolveRun: (result: RunResult) => void;
+type FakeWorker = AgentWorker & {
+  options: AgentWorkerOptions;
+  prompts: Array<{ message: string; streamingBehavior?: "steer" | "followUp" }>;
+  reap: () => void;
+  prompt: Mock<(message: string, streamingBehavior?: "steer" | "followUp") => Promise<void>>;
+  close: Mock<() => Promise<void>>;
   stop: Mock<() => Promise<void>>;
-  run: Mock<() => Promise<RunResult>>;
 };
 
-function fakeWorkerFactory(): { factory: Mock<(options: AgentWorkerOptions) => Promise<AgentRunWorker>>; runs: FakeRun[] } {
-  const runs: FakeRun[] = [];
-  const factory = vi.fn(async (options: AgentWorkerOptions): Promise<AgentRunWorker> => {
-    const gate = deferred<RunResult>();
-    const stop = vi.fn(async () => {});
-    const run = vi.fn(async () => await gate.promise);
-    const worker = { run, stop, options } as unknown as AgentRunWorker & { options: AgentWorkerOptions };
-    runs.push({ worker, resolveRun: gate.resolve, stop, run });
+function fakeWorkerFactory(): {
+  factory: Mock<(options: AgentWorkerOptions) => Promise<AgentWorker>>;
+  workers: FakeWorker[];
+} {
+  const workers: FakeWorker[] = [];
+  const factory = vi.fn(async (options: AgentWorkerOptions): Promise<AgentWorker> => {
+    let reapedCallback: (() => void) | undefined;
+    let alive = true;
+    let busy = false;
+    const prompts: Array<{ message: string; streamingBehavior?: "steer" | "followUp" }> = [];
+    const prompt = vi.fn(async (message: string, streamingBehavior?: "steer" | "followUp") => {
+      prompts.push({ message, ...(streamingBehavior !== undefined ? { streamingBehavior } : {}) });
+      busy = true;
+    });
+    const close = vi.fn(async () => {
+      alive = false;
+      busy = false;
+    });
+    const stop = vi.fn(async () => {
+      alive = false;
+      busy = false;
+    });
+    const onReaped = vi.fn((cb: () => void) => {
+      reapedCallback = cb;
+    });
+    const reap = () => {
+      alive = false;
+      busy = false;
+      reapedCallback?.();
+    };
+    const worker: FakeWorker = {
+      options,
+      prompts,
+      reap,
+      isAlive: () => alive,
+      isBusy: () => busy,
+      prompt,
+      close,
+      stop,
+      onReaped,
+    };
+    workers.push(worker);
     return worker;
   });
-  return { factory, runs };
+  return { factory, workers };
 }
-
-type ManualTimer = { fn: () => void; delay: number };
-function manualTimers() {
-  const pending = new Set<ManualTimer>();
-  const cleared: ManualTimer[] = [];
-  return {
-    cleared,
-    byDelay: (delay: number) => [...pending].filter((entry) => entry.delay === delay),
-    setTimeout: ((fn: () => void, delay: number) => {
-      const timer: ManualTimer = { fn, delay };
-      pending.add(timer);
-      return timer as unknown as NodeJS.Timeout;
-    }) as typeof setTimeout,
-    clearTimeout: ((timer: NodeJS.Timeout) => {
-      const entry = timer as unknown as ManualTimer;
-      pending.delete(entry);
-      cleared.push(entry);
-    }) as typeof clearTimeout,
-  };
-}
-
-const testConfig = { workspace: "/tmp/tg-bot2-test/workspace" };
 
 function managerOptions(overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
   return {
@@ -66,10 +77,10 @@ function managerOptions(overrides: Record<string, unknown> = {}): ConstructorPar
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
     now: () => 1_000_000,
-    combineDebounceMs: 0,
     ...overrides,
   };
 }
+
 async function withDataDir(run: (dataDir: string) => Promise<void>): Promise<void> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "tg-bot-agent-"));
   try {
@@ -125,255 +136,52 @@ it("loadUserSettings tolerates missing, empty, and malformed files", async () =>
   });
 });
 
-it("followup starts a fresh run when the resume window has never opened", async () => {
+it("followup starts a fresh worker and sends prompt with followUp streaming behavior", async () => {
   await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
+    const { factory, workers } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup(".");
-    await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
-    expect(factory.mock.calls[0]?.[0]).toMatchObject({ message: ".", resume: false, appendSystemPrompt: SYSTEM_PROMPT });
-    expect(runs[0]?.run).toHaveBeenCalledOnce();
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    await manager.followup("scheduled work");
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(factory.mock.calls[0]?.[0]).toMatchObject({ resume: false, appendSystemPrompt: SYSTEM_PROMPT });
+    expect(workers[0]?.prompt).toHaveBeenCalledWith("scheduled work", "followUp");
   });
 });
 
-it("followup queues behind an active run and drains combined in order", async () => {
+it("interrupt sends prompt with steer streaming behavior to the active worker", async () => {
   await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.followup("scheduled");
+    expect(workers).toHaveLength(1);
+    await manager.interrupt("stop and do this");
+    expect(workers).toHaveLength(1);
+    expect(workers[0]?.prompt).toHaveBeenLastCalledWith("stop and do this", "steer");
+  });
+});
+
+it("interrupt while idle starts a worker immediately", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    await manager.interrupt("user instruction");
+    expect(workers).toHaveLength(1);
+    expect(workers[0]?.prompt).toHaveBeenCalledWith("user instruction", "steer");
+  });
+});
+
+it("reaped idle worker triggers fresh worker creation on next message", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("first");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(workers).toHaveLength(1);
+
+    // Simulate idle reaping
+    workers[0]?.reap();
+
     await manager.followup("second");
-    await manager.followup("third");
-    expect(runs).toHaveLength(1);
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe("second\nthird");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("interrupt kills the active run and runs next, preserving queued followups", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup("scheduled");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    await manager.followup("queued");
-    await manager.interrupt(".");
-    await vi.waitFor(() => expect(runs[0]?.stop).toHaveBeenCalledOnce());
-    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe(".");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(3));
-    expect(runs[2]?.worker.options.message).toBe("queued");
-    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("interrupt while idle starts a run immediately", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.interrupt(".");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    expect(factory.mock.calls[0]?.[0].message).toBe(".");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("coalesces an interrupt burst into one stop and one combined message", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup("scheduled");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    await manager.interrupt("first");
-    await manager.interrupt("second");
-    await manager.interrupt("third");
-    await vi.waitFor(() => expect(runs[0]?.stop).toHaveBeenCalledOnce());
-    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe("first\nsecond\nthird");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("combines interrupts while idle into one message after the debounce window", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.interrupt("first");
-    await manager.interrupt("second");
-    await manager.interrupt("third");
-    expect(runs).toHaveLength(0);
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    expect(runs[0]?.worker.options.message).toBe("first\nsecond\nthird");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("force-drains a running burst at the cap and combines interrupts arriving during the abort", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const timers = manualTimers();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
-      workerFactory: factory,
-      combineDebounceMs: 100,
-      interruptForceDrainMs: 200,
-      now: () => 10 * 60 * 60 * 1000,
-      setTimeout: timers.setTimeout,
-      clearTimeout: timers.clearTimeout,
-    }));
-    await manager.followup("scheduled");
-    timers.byDelay(100)[0]?.fn();
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    await manager.interrupt("first");
-    await manager.interrupt("second");
-    expect(timers.byDelay(200)).toHaveLength(1);
-    timers.byDelay(200)[0]?.fn();
-    expect(runs[0]?.stop).toHaveBeenCalledOnce();
-    await manager.interrupt("third");
-    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe("first\nsecond\nthird");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("force-drains an idle interrupt at the cap", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const timers = manualTimers();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
-      workerFactory: factory,
-      combineDebounceMs: 100,
-      interruptForceDrainMs: 200,
-      now: () => 10 * 60 * 60 * 1000,
-      setTimeout: timers.setTimeout,
-      clearTimeout: timers.clearTimeout,
-    }));
-    await manager.interrupt("first");
-    expect(runs).toHaveLength(0);
-    timers.byDelay(200)[0]?.fn();
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    expect(runs[0]?.worker.options.message).toBe("first");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("queues followups behind interrupts still waiting out the debounce window", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.interrupt("first");
-    await manager.followup("later");
-    expect(runs).toHaveLength(0);
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    expect(runs[0]?.worker.options.message).toBe("first");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.message).toBe("later");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("combines idle followups into one message after the debounce window", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup("first");
-    await manager.followup("second");
-    expect(runs).toHaveLength(0);
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    expect(runs[0]?.worker.options.message).toBe("first\nsecond");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("combines followups queued during a run and delivers them at settle", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup("scheduled");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    await manager.followup("first");
-    await manager.followup("second");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[0]?.stop).not.toHaveBeenCalled();
-    expect(runs[1]?.worker.options.message).toBe("first\nsecond");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("restarts the debounce window on each new interrupt without restarting the force cap", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory } = fakeWorkerFactory();
-    const timers = manualTimers();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
-      workerFactory: factory,
-      combineDebounceMs: 100,
-      interruptForceDrainMs: 1_000,
-      setTimeout: timers.setTimeout,
-      clearTimeout: timers.clearTimeout,
-    }));
-    await manager.interrupt("first");
-    const firstDebounce = timers.byDelay(100)[0];
-    expect(firstDebounce).toBeDefined();
-    await manager.interrupt("second");
-    expect(timers.cleared).toContain(firstDebounce);
-    expect(timers.byDelay(100)).toHaveLength(1);
-    expect(timers.byDelay(1_000)).toHaveLength(1);
-  });
-});
-
-it("a natural settle cancels the pending interrupt stop", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, combineDebounceMs: 50, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup("scheduled");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    await manager.interrupt(".");
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[0]?.stop).not.toHaveBeenCalled();
-    expect(runs[1]?.worker.options.message).toBe(".");
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-  });
-});
-
-it("rejects a non-timer-safe combine debounce window", () => {
-  expect(() => new AgentManager(testConfig, managerOptions({ combineDebounceMs: -1 }))).toThrow("non-negative timer-safe integer");
-});
-
-it("rejects a force drain window shorter than the debounce window", () => {
-  expect(() => new AgentManager(testConfig, managerOptions({ combineDebounceMs: 100, interruptForceDrainMs: 50 }))).toThrow("at least the debounce window");
-});
-
-it("beginShutdown cancels pending interrupt stops", async () => {
-  await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
-    const timers = manualTimers();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({
-      workerFactory: factory,
-      combineDebounceMs: 100,
-      interruptForceDrainMs: 1_000,
-      now: () => 10 * 60 * 60 * 1000,
-      setTimeout: timers.setTimeout,
-      clearTimeout: timers.clearTimeout,
-    }));
-    await manager.followup("scheduled");
-    timers.byDelay(100)[0]?.fn();
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    await manager.interrupt(".");
-    expect(timers.byDelay(100)).toHaveLength(1);
-    expect(timers.byDelay(1_000)).toHaveLength(1);
-    await manager.beginShutdown();
-    expect(runs[0]?.stop).toHaveBeenCalledOnce();
-    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
-    expect(runs).toHaveLength(1);
+    expect(workers).toHaveLength(2);
+    expect(workers[1]?.prompt).toHaveBeenCalledWith("second", "followUp");
   });
 });
 
@@ -389,49 +197,45 @@ it("resumes within the window and starts fresh after it closes", async () => {
     await utimes(sessionFile, new Date(), new Date(tenHours - 3 * 60 * 60 * 1000));
 
     let now = tenHours;
-    const { factory, runs } = fakeWorkerFactory();
+    const { factory, workers } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => now }));
     await manager.followup("one");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    expect(runs[0]?.worker.options.resume).toBe(false);
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    expect(workers[0]?.options.resume).toBe(false);
 
     // Run one writes its session file at its start time.
     await utimes(sessionFile, new Date(), new Date(tenHours));
+    workers[0]?.reap();
 
     now = tenHours + 60_000;
     await manager.followup("two");
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.resume).toBe(true);
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    expect(workers[1]?.options.resume).toBe(true);
 
+    workers[1]?.reap();
     now = tenHours + 3 * 60 * 60 * 1000;
     await manager.followup("three");
-    await vi.waitFor(() => expect(runs).toHaveLength(3));
-    expect(runs[2]?.worker.options.resume).toBe(false);
-    runs[2]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    expect(workers[2]?.options.resume).toBe(false);
   });
 });
 
-it("a new-session marker forces a fresh run and is consumed", async () => {
+it("a new-session marker forces a fresh run, closes active worker, and is consumed", async () => {
   await withDataDir(async (dataDir) => {
     const tenHours = 10 * 60 * 60 * 1000;
     let now = tenHours;
-    const { factory, runs } = fakeWorkerFactory();
+    const { factory, workers } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => now }));
     await manager.followup("one");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
+    expect(workers).toHaveLength(1);
 
     const marker = path.join(dataDir, "workspace", ".tg-bot", "new-session");
     await mkdir(path.dirname(marker), { recursive: true });
     await writeFile(marker, "", "utf8");
     now = tenHours + 60_000;
+
     await manager.followup("two");
-    await vi.waitFor(() => expect(runs).toHaveLength(2));
-    expect(runs[1]?.worker.options.resume).toBe(false);
+    expect(workers[0]?.close).toHaveBeenCalled();
+    expect(workers).toHaveLength(2);
+    expect(workers[1]?.options.resume).toBe(false);
     await expect(readFile(marker, "utf8")).rejects.toThrow();
-    runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
 });
 
@@ -442,15 +246,14 @@ it("passes settings defaults as model and thinking CLI args", async () => {
       defaultModel: "deepseek/deepseek-chat",
       defaultThinkingLevel: "high",
     });
-    const { factory, runs } = fakeWorkerFactory();
+    const { factory } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup(".");
-    await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
+    expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
       model: "openrouter/deepseek/deepseek-chat",
       thinkingLevel: "high",
     });
-    runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
 });
 
@@ -468,17 +271,13 @@ it("a restart resumes a recent session file and starts fresh after the window cl
     const first = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: first.factory, now: () => now }));
     await manager.followup(".");
-    await vi.waitFor(() => expect(first.runs).toHaveLength(1));
     expect(first.factory.mock.calls[0]?.[0].resume).toBe(true);
-    first.runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
 
     await utimes(sessionFile, new Date(), new Date(now - 3 * 60 * 60 * 1000));
     const second = fakeWorkerFactory();
     const secondManager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: second.factory, now: () => now }));
     await secondManager.followup(".");
-    await vi.waitFor(() => expect(second.runs).toHaveLength(1));
     expect(second.factory.mock.calls[0]?.[0].resume).toBe(false);
-    second.runs[0]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
   });
 });
 
@@ -549,35 +348,14 @@ it("status counts active background tasks and schedule rows", async () => {
   });
 });
 
-it("beginShutdown stops active runs and rejects later work", async () => {
+it("beginShutdown stops active workers and rejects later work", async () => {
   await withDataDir(async (dataDir) => {
-    const { factory, runs } = fakeWorkerFactory();
+    const { factory, workers } = fakeWorkerFactory();
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("one");
-    await vi.waitFor(() => expect(runs).toHaveLength(1));
+    expect(workers).toHaveLength(1);
     await manager.beginShutdown();
-    expect(runs[0]?.stop).toHaveBeenCalledOnce();
+    expect(workers[0]?.close).toHaveBeenCalledOnce();
     await expect(manager.followup("two")).rejects.toThrow("Agent manager is shutting down");
-    runs[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
-  });
-});
-
-it("a failed run logs and continues draining queued followups", async () => {
-  await withDataDir(async (dataDir) => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      const { factory, runs } = fakeWorkerFactory();
-      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
-      await manager.followup("one");
-      await vi.waitFor(() => expect(runs).toHaveLength(1));
-      await manager.followup("two");
-      runs[0]?.resolveRun({ code: 1, signal: null, stderr: "boom", stdout: "" });
-      await vi.waitFor(() => expect(runs).toHaveLength(2));
-      expect(runs[1]?.worker.options.message).toBe("two");
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("boom"));
-      runs[1]?.resolveRun({ code: 0, signal: null, stderr: "", stdout: "" });
-    } finally {
-      errorSpy.mockRestore();
-    }
   });
 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -17,15 +17,17 @@ export type PiRunResult = {
   stdout: string;
 };
 
-export type PiRunWorkerOptions = PiRunSandboxPaths & {
-  /** The single message processed by the one-shot --print run. */
-  message: string;
+export type PiWorkerOptions = PiRunSandboxPaths & {
   bwrapPath?: string;
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   stopGraceMs?: number;
+  idleTimeoutMs?: number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 };
 
+export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_STOP_GRACE_MS = 1_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
@@ -99,21 +101,30 @@ async function prepareWorkspace(workspace: string): Promise<void> {
 }
 
 /**
- * One-shot Pi run: executes a single --print turn in a fresh bwrap process and
- * resolves when the process exits. A live worker therefore always means an
- * active run; termination is the only out-of-band signal.
+ * Pi RPC worker: manages a long-running `pi --mode rpc` process inside bwrap,
+ * handling JSON-RPC prompting, mid-flight steering, follow-ups, and idle reaping.
  */
-export class PiRunWorker {
-  private readonly options: PiRunWorkerOptions;
+export class PiWorker {
+  readonly options: PiWorkerOptions;
   private readonly bwrapPath: string;
   private readonly stopGraceMs: number;
+  private readonly idleTimeoutMs: number;
+  private readonly setTimeoutFn: typeof setTimeout;
+  private readonly clearTimeoutFn: typeof clearTimeout;
   private process: PiWorkerChildProcess | undefined;
   private stdout = "";
   private stderr = "";
   private lastActivityAt = 0;
   private lastActivity = "";
+  private isBusyState = false;
+  private idleTimer: NodeJS.Timeout | undefined;
+  private startPromise: Promise<void> | undefined;
+  private exitPromise: Promise<PiRunResult> | undefined;
+  private readonly settledResolvers = new Set<(result: PiRunResult) => void>();
+  private reapedCallback: (() => void) | undefined;
+  private closing = false;
 
-  constructor(options: PiRunWorkerOptions) {
+  constructor(options: PiWorkerOptions) {
     this.options = options;
     this.bwrapPath = options.bwrapPath ?? "bwrap";
     const stopGraceMs = options.stopGraceMs ?? DEFAULT_STOP_GRACE_MS;
@@ -124,11 +135,29 @@ export class PiRunWorker {
       throw new Error(`stopGraceMs must not exceed ${MAX_SIGNAL_TIMEOUT_MS}`);
     }
     this.stopGraceMs = stopGraceMs;
+    const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 0) {
+      throw new Error("idleTimeoutMs must be a non-negative integer");
+    }
+    this.idleTimeoutMs = idleTimeoutMs;
+    this.setTimeoutFn = options.setTimeout ?? setTimeout;
+    this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
   }
 
-  /** When the run last wrote output, and the tail of what it wrote. */
+  isAlive(): boolean {
+    return this.process !== undefined && this.process.exitCode === null && this.process.signalCode === null;
+  }
+
+  isBusy(): boolean {
+    return this.isBusyState;
+  }
+
   activity(): { at: number; text: string } {
     return { at: this.lastActivityAt, text: this.lastActivity };
+  }
+
+  onReaped(callback: () => void): void {
+    this.reapedCallback = callback;
   }
 
   private noteActivity(chunk: string | Buffer): void {
@@ -140,39 +169,25 @@ export class PiRunWorker {
     }
   }
 
-  /** Runs one turn to completion; resolves with the exit result. */
-  async run(): Promise<PiRunResult> {
-    if (this.process) throw new Error("Pi run worker is already running");
+  async start(): Promise<void> {
+    if (this.isAlive()) return;
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.startInternal();
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = undefined;
+    }
+  }
+
+  private async startInternal(): Promise<void> {
     this.stdout = "";
     this.stderr = "";
     this.lastActivityAt = 0;
     this.lastActivity = "";
-    try {
-      return await this.runInternal();
-    } finally {
-      this.process = undefined;
-    }
-  }
+    this.isBusyState = false;
+    this.closing = false;
 
-  /** Terminates the run; the run() promise settles with the signal. */
-  stop(): Promise<void> {
-    const child = this.process;
-    if (!child) return Promise.resolve();
-    const done = new Promise<void>((resolve) => {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        resolve();
-        return;
-      }
-      child.once("exit", () => resolve());
-    });
-    this.options.terminateProcessGroup(child, "SIGTERM");
-    const timer = setTimeout(() => {
-      this.options.terminateProcessGroup(child, "SIGKILL");
-    }, this.stopGraceMs);
-    return done.finally(() => clearTimeout(timer));
-  }
-
-  private async runInternal(): Promise<PiRunResult> {
     await prepareWorkspace(this.options.workspace);
     const promptFile = this.options.appendSystemPrompt !== undefined
       ? await ensurePromptFile(this.options.appRoot, this.options.appendSystemPrompt)
@@ -190,6 +205,7 @@ export class PiRunWorker {
         hostTools: this.options.hostTools,
       }),
     });
+
     let child: PiWorkerChildProcess;
     try {
       child = this.options.spawnProcess(this.bwrapPath, built.args, {
@@ -202,30 +218,167 @@ export class PiRunWorker {
     }
     this.process = child;
 
-    const exited = new Promise<PiRunResult>((resolve) => {
+    this.exitPromise = new Promise<PiRunResult>((resolve) => {
+      let buffer = "";
       child.stdout?.on("data", (chunk: Buffer | string) => {
         this.noteActivity(chunk);
-        this.stdout = boundedCapture(this.stdout, chunk);
+        const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        this.stdout = boundedCapture(this.stdout, text);
+        buffer += text;
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.length === 0) continue;
+          this.handleStdoutLine(trimmed);
+        }
       });
       child.stderr?.on("data", (chunk: Buffer | string) => {
         this.noteActivity(chunk);
         this.stderr = boundedCapture(this.stderr, chunk);
       });
       child.once("exit", (code, signal) => {
-        resolve({ code, signal, stderr: this.stderr, stdout: this.stdout });
+        if (buffer.trim().length > 0) {
+          this.handleStdoutLine(buffer.trim());
+        }
+        this.clearIdleTimer();
+        this.isBusyState = false;
+        this.process = undefined;
+        const result: PiRunResult = { code, signal, stderr: this.stderr, stdout: this.stdout };
+        this.resolveSettled(result);
+        resolve(result);
       });
     });
 
-    const stdin = child.stdin;
-    if (!stdin) {
-      this.options.terminateProcessGroup(child, "SIGKILL");
-      throw new Error("Pi run stdin is unavailable");
-    }
+    // Configure steering mode and follow-up mode to "all" on RPC startup
+    this.writeJson({ id: "init-steer", type: "set_steering_mode", mode: "all" });
+    this.writeJson({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
+
+    this.armIdleTimer();
+  }
+
+  private handleStdoutLine(line: string): void {
     try {
-      stdin.end(this.options.message, "utf8");
+      const event = JSON.parse(line) as { type?: string };
+      if (event.type === "agent_start" || event.type === "turn_start") {
+        this.isBusyState = true;
+        this.clearIdleTimer();
+      } else if (event.type === "agent_settled") {
+        this.isBusyState = false;
+        this.armIdleTimer();
+        this.resolveSettled({ code: null, signal: null, stderr: this.stderr, stdout: this.stdout });
+      }
     } catch {
-      this.options.terminateProcessGroup(child, "SIGKILL");
+      // Non-JSON stdout lines are activity only
     }
-    return await exited;
+  }
+
+  private resolveSettled(result: PiRunResult): void {
+    const resolvers = [...this.settledResolvers];
+    this.settledResolvers.clear();
+    for (const resolve of resolvers) {
+      resolve(result);
+    }
+  }
+
+  private writeJson(obj: unknown): void {
+    const stdin = this.process?.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) return;
+    try {
+      stdin.write(JSON.stringify(obj) + "\n", "utf8");
+    } catch {
+      // Write failure on closing stream
+    }
+  }
+
+  async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+    if (!this.isAlive()) {
+      await this.start();
+    }
+    this.isBusyState = true;
+    this.clearIdleTimer();
+    this.noteActivity(message);
+    this.writeJson({
+      id: randomUUID(),
+      type: "prompt",
+      message,
+      ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
+    });
+  }
+
+  waitForSettled(): Promise<PiRunResult> {
+    if (!this.isAlive()) {
+      return this.exitPromise ?? Promise.resolve({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
+    }
+    if (!this.isBusyState) {
+      return Promise.resolve({ code: null, signal: null, stderr: this.stderr, stdout: this.stdout });
+    }
+    return new Promise<PiRunResult>((resolve) => {
+      this.settledResolvers.add(resolve);
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.closing) return this.exitPromise ? this.exitPromise.then(() => {}) : Promise.resolve();
+    this.closing = true;
+    this.clearIdleTimer();
+    const child = this.process;
+    if (!child || !this.isAlive()) return Promise.resolve();
+
+    const done = this.exitPromise ?? Promise.resolve({ code: null, signal: null, stderr: "", stdout: "" });
+    try {
+      child.stdin?.end();
+    } catch {
+      this.options.terminateProcessGroup(child, "SIGTERM");
+    }
+
+    const timer = this.setTimeoutFn(() => {
+      if (this.isAlive()) {
+        this.options.terminateProcessGroup(child, "SIGKILL");
+      }
+    }, this.stopGraceMs);
+    timer.unref?.();
+
+    await done.finally(() => this.clearTimeoutFn(timer));
+  }
+
+  async stop(): Promise<void> {
+    this.clearIdleTimer();
+    const child = this.process;
+    if (!child || !this.isAlive()) return Promise.resolve();
+
+    const done = this.exitPromise ?? Promise.resolve({ code: null, signal: null, stderr: "", stdout: "" });
+    this.options.terminateProcessGroup(child, "SIGTERM");
+
+    const timer = this.setTimeoutFn(() => {
+      if (this.isAlive()) {
+        this.options.terminateProcessGroup(child, "SIGKILL");
+      }
+    }, this.stopGraceMs);
+    timer.unref?.();
+
+    await done.finally(() => this.clearTimeoutFn(timer));
+  }
+
+  private armIdleTimer(): void {
+    if (this.idleTimeoutMs <= 0 || !Number.isFinite(this.idleTimeoutMs)) return;
+    this.clearIdleTimer();
+    this.idleTimer = this.setTimeoutFn(() => {
+      void this.onIdleTimeout();
+    }, this.idleTimeoutMs);
+    this.idleTimer.unref?.();
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer !== undefined) {
+      this.clearTimeoutFn(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+  }
+
+  private async onIdleTimeout(): Promise<void> {
+    if (this.isBusyState || !this.isAlive()) return;
+    await this.close();
+    this.reapedCallback?.();
   }
 }

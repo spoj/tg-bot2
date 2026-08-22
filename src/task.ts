@@ -2,14 +2,15 @@ import { lstat, mkdir, opendir, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
 import type { EventSink } from "./events.js";
-import { PiRunWorker, type PiRunResult } from "./pi-worker.js";
+import { PiWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
-import type { CancelRequest, SpawnRequest } from "./request-bus.js";
+import type { CancelRequest, SpawnRequest, SteerTaskRequest } from "./request-bus.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
 import { defined, errorMessage, isMissing } from "./util.js";
 
 export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
+  steer(message: string): Promise<void>;
   stop(): Promise<void>;
   /** When the run last wrote output, and the tail of what it wrote. */
   activity(): { at: number; text: string };
@@ -149,19 +150,33 @@ export class WorkspaceTasks {
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
     this.logger = options.logger ?? ((error) => console.error("Workspace task error", error));
-    this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiRunWorker({
-      workspace: workerOptions.workspace,
-      appRoot: this.appRoot,
-      ...defined({ bwrapPath: this.bwrapPath }),
-      appendSystemPrompt: TASK_RUNNER_PROMPT,
-      hostTools: "send,start_browser",
-      message: workerOptions.prompt,
-      resume: false,
-      sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
-      spawnProcess: this.spawnProcess,
-      terminateProcessGroup: this.terminateProcessGroup,
-      ...defined({ stopGraceMs: this.stopGraceMs }),
-    }));
+    this.workerFactory = options.workerFactory ?? ((workerOptions) => {
+      const worker = new PiWorker({
+        workspace: workerOptions.workspace,
+        appRoot: this.appRoot,
+        ...defined({ bwrapPath: this.bwrapPath }),
+        appendSystemPrompt: TASK_RUNNER_PROMPT,
+        hostTools: "send,start_browser",
+        resume: false,
+        sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
+        idleTimeoutMs: 0,
+        spawnProcess: this.spawnProcess,
+        terminateProcessGroup: this.terminateProcessGroup,
+        ...defined({ stopGraceMs: this.stopGraceMs }),
+      });
+      return {
+        run: async () => {
+          await worker.start();
+          await worker.prompt(workerOptions.prompt);
+          const result = await worker.waitForSettled();
+          await worker.close();
+          return result;
+        },
+        steer: (message: string) => worker.prompt(message, "steer"),
+        stop: () => worker.stop(),
+        activity: () => worker.activity(),
+      };
+    });
   }
   async start(): Promise<void> {
     if (this.running) {
@@ -215,6 +230,13 @@ export class WorkspaceTasks {
     const entry = this.inFlight.find((item) => item.runId === record.runId);
     if (entry === undefined) return;
     await entry.worker.stop();
+  }
+
+  /** Injects a mid-flight steering message into a running task; no-op if task is not in-flight. */
+  async handleSteerRequest(record: SteerTaskRequest, _workspace: string): Promise<void> {
+    const entry = this.inFlight.find((item) => item.runId === record.runId);
+    if (entry === undefined) return;
+    await entry.worker.steer(record.message);
   }
 
   /** Records a spawn command whose prompt is unusable as failed, with a followup. */

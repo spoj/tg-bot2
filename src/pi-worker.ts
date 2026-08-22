@@ -32,7 +32,7 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   clearInterval?: typeof clearInterval;
 };
 
-export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours: agents (and any subprocesses they keep) run until this inactivity limit
+export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours of idle: settled and waiting for a prompt. Busy turns are not bounded by this (the idle timer is disarmed until the agent settles), so workers — and any subprocesses they keep — die only after being idle this long.
 const DEFAULT_STOP_GRACE_MS = 1_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;

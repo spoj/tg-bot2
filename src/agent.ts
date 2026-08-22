@@ -149,6 +149,24 @@ function originToTarget(origin?: string): AgentTarget | undefined {
     ...(parsed.threadId > 0 ? { threadId: parsed.threadId } : {}),
   };
 }
+
+function resolveSessionRequestTarget(record?: {
+  origin?: string | undefined;
+  chat_id?: number | undefined;
+  message_thread_id?: number | undefined;
+  chatId?: number | undefined;
+  threadId?: number | undefined;
+}): { chatId?: number | undefined; threadId?: number | undefined } {
+  if (!record) return {};
+  const origin = parseOrigin(record.origin);
+  const originChatId = origin?.kind === "chat" ? origin.chatId : undefined;
+  const originThreadId = origin?.kind === "chat" ? origin.threadId : undefined;
+
+  const chatId = record.chat_id ?? record.chatId ?? originChatId;
+  const explicitThread = record.message_thread_id ?? record.threadId;
+  const threadId = explicitThread ?? (chatId === originChatId ? originThreadId : undefined);
+  return { chatId, threadId };
+}
 export class AgentEventRouter {
   private readonly lastKnockTimes = new Map<number, number>();
   private readonly now: () => number;
@@ -173,71 +191,86 @@ export class AgentEventRouter {
       case "callback":
         await this.handleCallback(event, rawLine);
         break;
-      case "task_settled": {
-        const originTarget = originToTarget(event.origin);
-        if (originTarget) {
-          await this.notifier.followup(formatTaskSettledMessage(event), originTarget);
-        }
+      case "task_settled":
+        await this.handleTaskSettled(event);
         break;
-      }
-      case "task_progress": {
-        const originTarget = originToTarget(event.origin);
-        if (originTarget && event.tasks.length > 0) {
-          await this.notifier.followup(formatTaskProgressMessage(event.tasks), originTarget);
-        }
+      case "task_progress":
+        await this.handleTaskProgress(event);
         break;
-      }
-      case "outbox_sent": {
-        const originTarget = originToTarget(event.origin);
-        const target: AgentTarget = {
-          chatId: event.chat_id,
-          ...defined({ threadId: event.message_thread_id }),
-        };
-
-        if (event.request_type === "create_forum_topic" && originTarget && event.message_thread_id !== undefined) {
-          const topicName = event.summary ? ` "${truncate(event.summary, 120)}"` : "";
-          await this.notifier.followup(`[Topic${topicName} created with thread ID ${event.message_thread_id}]`, originTarget);
-        }
-
-        const isSameSession = originTarget !== undefined &&
-          originTarget.chatId === target.chatId &&
-          (originTarget.threadId ?? 0) === (target.threadId ?? 0);
-
-        if (!isSameSession) {
-          const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
-          const typeLabel = event.request_type ?? "message";
-          const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
-          await this.notifier.followup(message, target);
-        }
+      case "outbox_sent":
+        await this.handleOutboxSent(event);
         break;
-      }
-      case "outbox_rejected": {
-        const originTarget = originToTarget(event.origin);
-        const target: AgentTarget | undefined = originTarget ?? (typeof event.chat_id === "number"
-          ? { chatId: event.chat_id, ...defined({ threadId: event.message_thread_id }) }
-          : undefined);
-        await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, target);
+      case "outbox_rejected":
+        await this.handleOutboxRejected(event);
         break;
-      }
       case "chat_denied":
         await this.handleDeniedChat(event);
         break;
-      case "browser_ready": {
-        const originTarget = originToTarget(event.origin);
-        const statusLabel = event.status === "started" ? "started" : "reused existing";
-        await this.notifier.interrupt(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`, originTarget);
+      case "browser_ready":
+        await this.handleBrowserReady(event);
         break;
-      }
       case "browser_request_failed": {
         const originTarget = originToTarget(event.origin);
         await this.notifier.interrupt(`Browser request ${event.requestId} failed: ${event.error}`, originTarget);
         break;
       }
-        // edited_message, poll_answer, message_reaction, my_chat_member, chat_join_request, allowlist_updated, schedule_run_scheduled, schedule_run_cancelled, browser_closed, agent commands
+      default:
+        // other events
         break;
     }
   }
 
+  private async handleTaskSettled(event: Extract<BotEvent, { type: "task_settled" }>): Promise<void> {
+    const originTarget = originToTarget(event.origin);
+    if (originTarget) {
+      await this.notifier.followup(formatTaskSettledMessage(event), originTarget);
+    }
+  }
+
+  private async handleTaskProgress(event: Extract<BotEvent, { type: "task_progress" }>): Promise<void> {
+    const originTarget = originToTarget(event.origin);
+    if (originTarget && event.tasks.length > 0) {
+      await this.notifier.followup(formatTaskProgressMessage(event.tasks), originTarget);
+    }
+  }
+
+  private async handleOutboxSent(event: Extract<BotEvent, { type: "outbox_sent" }>): Promise<void> {
+    const originTarget = originToTarget(event.origin);
+    const target: AgentTarget = {
+      chatId: event.chat_id,
+      ...defined({ threadId: event.message_thread_id }),
+    };
+
+    if (event.request_type === "create_forum_topic" && originTarget && event.message_thread_id !== undefined) {
+      const topicName = event.summary ? ` "${truncate(event.summary, 120)}"` : "";
+      await this.notifier.followup(`[Topic${topicName} created with thread ID ${event.message_thread_id}]`, originTarget);
+    }
+
+    const isSameSession = originTarget !== undefined &&
+      originTarget.chatId === target.chatId &&
+      (originTarget.threadId ?? 0) === (target.threadId ?? 0);
+
+    if (!isSameSession) {
+      const summaryText = event.summary ? `: "${truncate(event.summary, 120)}"` : "";
+      const typeLabel = event.request_type ?? "message";
+      const message = `[Outbound ${typeLabel} sent to this chat${summaryText}]`;
+      await this.notifier.followup(message, target);
+    }
+  }
+
+  private async handleOutboxRejected(event: Extract<BotEvent, { type: "outbox_rejected" }>): Promise<void> {
+    const originTarget = originToTarget(event.origin);
+    const target: AgentTarget | undefined = originTarget ?? (typeof event.chat_id === "number"
+      ? { chatId: event.chat_id, ...defined({ threadId: event.message_thread_id }) }
+      : undefined);
+    await this.notifier.interrupt(`Send ${event.requestId} rejected: ${event.detail}`, target);
+  }
+
+  private async handleBrowserReady(event: Extract<BotEvent, { type: "browser_ready" }>): Promise<void> {
+    const originTarget = originToTarget(event.origin);
+    const statusLabel = event.status === "started" ? "started" : "reused existing";
+    await this.notifier.interrupt(`Browser is ready (${statusLabel}). CDP endpoint: ${event.wsEndpoint} (socket: ${event.socketPath})`, originTarget);
+  }
   private async handleMessage(event: Extract<BotEvent, { type: "message" }>, rawLine: string): Promise<void> {
     const isPrivate = event.chat_id > 0;
     const botInfo = this.botInfoProvider?.();
@@ -468,6 +501,16 @@ export class AgentManager {
    * Marks a conversation session for reset. The current turn completes normally,
    * after which the worker process is closed immediately and new_session_scheduled is emitted.
    */
+  private scheduleEntryReset(entry: ConversationWorkerEntry): void {
+    entry.pendingNewSession = true;
+    void entry.serial.run(async () => {
+      if (entry.pendingNewSession && entry.worker?.isAlive()) {
+        await entry.worker.close().catch(() => {});
+        entry.worker = undefined;
+      }
+    }).catch(() => {});
+  }
+
   async handleNewSessionRequest(record?: {
     requestId?: string | undefined;
     origin?: string | undefined;
@@ -476,35 +519,17 @@ export class AgentManager {
     chatId?: number | undefined;
     threadId?: number | undefined;
   }): Promise<void> {
-    const parsedOrigin = parseOrigin(record?.origin);
-    const originChatId = parsedOrigin && parsedOrigin.kind === "chat" ? parsedOrigin.chatId : undefined;
-    const originThreadId = parsedOrigin && parsedOrigin.kind === "chat" ? parsedOrigin.threadId : undefined;
-
-    const chatId = record?.chat_id ?? record?.chatId ?? originChatId;
-    const threadId = record?.message_thread_id ?? record?.threadId ?? (record?.chat_id === undefined && record?.chatId === undefined ? originThreadId : undefined);
+    const { chatId, threadId } = resolveSessionRequestTarget(record);
     const requestId = record?.requestId;
     const origin = record?.origin;
+
     if (chatId !== undefined) {
-      const entry = this.getOrCreateEntry(chatId, threadId);
-      entry.pendingNewSession = true;
-      void entry.serial.run(async () => {
-        if (entry.pendingNewSession && entry.worker?.isAlive()) {
-          await entry.worker.close().catch(() => {});
-          entry.worker = undefined;
-        }
-      }).catch(() => {});
+      this.scheduleEntryReset(this.getOrCreateEntry(chatId, threadId));
     } else {
       for (const entry of this.workers.values()) {
-        entry.pendingNewSession = true;
-        void entry.serial.run(async () => {
-          if (entry.pendingNewSession && entry.worker?.isAlive()) {
-            await entry.worker.close().catch(() => {});
-            entry.worker = undefined;
-          }
-        }).catch(() => {});
+        this.scheduleEntryReset(entry);
       }
-      const defaultEntry = this.getOrCreateEntry();
-      defaultEntry.pendingNewSession = true;
+      this.getOrCreateEntry().pendingNewSession = true;
     }
     if (requestId) {
       await this.events?.emit({

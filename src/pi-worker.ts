@@ -266,7 +266,7 @@ export class PiWorker {
       } else if (event.type === "agent_settled") {
         this.isBusyState = false;
         this.armIdleTimer();
-        this.resolveSettled({ code: null, signal: null, stderr: this.stderr, stdout: this.stdout });
+        this.resolveSettled({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
       }
     } catch {
       // Non-JSON stdout lines are activity only
@@ -311,7 +311,7 @@ export class PiWorker {
       return this.exitPromise ?? Promise.resolve({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
     }
     if (!this.isBusyState) {
-      return Promise.resolve({ code: null, signal: null, stderr: this.stderr, stdout: this.stdout });
+      return Promise.resolve({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
     }
     return new Promise<PiRunResult>((resolve) => {
       this.settledResolvers.add(resolve);

@@ -153,6 +153,8 @@ describe("PiWorker", () => {
 
       const result = await settled;
       expect(result.stdout).toContain("output chunk");
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

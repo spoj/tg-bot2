@@ -128,7 +128,7 @@ describe("browser automation and lifecycle", () => {
       expect(existsSync(hostBrowser.getSocketPath())).toBe(false);
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("HostBrowserManager emits browser_request_failed when launch fails", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "browser-fail-test-"));

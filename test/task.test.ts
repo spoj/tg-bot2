@@ -228,7 +228,7 @@ describe("WorkspaceTasks", () => {
     await vi.waitFor(() => expect(task?.steer).toHaveBeenLastCalledWith("third steer"));
   });
 
-  it("cancels a task before its initial prompt is written and settles it as aborted without steering", async () => {
+  it("cancels a task before its initial prompt is written and settles it aborted without steering", async () => {
     const { workspace, eventsLog } = await fixture();
     const { factory, tasks } = gatedWorkerFactory();
     const followup = vi.fn(async () => undefined);
@@ -248,6 +248,26 @@ describe("WorkspaceTasks", () => {
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
     expect(task?.steer).not.toHaveBeenCalled();
 
+    const events = await new WorkspaceEventLog(eventsLog).readAll();
+    expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
+  });
+
+  it("settles a cancelled starting task as aborted even when its prompt write never fires", async () => {
+    const { workspace, eventsLog } = await fixture();
+    const { factory, tasks } = gatedWorkerFactory();
+    const followup = vi.fn(async () => undefined);
+    const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
+
+    const { runId } = await service.spawn("long prompt", "123:0");
+    const task = tasks[0];
+    await expect(service.steer(runId, "too early")).resolves.toBe("delivered");
+    await expect(service.cancel(runId)).resolves.toBe("stopped");
+    expect(task?.steer).not.toHaveBeenCalled();
+
+    // promptWritten() is never called: the cancelled run must still settle aborted.
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
+    expect(task?.steer).not.toHaveBeenCalled();
+    expect((followup.mock.calls as unknown[][])[0]?.[0]).toContain("aborted");
     const events = await new WorkspaceEventLog(eventsLog).readAll();
     expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
   });

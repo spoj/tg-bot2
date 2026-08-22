@@ -276,6 +276,11 @@ export class PiWorker {
       });
     });
 
+    if (this.stopped) {
+      // stop() arrived before the spawn finished; never let this run go on.
+      await this.terminateProcess(child);
+    }
+
     // Configure steering mode and follow-up mode to "all" on RPC startup
     this.writeJson({ id: "init-steer", type: "set_steering_mode", mode: "all" });
     this.writeJson({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
@@ -387,9 +392,20 @@ export class PiWorker {
     this.stopped = true;
     this.clearIdleTimer();
     this.clearBusyWatchdog();
-    const child = this.process;
+    let child = this.process;
+    if (!child) {
+      // Stop arriving while the run is still starting: wait for the spawn, then
+      // terminate it here (otherwise the running prompt would take the task
+      // to completion instead of settling it aborted).
+      await this.startPromise?.catch(() => {});
+      child = this.process;
+    }
     if (!child || !this.isAlive()) return Promise.resolve();
+    await this.terminateProcess(child);
+  }
 
+  /** SIGTERM the process group, escalate to SIGKILL after stopGraceMs, and wait for exit. */
+  private async terminateProcess(child: PiWorkerChildProcess): Promise<void> {
     const done = this.exitPromise ?? Promise.resolve({ code: null, signal: null, stderr: "", stdout: "" });
     this.options.terminateProcessGroup(child, "SIGTERM");
 

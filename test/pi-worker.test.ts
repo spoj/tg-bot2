@@ -387,6 +387,30 @@ describe("PiWorker", () => {
     }
   });
 
+  it("stop() before start() terminates the spawned process and settles with a signal", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.stop();
+      const starting = worker.start();
+      await vi.waitFor(() => expect(terminate).toHaveBeenCalledWith(child, "SIGTERM"));
+      expect(spawn).toHaveBeenCalledOnce();
+      child.emit("exit", null, "SIGTERM");
+      await starting;
+      const result = await worker.waitForSettled();
+      expect(result.signal).toBe("SIGTERM");
+      expect(result.code).toBeNull();
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("does not respawn a stopped worker when prompted again", async () => {
     const f = await fixture();
     try {

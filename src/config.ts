@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { readFile, readdir } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { botPaths, isMissing } from "./util.js";
 
@@ -81,7 +81,13 @@ export async function loadConfig(options: { dataDir?: string; env?: NodeJS.Proce
     const dirBotId = Number(entry.name);
     if (!Number.isSafeInteger(dirBotId)) continue;
 
-    const authFile = path.join(botsDir, entry.name, "auth.json");
+    const botDirPath = path.join(botsDir, entry.name);
+    const botDirStat = await lstat(botDirPath);
+    if (botDirStat.isSymbolicLink()) {
+      throw new Error(`Bot directory ${botDirPath} must be a real directory, not a symlink (resolves to ${await realpath(botDirPath)})`);
+    }
+
+    const authFile = path.join(botDirPath, "auth.json");
     let token: string;
     try {
       token = await parseAuthToken(authFile);

@@ -229,13 +229,20 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     multimodalExtension,
   });
   const nodePath = await requireExecutable("node");
+  const runtimePaths = [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
   const args: string[] = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
     "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
     "--ro-bind", "/usr", "/usr",
   ];
-  for (const runtimePath of [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())]) {
+  for (const runtimePath of runtimePaths) {
     args.push("--ro-bind", runtimePath, runtimePath);
+  }
+  // requireExecutable returns the canonical realpath, so dirname() is the real parent
+  // dir even through symlink chains; skip when an already-bound prefix covers it.
+  const nodeDir = path.dirname(nodePath);
+  if (nodeDir !== "/" && !["/usr", ...runtimePaths].some((prefix) => nodeDir === prefix || nodeDir.startsWith(`${prefix}/`))) {
+    args.push("--ro-bind", nodeDir, nodeDir);
   }
   args.push(
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",

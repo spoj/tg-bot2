@@ -31,7 +31,7 @@ import {
 import { AgentEventRouter, type AgentStatus } from "../src/agent.js";
 import { appendEvents, WorkspaceEventLog } from "../src/events.js";
 import { botPaths } from "../src/util.js";
-import { isMessageDirectedToBot } from "../src/telegram.js";
+import { isBotGroupAdd, isMessageDirectedToBot } from "../src/telegram.js";
 import { resetAllowlistCache } from "../src/allowlist.js";
 
 const execFile = promisify(execFileCallback);
@@ -1145,6 +1145,56 @@ describe("Telegram chat events", () => {
         },
       });
       expect(prompt).not.toHaveBeenCalled();
+    });
+  });
+
+  it("treats member or administrator additions from left/kicked as bot group adds", () => {
+    const member = { status: "member" };
+    const administrator = { status: "administrator" };
+    const left = { status: "left" };
+    const kicked = { status: "kicked" };
+    expect(isBotGroupAdd({ old_chat_member: left, new_chat_member: member })).toBe(true);
+    expect(isBotGroupAdd({ old_chat_member: kicked, new_chat_member: member })).toBe(true);
+    expect(isBotGroupAdd({ old_chat_member: left, new_chat_member: administrator })).toBe(true);
+    expect(isBotGroupAdd({ old_chat_member: kicked, new_chat_member: administrator })).toBe(true);
+  });
+
+  it("does not treat permission changes or non-adds as bot group adds", () => {
+    const member = { status: "member" };
+    const administrator = { status: "administrator" };
+    const left = { status: "left" };
+    expect(isBotGroupAdd({ old_chat_member: member, new_chat_member: administrator })).toBe(false);
+    expect(isBotGroupAdd({ old_chat_member: member, new_chat_member: member })).toBe(false);
+    expect(isBotGroupAdd({ old_chat_member: administrator, new_chat_member: member })).toBe(false);
+    expect(isBotGroupAdd({ old_chat_member: left, new_chat_member: left })).toBe(false);
+    expect(isBotGroupAdd(null)).toBe(false);
+    expect(isBotGroupAdd({ old_chat_member: member })).toBe(false);
+  });
+
+  it("surfaces an administrator add on an unlisted chat instead of denying it", async () => {
+    await withWorkspace(async (dataDir) => {
+      const prompt = vi.fn(async () => undefined);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      await bot.handleUpdate({
+        update_id: 6,
+        my_chat_member: {
+          chat: { id: -100123, type: "channel", title: "Test Channel" },
+          from: { id: 42, is_bot: false, first_name: "Admin" },
+          date: 1_700_000_000,
+          old_chat_member: { status: "left", user: { id: 999, is_bot: true, first_name: "Bot" } },
+          new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
+        },
+      } as never);
+      const events = await waitForChatEvents(dataDir, (events) => events.some(
+        (event) => event.type === "my_chat_member" && event.chat_id === -100123,
+      ));
+      expect(events.find((event) => event.type === "my_chat_member")).toMatchObject({
+        type: "my_chat_member",
+        chat_id: -100123,
+        my_chat_member: { new_chat_member: { status: "administrator" } },
+      });
+      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
+      expect(denied.some((event) => event.chat_id === -100123)).toBe(false);
     });
   });
 

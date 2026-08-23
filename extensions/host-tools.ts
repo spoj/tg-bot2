@@ -4,17 +4,15 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * Host-tools extension: send/spawn/steer_task/cancel tools that call
+ * Host-tools extension: send/annotate/spawn/steer_conversation/steer_task/cancel tools that call
  * the host synchronously over the bridge socket mounted at PI_HOST_SOCKET. The host
  * authenticates PI_AGENT_TOKEN, validates each request, executes it, and returns the
  * result directly. PI_HOST_TOOLS selects which tools a run exposes (chat runs:
- * send,spawn,steer_task,cancel; task runs: send).
+ * send,annotate,spawn,steer_conversation,steer_task,cancel; task runs: annotate).
  */
 
 const SEND_SCHEMA = Type.Object({
   method: Type.String({ description: "Telegram Bot API method name, such as sendMessage, sendDocument, or editMessageText" }),
-  chat_id: Type.Optional(Type.Number({ description: "Telegram chat ID; defaults to the current chat for conversation agents" })),
-  message_thread_id: Type.Optional(Type.Number({ description: "Telegram topic ID; defaults to the current topic for conversation agents" })),
   topic_name: Type.Optional(Type.String({ description: "Host convenience for sendMessage: rename this topic after delivery" })),
 }, { additionalProperties: true });
 
@@ -95,14 +93,34 @@ function callHost(type: string, params: Record<string, unknown>, timeoutMs = DEF
 const HOST_TOOLS = {
   send: {
     label: "Send Telegram message",
-    description: "Call an allowed Telegram Bot API method with its documented snake_case payload. Fields pass through unchanged; /workspace media paths are copied to host-managed attachments before upload.",
+    description: "Call an allowed Telegram Bot API method in this agent's owning chat and thread. Omit chat_id and message_thread_id; the host derives both from the authenticated session.",
     parameters: SEND_SCHEMA,
     execute: async (request: Record<string, unknown>): Promise<ToolResult> => {
       try {
         const result = await callHost("send", { request }, SEND_TIMEOUT_MS);
         const method = typeof result.method === "string" ? result.method : "Telegram request";
         const messageId = typeof result.messageId === "number" ? ` (message_id ${result.messageId})` : "";
-        return text(`${method} succeeded${messageId}.`);
+        const attachments = Array.isArray(result.attachments)
+          ? result.attachments.filter((value): value is string => typeof value === "string").map((value) => `\nAttachment: ${value}`).join("")
+          : "";
+        return text(`${method} succeeded${messageId}.${attachments}`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  annotate: {
+    label: "Annotate timeline attachment",
+    description: "Retroactively add or replace a short, searchable description beside a sent or received attachment in /run/timeline.jsonl.",
+    parameters: Type.Object({
+      attachment: Type.String({ description: "Exact /run/attachments/... path recorded in the timeline" }),
+      description: Type.String({ minLength: 1, maxLength: 500, description: "Short factual description of the attachment's content" }),
+    }),
+    execute: async (params: { attachment: string; description: string }): Promise<ToolResult> => {
+      try {
+        const result = await callHost("annotate", params);
+        const occurrences = typeof result.occurrences === "number" ? result.occurrences : 1;
+        return text(`Annotated ${occurrences} timeline occurrence${occurrences === 1 ? "" : "s"} of ${params.attachment}.`);
       } catch (error) {
         return failure(error);
       }
@@ -120,6 +138,23 @@ const HOST_TOOLS = {
           return text(`Queued background task ${runId} (all task slots busy); it will start automatically. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
         }
         return text(`Launched background task ${runId}. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  steer_conversation: {
+    label: "Steer conversation agent",
+    description: "Wake another allowed conversation agent and give it an instruction. This does not send a Telegram message.",
+    parameters: Type.Object({
+      chat_id: Type.Number({ description: "Owning chat ID of the conversation agent to wake" }),
+      message_thread_id: Type.Optional(Type.Number({ description: "Owning topic ID; defaults to 0" })),
+      message: Type.String({ minLength: 1, description: "Instruction for the target conversation agent" }),
+    }),
+    execute: async (params: { chat_id: number; message_thread_id?: number; message: string }): Promise<ToolResult> => {
+      try {
+        await callHost("steer_conversation", params);
+        return text(`Steering delivered to conversation ${params.chat_id}:${params.message_thread_id ?? 0}.`);
       } catch (error) {
         return failure(error);
       }

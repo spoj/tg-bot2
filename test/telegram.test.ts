@@ -14,6 +14,7 @@ import {
 } from "../src/telegram.js";
 import { AgentEventRouter } from "../src/agent.js";
 import { appendTimelineEvents, WorkspaceTimeline } from "../src/events.js";
+import { conversationAgent } from "../src/agent-ref.js";
 import { botPaths } from "../src/util.js";
 import { isBotGroupAdd, isMessageDirectedToBot } from "../src/telegram.js";
 
@@ -108,13 +109,23 @@ async function makeTestBot(
   if (recordRequests) sentRequests = [];
   const followup = agents.followup ?? vi.fn(async () => undefined);
   const events = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+  for (const [pollId, chatId] of pollOwners ?? []) {
+    const owner = conversationAgent(chatId);
+    await events.publish({
+      type: "sent",
+      requestId: `seed-${pollId}`,
+      actor: owner,
+      target: owner,
+      request: { method: "sendPoll", chat_id: chatId },
+      pollId,
+    });
+  }
   const agentAccess = agents.restartAll ? { restartAll: agents.restartAll } : undefined;
   const bot = createTelegramBot(
     { token: "999:test-token", botId: 999, dataDir },
     events,
     undefined,
     agentAccess,
-    pollOwners,
   );
   const router = new AgentEventRouter(
     { interrupt: agents.interrupt, followup },
@@ -324,6 +335,7 @@ describe("raw Telegram Bot API dispatch", () => {
       });
       const managed = result.request?.document;
       expect(managed).toMatch(/^\/run\/attachments\/42\/\d{4}-\d{2}-\d{2}\/req-file\/report\.txt$/);
+      expect(result.attachmentPaths).toEqual([managed]);
       expect(await readFile(path.join(paths.attachments, String(managed).slice("/run/attachments/".length)), "utf8")).toBe("report");
       expect(bot.api.raw.sendDocument).toHaveBeenCalledWith({
         chat_id: 42,

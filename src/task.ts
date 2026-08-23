@@ -193,7 +193,7 @@ export class WorkspaceTasks {
         ...defined({ bwrapPath: this.bwrapPath }),
         taskRun: true,
         appendSystemPrompt: TASK_RUNNER_PROMPT,
-        hostTools: "send",
+        hostTools: "annotate",
         agentToken: workerOptions.token,
         sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
         idleTimeoutMs: 0,
@@ -308,7 +308,7 @@ export class WorkspaceTasks {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
     await writeTaskArtifact(runDirectory, PROMPT_FILE, prompt);
-    const token = this.credentials.issue({ kind: "task", runId }, ["send"]);
+    const token = this.credentials.issue({ kind: "task", runId }, ["annotate"]);
     const task: TaskRun = { runId, prompt, trigger, token };
     let worker: WorkspaceTaskWorker;
     try {

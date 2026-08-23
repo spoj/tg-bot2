@@ -1,20 +1,31 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentRef, ConversationAgentRef, TaskTrigger } from "./agent-ref.js";
+import { conversationAgent, type AgentRef, type ConversationAgentRef, type TaskTrigger } from "./agent-ref.js";
 import { appendJsonl } from "./util.js";
+import { SerialQueue } from "./queue.js";
+
+export type TimelineAttachment = {
+  type?: string | undefined;
+  path?: string | undefined;
+  mimeType?: string | undefined;
+  originalName?: string | undefined;
+  failure?: string | undefined;
+  description?: string | undefined;
+};
+
 
 export type TimelineEvent =
   | {
       type: "message";
       chat_id: number;
       message: unknown;
-      attachments: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }>;
+      attachments: TimelineAttachment[];
     }
   | {
       type: "edited_message";
       chat_id: number;
       message: unknown;
-      attachments: Array<{ type: string; path?: string | undefined; mimeType?: string | undefined; originalName?: string | undefined; failure?: string | undefined }>;
+      attachments: TimelineAttachment[];
     }
   | {
       type: "callback";
@@ -47,6 +58,7 @@ export type TimelineEvent =
       actor: AgentRef;
       target: ConversationAgentRef;
       request: Record<string, unknown>;
+      attachments?: TimelineAttachment[] | undefined;
       messageId?: number | undefined;
       pollId?: string | undefined;
     }
@@ -64,6 +76,7 @@ export type TimelineEvent =
       occurrenceId: string;
       prompt: string;
       dueAt: string;
+      origin: ConversationAgentRef;
     };
 
 export type RuntimeEvent = TimelineEvent | {
@@ -92,6 +105,9 @@ export type EventListener = (record: TimelineEnvelope & RuntimeEvent, rawLine: s
 
 export class WorkspaceTimeline {
   private readonly listeners = new Set<EventListener>();
+  private readonly writes = new SerialQueue();
+  private readonly messageOwners = new Map<string, ConversationAgentRef>();
+  private readonly pollOwners = new Map<string, ConversationAgentRef>();
 
   constructor(
     readonly filePath: string,
@@ -104,18 +120,84 @@ export class WorkspaceTimeline {
       this.listeners.delete(listener);
     };
   }
+  async loadOwnership(): Promise<void> {
+    await this.writes.run(async () => {
+      this.messageOwners.clear();
+      this.pollOwners.clear();
+      const lines = (await readFile(this.filePath, "utf8")).split("\n");
+      for (const line of lines) {
+        if (line) this.recordOwnership(JSON.parse(line) as TimelineRecord);
+      }
+    });
+  }
+
+  messageOwner(chatId: number, messageId: number): ConversationAgentRef | undefined {
+    return this.messageOwners.get(`${chatId}:${messageId}`);
+  }
+
+  pollOwner(pollId: string): ConversationAgentRef | undefined {
+    return this.pollOwners.get(pollId);
+  }
+
 
   async publish(event: TimelineEvent): Promise<string> {
     const rawLine = timelineLine(event);
     const record = JSON.parse(rawLine) as TimelineRecord;
+    this.recordOwnership(record);
     this.broadcast(record, rawLine);
-    await appendTimelineEvents(this.filePath, [record]);
+    await this.writes.run(() => appendTimelineEvents(this.filePath, [record]));
     return rawLine;
+  }
+
+  async annotateAttachment(attachmentPath: string, description: string): Promise<number> {
+    if (!attachmentPath.startsWith("/run/attachments/")) {
+      throw new Error("attachment must be an exact /run/attachments/... path from the timeline");
+    }
+    const trimmed = description.trim();
+    if (trimmed.length === 0) throw new Error("description must not be empty");
+    if (trimmed.length > 500) throw new Error("description must be at most 500 characters");
+
+    return this.writes.run(async () => {
+      const lines = (await readFile(this.filePath, "utf8")).split("\n");
+      let occurrences = 0;
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
+        if (!line) continue;
+        const record = JSON.parse(line) as TimelineRecord;
+        if (record.type !== "message" && record.type !== "edited_message" && record.type !== "sent") continue;
+        const matching = record.attachments?.filter((attachment) => attachment.path === attachmentPath);
+        if (!matching?.length) continue;
+        record.attachments = record.attachments?.map((attachment) => attachment.path === attachmentPath
+          ? { ...attachment, description: trimmed }
+          : attachment);
+        occurrences += matching.length;
+        lines[index] = JSON.stringify(record);
+      }
+      if (occurrences === 0) throw new Error("Attachment is not recorded in the timeline");
+      await writeFile(this.filePath, lines.join("\n"), "utf8");
+      return occurrences;
+    });
   }
 
   notify(event: Exclude<RuntimeEvent, TimelineEvent>): void {
     const rawLine = timelineLine(event);
     this.broadcast(JSON.parse(rawLine) as TimelineEnvelope & RuntimeEvent, rawLine);
+  }
+
+  private recordOwnership(record: TimelineRecord): void {
+    if (record.type === "message" || record.type === "edited_message") {
+      const message = record.message as { message_id?: unknown; message_thread_id?: unknown; poll?: { id?: unknown } };
+      const threadId = typeof message.message_thread_id === "number" ? message.message_thread_id : 0;
+      const owner = conversationAgent(record.chat_id, threadId);
+      if (typeof message.message_id === "number" && Number.isSafeInteger(message.message_id)) {
+        this.messageOwners.set(`${record.chat_id}:${message.message_id}`, owner);
+      }
+      if (typeof message.poll?.id === "string") this.pollOwners.set(message.poll.id, owner);
+      return;
+    }
+    if (record.type !== "sent") return;
+    if (record.messageId !== undefined) this.messageOwners.set(`${record.target.chatId}:${record.messageId}`, record.target);
+    if (record.pollId !== undefined) this.pollOwners.set(record.pollId, record.target);
   }
 
   private broadcast(record: TimelineEnvelope & RuntimeEvent, rawLine: string): void {
@@ -146,7 +228,7 @@ export function timelineLine(event: object): string {
 }
 
 export const TIMELINE_PROMPT = `/run/timeline.jsonl is read-only shared context across all chats. Each JSON line has {v:1,t,type,...}.
-- Inbound: message, edited_message, callback, poll_answer, message_reaction, my_chat_member, chat_join_request.
-- Completed actions: sent {actor,target,request,...}, task_finished, schedule_fired.
+- Inbound: message, edited_message, callback, poll_answer, message_reaction, my_chat_member, chat_join_request. Attachment objects may include a searchable description added later by annotate.
+- Completed actions: sent {actor,target,request,...}, task_finished, schedule_fired. Sent events include host-managed attachment paths when applicable.
 Use chat_id and message_thread_id to narrow context before searching globally. Treat sent actions as already complete. The host does not read this file for commands, recovery, or state.
 `;

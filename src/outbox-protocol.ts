@@ -41,6 +41,7 @@ export type WorkspaceOutboxDispatchResult = {
   pollId?: string;
   messageThreadId?: number;
   request?: WorkspaceOutboxRequest;
+  attachmentPaths?: string[];
   data?: unknown;
 };
 
@@ -73,12 +74,11 @@ export function validateRequest(value: unknown): WorkspaceOutboxRequest {
   }
   return request as WorkspaceOutboxRequest;
 }
-
-export const OUTBOX_PROMPT = `Use send as a thin Telegram Bot API client. Set method to an allowed Bot API method and put its documented snake_case parameters beside it. Conversation agents default chat_id and message_thread_id to the current conversation; task agents must set chat_id.
+export const OUTBOX_PROMPT = `Use send as a thin Telegram Bot API client for this conversation. Omit chat_id and message_thread_id: the host derives both from the authenticated owning session and rejects cross-conversation targets.
 Allowed methods: ${TELEGRAM_METHODS.join(", ")}.
 Host conveniences:
 - For upload methods, use an absolute /workspace/... path in the normal Telegram media field (photo, audio, video, animation, voice, video_note, or document). The host copies it into read-only /run/attachments before delivery and records that stable path.
 - sendMediaGroup applies the same substitution to each media item.
-- sendMessage may include topic_name; after delivering the message, the host renames that topic in the same tool call.
-All other parameters, including reply_markup keyboards and request_location/contact/poll/web_app buttons, pass through unchanged. The host validates routing and local files, delivers synchronously, and records successful calls in /run/timeline.jsonl.
+- sendMessage may include topic_name; after delivering the message, the host renames this conversation's topic in the same tool call.
+All other parameters, including reply_markup keyboards and request_location/contact/poll/web_app buttons, pass through unchanged. Message mutations are allowed only for messages recorded as owned by this conversation. The host validates ownership and local files, delivers synchronously, and records successful calls in /run/timeline.jsonl.
 `;

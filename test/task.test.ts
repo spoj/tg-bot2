@@ -110,22 +110,23 @@ function setupTasks(
   eventsLog: string,
   factory: Mock,
   options: Partial<WorkspaceTasksOptions> & { notifier?: AgentNotifier } = {},
-): { service: WorkspaceTasks; timeline: WorkspaceTimeline } {
+): { service: WorkspaceTasks; timeline: WorkspaceTimeline; credentials: AgentCredentials } {
   const timeline = new WorkspaceTimeline(eventsLog);
   const router = new AgentEventRouter(options.notifier ?? { followup: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined) });
   timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const { notifier: _notifier, ...taskOptions } = options;
+  const credentials = new AgentCredentials();
   const service = new WorkspaceTasks({
     workspace,
     timeline,
-    credentials: new AgentCredentials(),
+    credentials,
     appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
     workerFactory: factory,
     ...taskOptions,
   });
-  return { service, timeline };
+  return { service, timeline, credentials };
 }
 
 describe("WorkspaceTasks", () => {
@@ -146,6 +147,18 @@ describe("WorkspaceTasks", () => {
     expect(factory).not.toHaveBeenCalled();
     const events = await readTimeline(eventsLog);
     expect(events).toHaveLength(0);
+  });
+
+  it("issues anonymous tasks annotate-only host credentials", async () => {
+    const { workspace, eventsLog } = await fixture();
+    const { factory, tasks } = fakeWorkerFactory();
+    const { service, credentials } = setupTasks(workspace, eventsLog, factory);
+    await service.spawn("inspect attachment", TRIGGER, "run-isolated");
+    const token = tasks[0]?.options.token;
+    expect(credentials.authorize(token!, "annotate")).toEqual({ kind: "task", runId: "run-isolated" });
+    expect(() => credentials.authorize(token!, "send")).toThrow("not allowed to call send");
+    tasks[0]?.resolveRun(success());
+    await vi.waitFor(async () => expect(await readJson(path.join(workspace, ".pi", "tasks", "run-isolated", "result.json"))).toMatchObject({ status: "done" }));
   });
 
   it("spawns into a uuid run directory, records output, and settles with a followup", async () => {

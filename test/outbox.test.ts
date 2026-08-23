@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { conversationAgent, type AgentRef } from "../src/agent-ref.js";
-import { AgentEventRouter } from "../src/agent.js";
 import { WorkspaceOutbox, type OutboxSendResult, type WorkspaceOutboxOptions } from "../src/outbox.js";
 import { WorkspaceTimeline } from "../src/events.js";
 import type { WorkspaceOutboxDispatcher, WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
@@ -41,10 +40,10 @@ function setupOutbox(
   eventsLog: string,
   dispatch: WorkspaceOutboxDispatcher,
   options: Partial<WorkspaceOutboxOptions> = {},
-): { outbox: WorkspaceOutbox } {
+): { outbox: WorkspaceOutbox; timeline: WorkspaceTimeline } {
   const timeline = new WorkspaceTimeline(eventsLog);
   const outbox = new WorkspaceOutbox({ workspace, dispatch, timeline, ...options });
-  return { outbox };
+  return { outbox, timeline };
 }
 
 async function send(
@@ -85,9 +84,10 @@ describe("WorkspaceOutbox", () => {
   it("delivers valid sends, records the completed action, and returns the outcome", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
-    const dispatch = vi.fn(async () => undefined);
+    const attachment = "/run/attachments/42/2026-08-23/request/report.txt";
+    const dispatch = vi.fn(async () => ({ attachmentPaths: [attachment] }));
     const result = await send(workspace, eventsLog, dispatch, valid());
-    expect(result).toMatchObject({ method: "sendDocument" });
+    expect(result).toMatchObject({ method: "sendDocument", attachments: [attachment] });
     expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), valid());
     expect(await logEvents(eventsLog)).toMatchObject([{
       type: "sent",
@@ -95,6 +95,7 @@ describe("WorkspaceOutbox", () => {
       actor: conversationAgent(42),
       target: conversationAgent(42),
       request: valid(),
+      attachments: [{ path: attachment }],
     }]);
   });
 
@@ -140,15 +141,15 @@ describe("WorkspaceOutbox", () => {
     await allowChat(workspace, -100);
     const dispatch = vi.fn(async () => ({ messageThreadId: 105, data: { message_thread_id: 105, name: "Japan 2026" } }));
     const create = { method: "createForumTopic", chat_id: -100, name: "Japan 2026" };
-    await send(workspace, eventsLog, dispatch, create);
+    await send(workspace, eventsLog, dispatch, create, conversationAgent(-100));
     expect(dispatch).toHaveBeenCalledWith(-100, expect.any(String), create);
     expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "sent", target: conversationAgent(-100, 105), request: { method: "createForumTopic", name: "Japan 2026" } },
+      { type: "sent", target: conversationAgent(-100), request: { method: "createForumTopic", name: "Japan 2026" } },
     ]);
 
     const closeDispatch = vi.fn(async () => ({ messageThreadId: 105 }));
     const close = { method: "closeForumTopic", chat_id: -100, message_thread_id: 105 };
-    await send(workspace, eventsLog, closeDispatch, close);
+    await send(workspace, eventsLog, closeDispatch, close, conversationAgent(-100, 105));
     expect(closeDispatch).toHaveBeenCalledWith(-100, expect.any(String), close);
   });
 
@@ -160,9 +161,8 @@ describe("WorkspaceOutbox", () => {
     await send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 42, text: "x", reply_markup: [1] });
     await send(workspace, eventsLog, dispatch, { method: "sendLocation", chat_id: 42, latitude: 91, longitude: 0 });
     await send(workspace, eventsLog, dispatch, { method: "sendPoll", chat_id: 42, question: "q", options: ["only"] });
-    await send(workspace, eventsLog, dispatch, { method: "setMessageReaction", chat_id: 42, message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
-    expect(dispatch).toHaveBeenCalledTimes(5);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "sent")).toHaveLength(5);
+    expect(dispatch).toHaveBeenCalledTimes(4);
+    expect((await logEvents(eventsLog)).filter((event) => event.type === "sent")).toHaveLength(4);
   });
 
   it("records response identifiers from raw Bot API results", async () => {
@@ -237,31 +237,31 @@ describe("WorkspaceOutbox", () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => { throw new Error("topic upload failed"); });
-    await expect(send(workspace, eventsLog, dispatch, { ...valid(), message_thread_id: 1234 })).rejects.toThrow("topic upload failed");
+    await expect(send(workspace, eventsLog, dispatch, { ...valid(), message_thread_id: 1234 }, conversationAgent(42, 1234))).rejects.toThrow("topic upload failed");
     expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("dispatches message mutations and unconfined upload paths to the dispatcher", async () => {
+  it("allows message mutations only for messages owned by the conversation", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => undefined);
-    const reaction = { method: "setMessageReaction", chat_id: 42, message_id: 12, reaction: [] };
-    const edit = {
-      method: "editMessageText",
-      chat_id: 42,
-      message_id: 55,
-      text: "updated text",
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-    };
-    await send(workspace, eventsLog, dispatch, reaction);
-    await send(workspace, eventsLog, dispatch, edit);
-    await send(workspace, eventsLog, dispatch, { method: "deleteMessage", chat_id: 42, message_id: 56 });
-    await send(workspace, eventsLog, dispatch, valid("/workspace/../outside.txt"));
-    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), reaction);
-    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), edit);
-    expect(dispatch).toHaveBeenCalledTimes(4);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "sent")).toHaveLength(4);
+    const actor = conversationAgent(42, 7);
+    const { outbox, timeline } = setupOutbox(workspace, eventsLog, dispatch);
+    for (const messageId of [12, 55, 56]) {
+      await timeline.publish({ type: "message", chat_id: 42, message: { message_id: messageId, message_thread_id: 7 }, attachments: [] });
+    }
+    await timeline.publish({ type: "message", chat_id: 42, message: { message_id: 99, message_thread_id: 8 }, attachments: [] });
+
+    const reaction = { method: "setMessageReaction", message_id: 12, reaction: [] };
+    const edit = { method: "editMessageText", message_id: 55, text: "updated text" };
+    await outbox.send(reaction, actor);
+    await outbox.send(edit, actor);
+    await outbox.send({ method: "deleteMessage", message_id: 56 }, actor);
+    await expect(outbox.send({ method: "deleteMessage", message_id: 99 }, actor))
+      .rejects.toThrow("Message 99 is not owned by this conversation");
+    await expect(outbox.send({ method: "editMessageText", inline_message_id: "inline", text: "x" }, actor))
+      .rejects.toThrow("requires an owned message_id");
+    expect(dispatch).toHaveBeenCalledTimes(3);
   });
 
   it("rejects sends to chats not on the allow list", async () => {
@@ -273,16 +273,18 @@ describe("WorkspaceOutbox", () => {
     expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("defaults conversation targets and requires explicit task targets", async () => {
+  it("derives the authenticated owner target and rejects cross-conversation sends", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => undefined);
     await send(workspace, eventsLog, dispatch, { method: "sendMessage", text: "hi" }, conversationAgent(42, 7));
     expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), { method: "sendMessage", chat_id: 42, message_thread_id: 7, text: "hi" });
     await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", text: "hi" }, { kind: "task", runId: "run-1" }))
-      .rejects.toThrow("chat_id is required");
-    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 1.5, text: "hi" }))
-      .rejects.toThrow("chat_id must be a safe integer");
+      .rejects.toThrow("Background tasks cannot call send");
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 99, text: "hi" }))
+      .rejects.toThrow("cannot target another conversation's chat");
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", message_thread_id: 8, text: "hi" }, conversationAgent(42, 7)))
+      .rejects.toThrow("cannot target another conversation's thread");
   });
 
   it("fails closed when allowed.json is malformed", async () => {
@@ -302,28 +304,24 @@ describe("WorkspaceOutbox", () => {
 
     await send(workspace, eventsLog, dispatch, valid(), actor);
     await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 999, text: "blocked" }, actor))
-      .rejects.toThrow("not on the allow list");
+      .rejects.toThrow("cannot target another conversation's chat");
 
     expect(await logEvents(eventsLog)).toMatchObject([{
       type: "sent",
       actor,
-      target: conversationAgent(42),
-      request: { chat_id: 42 },
+      target: actor,
+      request: { chat_id: 42, message_thread_id: 100 },
     }]);
   });
 
-  it("wakes the responsible conversation after a task writes to it", async () => {
+  it("rejects anonymous task sends without writing the timeline", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
-    const timeline = new WorkspaceTimeline(eventsLog);
-    const followup = vi.fn(async () => undefined);
-    const router = new AgentEventRouter({ followup, interrupt: vi.fn(async () => undefined) });
-    timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
-    const outbox = new WorkspaceOutbox({ workspace, timeline, dispatch: vi.fn(async () => ({ messageId: 100 })) });
-
-    await outbox.send({ method: "sendMessage", chat_id: 42, message_thread_id: 7, text: "task result" }, { kind: "task", runId: "run-1" });
-
-    expect(followup).toHaveBeenCalledWith(expect.stringContaining("task result"), conversationAgent(42, 7));
+    const dispatch = vi.fn(async () => ({ messageId: 100 }));
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", text: "task result" }, { kind: "task", runId: "run-1" }))
+      .rejects.toThrow("Background tasks cannot call send");
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
   it("retries on 429 and emits a single outbox_sent once a retry succeeds", async () => {

@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { deferred } from "./helpers.js";
+import { conversationAgent, type ConversationAgentRef } from "../src/agent-ref.js";
 const temporaryDirectories: string[] = [];
 
 const state = vi.hoisted(() => {
@@ -14,11 +15,13 @@ const state = vi.hoisted(() => {
       return Promise.resolve();
     }),
     disposeAll: vi.fn(async () => { order.push("agents.disposeAll"); }),
+    interrupt: vi.fn(async () => undefined),
   };
   const bot = {
     start: vi.fn(),
     stop: vi.fn(async () => { order.push("bot.stop"); }),
   };
+  const taskSpawn = vi.fn(async () => ({ runId: "scheduled-run", status: "launched" }));
   return {
     order,
     startupOrder,
@@ -42,6 +45,7 @@ const state = vi.hoisted(() => {
     agentManager: vi.fn(class AgentManagerMock {
       beginShutdown = agents.beginShutdown;
       disposeAll = agents.disposeAll;
+      interrupt = agents.interrupt;
     }),
     agentEventRouter: vi.fn(class AgentEventRouterMock {
       onEvent = vi.fn();
@@ -69,8 +73,10 @@ const state = vi.hoisted(() => {
       start = vi.fn(async () => { startupOrder.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.start" : "bridge.start"); });
       stop = vi.fn(async () => { order.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.stop" : "bridge.stop"); });
     }),
+    taskSpawn,
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
+      spawn = taskSpawn;
       start = vi.fn(async () => { startupOrder.push("tasks.start"); });
       stop = vi.fn(async () => { order.push("tasks.stop"); });
     }),
@@ -122,6 +128,8 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   state.terminateActiveSandboxes.mockClear();
   state.agents.beginShutdown.mockClear();
   state.agents.disposeAll.mockClear();
+  state.agents.interrupt.mockClear();
+  state.taskSpawn.mockClear();
   state.bot.stop.mockClear();
   state.bot.start.mockReset();
   configure?.();
@@ -164,7 +172,7 @@ describe("application startup and shutdown wiring", () => {
     expect(schedulerOptions.statePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "scheduler-state.json"));
     expect(schedulerOptions.timeline).toBeDefined();
     expect(typeof schedulerOptions.fireTask).toBe("function");
-    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), timeline: expect.any(Object), pollOwners: expect.any(Map) }));
+    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), timeline: expect.any(Object) }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({
       workspace: workspacePath(),
       bwrapPath: "/validated/bwrap",
@@ -178,16 +186,18 @@ describe("application startup and shutdown wiring", () => {
       credentials: expect.any(Object),
       handlers: expect.objectContaining({
         send: expect.any(Function),
+        annotate: expect.any(Function),
         spawn: expect.any(Function),
         cancel: expect.any(Function),
         steerTask: expect.any(Function),
+        steerConversation: expect.any(Function),
       }),
     }));
     expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
       socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host-task.sock"),
       credentials: expect.any(Object),
       handlers: {
-        send: expect.any(Function),
+        annotate: expect.any(Function),
       },
     }));
     expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
@@ -242,6 +252,30 @@ describe("application startup and shutdown wiring", () => {
       request,
     );
     expect(result).toEqual({ messageId: 7 });
+  });
+
+  it("routes scheduled settlements and conversation steering through owners", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+    const origin = conversationAgent(42, 7);
+    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as {
+      fireTask: (occurrenceId: string, prompt: string, origin: ConversationAgentRef) => Promise<void>;
+    };
+    await schedulerOptions.fireTask("occurrence-1", "prepare report", origin);
+    expect(state.taskSpawn).toHaveBeenCalledWith("prepare report", { kind: "schedule", occurrenceId: "occurrence-1", origin }, "occurrence-1");
+
+    await mkdir(workspacePath(), { recursive: true });
+    await writeFile(path.join(workspacePath(), ".allowed.json"), JSON.stringify([42, 99]), "utf8");
+    const bridgeOptions = state.bridge.mock.calls[0]?.[0] as unknown as {
+      handlers: { steerConversation: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>> };
+    };
+    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 99, message_thread_id: 3, message: "Handle timeline message 120" }, origin))
+      .resolves.toEqual({ status: "delivered" });
+    expect(state.agents.interrupt).toHaveBeenCalledWith(
+      "Conversation 42:7 delegated work to you:\nHandle timeline message 120",
+      conversationAgent(99, 3),
+    );
   });
 
   it("raises the shutdown gate, disposes every service, and treats signal abort as graceful", async () => {

@@ -161,14 +161,16 @@ async function stageOutboundFile(
 
 async function prepareTelegramPayload(
   paths: { workspace: string; attachments: string }, chatId: number, requestId: string, request: WorkspaceOutboxRequest,
-): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest }> {
+): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest; attachmentPaths: string[] }> {
   const payload = telegramPayload(request);
   const recorded = structuredClone(request);
+  const attachmentPaths: string[] = [];
   const field = MEDIA_FIELDS[request.method];
   if (field !== undefined && typeof payload[field] === "string" && (payload[field] as string).startsWith("/")) {
     const staged = await stageOutboundFile(paths, chatId, requestId, payload[field] as string);
     payload[field] = staged.input;
     recorded[field] = staged.path;
+    attachmentPaths.push(staged.path);
   }
   if (request.method === "sendMediaGroup" && Array.isArray(payload.media)) {
     const recordedMedia = recorded.media as Array<Record<string, unknown>>;
@@ -179,18 +181,20 @@ async function prepareTelegramPayload(
         const staged = await stageOutboundFile(paths, chatId, requestId, copy.media, index);
         copy.media = staged.input;
         recordedMedia[index] = { ...(recordedMedia[index] ?? {}), media: staged.path };
+        attachmentPaths.push(staged.path);
       }
       return copy;
     }));
   }
-  return { payload, recorded };
+  return { payload, recorded, attachmentPaths };
 }
 
-function dispatchResult(data: unknown, request: WorkspaceOutboxRequest): WorkspaceOutboxDispatchResult {
+function dispatchResult(data: unknown, request: WorkspaceOutboxRequest, attachmentPaths: string[]): WorkspaceOutboxDispatchResult {
   const result = data !== null && typeof data === "object" ? data as Record<string, unknown> : {};
   const poll = result.poll !== null && typeof result.poll === "object" ? result.poll as Record<string, unknown> : undefined;
   return {
     request,
+    ...(attachmentPaths.length > 0 ? { attachmentPaths } : {}),
     ...(typeof result.message_id === "number" ? { messageId: result.message_id } : {}),
     ...(typeof poll?.id === "string" ? { pollId: poll.id } : {}),
     ...(typeof result.message_thread_id === "number" ? { messageThreadId: result.message_thread_id } : {}),
@@ -205,7 +209,7 @@ export async function dispatchOutboxRequest(
   requestId: string,
   request: WorkspaceOutboxRequest,
 ): Promise<WorkspaceOutboxDispatchResult> {
-  const { payload, recorded } = await prepareTelegramPayload(paths, chatId, requestId, request);
+  const { payload, recorded, attachmentPaths } = await prepareTelegramPayload(paths, chatId, requestId, request);
   const raw = bot.api.raw as unknown as Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
   const call = raw[request.method];
   if (!call) throw new Error(`Telegram Bot API method is unavailable: ${request.method}`);
@@ -217,7 +221,7 @@ export async function dispatchOutboxRequest(
       console.error("Incidental topic rename failed", error);
     }
   }
-  return dispatchResult(data, recorded);
+  return dispatchResult(data, recorded, attachmentPaths);
 }
 type AttachmentDirectory = {
   path: string;
@@ -547,7 +551,6 @@ export function createTelegramBot(
   timeline: WorkspaceTimeline,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
   agent?: AgentHostAccess,
-  pollOwners: Map<string, number> = new Map(),
 ): Bot {
   const bot = new Bot(config.token);
   const { workspace } = botPaths(config.dataDir, config.botId);
@@ -611,9 +614,9 @@ export function createTelegramBot(
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
-    const chatId = pollOwners.get(answer.poll_id);
-    if (chatId === undefined || !(await isChatAllowed(workspace, chatId))) return;
-    await timeline.publish({ type: "poll_answer", chat_id: chatId, poll_answer: answer });
+    const owner = timeline.pollOwner(answer.poll_id);
+    if (owner === undefined || !(await isChatAllowed(workspace, owner.chatId))) return;
+    await timeline.publish({ type: "poll_answer", chat_id: owner.chatId, poll_answer: answer });
   });
   bot.on("message_reaction", async (ctx) => {
     const reaction = ctx.messageReaction;

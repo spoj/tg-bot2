@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { conversationAgent, type ConversationAgentRef } from "./agent-ref.js";
 import type { WorkspaceTimeline } from "./events.js";
 import type { Recurrence, ScheduleRow } from "./schedule-protocol.js";
 import { isMissing, openPinnedDirectory, readFileBounded, type PinnedDirectory } from "./util.js";
@@ -20,7 +21,7 @@ export type WorkspaceSchedulerOptions = {
   workspace: string;
   statePath: string;
   timeline: WorkspaceTimeline;
-  fireTask?: (occurrenceId: string, prompt: string) => Promise<void>;
+  fireTask?: (occurrenceId: string, prompt: string, origin: ConversationAgentRef) => Promise<void>;
   pollIntervalMs?: number;
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -49,6 +50,16 @@ function invalid(message: string): never {
   throw new Error(`Invalid schedules file: ${message}`);
 }
 
+function validateOrigin(value: unknown, index: number): ScheduleRow["origin"] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) invalid(`row ${index} has an invalid origin`);
+  const origin = value as Record<string, unknown>;
+  if (typeof origin.chat_id !== "number" || !Number.isSafeInteger(origin.chat_id)) invalid(`row ${index} has an invalid origin.chat_id`);
+  if (origin.message_thread_id !== undefined && (typeof origin.message_thread_id !== "number" || !Number.isSafeInteger(origin.message_thread_id))) {
+    invalid(`row ${index} has an invalid origin.message_thread_id`);
+  }
+  return { chat_id: origin.chat_id, ...(typeof origin.message_thread_id === "number" ? { message_thread_id: origin.message_thread_id } : {}) };
+}
+
 function validateRow(value: unknown, index: number): ScheduleRow {
   if (value === null || typeof value !== "object" || Array.isArray(value)) invalid(`row ${index} must be an object`);
   const row = value as Record<string, unknown>;
@@ -59,7 +70,7 @@ function validateRow(value: unknown, index: number): ScheduleRow {
   if (row.recurrence !== null && row.recurrence !== "hourly" && row.recurrence !== "daily" && row.recurrence !== "weekly") {
     invalid(`row ${index} has an invalid recurrence`);
   }
-  return { prompt: row.prompt, start: row.start, recurrence: row.recurrence as Recurrence | null };
+  return { prompt: row.prompt, start: row.start, recurrence: row.recurrence as Recurrence | null, origin: validateOrigin(row.origin, index) };
 }
 
 function validateScheduleFile(value: unknown): ScheduleFile {
@@ -86,7 +97,7 @@ function validateStateFile(value: unknown): ScheduleStateFile {
 }
 
 function rowKey(row: ScheduleRow): string {
-  return JSON.stringify([row.prompt, row.start, row.recurrence]);
+  return JSON.stringify([row.prompt, row.start, row.recurrence, row.origin.chat_id, row.origin.message_thread_id ?? 0]);
 }
 
 function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): string {
@@ -237,13 +248,15 @@ export class WorkspaceScheduler {
 
     due.sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt) || left.row.prompt.localeCompare(right.row.prompt));
     for (const occurrence of due) {
+      const origin = conversationAgent(occurrence.row.origin.chat_id, occurrence.row.origin.message_thread_id ?? 0);
       await this.timeline.publish({
         type: "schedule_fired",
         occurrenceId: occurrence.occurrenceId,
         prompt: occurrence.row.prompt,
         dueAt: occurrence.dueAt,
+        origin,
       });
-      if (this.fireTask) await this.fireTask(occurrence.occurrenceId, occurrence.row.prompt).catch((error) => this.report(error));
+      if (this.fireTask) await this.fireTask(occurrence.occurrenceId, occurrence.row.prompt, origin).catch((error) => this.report(error));
     }
   }
 

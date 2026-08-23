@@ -160,6 +160,7 @@ it("followup starts a fresh worker and sends prompt with followUp streaming beha
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
       appendSystemPrompt: SYSTEM_PROMPT,
+      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel",
     });
     expect(workers[0]?.prompt).toHaveBeenCalledWith("scheduled work", "followUp");
   });
@@ -377,7 +378,7 @@ it("bounds user message steering waits", async () => {
   expect(interrupt).toHaveBeenCalledWith(rawLine, conversationAgent(829096380), USER_INTERRUPT_MAX_WAIT_MS);
 });
 
-it("routes task finishes to their spawning conversation and leaves scheduled tasks silent", async () => {
+it("routes task finishes to their originating conversation", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);
   const router = new AgentEventRouter({ followup, interrupt });
@@ -397,42 +398,14 @@ it("routes task finishes to their spawning conversation and leaves scheduled tas
   await router.onEvent({
     type: "task_finished",
     runId: "run-456",
-    trigger: { kind: "schedule", occurrenceId: "occurrence-1" },
+    trigger: { kind: "schedule", occurrenceId: "occurrence-1", origin: target },
     prompt: "scheduled check",
     status: "done",
     exitCode: 0,
   }, "");
-  expect(followup).not.toHaveBeenCalled();
+  expect(followup).toHaveBeenCalledWith(expect.stringContaining('Task "scheduled check" finished'), target);
 });
 
-it("follows up the target owner after another agent writes there and suppresses self-writes", async () => {
-  const followup = vi.fn(async () => undefined);
-  const interrupt = vi.fn(async () => undefined);
-  const router = new AgentEventRouter({ followup, interrupt });
-  const target = conversationAgent(829096380, 9534);
-  const request = { method: "sendMessage", chat_id: target.chatId, message_thread_id: target.threadId, text: "morning briefing" };
-  const rawLine = JSON.stringify({ v: 1, t: "2026-08-23T00:00:00.000Z", type: "sent", actor: { kind: "task", runId: "run-999" }, target, request });
-
-  await router.onEvent({
-    type: "sent",
-    requestId: "req-cross",
-    actor: { kind: "task", runId: "run-999" },
-    target,
-    request,
-  }, rawLine);
-  expect(followup).toHaveBeenCalledWith(expect.stringContaining(rawLine), target);
-
-  followup.mockClear();
-  await router.onEvent({
-    type: "sent",
-    requestId: "req-self",
-    actor: target,
-    target,
-    request,
-  }, rawLine);
-  expect(followup).not.toHaveBeenCalled();
-  expect(interrupt).not.toHaveBeenCalled();
-});
 
 it("edited_message is logged silently without waking the agent", async () => {
   const followup = vi.fn(async () => undefined);

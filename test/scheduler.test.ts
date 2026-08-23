@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceTimeline } from "../src/events.js";
 import { WorkspaceScheduler, type WorkspaceSchedulerOptions } from "../src/scheduler.js";
 import type { ScheduleRow } from "../src/schedule-protocol.js";
+import { conversationAgent } from "../src/agent-ref.js";
 
 const temporaryDirectories: string[] = [];
 const NOW = Date.parse("2026-01-10T12:00:00.000Z");
@@ -36,6 +37,7 @@ function row(overrides: Partial<ScheduleRow> = {}): ScheduleRow {
     prompt: "water the plants",
     start: "2026-01-10T11:00:00.000Z",
     recurrence: null,
+    origin: { chat_id: 42, message_thread_id: 7 },
     ...overrides,
   };
 }
@@ -62,12 +64,13 @@ describe("WorkspaceScheduler", () => {
     const first = makeScheduler(dataDir);
 
     await first.scheduler.poll(NOW);
-    expect(first.fireTask).toHaveBeenCalledWith(expect.any(String), "water the plants");
+    expect(first.fireTask).toHaveBeenCalledWith(expect.any(String), "water the plants", conversationAgent(42, 7));
     expect(await timeline(dataDir)).toMatchObject([{
       type: "schedule_fired",
       occurrenceId: expect.any(String),
       prompt: "water the plants",
       dueAt: "2026-01-10T11:00:00.000Z",
+      origin: conversationAgent(42, 7),
     }]);
 
     await first.scheduler.poll(NOW);
@@ -113,7 +116,19 @@ describe("WorkspaceScheduler", () => {
     expect(errors).toEqual([]);
 
     await writeFile(path.join(dataDir, "workspace", ".schedules.json"), "not json", "utf8");
+
     await scheduler.poll(NOW);
+    expect(errors).toHaveLength(1);
+  });
+  it("rejects schedules without a conversation origin", async () => {
+    const dataDir = await fixture();
+    await writeFile(path.join(dataDir, "workspace", ".schedules.json"), JSON.stringify({
+      version: 1,
+      schedules: [{ prompt: "water", start: "2026-01-10T11:00:00.000Z", recurrence: null }],
+    }), "utf8");
+    const { scheduler, fireTask, errors } = makeScheduler(dataDir);
+    await scheduler.poll(NOW);
+    expect(fireTask).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
   });
 

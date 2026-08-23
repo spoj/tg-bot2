@@ -3,7 +3,7 @@ import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
-import { conversationAgent, sameConversation, type ConversationAgentRef } from "./agent-ref.js";
+import { conversationAgent, type ConversationAgentRef } from "./agent-ref.js";
 import type { AgentCredentials } from "./host-bridge.js";
 import { defined } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
@@ -14,7 +14,7 @@ import { isMessageDirectedToBot, isBotGroupAdd } from "./telegram.js";
 
 export const SYSTEM_PROMPT = [
 `You are a persistent personal Telegram agent serving several chats.
-Assistant text is not delivered; communicate with users through send. Conversation agents default to the current chat and topic.
+Assistant text is not delivered; communicate with users through send. The host always targets this session's owning chat and topic.
 The writable workspace is /workspace. Sessions and agent state live under /workspace/.pi. Host-managed attachments are read-only under /run/attachments; copy one into /workspace before editing it.
 For browser automation, launch /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --user-data-dir=/workspace/.browser/profile, then connect with puppeteer-core at http://127.0.0.1:9222. The browser survives turns and stops with the session.
 Install project extensions with pi install <pkg> -l --approve. Project settings live at /workspace/.pi/settings.json.
@@ -26,7 +26,9 @@ Install project extensions with pi install <pkg> -l --approve. Project settings 
   `Behavior:
 - Keep Telegram replies concise unless the user asks for detail. Prefer HTML parse mode and Telegram-safe tags.
 - Keep chats responsive. If work needs sustained multi-step execution, acknowledge it, spawn a complete background task, then end the turn. Handle task_finished when it arrives.
-- Let a topic's subject emerge through conversation. When a short, useful name becomes clear—or materially changes—include topic_name in a normal sendMessage call. The host renames it in that same tool call. Never spend a separate tool call searching for or changing a topic name.
+- Let a topic's subject emerge through conversation. When a short, useful name becomes clear—or materially changes—include topic_name in a normal sendMessage call. The host renames this agent's topic in that same tool call. Never spend a separate tool call searching for or changing a topic name.
+- After interpreting an attachment, call annotate with its exact /run/attachments path and a short factual description. The host inserts it into the attachment's original timeline event for later search.
+- Use steer_conversation to wake another conversation owner when work belongs to its chat or topic. Give it the relevant timeline message reference and a concrete instruction; do not send into its conversation yourself.
 - Read only the context needed: current thread in /run/timeline.jsonl, then its chat, then other chats. For older detail, search /workspace/.pi/sessions/<chat_id>/<message_thread_id>/ first, then sibling threads and root sessions. Background task sessions are under /workspace/.pi/tasks/<runId>/sessions/.
 - /workspace/.allowed.json controls chat access. /workspace/.pi/agent/settings.json controls model and thinking. /restart applies settings changes.
 - Always give bash commands that can hang an explicit timeout in seconds. Use 300 by default; increase it only when the operation requires more time.
@@ -130,13 +132,10 @@ function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progre
  * (interrupt vs followup vs ignore) and prompt formatting.
  */
 
-function triggerConversation(event: { trigger: Extract<BotEvent, { type: "task_finished" | "task_progress" }>["trigger"] }): ConversationAgentRef | undefined {
-  return event.trigger.kind === "agent" ? event.trigger.agent : undefined;
+function triggerConversation(event: { trigger: Extract<BotEvent, { type: "task_finished" | "task_progress" }>["trigger"] }): ConversationAgentRef {
+  return event.trigger.kind === "agent" ? event.trigger.agent : event.trigger.origin;
 }
 
-function externalWritePrompt(rawLine: string): string {
-  return `Another agent successfully wrote to this conversation. The action is already complete; do not repeat it.\n${rawLine}\nContinue as the responsible agent for this conversation. Respond only if further action is appropriate.`;
-}
 
 export class AgentEventRouter {
   private readonly botInfoProvider?: (() => { id: number; username?: string } | undefined) | undefined;
@@ -164,9 +163,6 @@ export class AgentEventRouter {
       case "task_progress":
         await this.handleTaskProgress(event);
         break;
-      case "sent":
-        await this.handleSent(event, rawLine);
-        break;
       case "my_chat_member":
         await this.handleMyChatMember(event);
         break;
@@ -186,21 +182,13 @@ export class AgentEventRouter {
   }
 
   private async handleTaskFinished(event: Extract<BotEvent, { type: "task_finished" }>): Promise<void> {
-    const target = triggerConversation(event);
-    if (target) await this.notifier.followup(formatTaskFinishedMessage(event), target);
+    await this.notifier.followup(formatTaskFinishedMessage(event), triggerConversation(event));
   }
 
   private async handleTaskProgress(event: Extract<BotEvent, { type: "task_progress" }>): Promise<void> {
-    const target = triggerConversation(event);
-    if (target && event.tasks.length > 0) {
-      await this.notifier.followup(formatTaskProgressMessage(event.tasks), target);
-    }
+    if (event.tasks.length > 0) await this.notifier.followup(formatTaskProgressMessage(event.tasks), triggerConversation(event));
   }
 
-  private async handleSent(event: Extract<BotEvent, { type: "sent" }>, rawLine: string): Promise<void> {
-    if (event.actor.kind === "conversation" && sameConversation(event.actor, event.target)) return;
-    await this.notifier.followup(externalWritePrompt(rawLine), event.target);
-  }
 
   private async handleMessage(event: Extract<BotEvent, { type: "message" }>, rawLine: string): Promise<void> {
     const isPrivate = event.chat_id > 0;
@@ -378,7 +366,7 @@ export class AgentManager {
     this.release(entry, entry.worker);
 
     const actor = entry.actor;
-    const token = this.credentials.issue(actor, ["send", "spawn", "steer_task", "cancel"]);
+    const token = this.credentials.issue(actor, ["send", "annotate", "spawn", "steer_conversation", "steer_task", "cancel"]);
     entry.token = token;
     const settings = await loadUserSettings(this.workspace);
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
@@ -407,7 +395,7 @@ export class AgentManager {
         clearInterval: this.clearIntervalFn,
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,spawn,steer_task,cancel",
+      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel",
       taskRun: false,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,

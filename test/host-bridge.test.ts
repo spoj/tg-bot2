@@ -2,8 +2,9 @@ import net from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { HostBridge } from "../src/host-bridge.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { conversationAgent } from "../src/agent-ref.js";
+import { AgentCredentials, HostBridge, type HostCapability } from "../src/host-bridge.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -17,9 +18,16 @@ async function fixture(): Promise<{ socketPath: string }> {
   return { socketPath: path.join(root, "run", "host.sock") };
 }
 
-function makeBridge(socketPath: string, overrides: Partial<ConstructorParameters<typeof HostBridge>[0]["handlers"]> = {}): HostBridge {
-  return new HostBridge({
+function makeBridge(
+  socketPath: string,
+  capabilities: HostCapability[] = ["send", "spawn", "cancel", "steer_task"],
+  overrides: Partial<ConstructorParameters<typeof HostBridge>[0]["handlers"]> = {},
+): { bridge: HostBridge; token: string; credentials: AgentCredentials } {
+  const credentials = new AgentCredentials();
+  const token = credentials.issue(conversationAgent(123, 4), capabilities);
+  const bridge = new HostBridge({
     socketPath,
+    credentials,
     handlers: {
       send: async () => ({}),
       spawn: async () => ({ status: "launched", runId: "run-1" }),
@@ -28,19 +36,20 @@ function makeBridge(socketPath: string, overrides: Partial<ConstructorParameters
       ...overrides,
     },
   });
+  return { bridge, token, credentials };
 }
 
-function call(socketPath: string, type: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+function call(socketPath: string, token: string, type: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const socket = net.connect(socketPath);
     let buffer = "";
-    socket.on("connect", () => socket.write(`${JSON.stringify({ id: "req-1", type, params })}\n`));
+    socket.on("connect", () => socket.write(`${JSON.stringify({ id: "req-1", token, type, params })}\n`));
     socket.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf8");
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
       socket.destroy();
-      const parsed = JSON.parse(buffer.slice(0, newline)) as { id: string; ok: boolean; result?: unknown; error?: string };
+      const parsed = JSON.parse(buffer.slice(0, newline)) as { ok: boolean; result?: unknown; error?: string };
       if (parsed.ok) resolve(parsed.result as Record<string, unknown>);
       else reject(new Error(parsed.error));
     });
@@ -49,71 +58,86 @@ function call(socketPath: string, type: string, params: Record<string, unknown> 
 }
 
 describe("HostBridge", () => {
-  it("answers requests with handler results over the socket", async () => {
+  it("resolves authenticated actors before invoking handlers", async () => {
     const { socketPath } = await fixture();
-    const bridge = makeBridge(socketPath);
+    const send = vi.fn(async () => ({}));
+    const { bridge, token } = makeBridge(socketPath, ["send"], { send });
     await bridge.start();
     try {
-      expect(await call(socketPath, "spawn", { prompt: "work" })).toEqual({ status: "launched", runId: "run-1" });
-      expect(await call(socketPath, "cancel", { runId: "run-1" })).toEqual({ status: "not-running" });
+      await expect(call(socketPath, token, "send", { request: {} })).resolves.toEqual({});
+      expect(send).toHaveBeenCalledWith({ request: {} }, conversationAgent(123, 4));
     } finally {
       await bridge.stop();
     }
   });
 
-  it("reports handler failures to the caller", async () => {
+  it("rejects unknown tokens and capabilities", async () => {
     const { socketPath } = await fixture();
-    const bridge = makeBridge(socketPath, { spawn: async () => { throw new Error("prompt too large"); } });
+    const { bridge, token } = makeBridge(socketPath, ["send"]);
     await bridge.start();
     try {
-      await expect(call(socketPath, "spawn", { prompt: "x" })).rejects.toThrow("prompt too large");
+      await expect(call(socketPath, "unknown", "send")).rejects.toThrow("Unknown agent token");
+      await expect(call(socketPath, token, "spawn")).rejects.toThrow("not allowed to call spawn");
     } finally {
       await bridge.stop();
     }
   });
 
-  it("rejects unknown request types", async () => {
+  it("preserves UTF-8 split across socket chunks", async () => {
     const { socketPath } = await fixture();
-    const bridge = makeBridge(socketPath);
+    const { bridge, token } = makeBridge(socketPath, ["send"], { send: async (params) => ({ text: params.text }) });
     await bridge.start();
     try {
-      await expect(call(socketPath, "teleport")).rejects.toThrow("Unknown request type");
+      const text = "hello 🙂";
+      const payload = Buffer.from(`${JSON.stringify({ id: "req-utf8", token, type: "send", params: { text } })}\n`, "utf8");
+      const emojiStart = payload.indexOf(Buffer.from("🙂", "utf8"));
+      const echoed = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        const chunks: Buffer[] = [];
+        socket.on("connect", () => {
+          socket.write(payload.subarray(0, emojiStart + 1));
+          setTimeout(() => socket.write(payload.subarray(emojiStart + 1)), 10);
+        });
+        socket.on("data", (chunk: Buffer) => {
+          chunks.push(chunk);
+          const response = Buffer.concat(chunks);
+          const newline = response.indexOf(0x0a);
+          if (newline === -1) return;
+          socket.destroy();
+          const parsed = JSON.parse(response.subarray(0, newline).toString("utf8")) as { result: { text: string } };
+          resolve(parsed.result.text);
+        });
+        socket.on("error", reject);
+      });
+      expect(echoed).toBe(text);
     } finally {
       await bridge.stop();
     }
   });
 
-  it("rejects request types whose handlers the bridge does not expose", async () => {
+  it("reports handler failures and unknown request types", async () => {
     const { socketPath } = await fixture();
-    const bridge = new HostBridge({
-      socketPath,
-      handlers: {
-        send: async () => ({}),
-      },
-    });
+    const { bridge, token } = makeBridge(socketPath, ["spawn"], { spawn: async () => { throw new Error("prompt too large"); } });
     await bridge.start();
     try {
-      expect(await call(socketPath, "send", { request: { type: "send_message", version: 1, id: "x", text: "hi" }, origin: "123:0" })).toEqual({});
-      await expect(call(socketPath, "spawn", { prompt: "work" })).rejects.toThrow("Unknown request type: spawn");
-      await expect(call(socketPath, "steer_task", { runId: "run-1", message: "hi" })).rejects.toThrow("Unknown request type: steer_task");
-      await expect(call(socketPath, "cancel", { runId: "run-1" })).rejects.toThrow("Unknown request type: cancel");
+      await expect(call(socketPath, token, "spawn", { prompt: "x" })).rejects.toThrow("prompt too large");
+      await expect(call(socketPath, token, "teleport")).rejects.toThrow("Unknown request type");
     } finally {
       await bridge.stop();
     }
   });
 
-
-  it("restarts cleanly over a stale socket file", async () => {
+  it("rejects request types whose handlers are not exposed", async () => {
     const { socketPath } = await fixture();
-    const first = makeBridge(socketPath);
-    await first.start();
-    await first.stop();
-    const second = makeBridge(socketPath);
-    await second.start();
+    const credentials = new AgentCredentials();
+    const token = credentials.issue(conversationAgent(123), ["send", "spawn"]);
+    const bridge = new HostBridge({ socketPath, credentials, handlers: { send: async () => ({}) } });
+    await bridge.start();
     try {
-      expect(await call(socketPath, "steer_task", { runId: "run-1", message: "hi" })).toEqual({ status: "delivered" });
+      await expect(call(socketPath, token, "send", { request: {} })).resolves.toEqual({});
+      await expect(call(socketPath, token, "spawn", { prompt: "work" })).rejects.toThrow("Unknown request type: spawn");
     } finally {
-      await second.stop();
+      await bridge.stop();
     }
   });
 });

@@ -1,11 +1,14 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, unlink } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
+import type { AgentRef } from "./agent-ref.js";
 import { errorMessage, isMissing } from "./util.js";
 
-/** One request line from an agent tool: `{id, type, params}`. */
+/** One request line from an agent tool: `{id, token, type, params}`. */
 type BridgeRequest = {
   id: string;
+  token: string;
   type: string;
   params: Record<string, unknown>;
 };
@@ -13,7 +16,9 @@ type BridgeRequest = {
 /** One response line to the agent tool: `{id, ok, result | error}`. */
 type BridgeResponse = { id: string } & ({ ok: true; result: Record<string, unknown> } | { ok: false; error: string });
 
-export type BridgeHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
+export type HostCapability = "send" | "spawn" | "cancel" | "steer_task";
+
+export type BridgeHandler = (params: Record<string, unknown>, actor: AgentRef) => Promise<Record<string, unknown>>;
 
 export type HostBridgeHandlers = {
   send: BridgeHandler;
@@ -22,9 +27,38 @@ export type HostBridgeHandlers = {
   steerTask: BridgeHandler;
 };
 
+type AgentCredential = {
+  actor: AgentRef;
+  capabilities: ReadonlySet<HostCapability>;
+};
+
+export class AgentCredentials {
+  private readonly entries = new Map<string, AgentCredential>();
+
+  issue(actor: AgentRef, capabilities: readonly HostCapability[]): string {
+    const token = randomBytes(32).toString("base64url");
+    this.entries.set(token, { actor, capabilities: new Set(capabilities) });
+    return token;
+  }
+
+  revoke(token: string): void {
+    this.entries.delete(token);
+  }
+
+  authorize(token: string, capability: HostCapability): AgentRef {
+    const credential = this.entries.get(token);
+    if (!credential) throw new Error("Unknown agent token");
+    if (!credential.capabilities.has(capability)) {
+      throw new Error(`Agent is not allowed to call ${capability}`);
+    }
+    return credential.actor;
+  }
+}
+
 export type HostBridgeOptions = {
   /** Absolute path of the UNIX socket the agent tools dial. */
   socketPath: string;
+  credentials: AgentCredentials;
   /** Handlers by request type; a type without a handler is rejected as unknown. */
   handlers: Partial<HostBridgeHandlers>;
   /** Kills a connection whose request line exceeds this many bytes. */
@@ -41,6 +75,7 @@ const DEFAULT_MAX_LINE_BYTES = 2 * 1024 * 1024;
  */
 export class HostBridge {
   private readonly socketPath: string;
+  private readonly credentials: AgentCredentials;
   private readonly handlers: Partial<HostBridgeHandlers>;
   private readonly maxLineBytes: number;
   private readonly logger: (error: unknown) => void;
@@ -49,6 +84,7 @@ export class HostBridge {
 
   constructor(options: HostBridgeOptions) {
     this.socketPath = options.socketPath;
+    this.credentials = options.credentials;
     this.handlers = options.handlers;
     this.maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
     this.logger = options.logger ?? ((error) => console.error("Host bridge error", error));
@@ -87,19 +123,21 @@ export class HostBridge {
 
   private handleConnection(socket: net.Socket): void {
     this.connections.add(socket);
+    socket.setEncoding("utf8");
     let buffer = "";
-    socket.on("data", (chunk: Buffer | string) => {
-      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      if (buffer.length > this.maxLineBytes) {
-        socket.destroy();
-        return;
-      }
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
       let newline: number;
       while ((newline = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newline);
         buffer = buffer.slice(newline + 1);
+        if (Buffer.byteLength(line, "utf8") > this.maxLineBytes) {
+          socket.destroy();
+          return;
+        }
         if (line.trim().length > 0) void this.handleLine(socket, line);
       }
+      if (Buffer.byteLength(buffer, "utf8") > this.maxLineBytes) socket.destroy();
     });
     socket.on("error", () => {});
     socket.on("close", () => {
@@ -114,11 +152,12 @@ export class HostBridge {
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Request must be a JSON object");
       const typed = parsed as Record<string, unknown>;
       if (typeof typed.id !== "string" || typed.id.length === 0) throw new Error("Request id must be a non-empty string");
+      if (typeof typed.token !== "string" || typed.token.length === 0) throw new Error("Request token must be a non-empty string");
       if (typeof typed.type !== "string") throw new Error("Request type must be a string");
       if (typed.params === null || typeof typed.params !== "object" || Array.isArray(typed.params)) {
         throw new Error("Request params must be a JSON object");
       }
-      request = { id: typed.id, type: typed.type, params: typed.params as Record<string, unknown> };
+      request = { id: typed.id, token: typed.token, type: typed.type, params: typed.params as Record<string, unknown> };
     } catch (error) {
       this.logger(error);
       return;
@@ -130,24 +169,25 @@ export class HostBridge {
   }
 
   private async invoke(request: BridgeRequest): Promise<BridgeResponse> {
-    const handler = this.handlerFor(request.type);
-    if (handler === undefined) {
+    const route = this.handlerFor(request.type);
+    if (route === undefined) {
       return { id: request.id, ok: false, error: `Unknown request type: ${request.type}` };
     }
     try {
-      const result = await handler(request.params);
+      const actor = this.credentials.authorize(request.token, route.capability);
+      const result = await route.handler(request.params, actor);
       return { id: request.id, ok: true, result };
     } catch (error) {
       return { id: request.id, ok: false, error: errorMessage(error) };
     }
   }
 
-  private handlerFor(type: string): BridgeHandler | undefined {
+  private handlerFor(type: string): { handler: BridgeHandler; capability: HostCapability } | undefined {
     switch (type) {
-      case "send": return this.handlers.send;
-      case "spawn": return this.handlers.spawn;
-      case "cancel": return this.handlers.cancel;
-      case "steer_task": return this.handlers.steerTask;
+      case "send": return this.handlers.send ? { handler: this.handlers.send, capability: "send" } : undefined;
+      case "spawn": return this.handlers.spawn ? { handler: this.handlers.spawn, capability: "spawn" } : undefined;
+      case "cancel": return this.handlers.cancel ? { handler: this.handlers.cancel, capability: "cancel" } : undefined;
+      case "steer_task": return this.handlers.steerTask ? { handler: this.handlers.steerTask, capability: "steer_task" } : undefined;
       default: return undefined;
     }
   }

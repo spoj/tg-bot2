@@ -3,13 +3,13 @@ import { AgentManager, AgentEventRouter } from "./agent.js";
 import { WorkspaceOutbox } from "./outbox.js";
 import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
 import { WorkspaceScheduler } from "./scheduler.js";
-import { HostBridge } from "./host-bridge.js";
+import { AgentCredentials, HostBridge } from "./host-bridge.js";
 import { WorkspaceTasks } from "./task.js";
 import type { Bot } from "grammy";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
-import { EVENTS_FILE, WorkspaceEventLog } from "./events.js";
-import { TG_BOT_DIR, botPaths, isMissing } from "./util.js";
-import { lstat, mkdir, rename, writeFile } from "node:fs/promises";
+import { WorkspaceTimeline } from "./events.js";
+import { appendJsonl, botPaths } from "./util.js";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -47,37 +47,9 @@ function stringField(record: Record<string, unknown> | undefined, field: string)
   return typeof value === "string" ? value : "";
 }
 
-/**
- * One-time migration from the legacy agent-writable log location to the
- * host-owned one (`DATA_DIR/bots/<id>/events.jsonl`). Only regular files are
- * moved; a planted symlink is ignored. Ensures the host log exists afterwards
- * so the read-only bind mount into worker sandboxes always has a source.
- */
-export async function migrateEventsLog(workspace: string, eventsLog: string): Promise<void> {
-  try {
-    await lstat(eventsLog);
-    return;
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-  }
-  const legacy = path.join(workspace, TG_BOT_DIR, EVENTS_FILE);
-  let moved = false;
-  try {
-    const entry = await lstat(legacy);
-    if (entry.isFile() && !entry.isSymbolicLink()) {
-      await mkdir(path.dirname(eventsLog), { recursive: true, mode: 0o700 });
-      await rename(legacy, eventsLog);
-      moved = true;
-    }
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-  }
-  if (!moved) {
-    await mkdir(path.dirname(eventsLog), { recursive: true, mode: 0o700 });
-    await writeFile(eventsLog, "", { encoding: "utf8", mode: 0o600, flag: "ax" }).catch((error) => {
-      if (error && (error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    });
-  }
+export async function ensureTimeline(timelinePath: string): Promise<void> {
+  await mkdir(path.dirname(timelinePath), { recursive: true, mode: 0o700 });
+  await appendJsonl(timelinePath, []);
 }
 
 // Stops the scheduler, bridge, and tasks, disposes agents, terminates
@@ -131,63 +103,73 @@ export async function main(): Promise<void> {
     const { workspace } = paths;
     const runtimeConfig = { ...botConfig, dataDir, ...paths };
 
-    await migrateEventsLog(workspace, paths.eventsLog);
+    await ensureTimeline(paths.timeline);
     await mkdir(paths.runDir, { recursive: true, mode: 0o700 });
+    await mkdir(paths.attachments, { recursive: true, mode: 0o700 });
     const hostSocketDir = path.resolve(paths.runDir);
-    const hostEventsLog = path.resolve(paths.eventsLog);
-
-    const eventLog = new WorkspaceEventLog(hostEventsLog);
+    const hostTimeline = path.resolve(paths.timeline);
+    const hostAttachments = path.resolve(paths.attachments);
+    const credentials = new AgentCredentials();
+    const timeline = new WorkspaceTimeline(hostTimeline);
     const agentManager = new AgentManager({ workspace }, {
       appRoot: process.cwd(),
+      credentials,
       bwrapPath,
       spawnProcess,
       terminateProcessGroup,
-      events: eventLog,
       hostSocketDir,
-      hostEventsLog,
+      hostTimeline,
+      hostAttachments,
     });
     const deliveryQueue = new TelegramDeliveryQueue();
-    const bot = createTelegramBot(runtimeConfig, eventLog, deliveryQueue, agentManager);
+    const pollOwners = new Map<string, number>();
+    const bot = createTelegramBot(runtimeConfig, timeline, deliveryQueue, agentManager, pollOwners);
     const agentRouter = new AgentEventRouter(agentManager, { botInfo: () => bot.botInfo });
-    eventLog.subscribe((record, rawLine) => agentRouter.onEvent(record, rawLine));
+    timeline.subscribe((record, rawLine) => agentRouter.onEvent(record, rawLine));
 
     const outboxInstance = new WorkspaceOutbox({
       workspace,
-      events: eventLog,
-      dispatch: (chatId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, request)),
+      timeline,
+      pollOwners,
+      dispatch: (chatId, requestId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, requestId, request)),
     });
     const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
       workspace,
-      events: eventLog,
+      timeline,
+      credentials,
       appRoot: process.cwd(),
       bwrapPath,
       spawnProcess,
       terminateProcessGroup,
       hostSocketDir,
-      hostEventsLog,
+      hostTimeline,
+      hostAttachments,
     });
-    // The scheduler fires due runs by launching tasks directly; the fired event is
-    // written first, and boot reconciliation relaunches occurrences lost in between.
     const schedulerInstance = new WorkspaceScheduler({
       workspace,
-      events: eventLog,
-      fireTask: async (runId, prompt) => {
-        await tasksInstance.spawn(prompt, undefined, runId);
+      statePath: paths.schedulerState,
+      timeline,
+      fireTask: async (occurrenceId, prompt) => {
+        await tasksInstance.spawn(prompt, { kind: "schedule", occurrenceId }, occurrenceId);
       },
     });
     const hostHandlers = {
-      send: (params: Record<string, unknown>) => outboxInstance.send(params.request, stringField(params, "origin") || undefined),
-      spawn: (params: Record<string, unknown>) => tasksInstance.spawn(stringField(params, "prompt"), stringField(params, "origin") || undefined),
+      send: (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => outboxInstance.send(params.request, actor),
+      spawn: async (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => {
+        if (actor.kind !== "conversation") throw new Error("Only conversation agents can spawn tasks");
+        return tasksInstance.spawn(stringField(params, "prompt"), { kind: "agent", agent: actor });
+      },
       cancel: async (params: Record<string, unknown>) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
       steerTask: async (params: Record<string, unknown>) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),
     };
     const bridge: HostBridge = new HostBridge({
       socketPath: path.join(hostSocketDir, "host.sock"),
+      credentials,
       handlers: hostHandlers,
     });
-    // Task sandboxes get a capability-restricted socket: send only.
     const taskBridge: HostBridge = new HostBridge({
       socketPath: path.join(hostSocketDir, "host-task.sock"),
+      credentials,
       handlers: { send: hostHandlers.send },
     });
     return {
@@ -237,16 +219,6 @@ export async function main(): Promise<void> {
   process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
   try {
     for (const instance of instances) {
-      await instance.scheduler.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
-      await instance.tasks.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
       await instance.bridge.start();
       if (shuttingDown) {
         await shutdown("startup interrupted");
@@ -257,6 +229,12 @@ export async function main(): Promise<void> {
         await shutdown("startup interrupted");
         return;
       }
+      await instance.tasks.start();
+      if (shuttingDown) {
+        await shutdown("startup interrupted");
+        return;
+      }
+      await instance.scheduler.start();
       if (shuttingDown) {
         await shutdown("startup interrupted");
         return;

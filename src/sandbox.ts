@@ -139,20 +139,22 @@ export type PiRunSandboxPaths = {
   appendSystemPrompt?: string;
   /** In-sandbox directory for session files; defaults to /workspace/.pi/sessions. */
   sessionDir?: string;
-  /** "provider/modelId" pattern passed as --model; overrides session-restored models. */
+  /** "provider/modelId" passed at launch so session restoration cannot override the configured model. */
   model?: string;
-  /** Thinking level passed as --thinking. */
+  /** Thinking level passed at launch with the configured model. */
   thinkingLevel?: string;
   /** Comma-separated host tool names exposed via the mounted host-tools extension and PI_HOST_TOOLS. */
   hostTools?: string;
-  /** Compact origin identifier (e.g. "chatId:threadId" or "task:runId") passed as PI_AGENT_ORIGIN. */
-  agentOrigin?: string;
-  /** Host-owned directory bind-mounted at /workspace/.host; contains the host bridge socket. */
+  /** Host-issued capability token passed as PI_AGENT_TOKEN. */
+  agentToken?: string;
+  /** Host-owned runtime directory bind-mounted read-only at /run. */
   hostSocketDir?: string;
   /** Task runs dial the capability-restricted task bridge socket instead of the full one. */
   taskRun?: boolean;
-  /** Host-owned events log, read-only bind-mounted over /workspace/.tg-bot/events.jsonl. */
-  hostEventsLog?: string;
+  /** Host-owned global timeline exposed read-only at /run/timeline.jsonl. */
+  hostTimeline?: string;
+  /** Host-managed attachments exposed read-only at /run/attachments. */
+  hostAttachments?: string;
 };
 export type PiRunBwrapResult = { args: string[] };
 
@@ -263,13 +265,17 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--bind", workspace, "/workspace",
     ...(paths.hostSocketDir === undefined
       ? []
-      : ["--bind", await requireRealDirectory(paths.hostSocketDir, "Host socket directory"), "/workspace/.host"]),
-    ...(paths.hostEventsLog === undefined
+      : ["--bind", await requireRealDirectory(paths.hostSocketDir, "Host runtime directory"), "/run"]),
+    ...(paths.hostAttachments === undefined
       ? []
-      : ["--ro-bind", paths.hostEventsLog, "/workspace/.tg-bot/events.jsonl"]),
+      : ["--ro-bind", await requireRealDirectory(paths.hostAttachments, "Host attachments directory"), "/run/attachments"]),
+    ...(paths.hostTimeline === undefined
+      ? []
+      : ["--ro-bind", paths.hostTimeline, "/run/timeline.jsonl"]),
+    ...(paths.hostSocketDir === undefined ? [] : ["--remount-ro", "/run"]),
     ...(paths.hostSocketDir === undefined
       ? []
-      : ["--setenv", "PI_HOST_SOCKET", paths.taskRun ? "/workspace/.host/host-task.sock" : "/workspace/.host/host.sock"]),
+      : ["--setenv", "PI_HOST_SOCKET", paths.taskRun ? "/run/host-task.sock" : "/run/host.sock"]),
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
@@ -280,7 +286,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--setenv", "UV_TOOL_BIN_DIR", "/workspace/.local/bin",
     "--setenv", "UV_TOOL_DIR", "/workspace/.local/share/uv/tools",
     "--setenv", "UV_PYTHON_INSTALL_DIR", "/workspace/.python",
-    ...(paths.agentOrigin === undefined ? [] : ["--setenv", "PI_AGENT_ORIGIN", paths.agentOrigin]),
+    ...(paths.agentToken === undefined ? [] : ["--setenv", "PI_AGENT_TOKEN", paths.agentToken]),
   );
   const piArgs = [
     "--mode", "rpc",

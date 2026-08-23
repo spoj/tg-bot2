@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -14,6 +14,10 @@ integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "tg-pi-rpc-"));
     const workspace = path.join(root, "workspace");
     await mkdir(workspace, { recursive: true, mode: 0o700 });
+    const hostSocketDir = path.join(root, "run");
+    const hostTimeline = path.join(root, "timeline.jsonl");
+    await mkdir(hostSocketDir);
+    await writeFile(hostTimeline, "", "utf8");
     const appRoot = await realpath(process.cwd());
     const { bwrapPath } = await checkSandboxEnvironment(path.join(root, "data"));
 
@@ -24,6 +28,8 @@ integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
         bwrapPath,
         spawnProcess,
         terminateProcessGroup,
+        hostSocketDir,
+        hostTimeline,
         idleTimeoutMs: 60_000,
       });
 

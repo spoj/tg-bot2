@@ -31,7 +31,11 @@ type ChildFixture = {
 function fakeChildFixture(): ChildFixture {
   const child = new FakeChild();
   child.stdin.end = vi.fn(() => {});
-  child.stdin.write = vi.fn(() => true);
+  child.stdin.write = vi.fn((chunk: string) => {
+    const command = JSON.parse(chunk) as { id?: string; type?: string };
+    queueMicrotask(() => child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: {} })}\n`));
+    return true;
+  });
   child.stdin.writable = true;
   child.stdin.destroyed = false;
   const spawn = vi.fn((_executable: string, _args: string[], _options: unknown) => child as unknown as PiWorkerChildProcess);
@@ -51,7 +55,7 @@ async function fixture(): Promise<{ root: string; workspace: string; appRoot: st
 }
 
 describe("PiWorker", () => {
-  it("spawns bwrap with --mode rpc and configures steering and followup modes to all", async () => {
+  it("spawns bwrap with configured model flags and configures queue modes over RPC", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
@@ -60,6 +64,8 @@ describe("PiWorker", () => {
         appRoot: f.appRoot,
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
+        model: "openrouter/deepseek/deepseek-chat",
+        thinkingLevel: "high",
       });
       await worker.start();
       expect(spawn).toHaveBeenCalledOnce();
@@ -70,7 +76,10 @@ describe("PiWorker", () => {
       expect(args).toContain("rpc");
       expect(args).toContain("--session-dir");
       expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/sessions");
-
+      expect(args).toEqual(expect.arrayContaining([
+        "--model", "openrouter/deepseek/deepseek-chat",
+        "--thinking", "high",
+      ]));
       expect(child.stdin.write).toHaveBeenCalledWith(
         expect.stringContaining('"type":"set_steering_mode","mode":"all"'),
         "utf8",
@@ -108,6 +117,83 @@ describe("PiWorker", () => {
         "utf8",
       );
     } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts and queues a continuation when a steer exceeds its maximum wait", async () => {
+    vi.useFakeTimers();
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.prompt("initial work");
+      await worker.prompt("urgent update", "steer", 120_000);
+      child.stdin.write.mockClear();
+
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      const commands = child.stdin.write.mock.calls.map(([line]) => JSON.parse(line) as Record<string, unknown>);
+      expect(commands).toMatchObject([
+        { type: "abort" },
+        { type: "prompt", streamingBehavior: "steer" },
+      ]);
+      expect(commands[1]?.message).toContain("latest user instruction");
+    } finally {
+      vi.useRealTimers();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels the steering deadline when the queued steer is delivered", async () => {
+    vi.useFakeTimers();
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.prompt("initial work");
+      await worker.prompt("urgent update", "steer", 120_000);
+      child.stdout.emit("data", `${JSON.stringify({ type: "queue_update", steering: [], followUp: [] })}\n`);
+      child.stdin.write.mockClear();
+
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(child.stdin.write).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bound an initial user turn that was never queued", async () => {
+    vi.useFakeTimers();
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.prompt("initial work", "steer", 120_000);
+      child.stdin.write.mockClear();
+
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(child.stdin.write).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
       await rm(f.root, { recursive: true, force: true });
     }
   });
@@ -160,6 +246,52 @@ describe("PiWorker", () => {
     }
   });
 
+  it("preserves UTF-8 split across stdout chunks", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.prompt("do work");
+      const settled = worker.waitForSettled();
+      const output = Buffer.from("result 🙂\n", "utf8");
+      const emojiStart = Buffer.from("result ", "utf8").length;
+      child.stdout.emit("data", output.subarray(0, emojiStart + 1));
+      child.stdout.emit("data", output.subarray(emojiStart + 1));
+      child.stdout.emit("data", `${JSON.stringify({ type: "agent_settled" })}\n`);
+
+      await expect(settled).resolves.toMatchObject({ stdout: expect.stringContaining("result 🙂") });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for stdio close before finalizing captured output", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await worker.prompt("do work");
+      const settled = worker.waitForSettled();
+      child.emit("exit", 0, null);
+      child.stdout.emit("data", "final output\n");
+      child.emit("close", 0, null);
+
+      await expect(settled).resolves.toMatchObject({ stdout: expect.stringContaining("final output") });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("reaps the idle worker after idleTimeoutMs", async () => {
     vi.useFakeTimers();
     try {
@@ -180,7 +312,7 @@ describe("PiWorker", () => {
         expect(worker.isAlive()).toBe(true);
         const closing = vi.advanceTimersByTimeAsync(1_000);
         await vi.waitFor(() => expect(child.stdin.end).toHaveBeenCalled());
-        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
         await closing;
         await vi.waitFor(() => expect(reaped).toHaveBeenCalledOnce());
         expect(worker.isAlive()).toBe(false);
@@ -212,7 +344,7 @@ describe("PiWorker", () => {
         await vi.advanceTimersByTimeAsync(250);
         expect(terminate).toHaveBeenCalledWith(child, "SIGKILL");
 
-        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
         await closing;
       } finally {
         await rm(f.root, { recursive: true, force: true });
@@ -242,7 +374,7 @@ describe("PiWorker", () => {
         await vi.advanceTimersByTimeAsync(250);
         expect(terminate).toHaveBeenCalledWith(child, "SIGKILL");
 
-        child.emit("exit", null, "SIGKILL");
+        child.emit("close", null, "SIGKILL");
         await stopping;
       } finally {
         await rm(f.root, { recursive: true, force: true });
@@ -353,7 +485,7 @@ describe("PiWorker", () => {
       const starting = worker.start();
       await vi.waitFor(() => expect(terminate).toHaveBeenCalledWith(child, "SIGTERM"));
       expect(spawn).toHaveBeenCalledOnce();
-      child.emit("exit", null, "SIGTERM");
+      child.emit("close", null, "SIGTERM");
       await starting;
       const result = await worker.waitForSettled();
       expect(result.signal).toBe("SIGTERM");
@@ -375,7 +507,7 @@ describe("PiWorker", () => {
       });
       await worker.start();
       const stopping = worker.stop();
-      child.emit("exit", null, "SIGTERM");
+      child.emit("close", null, "SIGTERM");
       await stopping;
       await worker.prompt("late steer", "steer");
       expect(spawn).toHaveBeenCalledOnce();
@@ -405,7 +537,7 @@ describe("PiWorker", () => {
       });
       await taskWorker.start();
       const taskArgs = taskFixture.spawn.mock.calls[0]?.[1] ?? [];
-      expect(taskArgs[taskArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/workspace/.host/host-task.sock");
+      expect(taskArgs[taskArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/run/host-task.sock");
 
       const chatFixture = fakeChildFixture();
       const chatWorker = new PiWorker({
@@ -418,7 +550,7 @@ describe("PiWorker", () => {
       });
       await chatWorker.start();
       const chatArgs = chatFixture.spawn.mock.calls[0]?.[1] ?? [];
-      expect(chatArgs[chatArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/workspace/.host/host.sock");
+      expect(chatArgs[chatArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/run/host.sock");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

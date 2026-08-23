@@ -6,65 +6,46 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 /**
  * Host-tools extension: send/spawn/steer_task/cancel tools that call
  * the host synchronously over the bridge socket mounted at PI_HOST_SOCKET. The host
- * validates, executes, and records outcomes in its own events log; each tool returns
- * the host's result directly. PI_HOST_TOOLS selects which tools a run exposes
- * (chat runs: send,spawn,steer_task,cancel; task runs: send).
+ * authenticates PI_AGENT_TOKEN, validates each request, executes it, and returns the
+ * result directly. PI_HOST_TOOLS selects which tools a run exposes (chat runs:
+ * send,spawn,steer_task,cancel; task runs: send).
  */
 
 const SEND_SCHEMA = Type.Object({
-  chat_id: Type.Optional(Type.Number({ description: "Target Telegram chat ID (defaults to current chat for chat agents)" })),
-  message_thread_id: Type.Optional(Type.Number({ description: "Optional Telegram forum topic or message thread ID (defaults to current topic for chat agents)" })),
-  type: Type.String({ description: "Request type: send_message, send_file, send_media_group, send_location, send_poll, stop_poll, send_reaction, edit_message, delete_message, create_forum_topic, edit_forum_topic, close_forum_topic, reopen_forum_topic, or delete_forum_topic" }),
-  path: Type.Optional(Type.String({ description: "Workspace file path for send_file (relative or /workspace/...)" })),
-  caption: Type.Optional(Type.String({ description: "Optional caption for send_file" })),
-  kind: Type.Optional(Type.String({ description: "File kind for send_file: auto, photo, audio, video, voice, or document" })),
-  text: Type.Optional(Type.String({ description: "Message text for send_message or edit_message" })),
-  parse_mode: Type.Optional(Type.String({ description: "Formatting parse mode: prefer 'HTML' (supports <b>, <i>, <code>, <pre>, <blockquote>, <u>, <s>, <a>, bullet points •) or 'MarkdownV2'" })),
-  entities: Type.Optional(Type.Array(Type.Any())),
-  link_preview_options: Type.Optional(Type.Any()),
-  reply_markup: Type.Optional(Type.Any()),
-  reply_to_message_id: Type.Optional(Type.Number()),
-  disable_notification: Type.Optional(Type.Boolean()),
-  media: Type.Optional(Type.Array(Type.Any())),
-  latitude: Type.Optional(Type.Number()),
-  longitude: Type.Optional(Type.Number()),
-  horizontal_accuracy: Type.Optional(Type.Number()),
-  live_period: Type.Optional(Type.Number()),
-  venue: Type.Optional(Type.Any()),
-  question: Type.Optional(Type.String()),
-  options: Type.Optional(Type.Array(Type.String())),
-  is_anonymous: Type.Optional(Type.Boolean()),
-  allows_multiple_answers: Type.Optional(Type.Boolean()),
-  poll_type: Type.Optional(Type.String()),
-  correct_option_id: Type.Optional(Type.Number()),
-  message_id: Type.Optional(Type.Number()),
-  reaction: Type.Optional(Type.Array(Type.Any())),
-  name: Type.Optional(Type.String({ description: "Topic name for create_forum_topic or edit_forum_topic" })),
-  icon_color: Type.Optional(Type.Number({ description: "Color of the topic icon (RGB integer) for create_forum_topic" })),
-  icon_custom_emoji_id: Type.Optional(Type.String({ description: "Unique identifier of the custom emoji shown as the topic icon" })),
+  method: Type.String({ description: "Telegram Bot API method name, such as sendMessage, sendDocument, or editMessageText" }),
+  chat_id: Type.Optional(Type.Number({ description: "Telegram chat ID; defaults to the current chat for conversation agents" })),
+  message_thread_id: Type.Optional(Type.Number({ description: "Telegram topic ID; defaults to the current topic for conversation agents" })),
+  topic_name: Type.Optional(Type.String({ description: "Host convenience for sendMessage: rename this topic after delivery" })),
 }, { additionalProperties: true });
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const SEND_TIMEOUT_MS = 5 * 60_000;
 
 function text(content: string): ToolResult {
   return { content: [{ type: "text", text: content }], details: {} };
 }
 
 function failure(error: unknown): ToolResult {
-  return text(`FAILED: ${String(error)}. Nothing was executed by the host; retry if needed.`);
+  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl before retrying.`);
 }
 
 /** Sends one request line to the host bridge and resolves with the response result. */
 function callHost(type: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const socketPath = process.env.PI_HOST_SOCKET;
+    const token = process.env.PI_AGENT_TOKEN;
     if (!socketPath || socketPath.length === 0) {
       reject(new Error("PI_HOST_SOCKET is not set"));
       return;
     }
+    if (!token || token.length === 0) {
+      reject(new Error("PI_AGENT_TOKEN is not set"));
+      return;
+    }
     const socket = net.connect(socketPath);
+    socket.setEncoding("utf8");
     let buffer = "";
     const timer = setTimeout(() => {
       socket.destroy();
@@ -72,10 +53,10 @@ function callHost(type: string, params: Record<string, unknown>, timeoutMs = DEF
     }, timeoutMs);
     timer.unref?.();
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ id: randomUUID(), type, params })}\n`);
+      socket.write(`${JSON.stringify({ id: randomUUID(), token, type, params })}\n`);
     });
-    socket.on("data", (chunk: Buffer | string) => {
-      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
       const line = buffer.slice(0, newline);
@@ -110,73 +91,18 @@ function callHost(type: string, params: Record<string, unknown>, timeoutMs = DEF
   });
 }
 
-type SendChatOrigin = { chatId: number; threadId?: number };
-
-function explicitThreadId(request: Record<string, unknown>): number | undefined {
-  const raw = request.message_thread_id;
-  return typeof raw === "number" && Number.isSafeInteger(raw) ? raw : undefined;
-}
-
-/**
- * Resolves the send target from an explicit chat_id, falling back to the origin
- * chat only when chat_id is absent. An explicitly supplied non-safe-integer
- * chat_id is an error, never a silent default.
- */
-export function resolveSendTarget(
-  request: Record<string, unknown>,
-  chatOrigin: SendChatOrigin | undefined,
-): { chatId?: number; threadId?: number } | { error: string } {
-  const rawChatId = request.chat_id;
-  if (rawChatId !== undefined) {
-    if (typeof rawChatId !== "number" || !Number.isSafeInteger(rawChatId)) {
-      return { error: `chat_id must be a safe integer (got ${String(rawChatId)})` };
-    }
-    const threadId = explicitThreadId(request);
-    return { chatId: rawChatId, ...(threadId !== undefined ? { threadId } : {}) };
-  }
-  if (chatOrigin === undefined) {
-    return { error: "chat_id is required when calling send from a background task or without an active chat session." };
-  }
-  const threadId = explicitThreadId(request) ?? chatOrigin.threadId;
-  return { chatId: chatOrigin.chatId, ...(threadId !== undefined ? { threadId } : {}) };
-}
-
-function getChatOrigin(): { chatId: number; threadId?: number } | undefined {
-  const origin = process.env.PI_AGENT_ORIGIN;
-  if (!origin || origin.startsWith("task:") || origin === "default") return undefined;
-  const [chatStr, threadStr] = origin.split(":");
-  const chatId = Number(chatStr);
-  const threadId = Number(threadStr);
-  if (!Number.isSafeInteger(chatId)) return undefined;
-  return {
-    chatId,
-    ...(Number.isSafeInteger(threadId) && threadId > 0 ? { threadId } : {}),
-  };
-}
-
-function originParam(): Record<string, unknown> {
-  const origin = process.env.PI_AGENT_ORIGIN;
-  return origin ? { origin } : {};
-}
 
 const HOST_TOOLS = {
   send: {
     label: "Send Telegram message",
-    description: "Send a message, file, media album, location, poll, reaction, edit, or delete to a Telegram chat. Executes synchronously: the host validates, delivers to Telegram, and returns the outcome (messageId/pollId or the failure detail) in the tool result.",
+    description: "Call an allowed Telegram Bot API method with its documented snake_case payload. Fields pass through unchanged; /workspace media paths are copied to host-managed attachments before upload.",
     parameters: SEND_SCHEMA,
     execute: async (request: Record<string, unknown>): Promise<ToolResult> => {
-      const target = resolveSendTarget(request, getChatOrigin());
-      if ("error" in target) return text(`FAILED: ${target.error}`);
-
-      const finalRequest: Record<string, unknown> = {
-        ...request,
-        chat_id: target.chatId,
-        ...(target.threadId !== undefined ? { message_thread_id: target.threadId } : {}),
-      };
       try {
-        const result = await callHost("send", { request: finalRequest, ...originParam() });
-        const messageId = typeof result.messageId === "number" ? ` (messageId ${result.messageId})` : "";
-        return text(`Sent ${result.request_type ?? "request"}${messageId}.`);
+        const result = await callHost("send", { request }, SEND_TIMEOUT_MS);
+        const method = typeof result.method === "string" ? result.method : "Telegram request";
+        const messageId = typeof result.messageId === "number" ? ` (message_id ${result.messageId})` : "";
+        return text(`${method} succeeded${messageId}.`);
       } catch (error) {
         return failure(error);
       }
@@ -184,11 +110,11 @@ const HOST_TOOLS = {
   },
   spawn: {
     label: "Spawn background task",
-    description: "Start an autonomous background task with a fresh Pi agent in the workspace. Pass a complete self-contained prompt. Executes synchronously: the host mints the runId and launches the task immediately (or queues it when all 8 slots are busy; queued tasks start automatically as slots free). The result arrives as a followup message when the task settles; cancel it anytime with the cancel tool.",
+    description: "Start a background task from a complete, self-contained prompt. Returns its runId and whether it started or queued; task_finished follows up when it settles.",
     parameters: Type.Object({ prompt: Type.String({ description: "The complete prompt with all instructions and context for the background task agent" }) }),
     execute: async (params: { prompt: string }): Promise<ToolResult> => {
       try {
-        const result = await callHost("spawn", { prompt: params.prompt, ...originParam() });
+        const result = await callHost("spawn", { prompt: params.prompt });
         const runId = typeof result.runId === "string" ? result.runId : "unknown";
         if (result.status === "queued") {
           return text(`Queued background task ${runId} (all task slots busy); it will start automatically. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
@@ -201,7 +127,7 @@ const HOST_TOOLS = {
   },
   steer_task: {
     label: "Steer background task",
-    description: "Send mid-flight steering instructions to a running background task. The task agent receives your guidance between tool calls without restarting. Reports synchronously whether the task was running.",
+    description: "Guide a running background task between tool calls. Returns whether the task was running.",
     parameters: Type.Object({
       runId: Type.String({ description: "The task run UUID returned by the spawn tool" }),
       message: Type.String({ description: "Steering instruction or clarification to inject into the task agent" }),
@@ -219,7 +145,7 @@ const HOST_TOOLS = {
   },
   cancel: {
     label: "Cancel background task",
-    description: "Stop a running background task by the runId returned by the spawn tool, or remove a queued task before it starts. Reports synchronously what happened; a stopped task's settle followup arrives with aborted status.",
+    description: "Stop a running task or remove a queued task by runId. Returns what happened.",
     parameters: Type.Object({ runId: Type.String({ description: "The task run UUID returned by the spawn tool" }) }),
     execute: async (params: { runId: string }): Promise<ToolResult> => {
       try {

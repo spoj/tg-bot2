@@ -1,6 +1,6 @@
 # tg-bot2
 
-Personal Telegram agent. The trusted host process owns the Telegram token; turns run in a `pi --mode rpc` worker inside a Bubblewrap sandbox that supports mid-flight steering, follow-ups, and a 10-minute idle reaper.
+Personal Telegram agent. The trusted host process owns the Telegram token; turns run in a `pi --mode rpc` worker inside a Bubblewrap sandbox that supports mid-flight steering and follow-ups. Settled workers are reaped after two idle hours. Active turns are otherwise unbounded, but a queued user steer aborts the current operation after two minutes and immediately continues with that input.
 
 ## Requirements
 
@@ -23,10 +23,10 @@ A single instance listens to all bots found in `$DATA_DIR/bots/` (defaults to `~
 
 ## Chat access
 
-Each bot serves several Telegram chats — private chats and groups — from its own workspace. The bot's agent owns its allow list at `DATA_DIR/bots/<botId>/workspace/.tg-bot/allowed.json` (a JSON array of allowed chat IDs); the host enforces it in both directions.
+Each bot serves several Telegram chats — private chats and groups — from its own workspace. The bot's agent owns its allow list at `DATA_DIR/bots/<botId>/workspace/.allowed.json` (a JSON array of allowed chat IDs); the host enforces it in both directions.
 
 ## Key entry points
 
-- **Agent entry points** (`src/agent.ts`): `followup(text)` delivers follow-up instructions via RPC `followUp` streaming behavior; `interrupt(text)` delivers mid-flight steering via RPC `steer` streaming behavior. Idle workers are reaped after 10 minutes of inactivity and restored on demand.
-- **Host protocol** (host-owned log + synchronous bridge): `events.jsonl` lives at `DATA_DIR/bots/<botId>/events.jsonl` — outside the agent workspace. The host alone appends it: inbound Telegram messages/callbacks/votes (`chat_id` on each), and host outcomes (`outbox_sent`/`rejected`, `task_settled`, `task_progress`, `schedule_run_scheduled`/`fired`/`cancelled`, `allowlist_updated`, `chat_denied`, `browser_ready`/`browser_request_failed`/`browser_closed`). Workers read it read-only via a `--ro-bind` at `/workspace/.tg-bot/events.jsonl`. Agent tools (`send`/`spawn`/`steer_task`/`cancel`/`start_browser` registered by `extensions/host-tools.ts`) call the host synchronously over a UNIX socket bridge (`src/host-bridge.ts`) bind-mounted at `/workspace/.host/host.sock`; the host validates, executes, and returns the outcome in the tool result. Spawned tasks are host-minted UUID runs under `.pi/tasks/<runId>/` (up to 8 concurrent, excess queued in memory); boot reconciliation stamps crashed runs aborted, repairs settles lost mid-write, and relaunches fired schedule occurrences lost mid-fire. `.tg-bot/schedules.json` holds reminders as agent-owned rows (`prompt`, `start`, `recurrence` — `hourly`/`daily`/`weekly`/`null`).
+- **Conversation agents** (`src/agent.ts`): each `(chat_id, message_thread_id)` owns one responsible RPC session. User input steers it; task settlements and successful writes from other agents arrive as followups. Settled workers idle for 2 hours before reaping. If a user steer remains queued for 2 minutes, the host aborts the current operation and queues an immediate continuation so long-running tools cannot make the chat unresponsive.
+- **Host protocol** (shared timeline + authenticated bridge): host-owned files are exposed outside the writable workspace directly under `/run`: the bot-global read-only `timeline.jsonl`, read-only `attachments/`, and bridge sockets. The timeline contains accepted Telegram activity, successful outbound actions, task finishes, and schedule firings; the host never reads it for commands or recovery. Agent tools call the bridge with a host-issued capability token bound to a typed conversation/task identity. Agent-owned intent stays at `/workspace/.allowed.json` and `/workspace/.schedules.json`. Queued tasks are memory-only, task directories hold artifacts, and `scheduler-state.json` is a current snapshot rather than an event stream.
 - **Checks**: `pnpm check` runs every gate (lint, typecheck, tests) in one command — the same command CI runs. `pnpm check --integration` adds the bwrap suite (needs bwrap and the bundled Pi CLI). Individual gates: `pnpm lint`, `pnpm typecheck`, `pnpm test`.

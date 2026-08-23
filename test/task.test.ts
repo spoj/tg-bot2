@@ -1,11 +1,13 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
-import { WorkspaceTasks, type WorkspaceTaskWorkerOptions, type WorkspaceTasksOptions } from "../src/task.js";
-import { WorkspaceEventLog, eventLine } from "../src/events.js";
+import { conversationAgent, type TaskTrigger } from "../src/agent-ref.js";
 import { AgentEventRouter, type AgentNotifier } from "../src/agent.js";
+import { WorkspaceTimeline } from "../src/events.js";
+import { AgentCredentials } from "../src/host-bridge.js";
 import type { PiRunResult } from "../src/pi-worker.js";
+import { WorkspaceTasks, type WorkspaceTaskWorkerOptions, type WorkspaceTasksOptions } from "../src/task.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -19,13 +21,18 @@ async function fixture(): Promise<{ dataDir: string; workspace: string; eventsLo
   temporaryDirectories.push(dataDir);
   const workspace = path.join(dataDir, "workspace");
   await mkdir(workspace, { recursive: true });
-  const eventsLog = path.join(dataDir, "events.jsonl");
+  const eventsLog = path.join(dataDir, "timeline.jsonl");
   await writeFile(eventsLog, "", "utf8");
   return { dataDir, workspace, eventsLog };
 }
 
 async function readJson(filePath: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+}
+
+async function readTimeline(filePath: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(filePath, "utf8");
+  return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 type FakeTask = {
@@ -95,26 +102,30 @@ function gatedWorkerFactory(): { factory: Mock; tasks: GatedTask[] } {
 
 const success = (stdout = "final report"): PiRunResult => ({ code: 0, signal: null, stderr: "", stdout });
 
+const CHAT = conversationAgent(123);
+const TRIGGER: TaskTrigger = { kind: "agent", agent: CHAT };
+
 function setupTasks(
   workspace: string,
   eventsLog: string,
   factory: Mock,
   options: Partial<WorkspaceTasksOptions> & { notifier?: AgentNotifier } = {},
-): { service: WorkspaceTasks; events: WorkspaceEventLog } {
-  const events = new WorkspaceEventLog(eventsLog);
+): { service: WorkspaceTasks; timeline: WorkspaceTimeline } {
+  const timeline = new WorkspaceTimeline(eventsLog);
   const router = new AgentEventRouter(options.notifier ?? { followup: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined) });
-  events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
+  timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const { notifier: _notifier, ...taskOptions } = options;
   const service = new WorkspaceTasks({
     workspace,
-    events,
+    timeline,
+    credentials: new AgentCredentials(),
     appRoot: process.cwd(),
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
     workerFactory: factory,
     ...taskOptions,
   });
-  return { service, events };
+  return { service, timeline };
 }
 
 describe("WorkspaceTasks", () => {
@@ -129,10 +140,11 @@ describe("WorkspaceTasks", () => {
     const { factory } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    await expect(service.spawn("   ", "123:0")).rejects.toThrow("non-empty");
-    await expect(service.spawn("x".repeat(1024 * 1024 + 1), "123:0")).rejects.toThrow("exceeds");
+    await expect(service.spawn("   ", TRIGGER)).rejects.toThrow("non-empty");
+    await expect(service.spawn("x".repeat(1024 * 1024 + 1), TRIGGER)).rejects.toThrow("exceeds");
+    await expect(service.spawn("🙂".repeat(262_145), TRIGGER)).rejects.toThrow("exceeds");
     expect(factory).not.toHaveBeenCalled();
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
+    const events = await readTimeline(eventsLog);
     expect(events).toHaveLength(0);
   });
 
@@ -142,7 +154,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const launched = await service.spawn("Investigate the parser regression.", "123:0");
+    const launched = await service.spawn("Investigate the parser regression.", TRIGGER);
     expect(tasks).toHaveLength(1);
     expect(launched.status).toBe("launched");
     expect(tasks[0]?.options).toMatchObject({ runId: launched.runId, prompt: "Investigate the parser regression." });
@@ -154,14 +166,32 @@ describe("WorkspaceTasks", () => {
 
     expect(await readFile(path.join(runDir, "output.md"), "utf8")).toBe("the findings");
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "done", exitCode: 0 });
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
+    const events = await readTimeline(eventsLog);
     expect(events.map((event) => ({ type: event.type, ...("runId" in event ? { runId: event.runId } : {}) }))).toMatchObject([
-      { type: "task_settled", runId: launched.runId },
+      { type: "task_finished", runId: launched.runId },
     ]);
     expect(followup).toHaveBeenCalledWith(
       `Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/${launched.runId}/`,
-      { chatId: 123 },
+      CHAT,
     );
+  });
+
+  it("replaces planted artifact symlinks without touching their targets", async () => {
+    const { dataDir, workspace, eventsLog } = await fixture();
+    const { factory, tasks } = fakeWorkerFactory();
+    const { service } = setupTasks(workspace, eventsLog, factory);
+    const launched = await service.spawn("safe artifacts", TRIGGER);
+    const runDir = path.join(workspace, ".pi", "tasks", launched.runId);
+    const sentinel = path.join(dataDir, "sentinel");
+    await writeFile(sentinel, "unchanged", "utf8");
+    await symlink(sentinel, path.join(runDir, "output.md"));
+    await symlink(sentinel, path.join(runDir, "result.json"));
+
+    tasks[0]?.resolveRun(success("safe output"));
+    await vi.waitFor(async () => expect(await readFile(path.join(runDir, "output.md"), "utf8")).toBe("safe output"));
+
+    expect(await readFile(sentinel, "utf8")).toBe("unchanged");
+    expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "done" });
   });
 
   it("reports a failed run with a stderr tail and no output file", async () => {
@@ -170,14 +200,14 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("do the thing", "123:0");
+    const { runId } = await service.spawn("do the thing", TRIGGER);
     tasks[0]?.resolveRun({ code: 3, signal: null, stderr: "boom", stdout: "" });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
 
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "failed", exitCode: 3, stderr: "boom" });
     await expect(readFile(path.join(runDir, "output.md"), "utf8")).rejects.toThrow();
-    expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/${runId}/`, { chatId: 123 });
+    expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/${runId}/`, CHAT);
   });
 
   it("reports a worker that fails to spawn as a failed task", async () => {
@@ -188,10 +218,10 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    await service.spawn("prompt", "123:0");
+    await service.spawn("prompt", TRIGGER);
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
-    expect(events).toMatchObject([{ type: "task_settled", status: "failed", stderr: "bwrap missing" }]);
+    const events = await readTimeline(eventsLog);
+    expect(events).toMatchObject([{ type: "task_finished", status: "failed", stderr: "bwrap missing" }]);
   });
 
   it("steers a running task and reports unknown runs", async () => {
@@ -199,7 +229,7 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    const { runId } = await service.spawn("initial prompt", "123:0");
+    const { runId } = await service.spawn("initial prompt", TRIGGER);
     expect(tasks).toHaveLength(1);
 
     await expect(service.steer(runId, "use python 3.12")).resolves.toBe("delivered");
@@ -212,7 +242,7 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = gatedWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    const { runId } = await service.spawn("initial prompt", "123:0");
+    const { runId } = await service.spawn("initial prompt", TRIGGER);
     const task = tasks[0];
     expect(task).toBeDefined();
     expect(task?.onPrompted).toHaveBeenCalledOnce();
@@ -234,7 +264,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("long prompt", "123:0");
+    const { runId } = await service.spawn("long prompt", TRIGGER);
     const task = tasks[0];
     expect(task?.onPrompted).toHaveBeenCalledOnce();
 
@@ -248,8 +278,8 @@ describe("WorkspaceTasks", () => {
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
     expect(task?.steer).not.toHaveBeenCalled();
 
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
-    expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
+    const events = await readTimeline(eventsLog);
+    expect(events).toMatchObject([{ type: "task_finished", runId, status: "aborted" }]);
   });
 
   it("settles a cancelled starting task as aborted even when its prompt write never fires", async () => {
@@ -258,7 +288,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("long prompt", "123:0");
+    const { runId } = await service.spawn("long prompt", TRIGGER);
     const task = tasks[0];
     await expect(service.steer(runId, "too early")).resolves.toBe("delivered");
     await expect(service.cancel(runId)).resolves.toBe("stopped");
@@ -268,8 +298,8 @@ describe("WorkspaceTasks", () => {
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
     expect(task?.steer).not.toHaveBeenCalled();
     expect((followup.mock.calls as unknown[][])[0]?.[0]).toContain("aborted");
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
-    expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
+    const events = await readTimeline(eventsLog);
+    expect(events).toMatchObject([{ type: "task_finished", runId, status: "aborted" }]);
   });
 
   it("runs up to eight tasks concurrently and queues the rest until slots free", async () => {
@@ -280,12 +310,13 @@ describe("WorkspaceTasks", () => {
     await service.start();
 
     for (let index = 0; index < 8; index += 1) {
-      await expect(service.spawn(`prompt ${index}`, "123:0")).resolves.toMatchObject({ status: "launched" });
+      await expect(service.spawn(`prompt ${index}`, TRIGGER)).resolves.toMatchObject({ status: "launched" });
     }
     expect(tasks).toHaveLength(8);
-    const queued = await service.spawn("prompt 8", "123:0");
+    const queued = await service.spawn("prompt 8", TRIGGER);
     expect(queued.status).toBe("queued");
     expect(tasks).toHaveLength(8);
+    expect(await readTimeline(eventsLog)).toHaveLength(0);
 
     // A settled task frees a slot and the queued spawn launches automatically.
     tasks[0]?.resolveRun(success());
@@ -302,13 +333,13 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("prompt", "123:0");
+    const { runId } = await service.spawn("prompt", TRIGGER);
     tasks[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
 
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted", signal: "SIGTERM" });
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/${runId}/`, { chatId: 123 });
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/${runId}/`, CHAT);
   });
 
   it("cancels a running task mid-run and settles as aborted", async () => {
@@ -317,13 +348,13 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("long prompt", "123:0");
+    const { runId } = await service.spawn("long prompt", TRIGGER);
     await expect(service.cancel(runId)).resolves.toBe("stopped");
 
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
-    expect(events).toMatchObject([{ type: "task_settled", runId, status: "aborted" }]);
+    const events = await readTimeline(eventsLog);
+    expect(events).toMatchObject([{ type: "task_finished", runId, status: "aborted" }]);
   });
 
   it("cancels a queued spawn before it launches", async () => {
@@ -333,14 +364,14 @@ describe("WorkspaceTasks", () => {
     await service.start();
 
     for (let index = 0; index < 8; index += 1) {
-      await service.spawn(`prompt ${index}`, "123:0");
+      await service.spawn(`prompt ${index}`, TRIGGER);
     }
-    const queued = await service.spawn("never runs", "123:0");
+    const queued = await service.spawn("never runs", TRIGGER);
     await expect(service.cancel(queued.runId)).resolves.toBe("cancelled-queued");
 
     tasks[0]?.resolveRun(success());
     await vi.waitFor(async () => {
-      const settled = (await new WorkspaceEventLog(eventsLog).readAll()).filter((event) => event.type === "task_settled");
+      const settled = (await readTimeline(eventsLog)).filter((event) => event.type === "task_finished");
       expect(settled).toHaveLength(1);
     });
     // The freed slot stays empty: the cancelled spawn never launches.
@@ -352,24 +383,24 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    await service.spawn("real", "123:0");
+    await service.spawn("real", TRIGGER);
     await expect(service.cancel("run-missing")).resolves.toBe("not-running");
     expect(tasks[0]?.stop).not.toHaveBeenCalled();
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
+    const events = await readTimeline(eventsLog);
     expect(events).toHaveLength(0);
   });
 
-  it("reconciles crashed runs at boot and repairs settles missing their terminal", async () => {
+  it("marks unfinished run directories aborted without replaying timeline history", async () => {
     const { workspace, eventsLog } = await fixture();
     const deadRun = path.join(workspace, ".pi", "tasks", "22222222-2222-4222-8222-222222222222");
     await mkdir(path.join(deadRun, "sessions"), { recursive: true });
     await writeFile(path.join(deadRun, "prompt.txt"), "prompt", "utf8");
-    const noPromptRun = path.join(workspace, ".pi", "tasks", "44444444-4444-4444-8444-444444444444");
-    await mkdir(path.join(noPromptRun, "sessions"), { recursive: true });
-    const lostTerminalRun = path.join(workspace, ".pi", "tasks", "33333333-3333-4333-8333-333333333333");
-    await mkdir(lostTerminalRun, { recursive: true });
-    await writeFile(path.join(lostTerminalRun, "prompt.txt"), "settled before crash", "utf8");
-    await writeFile(path.join(lostTerminalRun, "result.json"), JSON.stringify({ status: "done", exitCode: 0 }), "utf8");
+    const finishedRun = path.join(workspace, ".pi", "tasks", "33333333-3333-4333-8333-333333333333");
+    await mkdir(finishedRun, { recursive: true });
+    await writeFile(path.join(finishedRun, "prompt.txt"), "done earlier", "utf8");
+    await writeFile(path.join(finishedRun, "result.json"), JSON.stringify({ status: "done", exitCode: 0 }), "utf8");
+    const emptyRun = path.join(workspace, ".pi", "tasks", "44444444-4444-4444-8444-444444444444");
+    await mkdir(path.join(emptyRun, "sessions"), { recursive: true });
     const { factory, tasks } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
@@ -378,57 +409,9 @@ describe("WorkspaceTasks", () => {
     expect(factory).not.toHaveBeenCalled();
     expect(tasks).toHaveLength(0);
     expect(await readJson(path.join(deadRun, "result.json"))).toEqual({ status: "aborted" });
-    expect(await readJson(path.join(lostTerminalRun, "result.json"))).toEqual({ status: "done", exitCode: 0 });
-    await expect(readFile(path.join(noPromptRun, "result.json"), "utf8")).rejects.toThrow();
-    await expect(readFile(path.join(noPromptRun, "sessions"), "utf8")).rejects.toThrow();
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
-    const settles = events.filter((event) => event.type === "task_settled");
-    expect(settles).toHaveLength(2);
-    expect(settles.find((event) => event.runId === "22222222-2222-4222-8222-222222222222")).toMatchObject({
-      type: "task_settled", status: "aborted", exitCode: null },
-    );
-    expect(settles.find((event) => event.runId === "33333333-3333-4333-8333-333333333333")).toMatchObject({
-      type: "task_settled", status: "done", exitCode: 0, prompt: "settled before crash",
-    });
-  });
-
-  it("skips runs already settled in the events log at boot", async () => {
-    const { workspace, eventsLog } = await fixture();
-    const settledRun = path.join(workspace, ".pi", "tasks", "33333333-3333-4333-8333-333333333333");
-    await mkdir(settledRun, { recursive: true });
-    await writeFile(path.join(settledRun, "prompt.txt"), "done earlier", "utf8");
-    await writeFile(path.join(settledRun, "result.json"), JSON.stringify({ status: "done", exitCode: 0 }), "utf8");
-    await writeFile(eventsLog, `${eventLine({ type: "task_settled", runId: "33333333-3333-4333-8333-333333333333", status: "done", exitCode: 0 })}\n`, "utf8");
-    const { factory, tasks } = fakeWorkerFactory();
-    const { service } = setupTasks(workspace, eventsLog, factory);
-
-    await service.start();
-
-    const events = await new WorkspaceEventLog(eventsLog).readAll();
-    expect(events).toHaveLength(1); // no duplicate settle, no repair
-    expect(factory).not.toHaveBeenCalled();
-    expect(tasks).toHaveLength(0);
-  });
-
-  it("relaunches fired schedule occurrences lost between firing and spawning", async () => {
-    const { workspace, eventsLog } = await fixture();
-    const claimedRun = path.join(workspace, ".pi", "tasks", "11111111-1111-4111-8111-111111111111");
-    await mkdir(path.join(claimedRun, "sessions"), { recursive: true });
-    await writeFile(path.join(claimedRun, "prompt.txt"), "already running", "utf8");
-    const eventsLogPath = eventsLog;
-    await writeFile(eventsLogPath, [
-      `${eventLine({ type: "schedule_run_fired", runId: "11111111-1111-4111-8111-111111111111", prompt: "already running" })}\n`,
-      `${eventLine({ type: "schedule_run_fired", runId: "99999999-9999-4999-8999-999999999999", prompt: "lost mid-fire" })}\n`,
-    ].join(""), "utf8");
-    const { factory, tasks } = fakeWorkerFactory();
-    const { service } = setupTasks(workspace, eventsLog, factory);
-
-    await service.start();
-
-    expect(factory).toHaveBeenCalledTimes(1);
-    expect(tasks).toHaveLength(1);
-    expect(tasks[0]?.options.runId).toBe("99999999-9999-4999-8999-999999999999");
-    expect(tasks[0]?.options.prompt).toBe("lost mid-fire");
+    expect(await readJson(path.join(finishedRun, "result.json"))).toEqual({ status: "done", exitCode: 0 });
+    await expect(readFile(path.join(emptyRun, "sessions"), "utf8")).rejects.toThrow();
+    expect(await readTimeline(eventsLog)).toEqual([]);
   });
 
   it("stop() stops in-flight workers and settles them as aborted", async () => {
@@ -438,14 +421,14 @@ describe("WorkspaceTasks", () => {
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
     await service.start();
 
-    const { runId } = await service.spawn("prompt", "123:0");
+    const { runId } = await service.spawn("prompt", TRIGGER);
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
     await service.stop();
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
 
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted" });
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/${runId}/`, { chatId: 123 });
+    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/${runId}/`, CHAT);
   });
 
   it("sends a heartbeat followup while tasks run and stays silent when idle", async () => {
@@ -471,7 +454,7 @@ describe("WorkspaceTasks", () => {
     callbacks[0]?.();
     expect(followup).not.toHaveBeenCalled();
 
-    await service.spawn("heartbeat me", "123:0");
+    await service.spawn("heartbeat me", TRIGGER);
     tasks[0]?.activity.mockReturnValue({ at: 45_000, text: "still thinking" });
     now.mockReturnValue(300_000);
     callbacks[0]?.();

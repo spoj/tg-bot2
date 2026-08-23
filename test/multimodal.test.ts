@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, type Mock } from "vitest";
@@ -48,6 +48,7 @@ function fakeContext(options: {
   availableModels?: Model<Api>[];
   findModel?: (provider: string, modelId: string) => Model<Api> | undefined;
   completeResponse?: AssistantMessage;
+  hasConfiguredAuth?: (model: Model<Api>) => boolean;
 }): { ctx: ExtensionContext; completeSpy: Mock } {
   const completeSpy = vi.fn().mockResolvedValue(
     options.completeResponse ?? fakeAssistantMessage(),
@@ -59,7 +60,7 @@ function fakeContext(options: {
       return fakeModel(provider, modelId);
     }),
     getAvailable: vi.fn(() => options.availableModels ?? [fakeModel("google", "gemini-2.5-flash")]),
-    hasConfiguredAuth: vi.fn(() => true),
+    hasConfiguredAuth: vi.fn((model: Model<Api>) => options.hasConfiguredAuth?.(model) ?? true),
     complete: completeSpy,
   };
 
@@ -78,71 +79,30 @@ function fakeContext(options: {
 }
 
 describe("multimodal extension", () => {
-  it("resolves model configured as string in .pi/agent/settings.json", async () => {
+  it("resolves the exact model named by the call", async () => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
     try {
-      const piAgentDir = path.join(tmp, ".pi", "agent");
-      await mkdir(piAgentDir, { recursive: true });
-      await writeFile(path.join(piAgentDir, "settings.json"), JSON.stringify({
-        multimodal: "anthropic/claude-3-7-sonnet",
-      }));
-
-      const { ctx } = fakeContext({ cwd: tmp });
-      const model = resolveMultimodalModel(ctx);
-      expect(model.provider).toBe("anthropic");
-      expect(model.id).toBe("claude-3-7-sonnet");
+      const selected = fakeModel("google-vertex", "gemini/models/flash");
+      const { ctx } = fakeContext({
+        cwd: tmp,
+        findModel: (provider, modelId) => provider === selected.provider && modelId === selected.id ? selected : undefined,
+      });
+      expect(resolveMultimodalModel(ctx, "google-vertex/gemini/models/flash")).toBe(selected);
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
   });
 
-  it("resolves model configured as object in .pi/settings.json", async () => {
+  it("rejects malformed, unknown, and unauthenticated model selections", async () => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
     try {
-      const piDir = path.join(tmp, ".pi");
-      await mkdir(piDir, { recursive: true });
-      await writeFile(path.join(piDir, "settings.json"), JSON.stringify({
-        multimodal: { provider: "google", model: "gemini-2.5-pro" },
-      }));
+      const { ctx } = fakeContext({ cwd: tmp, findModel: () => undefined });
+      expect(() => resolveMultimodalModel(ctx, "gemini")).toThrow("provider/model");
+      expect(() => resolveMultimodalModel(ctx, "google/missing")).toThrow("Model not found: google/missing");
 
-      const { ctx } = fakeContext({ cwd: tmp });
-      const model = resolveMultimodalModel(ctx);
-      expect(model.provider).toBe("google");
-      expect(model.id).toBe("gemini-2.5-pro");
-    } finally {
-      await rm(tmp, { recursive: true, force: true });
-    }
-  });
-
-  it("defaults to the session's main model if not in settings", async () => {
-    const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
-    try {
-      const mainModel = fakeModel("openai", "gpt-4o");
-      const { ctx } = fakeContext({ cwd: tmp, model: mainModel });
-      const model = resolveMultimodalModel(ctx);
-      expect(model).toBe(mainModel);
-    } finally {
-      await rm(tmp, { recursive: true, force: true });
-    }
-  });
-
-  it("falls back to available vision model if main model is undefined", async () => {
-    const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
-    try {
-      const visionModel = fakeModel("google", "gemini-2.5-flash");
-      const { ctx } = fakeContext({ cwd: tmp, availableModels: [visionModel] });
-      const model = resolveMultimodalModel(ctx);
-      expect(model).toBe(visionModel);
-    } finally {
-      await rm(tmp, { recursive: true, force: true });
-    }
-  });
-
-  it("throws if no model can be resolved", async () => {
-    const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
-    try {
-      const { ctx } = fakeContext({ cwd: tmp, availableModels: [] });
-      expect(() => resolveMultimodalModel(ctx)).toThrow("No model available for multimodal analysis");
+      const { ctx: noAuth } = fakeContext({ cwd: tmp, hasConfiguredAuth: () => false });
+      expect(() => resolveMultimodalModel(noAuth, "google/gemini-2.5-flash"))
+        .toThrow("Model has no configured authentication: google/gemini-2.5-flash");
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
@@ -164,7 +124,7 @@ describe("multimodal extension", () => {
       const { ctx, completeSpy } = fakeContext({ cwd: tmp, model: fakeModel("google", "gemini-2.5-flash") });
 
       const result = await executeMultimodal(
-        { prompt: "Transcribe and analyze these files", files: ["test.png", "voice.oga", "doc.pdf", "note.md"] },
+        { model: "google/gemini-2.5-flash", prompt: "Transcribe and analyze these files", files: ["test.png", "voice.oga", "doc.pdf", "note.md"] },
         undefined,
         ctx,
       );
@@ -195,7 +155,7 @@ describe("multimodal extension", () => {
     try {
       const { ctx } = fakeContext({ cwd: tmp, model: fakeModel("google", "gemini-2.5-flash") });
       const result = await executeMultimodal(
-        { prompt: "Analyze", files: ["nonexistent.png"] },
+        { model: "google/gemini-2.5-flash", prompt: "Analyze", files: ["nonexistent.png"] },
         undefined,
         ctx,
       );
@@ -213,7 +173,7 @@ describe("multimodal extension", () => {
 
       const { ctx } = fakeContext({ cwd: tmp, model: fakeModel("google", "gemini-2.5-flash") });
       const result = await executeMultimodal(
-        { prompt: "Analyze", files: ["binary.xyz123"] },
+        { model: "google/gemini-2.5-flash", prompt: "Analyze", files: ["binary.xyz123"] },
         undefined,
         ctx,
       );
@@ -240,7 +200,7 @@ describe("multimodal extension", () => {
       });
 
       const result = await executeMultimodal(
-        { prompt: "Analyze", files: ["test.jpg"] },
+        { model: "google/gemini-2.5-flash", prompt: "Analyze", files: ["test.jpg"] },
         undefined,
         ctx,
       );
@@ -283,7 +243,7 @@ describe("multimodal extension", () => {
       });
 
       const result = await executeMultimodal(
-        { prompt: "Analyze", files: ["test.pdf"] },
+        { model: "anthropic/claude-3-7-sonnet", prompt: "Analyze", files: ["test.pdf"] },
         undefined,
         ctx,
       );
@@ -307,6 +267,7 @@ describe("multimodal extension", () => {
     expect(tool).toBeDefined();
     expect(tool?.name).toBe("ask_multimodal");
     expect(tool?.label).toBe("Ask Multimodal");
-    expect(tool?.description).toContain("Analyze and inspect images");
+    expect(tool?.description).toContain("exact provider/model");
+    expect((tool?.parameters as unknown as { required?: string[] }).required).toContain("model");
   });
 });

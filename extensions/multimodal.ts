@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { Api, Context, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 
 const MULTIMODAL_SCHEMA = Type.Object({
+  model: Type.String({ description: "Exact provider/model ID to use for this call" }),
   prompt: Type.String({ description: "Question, transcription request, or analysis prompt for the multimodal model" }),
   files: Type.Array(Type.String(), { description: "Workspace file paths to inspect (images, audio notes, video, PDFs, text)" }),
 });
@@ -43,66 +44,27 @@ function text(content: string, details: Record<string, unknown> = {}): ToolResul
   return { content: [{ type: "text", text: content }], details };
 }
 
-function readSettings(cwd: string): Record<string, unknown> {
-  const candidates = [
-    process.env.PI_CODING_AGENT_DIR ? path.join(process.env.PI_CODING_AGENT_DIR, "settings.json") : undefined,
-    path.join(cwd, ".pi", "agent", "settings.json"),
-    path.join(cwd, ".pi", "settings.json"),
-  ].filter((p): p is string => typeof p === "string" && p.length > 0);
 
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      try {
-        return JSON.parse(readFileSync(candidate, "utf8"));
-      } catch {
-        // Ignore malformed settings
-      }
-    }
+export function resolveMultimodalModel(ctx: ExtensionContext, spec: string): Model<Api> {
+  const slash = spec.indexOf("/");
+  if (slash <= 0 || slash === spec.length - 1) {
+    throw new Error("model must use provider/model format");
   }
-  return {};
-}
-
-export function resolveMultimodalModel(ctx: ExtensionContext): Model<Api> {
-  const settings = readSettings(ctx.cwd);
-  const configured = settings.multimodal ?? settings.multimodalModel;
-
-  if (typeof configured === "string") {
-    const [provider, ...rest] = configured.split("/");
-    const modelId = rest.join("/");
-    if (provider && modelId) {
-      const found = ctx.modelRegistry.find(provider, modelId);
-      if (found) return found;
-    }
-  } else if (typeof configured === "object" && configured !== null) {
-    const conf = configured as Record<string, unknown>;
-    if (typeof conf.provider === "string" && typeof conf.model === "string") {
-      const found = ctx.modelRegistry.find(conf.provider, conf.model);
-      if (found) return found;
-    }
-  }
-
-  // If not in settings, default to the main model of the session
-  if (ctx.model) {
-    return ctx.model;
-  }
-
-  // Fallback: pick any available model supporting image input
-  const available = ctx.modelRegistry.getAvailable();
-  const visionModel = available.find((m) => m.input?.includes("image") && ctx.modelRegistry.hasConfiguredAuth(m));
-  if (visionModel) {
-    return visionModel;
-  }
-
-  throw new Error("No model available for multimodal analysis. Please configure a model in settings or auth.");
+  const provider = spec.slice(0, slash);
+  const modelId = spec.slice(slash + 1);
+  const model = ctx.modelRegistry.find(provider, modelId);
+  if (!model) throw new Error(`Model not found: ${spec}`);
+  if (!ctx.modelRegistry.hasConfiguredAuth(model)) throw new Error(`Model has no configured authentication: ${spec}`);
+  return model;
 }
 
 export async function executeMultimodal(
-  params: { prompt: string; files: string[] },
+  params: { model: string; prompt: string; files: string[] },
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
 ): Promise<ToolResult> {
   try {
-    const model = resolveMultimodalModel(ctx);
+    const model = resolveMultimodalModel(ctx, params.model);
     const parts: Array<TextContent | ImageContent> = [
       { type: "text", text: params.prompt },
     ];
@@ -182,11 +144,11 @@ export default function multimodalExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "ask_multimodal",
     label: "Ask Multimodal",
-    description: "Analyze and inspect images, audio recordings (.oga, .ogg, .mp3, .wav), videos (.mp4), PDFs, and documents using multimodal models.",
-    promptSnippet: "ask_multimodal: Inspect images, audio, video, and PDFs with multimodal models",
+    description: "Analyze files with the exact provider/model selected in each call. Always set model explicitly.",
+    promptSnippet: "ask_multimodal: inspect files with an explicit provider/model",
     parameters: MULTIMODAL_SCHEMA,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      return executeMultimodal(params as { prompt: string; files: string[] }, signal, ctx);
+      return executeMultimodal(params as { model: string; prompt: string; files: string[] }, signal, ctx);
     },
   });
 }

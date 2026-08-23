@@ -59,16 +59,17 @@ export async function requireRealDirectory(candidate: string, label: string, exp
   return canonical;
 }
 
-export const TG_BOT_DIR = ".tg-bot";
 
-/** Derives canonical directories for one bot: `DATA_DIR/bots/<botId>`, its persistent workspace, and host-owned state. */
-export function botPaths(dataDir: string, botId: number): { botDir: string; workspace: string; eventsLog: string; runDir: string } {
+/** Derives canonical directories for one bot: its workspace and host-owned state. */
+export function botPaths(dataDir: string, botId: number): { botDir: string; workspace: string; attachments: string; timeline: string; schedulerState: string; runDir: string } {
   if (!Number.isSafeInteger(botId)) throw new Error("Telegram bot ID must be a safe integer");
   const botDir = path.join(dataDir, "bots", String(botId));
   return {
     botDir,
     workspace: path.join(botDir, "workspace"),
-    eventsLog: path.join(botDir, "events.jsonl"),
+    attachments: path.join(botDir, "attachments"),
+    timeline: path.join(botDir, "timeline.jsonl"),
+    schedulerState: path.join(botDir, "scheduler-state.json"),
     runDir: path.join(botDir, "run"),
   };
 }
@@ -125,7 +126,7 @@ export async function readFileBounded(handle: FileHandle, capBytes: number): Pro
 }
 
 /**
- * Appends one or more serialized records to a JSONL store (filePath). A symlink planted
+ * Appends serialized records to a JSONL store (filePath), creating and validating the store even when the array is empty. A symlink planted
  * at the path is unlinked and the open retried (ELOOP defense). Writes loop until the
  * whole payload is on disk; zero write progress throws instead of reporting success
  * with a partial record.
@@ -135,7 +136,6 @@ export async function appendJsonl(
   recordOrRecords: string | string[],
 ): Promise<void> {
   const records = Array.isArray(recordOrRecords) ? recordOrRecords : [recordOrRecords];
-  if (records.length === 0) return;
   const payload = Buffer.from(records.map((r) => `${r}\n`).join(""), "utf8");
   const handle = await openJsonlAppend(filePath);
   try {
@@ -192,33 +192,4 @@ async function openJsonlAppend(filePath: string): Promise<FileHandle> {
 async function readJsonlLines(handle: FileHandle): Promise<string[]> {
   const contents = await readFileBounded(handle, JSONL_READ_CAP_BYTES);
   return contents.toString("utf8").split("\n").filter(Boolean);
-}
-
-export type AgentOrigin =
-  | { kind: "chat"; chatId: number; threadId: number }
-  | { kind: "task"; runId: string };
-
-export function parseOrigin(origin?: string): AgentOrigin | undefined {
-  if (typeof origin !== "string" || !origin) return undefined;
-  if (origin.startsWith("task:")) {
-    const runId = origin.slice(5).trim();
-    return runId ? { kind: "task", runId } : undefined;
-  }
-  const parts = origin.split(":");
-  if (parts.length !== 2) return undefined;
-  const chatId = Number(parts[0]);
-  const threadId = Number(parts[1]);
-  if (!Number.isSafeInteger(chatId) || !Number.isSafeInteger(threadId)) return undefined;
-  return { kind: "chat", chatId, threadId };
-}
-
-export function formatOrigin(target: { chatId?: number; threadId?: number } | { runId: string }): string {
-  if ("runId" in target && typeof target.runId === "string") {
-    return `task:${target.runId}`;
-  }
-  const chatTarget = target as { chatId?: number; threadId?: number };
-  if (typeof chatTarget.chatId === "number") {
-    return `${chatTarget.chatId}:${chatTarget.threadId ?? 0}`;
-  }
-  return "default";
 }

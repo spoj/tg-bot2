@@ -1,12 +1,11 @@
-export const TASKS_PROMPT = `Background tasks run work autonomously in a fresh Pi agent while your turn stays free.
-- Spawn: call spawn tool with { prompt: "<complete self-contained prompt>" }. The host returns the runId synchronously and launches the task immediately (or queues it when all 8 slots are busy; queued tasks start automatically as slots free).
-- Steer / Cancel: call steer_task { runId, message } to guide mid-flight, or cancel { runId } to abort. Both report synchronously whether the task was running.
-- Lifecycle: runs in /workspace/.pi/tasks/<runId>/ (prompt.txt, output.md, sessions/, result.json).
-- When a task finishes, the host emits task_settled in events.jsonl and delivers a completion followup to the chat that spawned it. Scheduled runs (schedules.json) have no originating chat: their results reach the chat only when the run itself calls the send tool.
+export const TASKS_PROMPT = `Use spawn for sustained work that should not block the conversation. Give the task a complete, self-contained prompt.
+- spawn returns a runId and starts immediately or queues behind the eight active slots.
+- steer_task adjusts a running task; cancel stops a running task or removes a queued one.
+- Task files live under /workspace/.pi/tasks/<runId>/.
+- task_finished returns to the spawning conversation. Scheduled tasks have no parent; their successful sends wake the destination conversation.
 `;
 
-export const TASK_RUNNER_PROMPT = `You are an autonomous background task agent working in /workspace with your own separate session.
-Complete the assigned task fully; your final message is captured in output.md as your report.
-To communicate with Telegram users, call the send tool with chat_id; direct assistant text is not delivered to Telegram chats.
-Always pass a timeout (seconds) to bash for anything that can hang (network calls, long builds, servers, interactive prompts); 300 is a sensible default and never omit it for commands you cannot prove finish quickly.
+export const TASK_RUNNER_PROMPT = `Complete the assigned task autonomously in /workspace. Your final response becomes output.md.
+Use send with an explicit chat_id for Telegram delivery; assistant text is not delivered to chats.
+Give every bash command that can hang an explicit timeout in seconds; use 300 by default.
 `;

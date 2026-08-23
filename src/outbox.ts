@@ -1,217 +1,127 @@
 import { randomUUID } from "node:crypto";
+import type { AgentRef } from "./agent-ref.js";
+import { conversationAgent } from "./agent-ref.js";
 import { readAllowedFile } from "./allowlist.js";
-import type { WorkspaceEventLog } from "./events.js";
+import type { WorkspaceTimeline } from "./events.js";
 import { defined, errorMessage } from "./util.js";
 import { validateRequest, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxDispatcher, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 
 export type WorkspaceOutboxOptions = {
-  /** The workspace directory this outbox operates in. */
   workspace: string;
-  /** Sends one validated request to Telegram and returns the response identifiers. */
   dispatch: WorkspaceOutboxDispatcher;
-  /** Unified event log for publishing outbox outcomes. */
-  events: WorkspaceEventLog;
-  logger?: (error: unknown) => void;
+  timeline: WorkspaceTimeline;
+  pollOwners?: Map<string, number>;
 };
 
-/** Synchronous outcome of one send tool call, returned directly to the agent. */
 export type OutboxSendResult = {
   requestId: string;
+  method: string;
   messageId?: number;
   pollId?: string;
   message_thread_id?: number;
-  request_type: string;
-  summary?: string;
 };
-
-function extractRequestSummary(request: WorkspaceOutboxRequest): string | undefined {
-  switch (request.type) {
-    case "send_message": return request.text;
-    case "send_file": return request.caption;
-    case "edit_message": return request.text;
-    case "send_poll": return request.question;
-    case "send_location": return request.venue?.title;
-    case "create_forum_topic":
-    case "edit_forum_topic": return request.name;
-    default: return undefined;
-  }
-}
-
-function extractRawThreadId(request: unknown): number | undefined {
-  if (request !== null && typeof request === "object" && !Array.isArray(request)) {
-    const threadId = (request as Record<string, unknown>).message_thread_id;
-    if (typeof threadId === "number" && Number.isSafeInteger(threadId)) {
-      return threadId;
-    }
-  }
-  return undefined;
-}
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_OUTBOX_ATTEMPTS = 3;
 const MAX_RETRY_AFTER_SECONDS = 60;
 
-function truncate(text: string, maxLength: number): string {
-  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
-}
-
-/** Retry delay in seconds for a Telegram 429 (rate limit) error, capped at 60s; undefined for non-429 errors. */
 function retryDelaySeconds(error: unknown): number | undefined {
   if (error === null || typeof error !== "object") return undefined;
-  const candidate = error as { error_code?: unknown; parameters?: { retry_after?: unknown } };
-  if (candidate.error_code !== 429 || typeof candidate.parameters !== "object" || candidate.parameters === null) return undefined;
-  const retryAfter = candidate.parameters.retry_after;
-  if (typeof retryAfter !== "number" || !Number.isFinite(retryAfter) || retryAfter <= 0) return undefined;
+  const parameters = "parameters" in error ? error.parameters : undefined;
+  if (parameters === null || typeof parameters !== "object") return undefined;
+  const retryAfter = "retry_after" in parameters ? parameters.retry_after : undefined;
+  if (typeof retryAfter !== "number" || !Number.isFinite(retryAfter) || retryAfter < 0) return undefined;
   return Math.min(retryAfter, MAX_RETRY_AFTER_SECONDS);
 }
 
 function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
-/**
- * Delivers send tool calls to Telegram synchronously: validates the request
- * against the outbox schema, checks its chat_id against the agent's allow list
- * (the egress gate), dispatches (retrying Telegram 429 rate limits with a capped
- * retry_after backoff, up to MAX_OUTBOX_ATTEMPTS attempts), records exactly one
- * terminal event (outbox_sent or outbox_rejected) in the events log, and returns
- * the outcome to the caller. Failures throw with the rejection detail.
- */
+
+export function applyDefaultTarget(request: Record<string, unknown>, actor: AgentRef): Record<string, unknown> {
+  if (request.chat_id !== undefined) return request;
+  if (actor.kind !== "conversation") {
+    throw new Error("chat_id is required when calling send from a background task");
+  }
+  return {
+    ...request,
+    chat_id: actor.chatId,
+    ...(request.message_thread_id === undefined && actor.threadId > 0 ? { message_thread_id: actor.threadId } : {}),
+  };
+}
+
 export class WorkspaceOutbox {
   private readonly workspace: string;
   private readonly dispatch: WorkspaceOutboxDispatcher;
-  private readonly events: WorkspaceEventLog;
-  private readonly logger: (error: unknown) => void;
+  private readonly timeline: WorkspaceTimeline;
+  private readonly pollOwners: Map<string, number> | undefined;
 
   constructor(options: WorkspaceOutboxOptions) {
     this.workspace = options.workspace;
     this.dispatch = options.dispatch;
-    this.events = options.events;
-    this.logger = options.logger ?? ((error) => console.error("Workspace outbox error", error));
+    this.timeline = options.timeline;
+    this.pollOwners = options.pollOwners;
   }
 
-  async send(request: unknown, origin?: string | undefined): Promise<OutboxSendResult> {
-    const requestId = randomUUID();
-    const rawThreadId = extractRawThreadId(request);
+  async send(request: unknown, actor: AgentRef): Promise<OutboxSendResult> {
     if (request === null || typeof request !== "object" || Array.isArray(request)) {
-      await this.reject(requestId, undefined, undefined, new Error("Outbox request must be a JSON object"), origin);
+      throw new Error("Outbox request must be a JSON object");
     }
     const raw = JSON.stringify(request);
-    if (raw.length > MAX_REQUEST_BYTES) {
-      await this.reject(requestId, undefined, rawThreadId, new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`), origin);
+    if (Buffer.byteLength(raw, "utf8") > MAX_REQUEST_BYTES) {
+      throw new Error(`Outbox request exceeds ${MAX_REQUEST_BYTES} bytes`);
     }
-    const validated = await this.parseValidated(request as Record<string, unknown>, requestId, origin);
+    const validated = this.parseValidated(applyDefaultTarget(request as Record<string, unknown>, actor));
     const chatId = validated.chat_id;
-    const threadId = ("message_thread_id" in validated && typeof validated.message_thread_id === "number")
-      ? validated.message_thread_id
-      : rawThreadId;
     const allowed = await readAllowedFile(this.workspace);
     if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) {
-      await this.reject(requestId, chatId, threadId, new Error(`Chat ${chatId} is not on the allow list`), origin);
+      throw new Error(`Chat ${chatId} is not on the allow list`);
     }
+
+    const requestId = randomUUID();
     let result: WorkspaceOutboxDispatchResult | undefined;
     try {
-      result = await this.dispatchWithRetry(chatId, validated);
+      result = await this.dispatchWithRetry(chatId, requestId, validated);
     } catch (error) {
-      await this.reject(requestId, chatId, threadId, error, origin);
-      throw error; // unreachable; reject throws
+      throw new Error(errorMessage(error));
     }
-    return await this.recordSent(requestId, chatId, validated, result, origin);
-  }
 
-  /** Persists the outbox_sent terminal event and returns the synchronous send summary. */
-  private async recordSent(
-    requestId: string,
-    chatId: number,
-    validated: WorkspaceOutboxRequest,
-    result: WorkspaceOutboxDispatchResult | undefined,
-    origin: string | undefined,
-  ): Promise<OutboxSendResult> {
-    const summary = extractRequestSummary(validated);
-    const resolvedThreadId = ("message_thread_id" in validated && typeof validated.message_thread_id === "number")
-      ? validated.message_thread_id
-      : result?.messageThreadId;
-    const emitted = await this.events.emit({
-      type: "outbox_sent",
+    const recorded = result?.request ?? validated;
+    const threadId = result?.messageThreadId ?? recorded.message_thread_id;
+    const target = conversationAgent(chatId, threadId ?? 0);
+    if (result?.pollId) this.pollOwners?.set(result.pollId, chatId);
+    await this.timeline.publish({
+      type: "sent",
       requestId,
-      chat_id: chatId,
-      ...defined({
-        origin,
-        message_thread_id: resolvedThreadId,
-        messageId: result?.messageId,
-        pollId: result?.pollId,
-        request_type: validated.type,
-        summary: summary ? truncate(summary, 200) : undefined,
-        data: result?.data,
-      }),
+      actor,
+      target,
+      request: recorded,
+      ...defined({ messageId: result?.messageId, pollId: result?.pollId }),
     });
-    if (emitted === undefined) {
-      this.logger(new Error(`Could not persist outbox_sent for request ${requestId}`));
-    }
     return {
       requestId,
-      request_type: validated.type,
+      method: recorded.method,
       ...defined({
         messageId: result?.messageId,
         pollId: result?.pollId,
-        message_thread_id: resolvedThreadId,
-        summary: summary ? truncate(summary, 200) : undefined,
+        message_thread_id: threadId,
       }),
     };
   }
 
-  /** Dispatches with up to MAX_OUTBOX_ATTEMPTS attempts; sleeps retry_after (capped) between 429 retries. */
-  private async dispatchWithRetry(chatId: number, validated: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
+  private parseValidated(request: Record<string, unknown>): WorkspaceOutboxRequest {
+    return validateRequest(request);
+  }
+
+  private async dispatchWithRetry(chatId: number, requestId: string, validated: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.dispatch(chatId, validated);
+        return await this.dispatch(chatId, requestId, validated);
       } catch (error) {
         const retryAfter = retryDelaySeconds(error);
         if (retryAfter === undefined || attempt >= MAX_OUTBOX_ATTEMPTS) throw error;
         await sleep(retryAfter * 1000);
       }
-    }
-  }
-  /** Validates the outbox schema; records outbox_rejected and throws on failure. */
-  private async parseValidated(request: Record<string, unknown>, requestId: string, origin: string | undefined): Promise<WorkspaceOutboxRequest> {
-    try {
-      return validateRequest({ ...request, version: 1 });
-    } catch (error) {
-      await this.reject(requestId, undefined, extractRawThreadId(request), error, origin);
-      throw error; // unreachable; reject throws
-    }
-  }
-
-
-  /** Records outbox_rejected in the events log and throws the rejection detail. */
-  private async reject(
-    requestId: string,
-    chatId: number | undefined,
-    threadId: number | undefined,
-    error: unknown,
-    origin?: string | undefined,
-  ): Promise<never> {
-    await this.recordRejection(requestId, chatId, threadId, error, origin);
-    throw new Error(errorMessage(error));
-  }
-
-  /** Emits outbox_rejected to the events log. */
-  private async recordRejection(requestId: string, chatId: number | undefined, threadId: number | undefined, error: unknown, origin?: string | undefined): Promise<void> {
-    let emitted: string | undefined;
-    try {
-      emitted = await this.events.emit({
-        type: "outbox_rejected",
-        requestId,
-        detail: errorMessage(error),
-        ...defined({ origin, chat_id: chatId, message_thread_id: threadId }),
-      });
-    } catch (emitError) {
-      this.logger(emitError);
-      return;
-    }
-    if (emitted === undefined) {
-      this.logger(new Error(`Could not persist outbox_rejected for request ${requestId}`));
     }
   }
 }

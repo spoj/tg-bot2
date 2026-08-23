@@ -26,7 +26,9 @@ describe("configuration", () => {
     expect(botPaths("/data", 123)).toEqual({
       botDir: "/data/bots/123",
       workspace: "/data/bots/123/workspace",
-      eventsLog: "/data/bots/123/events.jsonl",
+      attachments: "/data/bots/123/attachments",
+      timeline: "/data/bots/123/timeline.jsonl",
+      schedulerState: "/data/bots/123/scheduler-state.json",
       runDir: "/data/bots/123/run",
     });
     expect(() => botPaths("/data", Number.NaN)).toThrow();

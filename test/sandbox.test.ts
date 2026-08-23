@@ -289,27 +289,34 @@ it("binds the multimodal extension read-only when present", async () => {
   }
 });
 
-it("binds the host socket directory and read-only events log into Pi runs", async () => {
+it("mounts host-exposed files under /run outside the writable workspace", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");
   const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
   const runDir = path.join(f.root, "run");
-  const eventsLog = path.join(f.root, "events.jsonl");
+  const timeline = path.join(f.root, "timeline.jsonl");
+  const attachments = path.join(f.root, "attachments");
   try {
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
     await mkdir(runDir);
-    await writeFile(eventsLog, "", "utf8");
+    await mkdir(attachments);
+    await writeFile(timeline, "", "utf8");
     const workerArgs = await buildPiRunBwrapArgs({
       workspace: f.workspace,
       appRoot,
       hostSocketDir: runDir,
-      hostEventsLog: eventsLog,
+      hostTimeline: timeline,
+      hostAttachments: attachments,
+      agentToken: "secret-token",
     });
     expect(workerArgs.args).toEqual(expect.arrayContaining([
-      "--bind", await realpath(runDir), "/workspace/.host",
-      "--ro-bind", eventsLog, "/workspace/.tg-bot/events.jsonl",
-      "--setenv", "PI_HOST_SOCKET", "/workspace/.host/host.sock",
+      "--bind", await realpath(runDir), "/run",
+      "--ro-bind", await realpath(attachments), "/run/attachments",
+      "--ro-bind", timeline, "/run/timeline.jsonl",
+      "--remount-ro", "/run",
+      "--setenv", "PI_HOST_SOCKET", "/run/host.sock",
+      "--setenv", "PI_AGENT_TOKEN", "secret-token",
     ]));
   } finally {
     await rm(f.root, { recursive: true, force: true });

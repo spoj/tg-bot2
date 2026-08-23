@@ -1,10 +1,12 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as realSetTimeout } from "node:timers";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { conversationAgent, type AgentRef } from "../src/agent-ref.js";
+import { AgentEventRouter } from "../src/agent.js";
 import { WorkspaceOutbox, type OutboxSendResult, type WorkspaceOutboxOptions } from "../src/outbox.js";
-import { WorkspaceEventLog } from "../src/events.js";
+import { WorkspaceTimeline } from "../src/events.js";
 import type { WorkspaceOutboxDispatcher, WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
 
 const temporaryDirectories: string[] = [];
@@ -19,19 +21,19 @@ async function fixture(): Promise<{ dataDir: string; workspace: string; eventsLo
   temporaryDirectories.push(dataDir);
   const workspace = path.join(dataDir, "workspace");
   await mkdir(workspace, { recursive: true });
-  const eventsLog = path.join(dataDir, "events.jsonl");
+  const eventsLog = path.join(dataDir, "timeline.jsonl");
   await writeFile(eventsLog, "", "utf8");
   return { dataDir, workspace, eventsLog };
 }
 
 async function allowChat(workspace: string, chatId: number | number[]): Promise<void> {
   const ids = Array.isArray(chatId) ? chatId : [chatId];
-  await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
-  await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), JSON.stringify(ids), "utf8");
+  await writeFile(path.join(workspace, ".allowed.json"), JSON.stringify(ids), "utf8");
 }
 
-async function logEvents(eventsLog: string): Promise<Array<Record<string, unknown>>> {
-  return new WorkspaceEventLog(eventsLog).readAll();
+async function logEvents(timelinePath: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(timelinePath, "utf8");
+  return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function setupOutbox(
@@ -40,8 +42,8 @@ function setupOutbox(
   dispatch: WorkspaceOutboxDispatcher,
   options: Partial<WorkspaceOutboxOptions> = {},
 ): { outbox: WorkspaceOutbox } {
-  const events = new WorkspaceEventLog(eventsLog);
-  const outbox = new WorkspaceOutbox({ workspace, dispatch, events, ...options });
+  const timeline = new WorkspaceTimeline(eventsLog);
+  const outbox = new WorkspaceOutbox({ workspace, dispatch, timeline, ...options });
   return { outbox };
 }
 
@@ -50,10 +52,10 @@ async function send(
   eventsLog: string,
   dispatch: WorkspaceOutboxDispatcher,
   request: unknown,
-  origin?: string,
+  actor: AgentRef = conversationAgent(42),
   options: Partial<WorkspaceOutboxOptions> = {},
 ): Promise<OutboxSendResult> {
-  return setupOutbox(workspace, eventsLog, dispatch, options).outbox.send(request, origin);
+  return setupOutbox(workspace, eventsLog, dispatch, options).outbox.send(request, actor);
 }
 
 function rateLimitError(retryAfter: number): Error {
@@ -73,30 +75,34 @@ async function waitForRetryTimer(): Promise<void> {
 }
 
 const valid = (filePath = "/workspace/report.txt") => ({
-  type: "send_file",
+  method: "sendDocument",
   chat_id: 42,
-  path: filePath,
+  document: filePath,
   caption: "Report",
 });
 
 describe("WorkspaceOutbox", () => {
-  it("delivers valid sends, records outbox_sent, and returns the outcome", async () => {
+  it("delivers valid sends, records the completed action, and returns the outcome", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => undefined);
     const result = await send(workspace, eventsLog, dispatch, valid());
-    expect(result).toMatchObject({ request_type: "send_file" });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_file", chat_id: 42, path: "/workspace/report.txt", caption: "Report" });
-    expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "outbox_sent", requestId: expect.any(String), chat_id: 42 },
-    ]);
+    expect(result).toMatchObject({ method: "sendDocument" });
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), valid());
+    expect(await logEvents(eventsLog)).toMatchObject([{
+      type: "sent",
+      requestId: expect.any(String),
+      actor: conversationAgent(42),
+      target: conversationAgent(42),
+      request: valid(),
+    }]);
   });
 
-  it("dispatches send_message requests with their message fields", async () => {
+  it("dispatches Bot API requests with their payload fields", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const request = {
-      type: "send_message",
+      method: "sendMessage",
       chat_id: 42,
       text: "hello <b>world</b>",
       parse_mode: "HTML",
@@ -104,104 +110,86 @@ describe("WorkspaceOutbox", () => {
       reply_to_message_id: 42,
     };
     const dispatch = vi.fn(async () => ({ messageId: 9_001 }));
-    expect(await send(workspace, eventsLog, dispatch, request)).toMatchObject({ messageId: 9001, request_type: "send_message" });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...request });
+    expect(await send(workspace, eventsLog, dispatch, request)).toMatchObject({ messageId: 9001, method: "sendMessage" });
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), request);
     expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "outbox_sent", chat_id: 42, messageId: 9001 },
+      { type: "sent", target: conversationAgent(42), messageId: 9001, request: { text: "hello <b>world</b>" } },
     ]);
   });
 
-  it("dispatches create_forum_topic and close_forum_topic requests", async () => {
+  it("attaches incidental topic names to the current conversation thread", async () => {
+    const { workspace, eventsLog } = await fixture();
+    await allowChat(workspace, 42);
+    const dispatch = vi.fn(async () => ({ messageId: 9 }));
+
+    await send(workspace, eventsLog, dispatch, { method: "sendMessage", text: "Update", topic_name: "Planning the trip" }, conversationAgent(42, 7));
+
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), {
+      method: "sendMessage",
+      chat_id: 42,
+      message_thread_id: 7,
+      text: "Update",
+      topic_name: "Planning the trip",
+    });
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 42, text: "Update", topic_name: "Planning" }))
+      .rejects.toThrow("topic_name requires message_thread_id");
+  });
+
+  it("dispatches forum topic requests", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, -100);
     const dispatch = vi.fn(async () => ({ messageThreadId: 105, data: { message_thread_id: 105, name: "Japan 2026" } }));
-    await send(workspace, eventsLog, dispatch, { type: "create_forum_topic", chat_id: -100, name: "Japan 2026" });
-    expect(dispatch).toHaveBeenCalledWith(-100, { version: 1, type: "create_forum_topic", chat_id: -100, name: "Japan 2026" });
+    const create = { method: "createForumTopic", chat_id: -100, name: "Japan 2026" };
+    await send(workspace, eventsLog, dispatch, create);
+    expect(dispatch).toHaveBeenCalledWith(-100, expect.any(String), create);
     expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "outbox_sent", chat_id: -100, message_thread_id: 105, summary: "Japan 2026" },
+      { type: "sent", target: conversationAgent(-100, 105), request: { method: "createForumTopic", name: "Japan 2026" } },
     ]);
 
     const closeDispatch = vi.fn(async () => ({ messageThreadId: 105 }));
-    await send(workspace, eventsLog, closeDispatch, { type: "close_forum_topic", chat_id: -100, message_thread_id: 105 });
-    expect(closeDispatch).toHaveBeenCalledWith(-100, { version: 1, type: "close_forum_topic", chat_id: -100, message_thread_id: 105 });
+    const close = { method: "closeForumTopic", chat_id: -100, message_thread_id: 105 };
+    await send(workspace, eventsLog, closeDispatch, close);
+    expect(closeDispatch).toHaveBeenCalledWith(-100, expect.any(String), close);
   });
 
-  it("forwards send_message requests without host-side semantic validation", async () => {
+  it("forwards Bot API payloads without host-side semantic validation", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x", parse_mode: "Markdown" });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x", reply_markup: [1] });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x", reply_to_message_id: -3 });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x".repeat(4_097) });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "hello", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 5 }] });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x", entities: ["bold"] });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x", entities: [{ type: "bold", offset: 0 }] });
-    await send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 42, text: "x", link_preview_options: { url: "x".repeat(8_193) } });
-    expect(dispatch).toHaveBeenCalledTimes(8);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent")).toHaveLength(8);
+    await send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 42, text: "x", parse_mode: "Markdown" });
+    await send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 42, text: "x", reply_markup: [1] });
+    await send(workspace, eventsLog, dispatch, { method: "sendLocation", chat_id: 42, latitude: 91, longitude: 0 });
+    await send(workspace, eventsLog, dispatch, { method: "sendPoll", chat_id: 42, question: "q", options: ["only"] });
+    await send(workspace, eventsLog, dispatch, { method: "setMessageReaction", chat_id: 42, message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
+    expect(dispatch).toHaveBeenCalledTimes(5);
+    expect((await logEvents(eventsLog)).filter((event) => event.type === "sent")).toHaveLength(5);
   });
 
-  it("dispatches location, poll, and reaction requests and records poll ids", async () => {
+  it("records response identifiers from raw Bot API results", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
-    const location = {
-      type: "send_location",
-      chat_id: 42,
-      latitude: 52.52, longitude: 13.405, heading: 90,
-      venue: { title: "Gate", address: "Platz 1" },
-    };
-    const poll = {
-      type: "send_poll",
-      chat_id: 42,
-      question: "Pick one", options: ["a", "b", "c"],
-      is_anonymous: false, allows_multiple_answers: true, poll_type: "regular",
-    };
-    const reaction = {
-      type: "send_reaction",
-      chat_id: 42,
-      message_id: 12,
-      reaction: [{ type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" }],
-    };
-    const dispatch = vi.fn(async (_chatId: number, request: WorkspaceOutboxRequest) => {
-      if ("latitude" in request && request.latitude === 52.52) return { messageId: 301 };
-      if ("question" in request && request.question === "Pick one") return { messageId: 302, pollId: "poll-abc" };
+    const location = { method: "sendLocation", chat_id: 42, latitude: 52.52, longitude: 13.405 };
+    const poll = { method: "sendPoll", chat_id: 42, question: "Pick one", options: ["a", "b", "c"] };
+    const dispatch = vi.fn(async (_chatId: number, _requestId: string, request: WorkspaceOutboxRequest) => {
+      if (request.method === "sendLocation") return { messageId: 301 };
+      if (request.method === "sendPoll") return { messageId: 302, pollId: "poll-abc" };
       return undefined;
     });
     await send(workspace, eventsLog, dispatch, location);
     expect(await send(workspace, eventsLog, dispatch, poll)).toMatchObject({ pollId: "poll-abc", messageId: 302 });
-    await send(workspace, eventsLog, dispatch, reaction);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...location });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...poll });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...reaction });
-    const sent = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent");
-    expect(sent).toMatchObject([
-      { chat_id: 42, messageId: 301 },
-      { chat_id: 42, messageId: 302, pollId: "poll-abc" },
-      { chat_id: 42 },
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), location);
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), poll);
+    expect((await logEvents(eventsLog)).filter((event) => event.type === "sent")).toMatchObject([
+      { messageId: 301 },
+      { messageId: 302, pollId: "poll-abc" },
     ]);
   });
 
-  it("forwards location, poll, and reaction requests without host-side semantic validation", async () => {
-    const { workspace, eventsLog } = await fixture();
-    await allowChat(workspace, 42);
-    const dispatch = vi.fn(async () => undefined);
-    await send(workspace, eventsLog, dispatch, { type: "send_location", chat_id: 42, latitude: 91, longitude: 0 });
-    await send(workspace, eventsLog, dispatch, { type: "send_location", chat_id: 42, latitude: 1, longitude: 2, venue: { title: "x" } });
-    await send(workspace, eventsLog, dispatch, { type: "send_poll", chat_id: 42, question: "q", options: ["only"] });
-    await send(workspace, eventsLog, dispatch, { type: "send_poll", chat_id: 42, question: "q", options: ["a", "b"], poll_type: "quiz" });
-    await send(workspace, eventsLog, dispatch, { type: "send_poll", chat_id: 42, question: "q", options: ["a", "b"], poll_type: "quiz", correct_option_id: 5 });
-    await send(workspace, eventsLog, dispatch, { type: "send_reaction", chat_id: 42, message_id: 3, reaction: [{ type: "custom_emoji", custom_emoji_id: "" }] });
-    await send(workspace, eventsLog, dispatch, { type: "stop_poll", chat_id: 42, message_id: 0 });
-    expect(dispatch).toHaveBeenCalledTimes(7);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent")).toHaveLength(7);
-  });
-
-  it("dispatches send_media_group requests with their media payload", async () => {
+  it("dispatches sendMediaGroup requests with their media payload", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const group = {
-      type: "send_media_group",
+      method: "sendMediaGroup",
       chat_id: 42,
       media: [
         { type: "photo", media: "/workspace/a.png", caption: "first" },
@@ -210,161 +198,70 @@ describe("WorkspaceOutbox", () => {
     };
     const dispatch = vi.fn(async () => ({ messageId: 7 }));
     await send(workspace, eventsLog, dispatch, group);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...group });
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), group);
     expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "outbox_sent", chat_id: 42, messageId: 7 },
-    ]);
-  });
-
-  it("rejects send_media_group requests with fewer than two items or wrong item types", async () => {
-    const { workspace, eventsLog } = await fixture();
-    const dispatch = vi.fn(async () => undefined);
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_media_group", chat_id: 42, media: [{ type: "photo", media: "a.png" }] }))
-      .rejects.toThrow("must be an array of 2 to 10 items");
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_media_group", chat_id: 42, media: [{ type: "document", media: "a.pdf" }, { type: "photo", media: "b.png" }] }))
-      .rejects.toThrow("media item type must be photo or video");
-    expect(dispatch).not.toHaveBeenCalled();
-    const rejected = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([
-      { detail: expect.stringContaining("2 to 10 items") },
-      { detail: expect.stringContaining("photo or video") },
+      { type: "sent", target: conversationAgent(42), messageId: 7 },
     ]);
   });
 
   it("discards structurally invalid sends", async () => {
     const { workspace, eventsLog } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_file", chat_id: 42, path: "x", kind: "weird" }))
-      .rejects.toThrow("kind must be auto, photo, audio, video, voice, or document");
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_file", chat_id: 42, path: 7 }))
-      .rejects.toThrow("path must be a non-empty string");
+    await expect(send(workspace, eventsLog, dispatch, { chat_id: 42, text: "missing method" }))
+      .rejects.toThrow("Unsupported Telegram Bot API method: undefined");
     await expect(send(workspace, eventsLog, dispatch, "not-an-object"))
       .rejects.toThrow("must be a JSON object");
     expect(dispatch).not.toHaveBeenCalled();
-    const rejected = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([
-      { requestId: expect.any(String), detail: expect.stringContaining("must be auto, photo") },
-      { requestId: expect.any(String), detail: expect.stringContaining("must be a non-empty string") },
-      { requestId: expect.any(String), detail: expect.stringContaining("must be a JSON object") },
-    ]);
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
   it("discards oversized sends without delivering them", async () => {
     const { workspace, eventsLog } = await fixture();
     const dispatch = vi.fn(async () => undefined);
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_file", chat_id: 42, path: "x".repeat(1024 * 1024) }))
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 42, text: "🙂".repeat(262_145) }))
       .rejects.toThrow("exceeds 1048576 bytes");
     expect(dispatch).not.toHaveBeenCalled();
-    const rejected = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([{ detail: expect.stringContaining("exceeds 1048576 bytes") }]);
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("logs outbox_rejected and throws the dispatcher failure", async () => {
+  it("does not add failed dispatches to the shared timeline", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => { throw new Error("upload failed"); });
-    await expect(send(workspace, eventsLog, dispatch, valid(), "42:0")).rejects.toThrow("upload failed");
+    await expect(send(workspace, eventsLog, dispatch, valid())).rejects.toThrow("upload failed");
     expect(dispatch).toHaveBeenCalledTimes(1);
-    const events = await logEvents(eventsLog);
-    expect(events).toMatchObject([
-      { type: "outbox_rejected", chat_id: 42, origin: "42:0", detail: expect.stringContaining("upload failed") },
-    ]);
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("preserves message_thread_id in outbox_rejected", async () => {
+  it("does not add thread-targeted dispatch failures to the shared timeline", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => { throw new Error("topic upload failed"); });
     await expect(send(workspace, eventsLog, dispatch, { ...valid(), message_thread_id: 1234 })).rejects.toThrow("topic upload failed");
-    const events = await logEvents(eventsLog);
-    expect(events).toMatchObject([
-      { type: "outbox_rejected", chat_id: 42, message_thread_id: 1234, detail: expect.stringContaining("topic upload failed") },
-    ]);
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("dispatches an empty reaction array to remove a reaction", async () => {
+  it("dispatches message mutations and unconfined upload paths to the dispatcher", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => undefined);
-    await send(workspace, eventsLog, dispatch, { type: "send_reaction", chat_id: 42, message_id: 12, reaction: [] });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "send_reaction", chat_id: 42, message_id: 12, reaction: [] });
-    expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "outbox_sent", chat_id: 42 },
-    ]);
-  });
-
-  it("forwards reaction requests with too many or invalid entries", async () => {
-    const { workspace, eventsLog } = await fixture();
-    await allowChat(workspace, 42);
-    const dispatch = vi.fn(async () => undefined);
-    await send(workspace, eventsLog, dispatch, {
-      type: "send_reaction", chat_id: 42, message_id: 3,
-      reaction: [
-        { type: "emoji", emoji: "👍" }, { type: "emoji", emoji: "🔥" },
-        { type: "emoji", emoji: "😀" }, { type: "emoji", emoji: "😎" },
-      ],
-    });
-    await send(workspace, eventsLog, dispatch, { type: "send_reaction", chat_id: 42, message_id: 3, reaction: [{ type: "emoji", emoji: "" }] });
-    expect(dispatch).toHaveBeenCalledTimes(2);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent")).toHaveLength(2);
-  });
-
-  it("accepts a reaction mixing emoji and custom_emoji entries", async () => {
-    const { workspace, eventsLog } = await fixture();
-    await allowChat(workspace, 42);
-    const dispatch = vi.fn(async () => undefined);
-    const request = {
-      type: "send_reaction",
-      chat_id: 42,
-      message_id: 12,
-      reaction: [{ type: "emoji", emoji: "👍" }, { type: "custom_emoji", custom_emoji_id: "1234567890123456" }],
-    };
-    await send(workspace, eventsLog, dispatch, request);
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...request });
-    expect(await logEvents(eventsLog)).toMatchObject([
-      { type: "outbox_sent", chat_id: 42 },
-    ]);
-  });
-
-  it("dispatches edit_message and delete_message requests with their fields", async () => {
-    const { workspace, eventsLog } = await fixture();
-    await allowChat(workspace, 42);
+    const reaction = { method: "setMessageReaction", chat_id: 42, message_id: 12, reaction: [] };
     const edit = {
-      type: "edit_message",
+      method: "editMessageText",
       chat_id: 42,
       message_id: 55,
-      text: "updated text", parse_mode: "HTML",
+      text: "updated text",
+      parse_mode: "HTML",
       reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-      link_preview_options: { is_disabled: true },
     };
-    const dispatch = vi.fn(async () => undefined);
+    await send(workspace, eventsLog, dispatch, reaction);
     await send(workspace, eventsLog, dispatch, edit);
-    await send(workspace, eventsLog, dispatch, { type: "delete_message", chat_id: 42, message_id: 56 });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, ...edit });
-    expect(dispatch).toHaveBeenCalledWith(42, { version: 1, type: "delete_message", chat_id: 42, message_id: 56 });
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent")).toHaveLength(2);
-  });
-
-  it("forwards edit_message requests without host-side semantic validation", async () => {
-    const { workspace, eventsLog } = await fixture();
-    await allowChat(workspace, 42);
-    const dispatch = vi.fn(async () => undefined);
-    await send(workspace, eventsLog, dispatch, { type: "edit_message", chat_id: 42, message_id: 7, text: "x".repeat(4_097) });
-    await send(workspace, eventsLog, dispatch, { type: "edit_message", chat_id: 42, message_id: 9 });
-    await send(workspace, eventsLog, dispatch, { type: "edit_message", chat_id: 42, message_id: 9, text: "x", parse_mode: "HTML", entities: [{ type: "bold", offset: 0, length: 1 }] });
-    await send(workspace, eventsLog, dispatch, { type: "edit_message", chat_id: 42, message_id: 9, reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] } });
-    expect(dispatch).toHaveBeenCalledTimes(4);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent")).toHaveLength(4);
-  });
-
-  it("forwards send_file requests with unconfined paths to the dispatcher", async () => {
-    const { workspace, eventsLog } = await fixture();
-    await allowChat(workspace, 42);
-    const dispatch = vi.fn(async () => undefined);
+    await send(workspace, eventsLog, dispatch, { method: "deleteMessage", chat_id: 42, message_id: 56 });
     await send(workspace, eventsLog, dispatch, valid("/workspace/../outside.txt"));
-    await send(workspace, eventsLog, dispatch, valid("/workspace/"));
-    expect(dispatch).toHaveBeenCalledTimes(2);
-    expect((await logEvents(eventsLog)).filter((event) => event.type === "outbox_sent")).toHaveLength(2);
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), reaction);
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), edit);
+    expect(dispatch).toHaveBeenCalledTimes(4);
+    expect((await logEvents(eventsLog)).filter((event) => event.type === "sent")).toHaveLength(4);
   });
 
   it("rejects sends to chats not on the allow list", async () => {
@@ -373,62 +270,60 @@ describe("WorkspaceOutbox", () => {
     const dispatch = vi.fn(async () => undefined);
     await expect(send(workspace, eventsLog, dispatch, valid())).rejects.toThrow("Chat 42 is not on the allow list");
     expect(dispatch).not.toHaveBeenCalled();
-    const rejected = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([
-      { chat_id: 42, detail: expect.stringContaining("not on the allow list") },
-    ]);
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("rejects requests with a missing or non-safe-integer chat_id", async () => {
+  it("defaults conversation targets and requires explicit task targets", async () => {
     const { workspace, eventsLog } = await fixture();
+    await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => undefined);
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_message", text: "hi" })).rejects.toThrow("chat_id must be a safe integer");
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 1.5, text: "hi" })).rejects.toThrow("chat_id must be a safe integer");
-    expect(dispatch).not.toHaveBeenCalled();
-    const rejected = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([
-      { detail: expect.stringContaining("chat_id must be a safe integer") },
-      { detail: expect.stringContaining("chat_id must be a safe integer") },
-    ]);
+    await send(workspace, eventsLog, dispatch, { method: "sendMessage", text: "hi" }, conversationAgent(42, 7));
+    expect(dispatch).toHaveBeenCalledWith(42, expect.any(String), { method: "sendMessage", chat_id: 42, message_thread_id: 7, text: "hi" });
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", text: "hi" }, { kind: "task", runId: "run-1" }))
+      .rejects.toThrow("chat_id is required");
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 1.5, text: "hi" }))
+      .rejects.toThrow("chat_id must be a safe integer");
   });
 
   it("fails closed when allowed.json is malformed", async () => {
     const { workspace, eventsLog } = await fixture();
-    await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
-    await writeFile(path.join(workspace, ".tg-bot", "allowed.json"), "{ not valid json", "utf8");
+    await writeFile(path.join(workspace, ".allowed.json"), "{ not valid json", "utf8");
     const dispatch = vi.fn(async () => undefined);
     await expect(send(workspace, eventsLog, dispatch, valid())).rejects.toThrow("Chat 42 is not on the allow list");
     expect(dispatch).not.toHaveBeenCalled();
-    const rejected = (await logEvents(eventsLog)).filter((event) => event.type === "outbox_rejected");
-    expect(rejected).toMatchObject([
-      { chat_id: 42, detail: expect.stringContaining("not on the allow list") },
-    ]);
+    expect(await logEvents(eventsLog)).toEqual([]);
   });
 
-  it("preserves origin in outbox_sent and outbox_rejected events", async () => {
+  it("records the authenticated actor and resolved target only for successful sends", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     const dispatch = vi.fn(async () => ({ messageId: 999 }));
+    const actor = conversationAgent(42, 100);
 
-    await send(workspace, eventsLog, dispatch, valid(), "42:100");
-    await expect(send(workspace, eventsLog, dispatch, { type: "send_message", chat_id: 999, text: "blocked" }, "42:100"))
+    await send(workspace, eventsLog, dispatch, valid(), actor);
+    await expect(send(workspace, eventsLog, dispatch, { method: "sendMessage", chat_id: 999, text: "blocked" }, actor))
       .rejects.toThrow("not on the allow list");
 
+    expect(await logEvents(eventsLog)).toMatchObject([{
+      type: "sent",
+      actor,
+      target: conversationAgent(42),
+      request: { chat_id: 42 },
+    }]);
+  });
 
-    const events = await logEvents(eventsLog);
-    const sent = events.find((e) => e.type === "outbox_sent");
-    const rejected = events.find((e) => e.type === "outbox_rejected");
+  it("wakes the responsible conversation after a task writes to it", async () => {
+    const { workspace, eventsLog } = await fixture();
+    await allowChat(workspace, 42);
+    const timeline = new WorkspaceTimeline(eventsLog);
+    const followup = vi.fn(async () => undefined);
+    const router = new AgentEventRouter({ followup, interrupt: vi.fn(async () => undefined) });
+    timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
+    const outbox = new WorkspaceOutbox({ workspace, timeline, dispatch: vi.fn(async () => ({ messageId: 100 })) });
 
-    expect(sent).toMatchObject({
-      type: "outbox_sent",
-      origin: "42:100",
-      chat_id: 42,
-    });
-    expect(rejected).toMatchObject({
-      type: "outbox_rejected",
-      origin: "42:100",
-      chat_id: 999,
-    });
+    await outbox.send({ method: "sendMessage", chat_id: 42, message_thread_id: 7, text: "task result" }, { kind: "task", runId: "run-1" });
+
+    expect(followup).toHaveBeenCalledWith(expect.stringContaining("task result"), conversationAgent(42, 7));
   });
 
   it("retries on 429 and emits a single outbox_sent once a retry succeeds", async () => {
@@ -445,32 +340,31 @@ describe("WorkspaceOutbox", () => {
       await vi.advanceTimersByTimeAsync(5_100);
       await waitForRetryTimer();
       await vi.advanceTimersByTimeAsync(1_100);
-      await expect(pending).resolves.toMatchObject({ messageId: 9001, request_type: "send_file" });
+      await expect(pending).resolves.toMatchObject({ messageId: 9001, method: "sendDocument" });
       expect(dispatch).toHaveBeenCalledTimes(3);
       const events = await logEvents(eventsLog);
-      expect(events.filter((e) => e.type === "outbox_sent")).toHaveLength(1);
+      expect(events.filter((e) => e.type === "sent")).toHaveLength(1);
       expect(events.filter((e) => e.type === "outbox_rejected")).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("records exactly one outbox_rejected when every attempt is rate-limited", async () => {
+  it("does not record a failed rate-limited send", async () => {
     const { workspace, eventsLog } = await fixture();
     await allowChat(workspace, 42);
     vi.useFakeTimers();
     try {
       const dispatch = vi.fn<WorkspaceOutboxDispatcher>().mockRejectedValue(rateLimitError(5));
       const pending = send(workspace, eventsLog, dispatch, valid());
+      const rejection = expect(pending).rejects.toThrow("Too Many Requests");
       await waitForRetryTimer();
       await vi.advanceTimersByTimeAsync(5_100);
       await waitForRetryTimer();
       await vi.advanceTimersByTimeAsync(5_100);
-      await expect(pending).rejects.toThrow("Too Many Requests");
+      await rejection;
       expect(dispatch).toHaveBeenCalledTimes(3);
-      const events = await logEvents(eventsLog);
-      expect(events.filter((e) => e.type === "outbox_rejected")).toHaveLength(1);
-      expect(events.filter((e) => e.type === "outbox_sent")).toHaveLength(0);
+      expect(await logEvents(eventsLog)).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
@@ -489,11 +383,12 @@ describe("WorkspaceOutbox", () => {
       }) as typeof setTimeout);
       const dispatch = vi.fn<WorkspaceOutboxDispatcher>().mockRejectedValue(rateLimitError(300));
       const pending = send(workspace, eventsLog, dispatch, valid());
+      const rejection = expect(pending).rejects.toThrow("Too Many Requests");
       await waitForRetryTimer();
       await vi.advanceTimersByTimeAsync(61_000);
       await waitForRetryTimer();
       await vi.advanceTimersByTimeAsync(61_000);
-      await expect(pending).rejects.toThrow("Too Many Requests");
+      await rejection;
       expect(dispatch).toHaveBeenCalledTimes(3);
       expect(delays).toEqual([60_000, 60_000]);
     } finally {
@@ -501,35 +396,4 @@ describe("WorkspaceOutbox", () => {
     }
   });
 
-  it("logs loudly when outbox_sent cannot be persisted but still returns the outcome", async () => {
-    const { workspace, dataDir } = await fixture();
-    await allowChat(workspace, 42);
-    const blocked = path.join(dataDir, "blocked");
-    await writeFile(blocked, "not a directory", "utf8");
-    const errors: unknown[] = [];
-    const dispatch = vi.fn(async () => ({ messageId: 9001 }));
-
-    const result = await send(workspace, path.join(blocked, "events.jsonl"), dispatch, valid(), undefined, {
-      logger: (e: unknown) => errors.push(e),
-    });
-
-    expect(result).toMatchObject({ messageId: 9001 });
-    expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Could not persist outbox_sent");
-  });
-
-  it("logs loudly when outbox_rejected cannot be persisted", async () => {
-    const { workspace, dataDir } = await fixture();
-    await allowChat(workspace, 42);
-    const blocked = path.join(dataDir, "blocked");
-    await writeFile(blocked, "not a directory", "utf8");
-    const errors: unknown[] = [];
-
-    await expect(send(workspace, path.join(blocked, "events.jsonl"), vi.fn(async () => { throw new Error("upload failed"); }), valid(), "42:0", {
-      logger: (e: unknown) => errors.push(e),
-    })).rejects.toThrow("upload failed");
-
-    expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Could not persist outbox_rejected");
-  });
 });

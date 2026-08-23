@@ -1,22 +1,21 @@
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
-import { errorCode, readFileBounded, TG_BOT_DIR } from "./util.js";
-import { EVENTS_FILE, WorkspaceEventLog } from "./events.js";
+import { errorCode, readFileBounded } from "./util.js";
 /**
- * Agent-owned allow list: `workspace/.tg-bot/allowed.json`, containing an array of safe integer chat IDs.
- * The host enforces it both ways and emits `allowlist_updated` whenever changes are detected.
+ * Agent-owned allow list at `workspace/.allowed.json`.
+ * The host enforces the current file directly on ingress and egress.
  */
 export type AllowedFile =
   | { status: "missing" }
   | { status: "malformed" }
   | { status: "ready"; chats: number[] };
 
-const ALLOWED_FILE = "allowed.json";
+const ALLOWED_FILE = ".allowed.json";
 const ALLOWED_FILE_MAX_BYTES = 1024 * 1024;
 
 export function allowedFilePath(workspace: string): string {
-  return path.join(workspace, TG_BOT_DIR, ALLOWED_FILE);
+  return path.join(workspace, ALLOWED_FILE);
 }
 
 /**
@@ -86,52 +85,4 @@ export async function readAllowedFile(workspace: string): Promise<AllowedFile> {
 
   const uniqueSorted = Array.from(new Set(ids)).sort((a, b) => a - b);
   return { status: "ready", chats: uniqueSorted };
-}
-
-const lastEmittedAllowlists = new Map<string, string>();
-
-/** Clears the cached allowlist state for testing. */
-export function resetAllowlistCache(workspace?: string): void {
-  if (workspace) lastEmittedAllowlists.delete(workspace);
-  else lastEmittedAllowlists.clear();
-}
-
-async function lastLoggedAllowlist(eventLog: WorkspaceEventLog): Promise<string | undefined> {
-  const record = await eventLog.findLast((entry) => entry.type === "allowlist_updated" && "chats" in entry && Array.isArray(entry.chats));
-  if (record && record.type === "allowlist_updated") {
-    return JSON.stringify(record.chats);
-  }
-  return undefined;
-}
-
-/**
- * Synchronizes the allow list: reads `allowed.json`, compares against the in-memory cache
- * (seeded once from `events.jsonl` on first check after boot), and emits `allowlist_updated` if changed.
- */
-export async function syncAllowlist(workspace: string, events?: WorkspaceEventLog): Promise<number[] | null> {
-  const file = await readAllowedFile(workspace);
-  // Host state lives one level above the workspace (DATA_DIR/bots/<id>/events.jsonl).
-  const eventLog = events ?? new WorkspaceEventLog(path.resolve(workspace, "..", EVENTS_FILE));
-  if (!lastEmittedAllowlists.has(workspace)) {
-    const logged = await lastLoggedAllowlist(eventLog);
-    if (logged !== undefined) {
-      lastEmittedAllowlists.set(workspace, logged);
-    }
-  }
-  if (file.status !== "ready") {
-    if (lastEmittedAllowlists.has(workspace)) {
-      lastEmittedAllowlists.delete(workspace);
-      await events?.emit({ type: "allowlist_updated", chats: [] });
-    }
-    return null;
-  }
-
-  const serialized = JSON.stringify(file.chats);
-  const previous = lastEmittedAllowlists.get(workspace);
-  if (previous !== serialized) {
-    lastEmittedAllowlists.set(workspace, serialized);
-    await events?.emit({ type: "allowlist_updated", chats: file.chats });
-  }
-
-  return file.chats;
 }

@@ -1,32 +1,60 @@
-import { describe, expect, it } from "vitest";
-import { resolveSendTarget } from "../extensions/host-tools.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { expect, it, vi } from "vitest";
+import hostTools from "../extensions/host-tools.js";
+import { conversationAgent } from "../src/agent-ref.js";
+import { AgentCredentials, HostBridge } from "../src/host-bridge.js";
+import { deferred } from "./helpers.js";
 
-describe("resolveSendTarget", () => {
-  it("resolves an explicit safe-integer chat_id", () => {
-    expect(resolveSendTarget({ chat_id: 42 }, undefined)).toEqual({ chatId: 42 });
-    expect(resolveSendTarget({ chat_id: 42, message_thread_id: 7 }, undefined)).toEqual({ chatId: 42, threadId: 7 });
-  });
 
-  it("defaults to the origin chat only when chat_id is absent", () => {
-    const origin = { chatId: -100, threadId: 5 };
-    expect(resolveSendTarget({}, origin)).toEqual({ chatId: -100, threadId: 5 });
-    expect(resolveSendTarget({ message_thread_id: 9 }, origin)).toEqual({ chatId: -100, threadId: 9 });
-    expect(resolveSendTarget({}, undefined)).toEqual({
-      error: "chat_id is required when calling send from a background task or without an active chat session.",
-    });
-  });
+type RegisteredTool = {
+  name: string;
+  execute(toolCallId: string, params: Record<string, unknown>): Promise<{ content: Array<{ text: string }> }>;
+};
 
-  it("rejects an explicitly supplied non-safe-integer chat_id instead of defaulting", () => {
-    const origin = { chatId: -100, threadId: 5 };
-    for (const bad of [42.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "42"]) {
-      const result = resolveSendTarget({ chat_id: bad }, origin);
-      expect("error" in result).toBe(true);
-      expect("chatId" in result).toBe(false);
-    }
-    expect(resolveSendTarget({ chat_id: 42.5 }, origin)).toEqual({ error: "chat_id must be a safe integer (got 42.5)" });
+it("keeps send calls open through the outbox retry window", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "host-tools-test-"));
+  const socketPath = path.join(root, "host.sock");
+  const handlerStarted = deferred<void>();
+  const response = deferred<Record<string, unknown>>();
+  const credentials = new AgentCredentials();
+  const token = credentials.issue(conversationAgent(42), ["send"]);
+  const bridge = new HostBridge({
+    socketPath,
+    credentials,
+    handlers: {
+      send: async () => {
+        handlerStarted.resolve();
+        return response.promise;
+      },
+    },
   });
+  await bridge.start();
+  vi.useFakeTimers();
+  vi.stubEnv("PI_HOST_SOCKET", socketPath);
+  vi.stubEnv("PI_AGENT_TOKEN", token);
+  vi.stubEnv("PI_HOST_TOOLS", "send");
+  try {
+    let sendTool: RegisteredTool | undefined;
+    hostTools({
+      registerTool: (tool: RegisteredTool) => {
+        if (tool.name === "send") sendTool = tool;
+      },
+    } as never);
+    if (!sendTool) throw new Error("send tool was not registered");
 
-  it("drops an invalid message_thread_id alongside an explicit chat_id", () => {
-    expect(resolveSendTarget({ chat_id: 42, message_thread_id: 1.5 }, undefined)).toEqual({ chatId: 42 });
-  });
+    const pending = sendTool.execute("tool-1", { method: "sendMessage", chat_id: 42, text: "hello" });
+    await handlerStarted.promise;
+    await vi.advanceTimersByTimeAsync(30_001);
+    response.resolve({ method: "sendMessage" });
+
+    await expect(pending).resolves.toMatchObject({ content: [{ text: "sendMessage succeeded." }] });
+  } finally {
+    response.resolve({ method: "sendMessage" });
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
 });

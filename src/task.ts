@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, opendir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, opendir, rename, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
-import type { WorkspaceEventLog } from "./events.js";
+import type { TaskTrigger } from "./agent-ref.js";
+import type { WorkspaceTimeline } from "./events.js";
+import type { AgentCredentials } from "./host-bridge.js";
 import { PiWorker, type PiRunResult } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { TASK_RUNNER_PROMPT } from "./task-protocol.js";
-import { defined, errorMessage, isMissing } from "./util.js";
+import { closeQuietly, defined, errorMessage, isMissing, openPinnedDirectory } from "./util.js";
 
 export type WorkspaceTaskWorker = {
   run(): Promise<PiRunResult>;
@@ -21,13 +23,15 @@ export type WorkspaceTaskWorkerOptions = {
   workspace: string;
   runId: string;
   prompt: string;
+  token: string;
 };
 
 export type WorkspaceTaskWorkerFactory = (options: WorkspaceTaskWorkerOptions) => WorkspaceTaskWorker | Promise<WorkspaceTaskWorker>;
 
 export type WorkspaceTasksOptions = {
   workspace: string;
-  events: WorkspaceEventLog;
+  timeline: WorkspaceTimeline;
+  credentials: AgentCredentials;
   appRoot: string;
   bwrapPath?: string;
   spawnProcess: PiWorkerSpawn;
@@ -35,9 +39,9 @@ export type WorkspaceTasksOptions = {
   stopGraceMs?: number;
   workerFactory?: WorkspaceTaskWorkerFactory;
   heartbeatIntervalMs?: number;
-  /** Host socket dir and events log bind-mounted into task sandboxes. */
   hostSocketDir?: string;
-  hostEventsLog?: string;
+  hostTimeline?: string;
+  hostAttachments?: string;
   now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
@@ -59,20 +63,26 @@ const MAX_QUOTE_LENGTH = 120;
 type InFlightTask = {
   worker: WorkspaceTaskWorker;
   runId: string;
-  origin?: string | undefined;
+  trigger: TaskTrigger;
+  token: string;
   prompt: string;
   startedAt: number;
-  /** "starting" until the worker has written its initial prompt; steers queue meanwhile. */
   status: "starting" | "running";
   pendingSteers: string[];
-  /** Set when cancel arrives before the run was prompted; suppresses the pending-steer flush. */
   cancelled: boolean;
 };
 
 type QueuedSpawn = {
   runId: string;
   prompt: string;
-  origin?: string | undefined;
+  trigger: TaskTrigger;
+};
+
+type TaskRun = {
+  runId: string;
+  prompt: string;
+  trigger: TaskTrigger;
+  token: string;
 };
 
 export type SpawnResult = {
@@ -110,38 +120,27 @@ function truncate(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
 
-function parseSettledResult(raw: string): { status: "done" | "failed" | "aborted"; exitCode: number | null; stderr?: string | undefined } {
+async function writeTaskArtifact(directory: string, filename: string, content: string): Promise<void> {
+  const pinned = await openPinnedDirectory(directory);
+  const temporary = path.join(pinned.path, `.${filename}.${randomUUID()}.tmp`);
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const record = parsed as Record<string, unknown>;
-      if (record.status === "done" || record.status === "failed") {
-        return {
-          status: record.status,
-          exitCode: typeof record.exitCode === "number" ? record.exitCode : null,
-          ...(typeof record.stderr === "string" && record.stderr.length > 0 ? { stderr: record.stderr } : {}),
-        };
-      }
-    }
-  } catch {
-    // Unparseable result is treated as aborted.
+    await writeFile(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await rename(temporary, path.join(pinned.path, filename));
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+    await closeQuietly(pinned.handle);
   }
-  return { status: "aborted", exitCode: null };
 }
 
+
 /**
- * Runs agent-spawned background tasks synchronously on demand: the host mints a
- * uuid runId, creates the run directory under .pi/tasks/, launches a fresh Pi
- * worker (up to 8 concurrent; excess spawns queue in memory and launch as slots
- * free), records every settlement in the events log, and sends the agent a
- * completion followup quoting the prompt. Cancel and steer call in directly and
- * report their outcome. A run settles exactly once — immediately on exit (any
- * signal included), or at the next boot when the host reconciles run directories
- * against the events log (aborted stamp for crash-mid-run, terminal repair for
- * crash-mid-settle, re-launch for fired schedule occurrences lost mid-fire).
+ * Runs background tasks on demand. Queued work is process-local; launched runs
+ * keep their artifacts under .pi/tasks and publish meaningful progress and
+ * settlement updates independently of timeline durability.
  */
 export class WorkspaceTasks {
-  private readonly events: WorkspaceEventLog;
+  private readonly timeline: WorkspaceTimeline;
+  private readonly credentials: AgentCredentials;
   private readonly workspace: string;
   private readonly appRoot: string;
   private readonly bwrapPath: string | undefined;
@@ -151,7 +150,8 @@ export class WorkspaceTasks {
   private readonly workerFactory: WorkspaceTaskWorkerFactory;
   private readonly heartbeatIntervalMs: number;
   private readonly hostSocketDir: string | undefined;
-  private readonly hostEventsLog: string | undefined;
+  private readonly hostTimeline: string | undefined;
+  private readonly hostAttachments: string | undefined;
   private readonly now: () => number;
   private readonly schedule: typeof setInterval;
   private readonly cancelSchedule: typeof clearInterval;
@@ -170,14 +170,16 @@ export class WorkspaceTasks {
     }
     this.workspace = path.resolve(options.workspace);
     this.appRoot = path.resolve(options.appRoot);
+    this.credentials = options.credentials;
     this.bwrapPath = options.bwrapPath;
     this.spawnProcess = options.spawnProcess;
     this.terminateProcessGroup = options.terminateProcessGroup;
     this.stopGraceMs = options.stopGraceMs;
-    this.events = options.events;
+    this.timeline = options.timeline;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.hostSocketDir = options.hostSocketDir;
-    this.hostEventsLog = options.hostEventsLog;
+    this.hostTimeline = options.hostTimeline;
+    this.hostAttachments = options.hostAttachments;
     this.now = options.now ?? Date.now;
     this.schedule = options.setInterval ?? setInterval;
     this.cancelSchedule = options.clearInterval ?? clearInterval;
@@ -192,7 +194,7 @@ export class WorkspaceTasks {
         taskRun: true,
         appendSystemPrompt: TASK_RUNNER_PROMPT,
         hostTools: "send",
-        agentOrigin: `task:${workerOptions.runId}`,
+        agentToken: workerOptions.token,
         sessionDir: `/workspace/.pi/tasks/${workerOptions.runId}/${SESSIONS_DIR}`,
         idleTimeoutMs: 0,
         spawnProcess: this.spawnProcess,
@@ -200,7 +202,8 @@ export class WorkspaceTasks {
         ...defined({
           stopGraceMs: this.stopGraceMs,
           hostSocketDir: this.hostSocketDir,
-          hostEventsLog: this.hostEventsLog,
+          hostTimeline: this.hostTimeline,
+          hostAttachments: this.hostAttachments,
         }),
         onInitialPromptWritten: () => onPrompted?.(),
       });
@@ -232,6 +235,9 @@ export class WorkspaceTasks {
     this.startInFlight = initialReconcile;
     try {
       await initialReconcile;
+    } catch (error) {
+      this.running = false;
+      throw error;
     } finally {
       if (this.startInFlight === initialReconcile) this.startInFlight = undefined;
     }
@@ -258,15 +264,15 @@ export class WorkspaceTasks {
     }
   }
 
-  /** Launches a background task for one spawn tool call; queues when all slots are busy. */
-  async spawn(prompt: string, origin?: string | undefined, runId: string = randomUUID()): Promise<SpawnResult> {
+  /** Launches a background task for one spawn request; queues when all slots are busy. */
+  async spawn(prompt: string, trigger: TaskTrigger, runId: string = randomUUID()): Promise<SpawnResult> {
     if (prompt.trim().length === 0) throw new Error(TASK_PROMPT_EMPTY_MESSAGE);
-    if (prompt.length > MAX_TASK_BYTES) throw new Error(`Task prompt exceeds ${MAX_TASK_BYTES} bytes`);
+    if (Buffer.byteLength(prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Task prompt exceeds ${MAX_TASK_BYTES} bytes`);
     if (this.inFlight.length >= MAX_CONCURRENT_TASKS) {
-      this.queued.push({ runId, prompt, origin });
+      this.queued.push({ runId, prompt, trigger });
       return { runId, status: "queued" };
     }
-    await this.claimAndLaunch(this.workspace, runId, prompt, origin);
+    await this.claimAndLaunch(this.workspace, runId, prompt, trigger);
     return { runId, status: "launched" };
   }
 
@@ -298,16 +304,18 @@ export class WorkspaceTasks {
     return "delivered";
   }
 
-  /** Launches a background task in a fresh uuid run directory. */
-  private async claimAndLaunch(workspace: string, runId: string, prompt: string, origin?: string | undefined): Promise<void> {
+  private async claimAndLaunch(workspace: string, runId: string, prompt: string, trigger: TaskTrigger): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
-    await writeFile(path.join(runDirectory, PROMPT_FILE), prompt, { encoding: "utf8", mode: 0o600 });
+    await writeTaskArtifact(runDirectory, PROMPT_FILE, prompt);
+    const token = this.credentials.issue({ kind: "task", runId }, ["send"]);
+    const task: TaskRun = { runId, prompt, trigger, token };
     let worker: WorkspaceTaskWorker;
     try {
-      worker = await this.workerFactory({ workspace, runId, prompt });
+      worker = await this.workerFactory({ workspace, runId, prompt, token });
     } catch (error) {
-      await this.settleTask(workspace, { runId, prompt, origin }, runDirectory, {
+      this.credentials.revoke(token);
+      await this.settleTask(workspace, task, runDirectory, {
         code: null,
         signal: null,
         stderr: errorMessage(error),
@@ -315,14 +323,15 @@ export class WorkspaceTasks {
       });
       return;
     }
-    this.launchTask(workspace, { runId, prompt, origin }, runDirectory, worker);
+    this.launchTask(workspace, task, runDirectory, worker);
   }
 
-  private launchTask(workspace: string, task: { runId: string; prompt: string; origin?: string | undefined }, runDirectory: string, worker: WorkspaceTaskWorker): void {
+  private launchTask(workspace: string, task: TaskRun, runDirectory: string, worker: WorkspaceTaskWorker): void {
     const entry: InFlightTask = {
       worker,
       runId: task.runId,
-      origin: task.origin,
+      trigger: task.trigger,
+      token: task.token,
       prompt: task.prompt,
       startedAt: this.now(),
       status: "starting",
@@ -346,14 +355,12 @@ export class WorkspaceTasks {
     });
     const settle = this.runAndSettle(workspace, task, runDirectory, worker);
     this.pendingSettles.add(settle);
-    void settle
-      .catch((error) => this.report(error))
-      .finally(() => this.pendingSettles.delete(settle));
+    void settle.catch((error) => this.report(error)).finally(() => this.pendingSettles.delete(settle));
   }
 
   private async runAndSettle(
     workspace: string,
-    task: { runId: string; prompt: string; origin?: string | undefined },
+    task: TaskRun,
     runDirectory: string,
     worker: WorkspaceTaskWorker,
   ): Promise<void> {
@@ -363,40 +370,19 @@ export class WorkspaceTasks {
     } catch (error) {
       result = { code: null, signal: null, stderr: errorMessage(error), stdout: "" };
     } finally {
+      this.credentials.revoke(task.token);
       const index = this.inFlight.findIndex((entry) => entry.worker === worker);
       if (index >= 0) this.inFlight.splice(index, 1);
     }
     await this.settleTask(workspace, task, runDirectory, result);
     if (this.running) {
       const next = this.queued.shift();
-      if (next !== undefined) {
-        await this.claimAndLaunch(workspace, next.runId, next.prompt, next.origin).catch((error) => this.report(error));
-      }
+      if (next) await this.claimAndLaunch(workspace, next.runId, next.prompt, next.trigger).catch((error) => this.report(error));
     }
   }
 
-  /**
-   * Reconciles run directories against the events log at boot. The events log is
-   * authoritative for settlement; result.json is agent-writable and only consulted
-   * when the terminal event is missing:
-   * - runId already settled in the log → nothing to do;
-   * - result.json present without a terminal → re-emit the settle event (crash between result write and terminal);
-   * - prompt.txt without result.json → the run died mid-flight: stamp it aborted;
-   * - neither file → leftover empty dir, delete.
-   * Fired schedule occurrences with neither a terminal nor a run directory were
-   * lost between firing and spawning: launch them now.
-   */
+  /** Marks task directories left running across a host restart as aborted. */
   private async reconcileRuns(): Promise<void> {
-    const records = await this.events.readAll();
-    const settledRunIds = new Set<string>();
-    const firedRuns = new Map<string, string>();
-    for (const record of records) {
-      if (record.type === "task_settled" && typeof record.runId === "string" && record.runId.length > 0) {
-        settledRunIds.add(record.runId);
-      } else if (record.type === "schedule_run_fired" && typeof record.runId === "string" && typeof record.prompt === "string") {
-        firedRuns.set(record.runId, record.prompt);
-      }
-    }
     let tasksPath: string;
     try {
       tasksPath = await ensureTasksDirectory(this.workspace);
@@ -404,129 +390,81 @@ export class WorkspaceTasks {
       this.report(error);
       return;
     }
-    await this.reconcileRunDirectories(tasksPath, settledRunIds);
-    await this.recoverFiredOccurrences(tasksPath, settledRunIds, firedRuns);
-  }
-
-  private async reconcileRunDirectories(tasksPath: string, settledRunIds: Set<string>): Promise<void> {
     for (const entry of await readDirEntries(tasksPath)) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      if (settledRunIds.has(entry.name)) continue;
       const runDirectory = path.join(tasksPath, entry.name);
-      let resultRaw: string | undefined;
       try {
-        resultRaw = await readFile(path.join(runDirectory, RESULT_FILE), "utf8");
+        await lstat(path.join(runDirectory, RESULT_FILE));
+        continue;
       } catch (error) {
         if (!isMissing(error)) {
           this.report(error);
           continue;
         }
-      }
-      if (resultRaw !== undefined) {
-        const prompt = await readFile(path.join(runDirectory, PROMPT_FILE), "utf8").catch(() => undefined);
-        const result = parseSettledResult(resultRaw);
-        await this.events.emit({
-          type: "task_settled",
-          runId: entry.name,
-          ...(prompt !== undefined ? { prompt } : {}),
-          status: result.status,
-          exitCode: result.exitCode,
-          ...defined({ stderr: result.stderr }),
-        });
-        continue;
       }
       try {
         await lstat(path.join(runDirectory, PROMPT_FILE));
-      } catch (promptError) {
-        if (isMissing(promptError)) {
+      } catch (error) {
+        if (isMissing(error)) {
           await rm(runDirectory, { recursive: true, force: true }).catch(() => {});
           continue;
         }
-        this.report(promptError);
+        this.report(error);
         continue;
       }
-      await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({ status: "aborted" }), { encoding: "utf8", mode: 0o600 });
-      await this.events.emit({
-        type: "task_settled",
-        runId: entry.name,
-        status: "aborted",
-        exitCode: null,
-      });
+      await writeTaskArtifact(runDirectory, RESULT_FILE, JSON.stringify({ status: "aborted" }));
     }
   }
 
-  private async recoverFiredOccurrences(tasksPath: string, settledRunIds: Set<string>, firedRuns: Map<string, string>): Promise<void> {
-    for (const [runId, prompt] of firedRuns) {
-      if (settledRunIds.has(runId)) continue;
-      try {
-        await lstat(path.join(tasksPath, runId));
-        continue;
-      } catch (error) {
-        if (!isMissing(error)) {
-          this.report(error);
-          continue;
-        }
-      }
-      await this.spawn(prompt, undefined, runId).catch((error) => this.report(error));
-    }
-  }
-
-  /** Records the outcome, appends the system event, and sends the agent a completion followup. */
   private async settleTask(
     workspace: string,
-    task: { runId: string; prompt: string; origin?: string | undefined },
+    task: TaskRun,
     runDirectory: string,
     result: PiRunResult,
   ): Promise<void> {
     const status: "done" | "failed" | "aborted" = result.signal !== null ? "aborted" : result.code === 0 ? "done" : "failed";
     const stderr = status === "failed" ? errorMessage(result.stderr) : undefined;
     if (status === "done" && result.stdout.trim().length > 0) {
-      await writeFile(path.join(runDirectory, OUTPUT_FILE), result.stdout, { encoding: "utf8", mode: 0o600 });
+      await writeTaskArtifact(runDirectory, OUTPUT_FILE, result.stdout);
     }
-    await writeFile(path.join(runDirectory, RESULT_FILE), JSON.stringify({
+    await writeTaskArtifact(runDirectory, RESULT_FILE, JSON.stringify({
       status,
       exitCode: result.code,
       signal: result.signal,
       ...defined({ stderr }),
-    }), { encoding: "utf8", mode: 0o600 });
-    const emitted = await this.events.emit({
-      type: "task_settled",
+    }));
+    await this.timeline.publish({
+      type: "task_finished",
       runId: task.runId,
+      trigger: task.trigger,
       prompt: task.prompt,
       status,
       exitCode: result.code,
-      ...defined({ origin: task.origin, stderr }),
+      ...defined({ stderr }),
     });
-    if (emitted === undefined) {
-      this.report(new Error(`Could not persist task_settled for run ${task.runId}`));
-    }
   }
 
-  /** Emits a task_progress event while tasks run; silent when everything is idle. */
   private heartbeat(): void {
     if (this.inFlight.length === 0) return;
     const now = this.now();
-    const byOrigin = new Map<string | undefined, InFlightTask[]>();
+    const groups = new Map<string, { trigger: Extract<TaskTrigger, { kind: "agent" }>; tasks: InFlightTask[] }>();
     for (const task of this.inFlight) {
-      const list = byOrigin.get(task.origin) ?? [];
-      list.push(task);
-      byOrigin.set(task.origin, list);
+      if (task.trigger.kind !== "agent") continue;
+      const { chatId, threadId } = task.trigger.agent;
+      const key = `${chatId}:${threadId}`;
+      const group = groups.get(key) ?? { trigger: task.trigger, tasks: [] };
+      group.tasks.push(task);
+      groups.set(key, group);
     }
-    for (const [origin, tasksList] of byOrigin) {
-      const tasks = tasksList.map((task) => {
+    for (const { trigger, tasks: running } of groups.values()) {
+      const tasks = running.map((task) => {
         const { at, text } = task.worker.activity();
         const runningMs = Math.max(0, now - task.startedAt);
         const idleMs = at > 0 ? Math.max(0, now - at) : null;
         const lastOutput = text.trim().length > 0 ? truncate(text.trim(), MAX_QUOTE_LENGTH) : undefined;
-        return {
-          runId: task.runId,
-          prompt: task.prompt,
-          runningMs,
-          idleMs,
-          ...defined({ lastOutput }),
-        };
+        return { runId: task.runId, prompt: task.prompt, runningMs, idleMs, ...defined({ lastOutput }) };
       });
-      void this.events.publish({ type: "task_progress", ...defined({ origin }), tasks }).catch((error) => this.report(error));
+      this.timeline.notify({ type: "task_progress", trigger, tasks });
     }
   }
 

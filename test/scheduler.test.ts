@@ -1,251 +1,165 @@
-import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { WorkspaceTimeline } from "../src/events.js";
 import { WorkspaceScheduler, type WorkspaceSchedulerOptions } from "../src/scheduler.js";
-import { WorkspaceEventLog } from "../src/events.js";
-import { defined } from "../src/util.js";
 import type { ScheduleRow } from "../src/schedule-protocol.js";
 
-const NOW = Date.parse("2026-01-10T12:30:00.000Z");
+const temporaryDirectories: string[] = [];
+const NOW = Date.parse("2026-01-10T12:00:00.000Z");
 
-async function temporaryDirectory(): Promise<string> {
-  return mkdtemp(path.join(os.tmpdir(), "tg-bot2-workspace-scheduler-"));
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+async function fixture(): Promise<string> {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "scheduler-test-"));
+  temporaryDirectories.push(dataDir);
+  await mkdir(path.join(dataDir, "workspace"), { recursive: true });
+  await writeFile(path.join(dataDir, "timeline.jsonl"), "", "utf8");
+  return dataDir;
+}
+
+async function writeSchedules(dataDir: string, schedules: ScheduleRow[]): Promise<void> {
+  await writeFile(path.join(dataDir, "workspace", ".schedules.json"), JSON.stringify({ version: 1, schedules }), "utf8");
+}
+
+async function timeline(dataDir: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(path.join(dataDir, "timeline.jsonl"), "utf8");
+  return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function row(overrides: Partial<ScheduleRow> = {}): ScheduleRow {
-  return { prompt: "water the plants", start: "2026-01-10T12:00:00.000Z", recurrence: null, ...overrides };
-}
-
-async function writeSchedules(dataDir: string, schedules: unknown): Promise<string> {
-  const metadata = path.join(dataDir, "workspace", ".tg-bot");
-  await mkdir(metadata, { recursive: true });
-  const filePath = path.join(metadata, "schedules.json");
-  await writeFile(filePath, JSON.stringify({ version: 1, schedules }), "utf8");
-  return filePath;
-}
-
-async function logEvents(dataDir: string): Promise<Array<Record<string, unknown>>> {
-  const filePath = path.join(dataDir, "events.jsonl");
-  const contents = await readFile(filePath, "utf8").catch(() => "");
-  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
-}
-
-async function withDirectory(test: (dataDir: string) => Promise<void>): Promise<void> {
-  const dataDir = await temporaryDirectory();
-  try {
-    await test(dataDir);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-}
-
-function makeScheduler(
-  dataDir: string,
-  options: Partial<WorkspaceSchedulerOptions> = {},
-): { scheduler: WorkspaceScheduler; events: WorkspaceEventLog } {
-  const defaultWorkspace = path.join(dataDir, "workspace");
-  const defaultEvents = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
-  const {
-    workspace = defaultWorkspace,
-    events = defaultEvents,
-    now = () => NOW,
-    ...rest
-  } = options;
-  const scheduler = new WorkspaceScheduler({
-    workspace,
-    events,
-    now,
-    ...defined(rest),
-  });
-  return { scheduler, events };
-}
-
-function fakeInterval() {
-  const callbacks: Array<() => void> = [];
   return {
-    callbacks,
-    setIntervalMock: vi.fn((callback: () => void) => {
-      callbacks.push(callback);
-      return callbacks.length;
-    }),
-    clearIntervalMock: vi.fn(),
+    prompt: "water the plants",
+    start: "2026-01-10T11:00:00.000Z",
+    recurrence: null,
+    ...overrides,
   };
 }
 
-afterEach(() => {
-  vi.restoreAllMocks();
-});
+function makeScheduler(dataDir: string, overrides: Partial<WorkspaceSchedulerOptions> = {}): { scheduler: WorkspaceScheduler; fireTask: ReturnType<typeof vi.fn>; errors: unknown[] } {
+  const fireTask = vi.fn(async () => {});
+  const errors: unknown[] = [];
+  const scheduler = new WorkspaceScheduler({
+    workspace: path.join(dataDir, "workspace"),
+    statePath: path.join(dataDir, "scheduler-state.json"),
+    timeline: new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl")),
+    fireTask,
+    now: () => NOW,
+    logger: (error) => errors.push(error),
+    ...overrides,
+  });
+  return { scheduler, fireTask, errors };
+}
 
-describe("WorkspaceScheduler firing", () => {
-  it("fires a due schedule and appends schedule_run_fired to events.jsonl", () => withDirectory(async (dataDir) => {
+describe("WorkspaceScheduler", () => {
+  it("fires a due one-shot once and records only the meaningful firing", async () => {
+    const dataDir = await fixture();
     await writeSchedules(dataDir, [row()]);
+    const first = makeScheduler(dataDir);
+
+    await first.scheduler.poll(NOW);
+    expect(first.fireTask).toHaveBeenCalledWith(expect.any(String), "water the plants");
+    expect(await timeline(dataDir)).toMatchObject([{
+      type: "schedule_fired",
+      occurrenceId: expect.any(String),
+      prompt: "water the plants",
+      dueAt: "2026-01-10T11:00:00.000Z",
+    }]);
+
+    await first.scheduler.poll(NOW);
+    const restarted = makeScheduler(dataDir);
+    await restarted.scheduler.poll(NOW);
+    expect(first.fireTask).toHaveBeenCalledOnce();
+    expect(restarted.fireTask).not.toHaveBeenCalled();
+    expect(await timeline(dataDir)).toHaveLength(1);
+  });
+
+  it("advances a recurring row to the next future occurrence", async () => {
+    const dataDir = await fixture();
+    await writeSchedules(dataDir, [row({ recurrence: "daily", start: "2026-01-08T12:00:00.000Z" })]);
+    const { scheduler, fireTask } = makeScheduler(dataDir);
+
+    await scheduler.poll(NOW);
+    expect(fireTask).toHaveBeenCalledOnce();
+    const state = JSON.parse(await readFile(path.join(dataDir, "scheduler-state.json"), "utf8")) as { rows: Array<{ nextDueAt: string }> };
+    expect(state.rows[0]?.nextDueAt).toBe("2026-01-11T12:00:00.000Z");
+
+    await scheduler.poll(Date.parse("2026-01-11T12:00:00.000Z"));
+    expect(fireTask).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops state for removed rows and treats edited rows as new intent", async () => {
+    const dataDir = await fixture();
+    await writeSchedules(dataDir, [row({ start: "2026-01-11T12:00:00.000Z" })]);
     const { scheduler } = makeScheduler(dataDir);
-
     await scheduler.poll(NOW);
 
-    const events = await logEvents(dataDir);
-    expect(events).toMatchObject([
-      { type: "schedule_run_scheduled", prompt: "water the plants" },
-      { type: "schedule_run_fired", prompt: "water the plants" },
-    ]);
-  }));
-
-  it("advances a recurring schedule after firing", () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, [row({ recurrence: "daily", start: "2026-01-10T12:00:00.000Z" })]);
-    const { scheduler } = makeScheduler(dataDir);
-
+    await writeSchedules(dataDir, [row({ prompt: "water the garden", start: "2026-01-12T12:00:00.000Z" })]);
     await scheduler.poll(NOW);
+    const state = JSON.parse(await readFile(path.join(dataDir, "scheduler-state.json"), "utf8")) as { rows: Array<{ key: string; nextDueAt: string }> };
+    expect(state.rows).toHaveLength(1);
+    expect(state.rows[0]?.key).toContain("water the garden");
+    expect(state.rows[0]?.nextDueAt).toBe("2026-01-12T12:00:00.000Z");
+  });
 
-    const events = await logEvents(dataDir);
-    const scheduled = events.filter((e) => e.type === "schedule_run_scheduled");
-    expect(scheduled).toHaveLength(2);
-    expect(scheduled[1]).toMatchObject({ dueAt: "2026-01-11T12:00:00.000Z" });
-    const fired = events.filter((e) => e.type === "schedule_run_fired");
-    expect(fired).toHaveLength(1);
-  }));
-
-  it("cancels runs whose row vanished from schedules.json", () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, [row({ prompt: "row-1", start: "2026-01-10T14:00:00.000Z" })]);
-    const { scheduler } = makeScheduler(dataDir);
-
+  it("ignores missing schedules and reports malformed schedules", async () => {
+    const dataDir = await fixture();
+    const { scheduler, errors } = makeScheduler(dataDir);
     await scheduler.poll(NOW);
-    expect((await logEvents(dataDir)).filter((e) => e.type === "schedule_run_scheduled")).toHaveLength(1);
+    expect(errors).toEqual([]);
 
-    await writeSchedules(dataDir, []);
-    await scheduler.poll(NOW);
-
-    const events = await logEvents(dataDir);
-    expect(events.filter((e) => e.type === "schedule_run_cancelled")).toHaveLength(1);
-  }));
-
-  it("replaces a run when its prompt or start changes", () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, [row({ prompt: "original", start: "2026-01-10T14:00:00.000Z" })]);
-    const { scheduler } = makeScheduler(dataDir);
-
-    await scheduler.poll(NOW);
-    await writeSchedules(dataDir, [row({ prompt: "updated", start: "2026-01-10T14:00:00.000Z" })]);
-    await scheduler.poll(NOW);
-
-    const events = await logEvents(dataDir);
-    expect(events.filter((e) => e.type === "schedule_run_cancelled")).toHaveLength(1);
-    expect(events.filter((e) => e.type === "schedule_run_scheduled")).toHaveLength(2);
-  }));
-
-  it("ignores missing schedules.json quietly", () => withDirectory(async (dataDir) => {
-    const { scheduler } = makeScheduler(dataDir);
-    await expect(scheduler.poll(NOW)).resolves.toBeUndefined();
-    expect(await logEvents(dataDir)).toHaveLength(0);
-  }));
-
-  it("recovers state from events.jsonl at boot without duplicate runs", () => withDirectory(async (dataDir) => {
-    await writeSchedules(dataDir, [row()]);
-    const { scheduler: scheduler1 } = makeScheduler(dataDir);
-    await scheduler1.poll(NOW);
-    const events1 = await logEvents(dataDir);
-    expect(events1.filter((e) => e.type === "schedule_run_fired")).toHaveLength(1);
-
-    const { scheduler: scheduler2 } = makeScheduler(dataDir);
-    await scheduler2.poll(NOW);
-    const events2 = await logEvents(dataDir);
-    expect(events2.filter((e) => e.type === "schedule_run_fired")).toHaveLength(1);
-  }));
-});
-
-describe("WorkspaceScheduler validation", () => {
-  it("rejects non-positive or non-timer-safe intervals", () => withDirectory(async (dataDir) => {
-    const workspace = path.join(dataDir, "workspace");
-    const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
-    expect(() => new WorkspaceScheduler({ workspace, events, pollIntervalMs: 0 })).toThrow("positive timer-safe integer");
-    expect(() => new WorkspaceScheduler({ workspace, events, pollIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
-  }));
-
-  it("reports malformed schedules.json to logger", () => withDirectory(async (dataDir) => {
-    const metadata = path.join(dataDir, "workspace", ".tg-bot");
-    await mkdir(metadata, { recursive: true });
-    await writeFile(path.join(metadata, "schedules.json"), "{ invalid json", "utf8");
-    const errors: unknown[] = [];
-    const { scheduler } = makeScheduler(dataDir, { logger: (e: unknown) => errors.push(e) });
-
+    await writeFile(path.join(dataDir, "workspace", ".schedules.json"), "not json", "utf8");
     await scheduler.poll(NOW);
     expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Malformed schedules");
-  }));
-});
+  });
 
-describe("WorkspaceScheduler durability", () => {
-  it("reports a FIFO at schedules.json instead of blocking on it", () => withDirectory(async (dataDir) => {
-    const metadata = path.join(dataDir, "workspace", ".tg-bot");
-    await mkdir(metadata, { recursive: true });
-    execFileSync("mkfifo", [path.join(metadata, "schedules.json")]);
-    const errors: unknown[] = [];
-    const { scheduler } = makeScheduler(dataDir, { logger: (e: unknown) => errors.push(e) });
-
-    await scheduler.poll(NOW);
-
-    expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Could not read schedules");
-    expect(await logEvents(dataDir)).toHaveLength(0);
-  }));
-
-  it("reports an oversized schedules.json as an explicit error", () => withDirectory(async (dataDir) => {
-    const filePath = await writeSchedules(dataDir, []);
-    await truncate(filePath, 1024 * 1024 + 1);
-    const errors: unknown[] = [];
-    const { scheduler } = makeScheduler(dataDir, { logger: (e: unknown) => errors.push(e) });
-
-    await scheduler.poll(NOW);
-
-    expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Could not read schedules");
-    expect((errors[0] as { cause?: { message?: string } }).cause?.message).toContain("exceeds");
-    expect(await logEvents(dataDir)).toHaveLength(0);
-  }));
-
-  it("does not schedule a run whose schedule_run_scheduled did not persist", () => withDirectory(async (dataDir) => {
+  it("does not fire when its current-state snapshot cannot be saved", async () => {
+    const dataDir = await fixture();
     await writeSchedules(dataDir, [row()]);
-    const errors: unknown[] = [];
-    const fireTask = vi.fn(async () => {});
-    const { scheduler, events } = makeScheduler(dataDir, { fireTask, logger: (e: unknown) => errors.push(e) });
-    vi.spyOn(events, "emit").mockResolvedValue(undefined);
+    const blocked = path.join(dataDir, "blocked");
+    await writeFile(blocked, "not a directory", "utf8");
+    const { scheduler, fireTask, errors } = makeScheduler(dataDir, { statePath: path.join(blocked, "scheduler-state.json") });
 
     await scheduler.poll(NOW);
-
     expect(fireTask).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Could not persist schedule_run_scheduled");
-    expect(await logEvents(dataDir)).toHaveLength(0);
-  }));
+    expect(await timeline(dataDir)).toEqual([]);
+  });
 
-  it("does not launch the task when schedule_run_fired did not persist", () => withDirectory(async (dataDir) => {
+  it("coalesces concurrent polls", async () => {
+    const dataDir = await fixture();
     await writeSchedules(dataDir, [row()]);
-    const errors: unknown[] = [];
-    const fireTask = vi.fn(async () => {});
-    const { scheduler, events } = makeScheduler(dataDir, { fireTask, logger: (e: unknown) => errors.push(e) });
-    const emitSpy = vi.spyOn(events, "emit");
-    emitSpy.mockImplementationOnce(async () => "scheduled-line").mockImplementationOnce(async () => undefined);
+    const { scheduler, fireTask } = makeScheduler(dataDir);
+    await Promise.all([scheduler.poll(NOW), scheduler.poll(NOW), scheduler.poll(NOW)]);
+    expect(fireTask).toHaveBeenCalledOnce();
+  });
 
-    await scheduler.poll(NOW);
+  it("rejects invalid poll intervals", async () => {
+    const dataDir = await fixture();
+    const base = {
+      workspace: path.join(dataDir, "workspace"),
+      statePath: path.join(dataDir, "scheduler-state.json"),
+      timeline: new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl")),
+    };
+    expect(() => new WorkspaceScheduler({ ...base, pollIntervalMs: 0 })).toThrow("positive timer-safe integer");
+    expect(() => new WorkspaceScheduler({ ...base, pollIntervalMs: 2_147_483_648 })).toThrow("positive timer-safe integer");
+  });
 
-    expect(fireTask).not.toHaveBeenCalled();
-    expect(errors).toHaveLength(1);
-    expect((errors[0] as Error).message).toContain("Could not persist schedule_run_fired");
-  }));
-});
-
-describe("WorkspaceScheduler lifecycle", () => {
-  it("starts periodic timer and stops cleanly", () => withDirectory(async (dataDir) => {
-    const interval = fakeInterval();
-    const { scheduler } = makeScheduler(dataDir, {
-      setInterval: interval.setIntervalMock as unknown as typeof setInterval,
-      clearInterval: interval.clearIntervalMock as unknown as typeof clearInterval,
-    });
+  it("starts once and stops its polling timer", async () => {
+    const dataDir = await fixture();
+    const timer = { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
+    const setIntervalFn = vi.fn(() => timer);
+    const clearIntervalFn = vi.fn();
+    const { scheduler } = makeScheduler(dataDir, { setInterval: setIntervalFn as unknown as typeof setInterval, clearInterval: clearIntervalFn as unknown as typeof clearInterval });
 
     await scheduler.start();
-    expect(interval.setIntervalMock).toHaveBeenCalledOnce();
-
+    await scheduler.start();
+    expect(setIntervalFn).toHaveBeenCalledOnce();
     await scheduler.stop();
-    expect(interval.clearIntervalMock).toHaveBeenCalledOnce();
-  }));
+    expect(clearIntervalFn).toHaveBeenCalledWith(timer);
+  });
 });

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import {
   buildPiRunBwrapArgs,
   type PiRunSandboxPaths,
@@ -37,6 +38,7 @@ const DEFAULT_STOP_GRACE_MS = 1_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
 const MAX_ACTIVITY_TEXT = 240;
+const STEER_CONTINUATION = "Continue from the latest user instruction without repeating completed work.";
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -91,7 +93,6 @@ async function prepareWorkspace(workspace: string): Promise<void> {
     ".pi",
     ".pi/agent",
     ".pi/sessions",
-    ".tg-bot",
     ".cache",
     ".cache/npm",
     ".cache/uv",
@@ -126,6 +127,8 @@ export class PiWorker {
   private lastActivity = "";
   private isBusyState = false;
   private idleTimer: NodeJS.Timeout | undefined;
+  private steerWaitTimer: NodeJS.Timeout | undefined;
+  private steerWaitExpiresAt: number | undefined;
   private startPromise: Promise<void> | undefined;
   private exitPromise: Promise<PiRunResult> | undefined;
   private readonly settledResolvers = new Set<(result: PiRunResult) => void>();
@@ -214,8 +217,10 @@ export class PiWorker {
         model: this.options.model,
         thinkingLevel: this.options.thinkingLevel,
         hostTools: this.options.hostTools,
+        agentToken: this.options.agentToken,
         hostSocketDir: this.options.hostSocketDir,
-        hostEventsLog: this.options.hostEventsLog,
+        hostTimeline: this.options.hostTimeline,
+        hostAttachments: this.options.hostAttachments,
         taskRun: this.options.taskRun,
       }),
     });
@@ -234,9 +239,10 @@ export class PiWorker {
 
     this.exitPromise = new Promise<PiRunResult>((resolve) => {
       let buffer = "";
-      child.stdout?.on("data", (chunk: Buffer | string) => {
-        this.noteActivity(chunk);
-        const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
+      const consumeStdout = (text: string): void => {
+        if (text.length === 0) return;
         this.stdout = boundedCapture(this.stdout, text);
         buffer += text;
         const lines = buffer.split("\n");
@@ -246,16 +252,27 @@ export class PiWorker {
           if (trimmed.length === 0) continue;
           this.handleStdoutLine(trimmed);
         }
+      };
+      const consumeStderr = (text: string): void => {
+        if (text.length === 0) return;
+        this.noteActivity(text);
+        this.stderr = boundedCapture(this.stderr, text);
+      };
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        consumeStdout(typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk));
       });
       child.stderr?.on("data", (chunk: Buffer | string) => {
-        this.noteActivity(chunk);
-        this.stderr = boundedCapture(this.stderr, chunk);
+        consumeStderr(typeof chunk === "string" ? chunk : stderrDecoder.write(chunk));
       });
-      child.once("exit", (code, signal) => {
+      child.once("error", (error) => consumeStderr(asError(error).message));
+      child.once("close", (code, signal) => {
+        consumeStdout(stdoutDecoder.end());
+        consumeStderr(stderrDecoder.end());
         if (buffer.trim().length > 0) {
           this.handleStdoutLine(buffer.trim());
         }
         this.clearIdleTimer();
+        this.clearSteerWaitTimer();
         this.isBusyState = false;
         this.process = undefined;
         const result: PiRunResult = { code, signal, stderr: this.stderr, stdout: this.stdout };
@@ -267,9 +284,9 @@ export class PiWorker {
     if (this.stopped) {
       // stop() arrived before the spawn finished; never let this run go on.
       await this.terminateProcess(child);
+      return;
     }
 
-    // Configure steering mode and follow-up mode to "all" on RPC startup
     this.writeJson({ id: "init-steer", type: "set_steering_mode", mode: "all" });
     this.writeJson({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
 
@@ -278,17 +295,23 @@ export class PiWorker {
 
   private handleStdoutLine(line: string): void {
     try {
-      const event = JSON.parse(line) as { type?: string };
+      const event = JSON.parse(line) as { id?: unknown; type?: unknown; success?: unknown; error?: unknown; steering?: unknown };
+      if (event.type === "response") return;
+      if (event.type === "queue_update" && Array.isArray(event.steering) && event.steering.length === 0) {
+        this.clearSteerWaitTimer();
+      }
+      this.noteActivity(line);
       if (event.type === "agent_start" || event.type === "turn_start") {
         this.isBusyState = true;
         this.clearIdleTimer();
       } else if (event.type === "agent_settled") {
         this.isBusyState = false;
+        this.clearSteerWaitTimer();
         this.armIdleTimer();
         this.resolveSettled({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
       }
     } catch {
-      // Non-JSON stdout lines are activity only
+      this.noteActivity(line);
     }
   }
 
@@ -313,11 +336,13 @@ export class PiWorker {
   }
 
 
-  async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+
+  async prompt(message: string, streamingBehavior?: "steer" | "followUp", maxWaitMs?: number): Promise<void> {
     if (!this.isAlive()) {
       if (this.stopped) return;
       await this.start();
     }
+    const queued = this.isBusyState && streamingBehavior === "steer";
     this.isBusyState = true;
     this.clearIdleTimer();
     this.noteActivity(message);
@@ -327,10 +352,33 @@ export class PiWorker {
       message,
       ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
     });
+    if (wrote && queued && maxWaitMs !== undefined) this.armSteerWaitTimer(maxWaitMs);
     if (wrote && !this.initialPromptWritten) {
       this.initialPromptWritten = true;
       this.options.onInitialPromptWritten?.();
     }
+  }
+
+  private armSteerWaitTimer(maxWaitMs: number): void {
+    const expiresAt = this.now() + maxWaitMs;
+    if (this.steerWaitExpiresAt !== undefined && this.steerWaitExpiresAt <= expiresAt) return;
+    this.clearSteerWaitTimer();
+    const child = this.process;
+    this.steerWaitExpiresAt = expiresAt;
+    this.steerWaitTimer = this.setTimeoutFn(() => {
+      this.steerWaitTimer = undefined;
+      this.steerWaitExpiresAt = undefined;
+      if (this.process !== child || !this.isBusyState || !this.isAlive()) return;
+      this.writeJson({ id: randomUUID(), type: "abort" });
+      this.writeJson({ id: randomUUID(), type: "prompt", message: STEER_CONTINUATION, streamingBehavior: "steer" });
+    }, maxWaitMs);
+    this.steerWaitTimer.unref?.();
+  }
+
+  private clearSteerWaitTimer(): void {
+    if (this.steerWaitTimer !== undefined) this.clearTimeoutFn(this.steerWaitTimer);
+    this.steerWaitTimer = undefined;
+    this.steerWaitExpiresAt = undefined;
   }
 
   waitForSettled(): Promise<PiRunResult> {
@@ -348,6 +396,7 @@ export class PiWorker {
   async close(): Promise<void> {
     if (this.closing) return this.exitPromise ? this.exitPromise.then(() => {}) : Promise.resolve();
     this.closing = true;
+    this.clearSteerWaitTimer();
     this.clearIdleTimer();
     const child = this.process;
     if (!child || !this.isAlive()) return Promise.resolve();
@@ -371,6 +420,7 @@ export class PiWorker {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.clearSteerWaitTimer();
     this.clearIdleTimer();
     let child = this.process;
     if (!child) {

@@ -1,47 +1,42 @@
-import type { Dirent } from "node:fs";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
-import { TG_BOT_DIR, defined, parseOrigin } from "./util.js";
+import { conversationAgent, sameConversation, type ConversationAgentRef } from "./agent-ref.js";
+import type { AgentCredentials } from "./host-bridge.js";
+import { defined } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
-import { EVENTS_PROMPT, WorkspaceEventLog, type BotEvent } from "./events.js";
+import { TIMELINE_PROMPT, type BotEvent } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 import { TASKS_PROMPT } from "./task-protocol.js";
 import { isMessageDirectedToBot, isBotGroupAdd } from "./telegram.js";
 
 export const SYSTEM_PROMPT = [
-`You are a persistent personal agent reached through Telegram serving multiple chats concurrently.
-Direct assistant text output is not delivered to Telegram — you must call the send tool with the target chat_id to communicate.
-Your writable workspace is /workspace; runtime/sessions live under /workspace/.pi. Attachments are downloaded to /workspace/attachments/<chat_id>/...
-To automate a browser, launch Chrome yourself inside your sandbox: /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --user-data-dir=/workspace/.browser/profile & then drive it with puppeteer-core over http://127.0.0.1:9222 (import puppeteer from 'puppeteer-core' resolves anywhere under /workspace). It keeps running between your turns and dies with this session when it idles out.
-Install project extensions with pi install <pkg> -l --approve; project settings live at /workspace/.pi/settings.json.
+`You are a persistent personal Telegram agent serving several chats.
+Assistant text is not delivered; communicate with users through send. Conversation agents default to the current chat and topic.
+The writable workspace is /workspace. Sessions and agent state live under /workspace/.pi. Host-managed attachments are read-only under /run/attachments; copy one into /workspace before editing it.
+For browser automation, launch /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --user-data-dir=/workspace/.browser/profile, then connect with puppeteer-core at http://127.0.0.1:9222. The browser survives turns and stops with the session.
+Install project extensions with pi install <pkg> -l --approve. Project settings live at /workspace/.pi/settings.json.
 `,
   OUTBOX_PROMPT,
-  EVENTS_PROMPT,
+  TIMELINE_PROMPT,
   SCHEDULES_PROMPT,
   TASKS_PROMPT,
-  `Keep Telegram-facing answers concise unless the user asks for detail.
-Responsiveness & Multi-Chat Orchestration:
-- Never leave users hanging on long queries. For multi-step research or deep tasks, send a quick acknowledgment via the send tool, spawn a background task (spawn tool), and finish your turn so the main loop stays responsive to other chats. Deliver findings when task_settled arrives.
-- Message formatting: Prefer parse_mode: "HTML" (using <b>, <i>, <code>, <pre>, <blockquote>, <a>, bullet points •) over raw markdown so messages render cleanly on Telegram.
-- Forum topics: When conversing in a topic (message_thread_id is present), rename it around message 2-3 to a short descriptive name distinct from the last 10 active topic names in events.jsonl using edit_forum_topic.
-- Allowlist & Status: /workspace/.tg-bot/allowed.json controls allowed chat IDs. /status reports current model, thinking level, and session info. Adjust model/thinking in /workspace/.pi/agent/settings.json.
-- Session continuity: Each worker starts fresh; past session files under /workspace/.pi/sessions and the events.jsonl timeline are your memory across restarts. An admin can /restart to apply settings changes.
-- Bash timeouts: always pass a timeout (seconds) to bash for anything that can hang (network calls, long builds, servers, interactive prompts). 300 is a sensible default; longer only with justification, and never omit it for commands you cannot prove finish quickly.
-- Context gathering hierarchy:
-  1. Thread context: if message_thread_id is present, query events.jsonl filtered by chat_id and message_thread_id (using grep, rq, or jq).
-  2. Chat context: if not in a thread or broader context is needed, query events.jsonl filtered by chat_id.
-  3. Global context: search unconstrained across events.jsonl for system events, tasks, or schedules.
-  Session files persist under /workspace/.pi/sessions/<chat_id>/<message_thread_id>/*.jsonl (with 0 for general/unthreaded chats; background tasks under /workspace/.pi/tasks/<runId>/sessions/). When referencing older history, search active thread sessions first, then the chat (<chat_id>/*), then root sessions.
+  `Behavior:
+- Keep Telegram replies concise unless the user asks for detail. Prefer HTML parse mode and Telegram-safe tags.
+- Keep chats responsive. If work needs sustained multi-step execution, acknowledge it, spawn a complete background task, then end the turn. Handle task_finished when it arrives.
+- Let a topic's subject emerge through conversation. When a short, useful name becomes clear—or materially changes—include topic_name in a normal sendMessage call. The host renames it in that same tool call. Never spend a separate tool call searching for or changing a topic name.
+- Read only the context needed: current thread in /run/timeline.jsonl, then its chat, then other chats. For older detail, search /workspace/.pi/sessions/<chat_id>/<message_thread_id>/ first, then sibling threads and root sessions. Background task sessions are under /workspace/.pi/tasks/<runId>/sessions/.
+- /workspace/.allowed.json controls chat access. /workspace/.pi/agent/settings.json controls model and thinking. /restart applies settings changes.
+- Always give bash commands that can hang an explicit timeout in seconds. Use 300 by default; increase it only when the operation requires more time.
 `,
 ].join("");
 
 export type AgentWorker = {
   isAlive(): boolean;
   isBusy(): boolean;
-  prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void>;
+  prompt(message: string, streamingBehavior?: "steer" | "followUp", maxWaitMs?: number): Promise<void>;
   waitForSettled(): Promise<unknown>;
   close(): Promise<void>;
   stop(): Promise<void>;
@@ -51,18 +46,20 @@ export type AgentWorker = {
 
 export type AgentWorkerOptions = {
   workspace: string;
-  sessionDir?: string;
+  sessionDir: string;
+  model?: string;
   appRoot: string;
   bwrapPath?: string;
   appendSystemPrompt?: string;
   hostTools?: string;
-  agentOrigin?: string;
+  agentToken: string;
   thinkingLevel?: string;
   idleTimeoutMs?: number;
+  stopGraceMs?: number;
   now?: () => number;
   hostSocketDir?: string;
-  hostEventsLog?: string;
-  /** Chat runs dial the full host socket (false); task runs get the restricted one (true). */
+  hostTimeline?: string;
+  hostAttachments?: string;
   taskRun?: boolean;
   spawnProcess: PiWorkerSpawn;
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
@@ -76,6 +73,7 @@ export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | 
 
 export type AgentManagerOptions = {
   appRoot: string;
+  credentials: AgentCredentials;
   bwrapPath?: string;
   workerFactory?: AgentWorkerFactory;
   spawnProcess: PiWorkerSpawn;
@@ -83,32 +81,18 @@ export type AgentManagerOptions = {
   stopGraceMs?: number;
   idleTimeoutMs?: number;
   hostSocketDir?: string;
-  hostEventsLog?: string;
+  hostTimeline?: string;
+  hostAttachments?: string;
   now?: () => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
-  events?: WorkspaceEventLog;
-};
-
-export type AgentStatus = {
-  model?: { provider: string; id: string };
-  thinkingLevel: string;
-  sessionFile?: string;
-  messageCount: number;
-  autoCompactionEnabled: boolean;
-  activeTasks?: number;
-  activeSchedules?: number;
-};
-export type AgentTarget = {
-  chatId?: number | undefined;
-  threadId?: number | undefined;
 };
 
 export type AgentNotifier = {
-  interrupt(text: string, target?: AgentTarget): Promise<void>;
-  followup(text: string, target?: AgentTarget): Promise<void>;
+  interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number): Promise<void>;
+  followup(text: string, target: ConversationAgentRef): Promise<void>;
 };
 
 function truncate(text: string, maxLength: number): string {
@@ -122,14 +106,13 @@ function formatDuration(milliseconds: number): string {
   return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
-function formatTaskSettledMessage(event: Extract<BotEvent, { type: "task_settled" }>): string {
+function formatTaskFinishedMessage(event: Extract<BotEvent, { type: "task_finished" }>): string {
   const outcome = event.status === "done"
     ? "finished"
     : event.status === "failed"
       ? `failed (exit ${event.exitCode ?? "unknown"})`
       : "aborted";
-  const promptText = event.prompt ? ` "${truncate(event.prompt, 100)}"` : "";
-  return `Task${promptText} ${outcome}. Run files: /workspace/.pi/tasks/${event.runId}/`;
+  return `Task "${truncate(event.prompt, 100)}" ${outcome}. Run files: /workspace/.pi/tasks/${event.runId}/`;
 }
 
 function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progress" }>["tasks"]): string {
@@ -147,13 +130,12 @@ function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progre
  * (interrupt vs followup vs ignore) and prompt formatting.
  */
 
-function originToTarget(origin?: string): AgentTarget | undefined {
-  const parsed = parseOrigin(origin);
-  if (!parsed || parsed.kind !== "chat") return undefined;
-  return {
-    chatId: parsed.chatId,
-    ...(parsed.threadId > 0 ? { threadId: parsed.threadId } : {}),
-  };
+function triggerConversation(event: { trigger: Extract<BotEvent, { type: "task_finished" | "task_progress" }>["trigger"] }): ConversationAgentRef | undefined {
+  return event.trigger.kind === "agent" ? event.trigger.agent : undefined;
+}
+
+function externalWritePrompt(rawLine: string): string {
+  return `Another agent successfully wrote to this conversation. The action is already complete; do not repeat it.\n${rawLine}\nContinue as the responsible agent for this conversation. Respond only if further action is appropriate.`;
 }
 
 export class AgentEventRouter {
@@ -176,18 +158,19 @@ export class AgentEventRouter {
       case "callback":
         await this.handleCallback(event, rawLine);
         break;
-      case "task_settled":
-        await this.handleTaskSettled(event);
+      case "task_finished":
+        await this.handleTaskFinished(event);
         break;
       case "task_progress":
         await this.handleTaskProgress(event);
+        break;
+      case "sent":
+        await this.handleSent(event, rawLine);
         break;
       case "my_chat_member":
         await this.handleMyChatMember(event);
         break;
       default:
-        // Send and browser outcomes reach the agent synchronously through the
-        // tool results; the events remain in the log as timeline history only.
         break;
     }
   }
@@ -197,23 +180,26 @@ export class AgentEventRouter {
     if (event.chat_id >= 0) return;
     if (!isBotGroupAdd(event.my_chat_member)) return;
     await this.notifier.followup(
-      `Bot was added to group or channel ${event.chat_id}. To allow it, add ${event.chat_id} to /workspace/.tg-bot/allowed.json.`,
-      { chatId: event.chat_id },
+      `Bot was added to group or channel ${event.chat_id}. To allow it, add ${event.chat_id} to /workspace/.allowed.json.`,
+      conversationAgent(event.chat_id),
     );
   }
 
-  private async handleTaskSettled(event: Extract<BotEvent, { type: "task_settled" }>): Promise<void> {
-    const originTarget = originToTarget(event.origin);
-    if (originTarget) {
-      await this.notifier.followup(formatTaskSettledMessage(event), originTarget);
-    }
+  private async handleTaskFinished(event: Extract<BotEvent, { type: "task_finished" }>): Promise<void> {
+    const target = triggerConversation(event);
+    if (target) await this.notifier.followup(formatTaskFinishedMessage(event), target);
   }
 
   private async handleTaskProgress(event: Extract<BotEvent, { type: "task_progress" }>): Promise<void> {
-    const originTarget = originToTarget(event.origin);
-    if (originTarget && event.tasks.length > 0) {
-      await this.notifier.followup(formatTaskProgressMessage(event.tasks), originTarget);
+    const target = triggerConversation(event);
+    if (target && event.tasks.length > 0) {
+      await this.notifier.followup(formatTaskProgressMessage(event.tasks), target);
     }
+  }
+
+  private async handleSent(event: Extract<BotEvent, { type: "sent" }>, rawLine: string): Promise<void> {
+    if (event.actor.kind === "conversation" && sameConversation(event.actor, event.target)) return;
+    await this.notifier.followup(externalWritePrompt(rawLine), event.target);
   }
 
   private async handleMessage(event: Extract<BotEvent, { type: "message" }>, rawLine: string): Promise<void> {
@@ -223,20 +209,21 @@ export class AgentEventRouter {
     if (isPrivate || (msg && isMessageDirectedToBot(msg, botInfo))) {
       const threadId = msg && typeof msg === "object" && "message_thread_id" in msg && typeof msg.message_thread_id === "number"
         ? msg.message_thread_id
-        : undefined;
-      await this.notifier.interrupt(rawLine, { chatId: event.chat_id, threadId });
+        : 0;
+      await this.notifier.interrupt(rawLine, conversationAgent(event.chat_id, threadId), USER_INTERRUPT_MAX_WAIT_MS);
     }
   }
 
   private async handleCallback(event: Extract<BotEvent, { type: "callback" }>, rawLine: string): Promise<void> {
     const query = event.callback_query as { message?: { message_thread_id?: number } } | undefined;
-    const threadId = query?.message?.message_thread_id;
-    await this.notifier.interrupt(rawLine, { chatId: event.chat_id, threadId });
+    const threadId = query?.message?.message_thread_id ?? 0;
+    await this.notifier.interrupt(rawLine, conversationAgent(event.chat_id, threadId), USER_INTERRUPT_MAX_WAIT_MS);
   }
 
 }
 
 const RESTART_SETTLE_CAP_MS = 30_000;
+export const USER_INTERRUPT_MAX_WAIT_MS = 2 * 60 * 1_000;
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
@@ -251,113 +238,22 @@ export async function loadUserSettings(workspace: string): Promise<Record<string
   }
 }
 
-async function readSessionSummary(sessionsDirectory: string): Promise<{
-  messageCount: number;
-  model: { provider: string; id: string } | undefined;
-  thinkingLevel: string | undefined;
-  sessionFile: string;
-} | undefined> {
-  const newest = await newestSessionFile(sessionsDirectory);
-  if (!newest) return undefined;
-  try {
-    const raw = await readFile(newest.fullPath, "utf8");
-    let messageCount = 0;
-    let model: { provider: string; id: string } | undefined;
-    let thinkingLevel: string | undefined;
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      let entry: unknown;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
-      const record = entry as Record<string, unknown>;
-      if (record.type === "message") messageCount += 1;
-      else if (record.type === "model_change" && typeof record.provider === "string" && typeof record.modelId === "string") {
-        model = { provider: record.provider, id: record.modelId };
-      } else if (record.type === "thinking_level_change" && typeof record.thinkingLevel === "string") {
-        thinkingLevel = record.thinkingLevel;
-      }
-    }
-    return { messageCount, model, thinkingLevel, sessionFile: newest.name };
-  } catch {
-    return undefined;
-  }
-}
-
-async function newestSessionFile(sessionsDirectory: string): Promise<{ fullPath: string; name: string; mtimeMs: number } | undefined> {
-  let newest: { fullPath: string; name: string; mtimeMs: number } | undefined;
-  async function walk(dir: string): Promise<void> {
-    let entries: Dirent[];
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await walk(fullPath);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        try {
-          const fileStat = await stat(fullPath);
-          if (!newest || fileStat.mtimeMs > newest.mtimeMs) {
-            newest = { fullPath, name: entry.name, mtimeMs: fileStat.mtimeMs };
-          }
-        } catch {}
-      }
-    }
-  }
-  await walk(sessionsDirectory);
-  return newest;
-}
-
-async function countActiveTasks(workspace: string): Promise<number | undefined> {
-  try {
-    const taskEntries = await readdir(path.join(workspace, ".pi", "tasks"), { withFileTypes: true });
-    let activeTasks = 0;
-    for (const entry of taskEntries) {
-      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      try {
-        await stat(path.join(workspace, ".pi", "tasks", entry.name, "result.json"));
-      } catch {
-        activeTasks += 1;
-      }
-    }
-    return activeTasks;
-  } catch {
-    return undefined;
-  }
-}
-
-async function countActiveSchedules(workspace: string): Promise<number | undefined> {
-  try {
-    const rawSchedules = await readFile(path.join(workspace, TG_BOT_DIR, "schedules.json"), "utf8");
-    const parsedSchedules = JSON.parse(rawSchedules) as { schedules?: unknown[] };
-    if (!Array.isArray(parsedSchedules.schedules)) return undefined;
-    return parsedSchedules.schedules.length;
-  } catch {
-    return undefined;
-  }
-}
 
 type ConversationWorkerEntry = {
+  actor: ConversationAgentRef;
   worker: AgentWorker | undefined;
+  token: string | undefined;
   serial: SerialQueue;
 };
 
-function conversationKey(chatId?: number, threadId?: number): string {
-  if (chatId === undefined) return "default";
-  return `${chatId}:${threadId ?? 0}`;
+function conversationKey(actor: ConversationAgentRef): string {
+  return `${actor.chatId}:${actor.threadId}`;
 }
-
 
 export class AgentManager {
   private readonly workspace: string;
   private readonly appRoot: string;
+  private readonly credentials: AgentCredentials;
   private readonly bwrapPath: string | undefined;
   private readonly spawnProcess: PiWorkerSpawn;
   private readonly terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
@@ -370,13 +266,15 @@ export class AgentManager {
   private readonly clearIntervalFn: typeof clearInterval | undefined;
   private readonly workerFactory: AgentWorkerFactory;
   private readonly hostSocketDir: string | undefined;
-  private readonly hostEventsLog: string | undefined;
+  private readonly hostTimeline: string | undefined;
+  private readonly hostAttachments: string | undefined;
   private readonly workers = new Map<string, ConversationWorkerEntry>();
-  private readonly events: WorkspaceEventLog | undefined;
   private shuttingDown = false;
+
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
     this.workspace = config.workspace;
     this.appRoot = options.appRoot;
+    this.credentials = options.credentials;
     this.bwrapPath = options.bwrapPath;
     this.spawnProcess = options.spawnProcess;
     this.terminateProcessGroup = options.terminateProcessGroup;
@@ -389,63 +287,50 @@ export class AgentManager {
     this.clearIntervalFn = options.clearInterval;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
     this.hostSocketDir = options.hostSocketDir;
-    this.hostEventsLog = options.hostEventsLog;
-    this.events = options.events;
+    this.hostTimeline = options.hostTimeline;
+    this.hostAttachments = options.hostAttachments;
   }
 
-  private getOrCreateEntry(chatId?: number, threadId?: number): ConversationWorkerEntry {
-    const key = conversationKey(chatId, threadId);
+  private getOrCreateEntry(actor: ConversationAgentRef): ConversationWorkerEntry {
+    const key = conversationKey(actor);
     let entry = this.workers.get(key);
     if (!entry) {
-      entry = {
-        worker: undefined,
-        serial: new SerialQueue(),
-      };
+      entry = { actor, worker: undefined, token: undefined, serial: new SerialQueue() };
       this.workers.set(key, entry);
     }
     return entry;
   }
 
-  /**
-   * Delivers a followup message to the targeted conversation worker using streaming followUp behavior.
-   */
-  async followup(text: string, target?: AgentTarget): Promise<void> {
+  async followup(text: string, target: ConversationAgentRef): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = this.getOrCreateEntry(target?.chatId, target?.threadId);
+    const entry = this.getOrCreateEntry(target);
     return entry.serial.run(async () => {
       if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(entry, target?.chatId, target?.threadId);
+      const worker = await this.ensureWorker(entry);
       await worker.prompt(text, "followUp");
     });
   }
 
-  /**
-   * Delivers an interrupt message to the targeted conversation worker using streaming steer behavior.
-   */
-  async interrupt(text: string, target?: AgentTarget): Promise<void> {
+  async interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = this.getOrCreateEntry(target?.chatId, target?.threadId);
+    const entry = this.getOrCreateEntry(target);
     return entry.serial.run(async () => {
       if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(entry, target?.chatId, target?.threadId);
-      await worker.prompt(text, "steer");
+      const worker = await this.ensureWorker(entry);
+      await worker.prompt(text, "steer", maxWaitMs);
     });
   }
 
-  /**
-   * Restarts every conversation worker: each active worker first waits for its current
-   * turn to settle (bounded by a hard 30s cap), then is closed, so the next message
-   * respawns it with the current settings while its session is still fresh. A worker
-   * whose close fails stays in the map and exit detection owns its cleanup.
-   * Used by the host /restart command to apply settings changes.
-   */
   async restartAll(): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
     await Promise.all(
       [...this.workers.values()].map(async (entry) => {
         await entry.serial.run(async () => {
           const worker = entry.worker;
-          if (!worker?.isAlive()) return;
+          if (!worker?.isAlive()) {
+            this.release(entry, worker);
+            return;
+          }
           await Promise.race([
             worker.waitForSettled(),
             new Promise<void>((resolve) => {
@@ -459,7 +344,7 @@ export class AgentManager {
             console.error("Agent restart close failed", error);
             return;
           }
-          entry.worker = undefined;
+          this.release(entry, worker);
         });
       }),
     );
@@ -471,7 +356,7 @@ export class AgentManager {
     this.workers.clear();
     const closes = entries.map((entry) => {
       const worker = entry.worker;
-      entry.worker = undefined;
+      this.release(entry, worker);
       return worker ? worker.close().catch((error) => console.error("Agent shutdown stop failed", error)) : Promise.resolve();
     });
     await Promise.all(closes);
@@ -481,46 +366,20 @@ export class AgentManager {
     await this.beginShutdown();
   }
 
-  async status(): Promise<AgentStatus> {
-    const workspace = this.workspace;
-    const settings = await loadUserSettings(workspace);
-    const sessionsDirectory = path.join(workspace, ".pi", "sessions");
-    let result: AgentStatus = {
-      thinkingLevel: typeof settings.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : "off",
-      messageCount: 0,
-      autoCompactionEnabled: (settings.autoCompaction as { enabled?: unknown } | undefined)?.enabled !== false,
-    };
-    const session = await readSessionSummary(sessionsDirectory);
-    if (session) {
-      result = {
-        ...defined({ model: session.model }),
-        thinkingLevel: session.thinkingLevel ?? result.thinkingLevel,
-        sessionFile: session.sessionFile,
-        messageCount: session.messageCount,
-        autoCompactionEnabled: result.autoCompactionEnabled,
-      };
-    }
-    const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
-    const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
-    if (!result.model && settingsProvider && settingsModel) {
-      result = { ...result, model: { provider: settingsProvider, id: settingsModel } };
-    }
-    const activeTasks = await countActiveTasks(workspace);
-    if (activeTasks !== undefined) result = { ...result, activeTasks };
-    const activeSchedules = await countActiveSchedules(workspace);
-    if (activeSchedules !== undefined) result = { ...result, activeSchedules };
-    return result;
+  private release(entry: ConversationWorkerEntry, worker?: AgentWorker): void {
+    if (worker && entry.worker !== worker) return;
+    if (entry.token) this.credentials.revoke(entry.token);
+    entry.token = undefined;
+    entry.worker = undefined;
   }
 
-  private async ensureWorker(entry: ConversationWorkerEntry, chatId?: number, threadId?: number): Promise<AgentWorker> {
-    if (entry.worker && entry.worker.isAlive()) {
-      return entry.worker;
-    }
-    const sessionSubdir = chatId !== undefined
-      ? path.join(".pi", "sessions", String(chatId), String(threadId ?? 0))
-      : path.join(".pi", "sessions");
+  private async ensureWorker(entry: ConversationWorkerEntry): Promise<AgentWorker> {
+    if (entry.worker?.isAlive()) return entry.worker;
+    this.release(entry, entry.worker);
 
-
+    const actor = entry.actor;
+    const token = this.credentials.issue(actor, ["send", "spawn", "steer_task", "cancel"]);
+    entry.token = token;
     const settings = await loadUserSettings(this.workspace);
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
     const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
@@ -529,8 +388,9 @@ export class AgentManager {
 
     const workerOptions: AgentWorkerOptions = {
       workspace: this.workspace,
-      sessionDir: `/workspace/${sessionSubdir}`,
+      sessionDir: `/workspace/${path.join(".pi", "sessions", String(actor.chatId), String(actor.threadId))}`,
       appRoot: this.appRoot,
+      agentToken: token,
       now: this.now,
       ...defined({
         bwrapPath: this.bwrapPath,
@@ -539,7 +399,8 @@ export class AgentManager {
         stopGraceMs: this.stopGraceMs,
         idleTimeoutMs: this.idleTimeoutMs,
         hostSocketDir: this.hostSocketDir,
-        hostEventsLog: this.hostEventsLog,
+        hostTimeline: this.hostTimeline,
+        hostAttachments: this.hostAttachments,
         setTimeout: this.setTimeoutFn,
         clearTimeout: this.clearTimeoutFn,
         setInterval: this.setIntervalFn,
@@ -548,17 +409,18 @@ export class AgentManager {
       appendSystemPrompt: SYSTEM_PROMPT,
       hostTools: "send,spawn,steer_task,cancel",
       taskRun: false,
-      agentOrigin: conversationKey(chatId, threadId),
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,
     };
 
-    const worker = await this.workerFactory(workerOptions);
-    worker.onReaped(() => {
-      if (entry.worker === worker) {
-        entry.worker = undefined;
-      }
-    });
+    let worker: AgentWorker;
+    try {
+      worker = await this.workerFactory(workerOptions);
+    } catch (error) {
+      this.release(entry);
+      throw error;
+    }
+    worker.onReaped(() => this.release(entry, worker));
     entry.worker = worker;
     return worker;
   }

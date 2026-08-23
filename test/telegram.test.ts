@@ -1,73 +1,50 @@
-import { execFile as execFileCallback, execFileSync } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it, vi, type Mock } from "vitest";
-import { appendFile, lstat, mkdtemp, mkdir, open as openFile, readFile, readdir, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 
-import { GrammyError, type Bot } from "grammy";
+import { InputFile, type Bot } from "grammy";
 import {
   createTelegramBot,
-  createTelegramForumTopic,
-  editTelegramForumTopic,
-  closeTelegramForumTopic,
-  reopenTelegramForumTopic,
-  deleteTelegramForumTopic,
-  deleteTelegramMessage,
-  formatStatus,
+  dispatchOutboxRequest,
   attachmentSource,
-  sendTelegramEditMessage,
-  sendTelegramLocation,
-  sendTelegramMediaGroup,
-  sendTelegramPoll,
-  sendTelegramReaction,
-  sendTelegramRichMessage,
-  sendWorkspaceFile,
-  splitTelegramText,
-  stopTelegramPoll,
+  registerBotCommands,
   TelegramDeliveryQueue,
 } from "../src/telegram.js";
-import { AgentEventRouter, type AgentStatus } from "../src/agent.js";
-import { appendEvents, WorkspaceEventLog } from "../src/events.js";
+import { AgentEventRouter } from "../src/agent.js";
+import { appendTimelineEvents, WorkspaceTimeline } from "../src/events.js";
 import { botPaths } from "../src/util.js";
 import { isBotGroupAdd, isMessageDirectedToBot } from "../src/telegram.js";
-import { resetAllowlistCache } from "../src/allowlist.js";
 
-const execFile = promisify(execFileCallback);
 function fakeBot() {
+  const raw = {
+    sendMessage: vi.fn(async () => ({ message_id: 123 })),
+    sendPhoto: vi.fn(async () => ({ message_id: 123 })),
+    sendAudio: vi.fn(async () => ({ message_id: 123 })),
+    sendVideo: vi.fn(async () => ({ message_id: 123 })),
+    sendVoice: vi.fn(async () => ({ message_id: 123 })),
+    sendDocument: vi.fn(async () => ({ message_id: 123 })),
+    sendMediaGroup: vi.fn(async () => [{ message_id: 11 }, { message_id: 12 }]),
+    editMessageText: vi.fn(async () => ({ message_id: 123 })),
+    editForumTopic: vi.fn(async () => true),
+    createForumTopic: vi.fn(async () => ({ message_thread_id: 105, name: "topic" })),
+  };
   return {
     api: {
-      deleteMessage: vi.fn(async () => true),
-      editMessageText: vi.fn(async () => ({ message_id: 123 })),
-      sendAudio: vi.fn(async () => ({ message_id: 123 })),
-      sendDocument: vi.fn(async () => ({ message_id: 123 })),
-      sendLocation: vi.fn(async () => ({ message_id: 123 })),
-      sendMediaGroup: vi.fn(async () => [{ message_id: 11 }, { message_id: 12 }]),
+      raw,
       sendMessage: vi.fn(async () => ({ message_id: 123 })),
-      sendPhoto: vi.fn(async () => ({ message_id: 123 })),
-      sendPoll: vi.fn(async () => ({ message_id: 123, poll: { id: "poll-9" } })),
-      sendVenue: vi.fn(async () => ({ message_id: 123 })),
-      sendVideo: vi.fn(async () => ({ message_id: 123 })),
-      sendVoice: vi.fn(async () => ({ message_id: 123 })),
-      setMessageReaction: vi.fn(async () => true),
-      stopPoll: vi.fn(async () => ({ id: "poll-9", question: "Q", options: [], total_voter_count: 0, is_closed: true })),
-      createForumTopic: vi.fn(async (_chatId: number, name: string) => ({ message_thread_id: 105, name })),
-      editForumTopic: vi.fn(async () => true),
-      closeForumTopic: vi.fn(async () => true),
-      reopenForumTopic: vi.fn(async () => true),
-      deleteForumTopic: vi.fn(async () => true),
+      getFile: vi.fn(async () => ({ file_path: "documents/report.txt" })),
+      setMyCommands: vi.fn(async () => true),
     },
   } as unknown as Bot;
 }
 async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
   const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-"));
-  resetAllowlistCache();
   try {
     await writeAllowedChats(workspace, [42]);
     await run(workspace);
   } finally {
-    resetAllowlistCache();
     await rm(workspace, { recursive: true, force: true });
   }
 }
@@ -75,7 +52,7 @@ function workspaceDir(dataDir: string): string {
   return botPaths(dataDir, 999).workspace;
 }
 async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(dataDir, "events.jsonl"), "utf8").catch(() => "");
+  const content = await readFile(path.join(dataDir, "timeline.jsonl"), "utf8").catch(() => "");
   const result: Record<string, unknown>[] = [];
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
@@ -92,10 +69,10 @@ async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]
 }
 
 async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string } | number>): Promise<void> {
-  const directory = path.join(workspaceDir(dataDir), ".tg-bot");
-  await mkdir(directory, { recursive: true });
+  const workspace = workspaceDir(dataDir);
+  await mkdir(workspace, { recursive: true });
   const ids = chats.map((chat) => (typeof chat === "number" ? chat : chat.chat_id));
-  await writeFile(path.join(directory, "allowed.json"), `${JSON.stringify(ids, null, 2)}\n`);
+  await writeFile(path.join(workspace, ".allowed.json"), `${JSON.stringify(ids, null, 2)}\n`);
 }
 
 async function waitForChatEvents(dataDir: string, predicate: (events: Record<string, unknown>[]) => boolean): Promise<Record<string, unknown>[]> {
@@ -125,23 +102,19 @@ let sentRequests: Array<{ url: string; body: string }> = [];
 
 async function makeTestBot(
   dataDir: string,
-  agents: { interrupt: Mock<(text: string) => Promise<void>>; followup?: Mock<(text: string) => Promise<void>> },
-  { fetchResult, recordRequests = false }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean } = {},
+  agents: { interrupt: Mock<(text: string) => Promise<void>>; followup?: Mock<(text: string) => Promise<void>>; restartAll?: Mock<() => Promise<void>> },
+  { fetchResult, recordRequests = false, pollOwners }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean; pollOwners?: Map<string, number> } = {},
 ): Promise<Bot> {
   if (recordRequests) sentRequests = [];
   const followup = agents.followup ?? vi.fn(async () => undefined);
-  const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
-  const agentAccess = "status" in agents
-    ? {
-        status: (agents as { status: () => Promise<AgentStatus> }).status,
-        restartAll: vi.fn(async () => undefined),
-      }
-    : undefined;
+  const events = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+  const agentAccess = agents.restartAll ? { restartAll: agents.restartAll } : undefined;
   const bot = createTelegramBot(
     { token: "999:test-token", botId: 999, dataDir },
     events,
     undefined,
     agentAccess,
+    pollOwners,
   );
   const router = new AgentEventRouter(
     { interrupt: agents.interrupt, followup },
@@ -173,7 +146,7 @@ async function runAttachmentFixture(
   beforeUpdate?: (bot: Bot) => void,
 ): Promise<Mock> {
   const prompt = vi.fn(async () => undefined);
-  const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
+  const events = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
   const router = new AgentEventRouter({ interrupt: prompt, followup: vi.fn(async () => undefined) });
   events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const bot = createTelegramBot({
@@ -233,36 +206,7 @@ function chunkedResponse(chunks: readonly Uint8Array[], headers?: HeadersInit): 
     },
   }), { status: 200, ...(headers === undefined ? {} : { headers }) });
 }
-async function createFifo(fifoPath: string): Promise<boolean> {
-  try {
-    await execFile("mkfifo", [fifoPath]);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOSYS" || code === "ENOTSUP" || code === "EOPNOTSUPP") return false;
-    throw error;
-  }
-}
 
-it("splits Telegram responses below the limit without losing content", () => {
-  const text = `${"a".repeat(30)}\n\n${"b".repeat(30)} ${"c".repeat(30)}`;
-  const chunks = splitTelegramText(text, 40);
-  expect(chunks.every((chunk) => chunk.length <= 40)).toBe(true);
-  expect(chunks.join("")).toBe(text);
-});
-
-describe("splitTelegramText", () => {
-  it("handles exact limits and empty input", () => {
-    expect(splitTelegramText("abcd", 4)).toEqual(["abcd"]);
-    expect(splitTelegramText("")).toEqual([]);
-  });
-  it("caps a delimiter that starts at the message limit", () => {
-    const text = `${"a".repeat(4_000)}\n\nb`;
-    const chunks = splitTelegramText(text);
-    expect(chunks).toEqual(["a".repeat(4_000), "\n\nb"]);
-    expect(chunks.every((chunk) => chunk.length <= 4_000)).toBe(true);
-  });
-});
 
 
 describe("TelegramDeliveryQueue", () => {
@@ -343,276 +287,96 @@ describe("TelegramDeliveryQueue", () => {
   });
 });
 
-it("sends a valid workspace file with a bounded caption", async () => {
-  await withWorkspace(async (workspace) => {
-    await writeFile(path.join(workspace, "report.txt"), "report");
-    const bot = fakeBot();
-    const caption = "caption".repeat(300);
-
-    await expect(sendWorkspaceFile(bot, {
-      chatId: 42,
-      workspace,
-      sandboxPath: "/workspace/report.txt",
-      caption,
-    })).resolves.toBe(123);
-
-    const sendDocument = bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>;
-    expect(sendDocument).toHaveBeenCalledTimes(1);
-    expect(sendDocument.mock.calls[0]?.[0]).toBe(42);
-    expect(sendDocument.mock.calls[0]?.[2]).toEqual({ caption: Array.from(caption).slice(0, 1_024).join("") });
-  });
-});
-it("passes reply target and notification settings to the send method", async () => {
-  await withWorkspace(async (workspace) => {
-    await writeFile(path.join(workspace, "report.txt"), "report");
-    const bot = fakeBot();
-
-    await expect(sendWorkspaceFile(bot, {
-      chatId: 42,
-      workspace,
-      sandboxPath: "/workspace/report.txt",
-      replyToMessageId: 9,
-      disableNotification: true,
-    })).resolves.toBe(123);
-
-    const sendDocument = bot.api.sendDocument as unknown as Mock;
-    expect(sendDocument.mock.calls[0]?.[0]).toBe(42);
-    expect(sendDocument.mock.calls[0]?.[2]).toEqual({ reply_to_message_id: 9, disable_notification: true });
-  });
-});
-it("sends detected media kinds with the matching API methods", async () => {
-  await withWorkspace(async (workspace) => {
-    const cases = [
-      ["shot.png", "sendPhoto"],
-      ["clip.mp4", "sendVideo"],
-      ["song.mp3", "sendAudio"],
-    ] as const;
-    for (const [name, method] of cases) {
-      await writeFile(path.join(workspace, name), "payload");
+describe("raw Telegram Bot API dispatch", () => {
+  it("passes Bot API payloads and request-location keyboards through unchanged", async () => {
+    await withWorkspace(async (dataDir) => {
+      const paths = botPaths(dataDir, 999);
+      await mkdir(paths.attachments, { recursive: true });
       const bot = fakeBot();
-      await expect(sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: name })).resolves.toBe(123);
-      const api = bot.api[method] as unknown as ReturnType<typeof vi.fn>;
-      expect(api).toHaveBeenCalledTimes(1);
-      expect(api.mock.calls[0]?.[0]).toBe(42);
-      const others = (["sendPhoto", "sendVideo", "sendAudio", "sendVoice", "sendDocument"] as const).filter((entry) => entry !== method);
-      for (const other of others) expect(bot.api[other] as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-    }
-  });
-});
-
-it("honors explicit kinds and voice overrides", async () => {
-  await withWorkspace(async (workspace) => {
-    await writeFile(path.join(workspace, "note.ogg"), "payload");
-    const bot = fakeBot();
-    await sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: "note.ogg", kind: "voice" });
-    expect(bot.api.sendVoice as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
-    expect(bot.api.sendAudio as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-
-    const forcedDocument = fakeBot();
-    await sendWorkspaceFile(forcedDocument, { chatId: 42, workspace, sandboxPath: "note.ogg", kind: "document" });
-    expect(forcedDocument.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
-    expect(forcedDocument.api.sendAudio as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-  });
-});
-
-it("sends a media group as an album with mapped items and options", async () => {
-  await withWorkspace(async (workspace) => {
-    await writeFile(path.join(workspace, "a.png"), "a");
-    await writeFile(path.join(workspace, "b.mp4"), "b");
-    const bot = fakeBot();
-    const group = {
-      version: 1 as const,
-      id: "album",
-      type: "send_media_group" as const,
-      chat_id: 42,
-      media: [
-        { type: "photo" as const, media: "a.png", caption: "first" },
-        { type: "video" as const, media: "/workspace/b.mp4", caption: "x".repeat(2_000) },
-      ],
-      disable_notification: true,
-    };
-
-    await expect(sendTelegramMediaGroup(bot, { chatId: 42, workspace, request: group })).resolves.toBe(11);
-    const api = bot.api.sendMediaGroup as unknown as ReturnType<typeof vi.fn>;
-    expect(api).toHaveBeenCalledTimes(1);
-    expect(api.mock.calls[0]?.[0]).toBe(42);
-    const [media, options] = [api.mock.calls[0]?.[1], api.mock.calls[0]?.[2]];
-    expect(media).toHaveLength(2);
-    expect(media[0]).toMatchObject({ type: "photo", caption: "first" });
-    expect(media[1]).toMatchObject({ type: "video", caption: "x".repeat(1_024) });
-    expect(options).toEqual({ disable_notification: true });
-  });
-});
-
-it("rejects media group items that escape the workspace", async () => {
-  await withWorkspace(async (workspace) => {
-    await writeFile(path.join(workspace, "ok.png"), "a");
-    const bot = fakeBot();
-    const group = {
-      version: 1 as const,
-      id: "album",
-      type: "send_media_group" as const,
-      chat_id: 42,
-      media: [
-        { type: "photo" as const, media: "ok.png" },
-        { type: "video" as const, media: "/workspace/../outside.mp4" },
-      ],
-    };
-    await expect(sendTelegramMediaGroup(bot, { chatId: 42, workspace, request: group })).rejects.toThrow("path escapes the workspace");
-  });
-});
-
-it("sends oversized images as documents instead of photos", async () => {
-  await withWorkspace(async (workspace) => {
-    const big = path.join(workspace, "big.png");
-    await writeFile(big, "");
-    await truncate(big, 10 * 1024 * 1024 + 1);
-    const bot = fakeBot();
-    await expect(sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: "big.png" })).resolves.toBe(123);
-    expect(bot.api.sendPhoto as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-    expect(bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
-  });
-});
-it("applies the photo cap to explicit photo overrides as well", async () => {
-  await withWorkspace(async (workspace) => {
-    const big = path.join(workspace, "big.bin");
-    await writeFile(big, "");
-    await truncate(big, 10 * 1024 * 1024 + 1);
-    const bot = fakeBot();
-    await expect(sendWorkspaceFile(bot, { chatId: 42, workspace, sandboxPath: "big.bin", kind: "photo" })).resolves.toBe(123);
-    expect(bot.api.sendPhoto as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-    expect(bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
-  });
-});
-
-
-
-it("rejects FIFOs without blocking when FIFO creation is supported", async () => {
-  await withWorkspace(async (workspace) => {
-    const fifo = path.join(workspace, "workspace-outbox-fifo");
-    if (!(await createFifo(fifo))) return;
-    const bot = fakeBot();
-    const outcomePromise = sendWorkspaceFile(bot, {
-      chatId: 42,
-      workspace,
-      sandboxPath: "workspace-outbox-fifo",
-    }).then(
-      () => ({ kind: "resolved" as const }),
-      (error: unknown) => ({ kind: "rejected" as const, error }),
-    );
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const outcome = await Promise.race([
-      outcomePromise,
-      new Promise<"timeout">((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), 250);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (outcome === "timeout") {
-      const writer = await openFile(fifo, fsConstants.O_WRONLY);
-      await writer.close();
-      await outcomePromise;
-      throw new Error("sendWorkspaceFile blocked while opening a FIFO.");
-    }
-    expect(outcome.kind).toBe("rejected");
-    if (outcome.kind === "rejected") expect(outcome.error).toEqual(
-      expect.objectContaining({ message: expect.stringMatching(/regular file/) }),
-    );
-    expect((bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-  });
-}, 2_000);
-
-it("rejects traversal and symlinks that resolve outside the workspace", async () => {
-
-  const parent = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-parent-"));
-  const workspace = path.join(parent, "workspace");
-  const outside = path.join(parent, "outside.txt");
-  try {
-    await mkdir(workspace);
-    await writeFile(outside, "secret");
-    await symlink(outside, path.join(workspace, "link.txt"));
-    const bot = fakeBot();
-
-    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "../outside.txt" }))
-      .rejects.toThrow(/escapes/);
-    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "/workspace/link.txt" }))
-      .rejects.toThrow(/outside/);
-    expect((bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-it("rejects missing files, directories, and files over the upload cap", async () => {
-  await withWorkspace(async (workspace) => {
-    await mkdir(path.join(workspace, "directory"));
-    const oversized = path.join(workspace, "oversized.bin");
-    await writeFile(oversized, "x");
-    await truncate(oversized, 20 * 1024 * 1024 + 1);
-    const bot = fakeBot();
-
-    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "missing.txt" }))
-      .rejects.toThrow(/does not exist/);
-    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "directory" }))
-      .rejects.toThrow(/regular file/);
-    await expect(sendWorkspaceFile(bot, { chatId: 1, workspace, sandboxPath: "oversized.bin" }))
-      .rejects.toThrow(/20 MiB/);
-  });
-});
-it("rejects a regular file that grows beyond the upload cap after stat", async () => {
-  await withWorkspace(async (workspace) => {
-    const file = path.join(workspace, "growing.bin");
-    await writeFile(file, "");
-    await truncate(file, 20 * 1024 * 1024);
-    const probe = await openFile(file, fsConstants.O_RDONLY);
-    const prototype = Object.getPrototypeOf(probe) as {
-      read: (this: unknown, ...args: any[]) => Promise<any>;
-    };
-    const originalRead = prototype.read;
-    let grew = false;
-    const readSpy = vi.spyOn(prototype, "read").mockImplementation(async function (this: unknown, ...args: any[]) {
-      if (!grew) {
-        grew = true;
-        await appendFile(file, Buffer.from("x"));
-      }
-      return originalRead.apply(this, args);
+      const replyMarkup = { keyboard: [[{ text: "Share location", request_location: true }]], resize_keyboard: true };
+      await expect(dispatchOutboxRequest(bot, paths, 42, "req-1", {
+        method: "sendMessage",
+        chat_id: 42,
+        text: "Where are you?",
+        reply_markup: replyMarkup,
+        protect_content: true,
+      })).resolves.toMatchObject({ messageId: 123 });
+      expect(bot.api.raw.sendMessage).toHaveBeenCalledWith({
+        chat_id: 42,
+        text: "Where are you?",
+        reply_markup: replyMarkup,
+        protect_content: true,
+      });
     });
-    try {
-      const bot = fakeBot();
-      await expect(sendWorkspaceFile(bot, {
-        chatId: 42,
-        workspace,
-        sandboxPath: "growing.bin",
-      })).rejects.toThrow(/20 MiB/);
-      expect((bot.api.sendDocument as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-    } finally {
-      readSpy.mockRestore();
-      await probe.close();
-    }
   });
-});
 
+  it("copies workspace uploads into host attachments before delivery", async () => {
+    await withWorkspace(async (dataDir) => {
+      const paths = botPaths(dataDir, 999);
+      await mkdir(paths.attachments, { recursive: true });
+      await writeFile(path.join(paths.workspace, "report.txt"), "report", "utf8");
+      const bot = fakeBot();
+      const result = await dispatchOutboxRequest(bot, paths, 42, "req-file", {
+        method: "sendDocument",
+        chat_id: 42,
+        document: "/workspace/report.txt",
+        caption: "Report",
+      });
+      const managed = result.request?.document;
+      expect(managed).toMatch(/^\/run\/attachments\/42\/\d{4}-\d{2}-\d{2}\/req-file\/report\.txt$/);
+      expect(await readFile(path.join(paths.attachments, String(managed).slice("/run/attachments/".length)), "utf8")).toBe("report");
+      expect(bot.api.raw.sendDocument).toHaveBeenCalledWith({
+        chat_id: 42,
+        document: expect.any(InputFile),
+        caption: "Report",
+      });
+    });
+  });
 
-describe("Telegram forum topic management", () => {
-  it("creates, edits, closes, reopens, and deletes topics", async () => {
-    const bot = fakeBot();
-    const created = await createTelegramForumTopic(bot, -100, { version: 1, type: "create_forum_topic", chat_id: -100, name: "Travel 2026", icon_color: 7322096 });
-    expect(created).toEqual({ messageThreadId: 105, data: { message_thread_id: 105, name: "Travel 2026" } });
-    expect(bot.api.createForumTopic).toHaveBeenCalledWith(-100, "Travel 2026", { icon_color: 7322096 });
+  it("reuses the staged copy when Telegram retries the same request", async () => {
+    await withWorkspace(async (dataDir) => {
+      const paths = botPaths(dataDir, 999);
+      await mkdir(paths.attachments, { recursive: true });
+      await writeFile(path.join(paths.workspace, "report.txt"), "report", "utf8");
+      const bot = fakeBot();
+      const request = { method: "sendDocument" as const, chat_id: 42, document: "/workspace/report.txt" };
 
-    const edited = await editTelegramForumTopic(bot, -100, { version: 1, type: "edit_forum_topic", chat_id: -100, message_thread_id: 105, name: "Japan 2026" });
-    expect(edited).toEqual({ messageThreadId: 105 });
-    expect(bot.api.editForumTopic).toHaveBeenCalledWith(-100, 105, { name: "Japan 2026" });
+      const first = await dispatchOutboxRequest(bot, paths, 42, "req-retry", request);
+      const second = await dispatchOutboxRequest(bot, paths, 42, "req-retry", request);
 
-    expect(await closeTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
-    expect(bot.api.closeForumTopic).toHaveBeenCalledWith(-100, 105);
+      expect(second.request?.document).toBe(first.request?.document);
+      expect(bot.api.raw.sendDocument).toHaveBeenCalledTimes(2);
+      expect(await readFile(path.join(paths.attachments, String(first.request?.document).slice("/run/attachments/".length)), "utf8")).toBe("report");
+    });
+  });
 
-    expect(await reopenTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
-    expect(bot.api.reopenForumTopic).toHaveBeenCalledWith(-100, 105);
+  it("rejects local files outside the exposed roots", async () => {
+    await withWorkspace(async (dataDir) => {
+      const paths = botPaths(dataDir, 999);
+      await mkdir(paths.attachments, { recursive: true });
+      await expect(dispatchOutboxRequest(fakeBot(), paths, 42, "req-bad", {
+        method: "sendDocument",
+        chat_id: 42,
+        document: "/etc/passwd",
+      })).rejects.toThrow("under /workspace");
+    });
+  });
 
-
-    expect(await deleteTelegramForumTopic(bot, -100, 105)).toEqual({ messageThreadId: 105 });
-    expect(bot.api.deleteForumTopic).toHaveBeenCalledWith(-100, 105);
+  it("applies incidental topic names after message delivery", async () => {
+    await withWorkspace(async (dataDir) => {
+      const paths = botPaths(dataDir, 999);
+      await mkdir(paths.attachments, { recursive: true });
+      const bot = fakeBot();
+      await dispatchOutboxRequest(bot, paths, 42, "req-topic", {
+        method: "sendMessage",
+        chat_id: 42,
+        message_thread_id: 7,
+        text: "The itinerary is taking shape.",
+        topic_name: "Japan itinerary",
+      });
+      expect(bot.api.raw.sendMessage).toHaveBeenCalledWith({ chat_id: 42, message_thread_id: 7, text: "The itinerary is taking shape." });
+      expect(bot.api.raw.editForumTopic).toHaveBeenCalledWith({ chat_id: 42, message_thread_id: 7, name: "Japan itinerary" });
+    });
   });
 });
 
@@ -701,7 +465,7 @@ describe("Telegram attachment downloads", () => {
         ]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
         expect((await firstMessageAttachment(dataDir)).failure).toMatch(/20 MB/);
-        expect(await readFile(path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+        expect(await readFile(path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
       });
     } finally {
       vi.unstubAllGlobals();
@@ -738,12 +502,12 @@ describe("Telegram attachment downloads", () => {
           new TextEncoder().encode("telegram"),
         ]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        const destination = path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7", "report.txt");
+        const destination = path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7", "report.txt");
         expect(await readFile(destination, "utf8")).toBe("hello telegram");
         const attachment = await firstMessageAttachment(dataDir);
         expect(attachment.mimeType).toBe("text/plain");
         expect(attachment.originalName).toBe("report.txt");
-        expect(attachment.path).toBe("/workspace/attachments/42/2023-11-14/7/report.txt");
+        expect(attachment.path).toBe("/run/attachments/42/2023-11-14/7/report.txt");
       });
     } finally {
       vi.unstubAllGlobals();
@@ -752,7 +516,7 @@ describe("Telegram attachment downloads", () => {
   it("does not publish an attachment after its pinned directory is replaced", async () => {
     try {
       await withWorkspace(async (dataDir) => {
-        const directory = path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7");
+        const directory = path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7");
         await mkdir(directory, { recursive: true });
         let pulls = 0;
         let replaced = false;
@@ -786,7 +550,7 @@ describe("Telegram attachment downloads", () => {
         const fileName = `${"界".repeat(100)}.txt`;
         await runAttachmentFixture(dataDir, vi.fn(async () => chunkedResponse([new TextEncoder().encode("hello")])) as unknown as typeof fetch, fileName);
         expect((await firstMessageAttachment(dataDir)).failure).toBeUndefined();
-        const directory = path.join(workspaceDir(dataDir), "attachments", "42", "2023-11-14", "7");
+        const directory = path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7");
         const [savedName] = await readdir(directory);
         expect(savedName).toBeDefined();
         expect(Buffer.byteLength(savedName!)).toBeLessThanOrEqual(255);
@@ -796,20 +560,18 @@ describe("Telegram attachment downloads", () => {
     }
   });
 
-  it("rejects a pre-existing symlinked workspace", async () => {
+  it("rejects a pre-existing symlinked attachment root", async () => {
     try {
       await withWorkspace(async (dataDir) => {
         const outside = path.join(dataDir, "outside");
-        const workspace = workspaceDir(dataDir);
-        await rm(workspace, { recursive: true, force: true });
-        await mkdir(path.join(outside, ".tg-bot"), { recursive: true });
-        await writeFile(path.join(outside, ".tg-bot", "allowed.json"), JSON.stringify([42]));
-        await mkdir(path.dirname(workspace), { recursive: true });
-        await symlink(outside, workspace);
+        const attachments = botPaths(dataDir, 999).attachments;
+        await mkdir(outside, { recursive: true });
+        await mkdir(path.dirname(attachments), { recursive: true });
+        await symlink(outside, attachments);
         const response = chunkedResponse([new TextEncoder().encode("secret")]);
         await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
         expect((await firstMessageAttachment(dataDir)).failure).toMatch(/download failed/);
-        expect(await readFile(path.join(outside, "attachments", "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
+        expect(await readFile(path.join(outside, "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
       });
     } finally {
       vi.unstubAllGlobals();
@@ -867,129 +629,6 @@ describe("Telegram location and venue updates", () => {
       });
       expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } }, attachments: [] });
     });
-  });
-});
-describe("Telegram rich messages", () => {
-  it("sends a rich message with markup, keyboard, and reply target", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramRichMessage(bot, 42, {
-      version: 1,
-      type: "send_message",
-      chat_id: 42,
-      text: "<b>hi</b>",
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-      reply_to_message_id: 7,
-    })).resolves.toBe(123);
-    const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
-    expect(sendMessage).toHaveBeenCalledWith(42, "<b>hi</b>", {
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-      reply_to_message_id: 7,
-    });
-  });
-
-  it("rejects malformed markup and throws GrammyError without plain retry", async () => {
-    const bot = fakeBot();
-    const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
-    sendMessage.mockRejectedValueOnce(new GrammyError(
-      "Bad Request: can't parse entities",
-      { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
-      "sendMessage",
-      { chat_id: 42, text: "<b>hi", parse_mode: "HTML" },
-    ));
-    await expect(sendTelegramRichMessage(bot, 42, {
-      version: 1,
-      type: "send_message",
-      chat_id: 42,
-      text: "<b>hi",
-      parse_mode: "HTML",
-      reply_to_message_id: 7,
-    })).rejects.toThrow(/can't parse entities/);
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it("propagates non-parse failures without a plain retry", async () => {
-    const bot = fakeBot();
-    const sendMessage = bot.api.sendMessage as unknown as ReturnType<typeof vi.fn>;
-    sendMessage.mockRejectedValueOnce(new GrammyError(
-      "Bad Request: chat not found",
-      { ok: false, error_code: 400, description: "Bad Request: chat not found" },
-      "sendMessage",
-      { chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" },
-    ));
-    await expect(sendTelegramRichMessage(bot, 42, { version: 1, type: "send_message", chat_id: 42, text: "<b>hi</b>", parse_mode: "HTML" })).rejects.toThrow("chat not found");
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it("passes entities, link preview options, and notifications to sendMessage", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramRichMessage(bot, 42, {
-      version: 1,
-      type: "send_message",
-      chat_id: 42,
-      text: "hi",
-      entities: [{ type: "bold", offset: 0, length: 2 }],
-      link_preview_options: { is_disabled: true },
-      disable_notification: true,
-    })).resolves.toBe(123);
-    const sendMessage = bot.api.sendMessage as unknown as Mock;
-    expect(sendMessage).toHaveBeenCalledWith(42, "hi", {
-      entities: [{ type: "bold", offset: 0, length: 2 }],
-      link_preview_options: { is_disabled: true },
-      disable_notification: true,
-    });
-  });
-});
-
-describe("Telegram message editing and deletion", () => {
-  it("edits a message and returns the edited message id", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramEditMessage(bot, 42, {
-      version: 1,
-      type: "edit_message",
-      chat_id: 42,
-      message_id: 7,
-      text: "<b>updated</b>",
-      parse_mode: "HTML",
-      link_preview_options: { is_disabled: true },
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-    })).resolves.toBe(123);
-    const editMessageText = bot.api.editMessageText as unknown as Mock;
-    expect(editMessageText).toHaveBeenCalledWith(42, 7, "<b>updated</b>", {
-      parse_mode: "HTML",
-      link_preview_options: { is_disabled: true },
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-    });
-  });
-
-  it("rejects a malformed edit without plain retry", async () => {
-    const bot = fakeBot();
-    const editMessageText = bot.api.editMessageText as unknown as Mock;
-    editMessageText.mockRejectedValueOnce(new GrammyError(
-      "Bad Request: can't parse entities",
-      { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
-      "editMessageText",
-      { chat_id: 42, message_id: 7, text: "<b>updated", parse_mode: "HTML" },
-    ));
-    await expect(sendTelegramEditMessage(bot, 42, {
-      version: 1,
-      type: "edit_message",
-      chat_id: 42,
-      message_id: 7,
-      text: "<b>updated",
-      parse_mode: "HTML",
-      link_preview_options: { is_disabled: true },
-      reply_markup: { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] },
-    })).rejects.toThrow(/can't parse entities/);
-    expect(editMessageText).toHaveBeenCalledTimes(1);
-  });
-
-  it("deletes a message through the Bot API", async () => {
-    const bot = fakeBot();
-    await expect(deleteTelegramMessage(bot, 42, 7)).resolves.toBeUndefined();
-    const deleteMessage = bot.api.deleteMessage as unknown as Mock;
-    expect(deleteMessage).toHaveBeenCalledWith(42, 7);
   });
 });
 
@@ -1089,7 +728,7 @@ describe("Telegram chat events", () => {
         message: { message_id: 7, text: "hello" },
         attachments: [],
       });
-      const chatLog = await readFile(path.join(dataDir, "events.jsonl"), "utf8");
+      const chatLog = await readFile(path.join(dataDir, "timeline.jsonl"), "utf8");
       expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
     });
   });
@@ -1193,8 +832,7 @@ describe("Telegram chat events", () => {
         chat_id: -100123,
         my_chat_member: { new_chat_member: { status: "administrator" } },
       });
-      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
-      expect(denied.some((event) => event.chat_id === -100123)).toBe(false);
+      expect(events.some((event) => event.type === "chat_denied")).toBe(false);
     });
   });
 
@@ -1250,13 +888,11 @@ describe("Telegram chat events", () => {
     });
   });
 
-  it("does not hang or follow a FIFO planted at the events file path", async () => {
+  it("does not hang or follow a FIFO planted at the timeline path", async () => {
     await withWorkspace(async (workspace) => {
-      const eventsDir = path.join(workspace, ".tg-bot");
-      await mkdir(eventsDir, { recursive: true });
-      const fifoPath = path.join(eventsDir, "events.jsonl");
+      const fifoPath = path.join(workspace, "timeline.jsonl");
       execFileSync("mkfifo", [fifoPath]);
-      await expect(appendEvents(workspace, [{ type: "message", chat_id: 42, message: { message_id: 1 }, attachments: [] }])).resolves.toBeUndefined();
+      await expect(appendTimelineEvents(fifoPath, [{ type: "message", chat_id: 42, message: { message_id: 1 }, attachments: [] }])).resolves.toBe(false);
       expect((await lstat(fifoPath)).isFIFO()).toBe(true);
     });
   }, 2_000);
@@ -1283,37 +919,13 @@ describe("Telegram ingress gate", () => {
 
   it("drops a message and fails closed when allowed.json is missing", async () => {
     await withWorkspace(async (dataDir) => {
-      await rm(path.join(workspaceDir(dataDir), ".tg-bot", "allowed.json"), { force: true });
-      resetAllowlistCache();
+      await rm(path.join(workspaceDir(dataDir), ".allowed.json"), { force: true });
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
       await bot.handleUpdate(messageUpdate(42, { title: "Bootstrap Group" }) as never);
 
       expect(prompt).not.toHaveBeenCalled();
-      const system = await readLogEvents(dataDir);
-      expect(system.some((event) => event.type === "chat_denied" && event.chat_id === 42)).toBe(true);
-    });
-  });
-  it("emits allowlist_updated when allowed.json is detected and updated", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [42, 100]);
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-
-      await bot.handleUpdate(messageUpdate(42) as never);
-      expect(prompt).toHaveBeenCalledTimes(1);
-
-      const events = await readLogEvents(dataDir);
-      expect(events.some((event) => event.type === "allowlist_updated" && JSON.stringify(event.chats) === JSON.stringify([42, 100]))).toBe(true);
-
-      await writeAllowedChats(dataDir, [42, 100, 200]);
-      await bot.handleUpdate(messageUpdate(200) as never);
-      expect(prompt).toHaveBeenCalledTimes(2);
-
-      const eventsAfter = await readLogEvents(dataDir);
-      const allowEvents = eventsAfter.filter((event) => event.type === "allowlist_updated");
-      expect(allowEvents).toHaveLength(2);
-      expect(allowEvents[1]).toMatchObject({ type: "allowlist_updated", chats: [42, 100, 200] });
+      expect(await readLogEvents(dataDir)).toEqual([]);
     });
   });
 
@@ -1327,29 +939,19 @@ describe("Telegram ingress gate", () => {
       expect(prompt).not.toHaveBeenCalled();
       expect(sentRequests.some((request) => request.url.endsWith("/sendMessage"))).toBe(false);
 
-      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
-      expect(denied).toHaveLength(1);
-      expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 999, title: "Secret Group" });
+      expect(await readLogEvents(dataDir)).toEqual([]);
     });
   });
 
-  it("logs chat_denied for unlisted chats and never notifies the agent", async () => {
+  it("drops unlisted chats without adding them to the shared timeline", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
       const interrupt = vi.fn(async () => undefined);
       const followup = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt, followup });
 
-      // Knock from stranger 999 is logged, never notifies
       await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
-      expect(interrupt).not.toHaveBeenCalled();
-      expect(followup).not.toHaveBeenCalled();
-
-      // Repeated knock still silent
       await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
-      expect(followup).not.toHaveBeenCalled();
-
-      // Group knock is also silent
       await bot.handleUpdate({
         update_id: 10,
         message: {
@@ -1360,11 +962,10 @@ describe("Telegram ingress gate", () => {
           text: "hello",
         },
       } as never);
-      expect(followup).not.toHaveBeenCalled();
 
-      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
-      expect(denied).toHaveLength(3);
-      expect(denied.map((event) => event.chat_id)).toEqual([999, 999, -500]);
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(followup).not.toHaveBeenCalled();
+      expect(await readLogEvents(dataDir)).toEqual([]);
     });
   });
 
@@ -1380,9 +981,7 @@ describe("Telegram ingress gate", () => {
 
       await bot.handleUpdate(messageUpdate(999) as never);
       expect(prompt).toHaveBeenCalledTimes(1);
-      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
-      expect(denied).toHaveLength(1);
-      expect(denied[0]).toMatchObject({ chat_id: 999 });
+      expect((await readLogEvents(dataDir)).filter((event) => event.type === "message")).toHaveLength(1);
     });
   });
 
@@ -1503,9 +1102,9 @@ describe("Telegram ingress gate", () => {
 
   it("fails closed when allowed.json is malformed", async () => {
     await withWorkspace(async (dataDir) => {
-      const directory = path.join(workspaceDir(dataDir), ".tg-bot");
+      const directory = workspaceDir(dataDir);
       await mkdir(directory, { recursive: true });
-      const malformed = path.join(directory, "allowed.json");
+      const malformed = path.join(directory, ".allowed.json");
       await writeFile(malformed, "{ not valid json\n", "utf8");
       const prompt = vi.fn(async () => undefined);
       const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
@@ -1513,109 +1112,20 @@ describe("Telegram ingress gate", () => {
       await bot.handleUpdate(messageUpdate(42) as never);
 
       expect(prompt).not.toHaveBeenCalled();
-      const denied = (await readLogEvents(dataDir)).filter((event) => event.type === "chat_denied");
-      expect(denied).toHaveLength(1);
-      expect(denied[0]).toMatchObject({ type: "chat_denied", chat_id: 42 });
+      expect(await readLogEvents(dataDir)).toEqual([]);
       expect(await readFile(malformed, "utf8")).toBe("{ not valid json\n");
     });
   });
 });
 
-describe("Telegram locations, polls, and reactions", () => {
-  it("sends a location pin with optional fields", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramLocation(bot, 42, {
-      version: 1,
-      type: "send_location",
-      chat_id: 42,
-      latitude: 52.52,
-      longitude: 13.405,
-      heading: 180,
-      live_period: 120,
-    })).resolves.toBe(123);
-    const sendLocation = bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>;
-    expect(sendLocation).toHaveBeenCalledWith(42, 52.52, 13.405, { heading: 180, live_period: 120 });
-  });
-
-  it("sends a venue when venue fields are present", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramLocation(bot, 42, {
-      version: 1,
-      type: "send_location",
-      chat_id: 42,
-      latitude: 52.5163,
-      longitude: 13.3777,
-      venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
-    })).resolves.toBe(123);
-    expect(bot.api.sendVenue as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, 52.5163, 13.3777, "Brandenburg Gate", "Pariser Platz 1");
-    expect(bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-  });
-
-  it("sends a venue with reply and notification options", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramLocation(bot, 42, {
-      version: 1,
-      type: "send_location",
-      chat_id: 42,
-      latitude: 52.5163,
-      longitude: 13.3777,
-      venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" },
-      reply_to_message_id: 9,
-      disable_notification: true,
-    })).resolves.toBe(123);
-    expect(bot.api.sendVenue as unknown as Mock).toHaveBeenCalledWith(42, 52.5163, 13.3777, "Brandenburg Gate", "Pariser Platz 1", { reply_to_message_id: 9, disable_notification: true });
-    expect(bot.api.sendLocation as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-  });
-
-  it("sends a poll and returns its message and poll ids", async () => {
-    const bot = fakeBot();
-    await expect(sendTelegramPoll(bot, 42, {
-      version: 1,
-      type: "send_poll",
-      chat_id: 42,
-      question: "Pick one",
-      options: ["a", "b"],
-      is_anonymous: false,
-      poll_type: "quiz",
-      correct_option_id: 1,
-    })).resolves.toEqual({ messageId: 123, pollId: "poll-9" });
-    expect(bot.api.sendPoll as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, "Pick one", ["a", "b"], {
-      is_anonymous: false,
-      type: "quiz",
-      correct_option_id: 1,
-    });
-  });
-
-  it("stops a poll and returns the final poll", async () => {
-    const bot = fakeBot();
-    const poll = await stopTelegramPoll(bot, 42, 123);
-    expect(poll.id).toBe("poll-9");
-    expect(bot.api.stopPoll as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(42, 123, undefined);
-  });
-
-  it("sets and clears reactions", async () => {
-    const bot = fakeBot();
-    await sendTelegramReaction(bot, 42, 123, [
-      { type: "emoji", emoji: "👍" },
-      { type: "custom_emoji", custom_emoji_id: "custom-1" },
-    ]);
-    const setReaction = bot.api.setMessageReaction as unknown as Mock;
-    expect(setReaction).toHaveBeenCalledWith(42, 123, [
-      { type: "emoji", emoji: "👍" },
-      { type: "custom_emoji", custom_emoji_id: "custom-1" },
-    ]);
-    await sendTelegramReaction(bot, 42, 123, []);
-    expect(setReaction.mock.calls[1]).toEqual([42, 123, []]);
-  });
-});
 
 describe("Telegram poll answers", () => {
-  it("records a poll answer event for the owning chat without waking", async () => {
+  it("records a poll answer for the in-memory owning chat without waking", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await appendEvents(path.join(dataDir, "events.jsonl"), [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      const pollOwners = new Map([["poll-9", 42]]);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, pollOwners });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1625,26 +1135,22 @@ describe("Telegram poll answers", () => {
         },
       } as never);
       expect(prompt).not.toHaveBeenCalled();
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
+      const events = await waitForChatEvents(dataDir, (records) => records.some((event) => event.type === "poll_answer"));
       expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
         type: "poll_answer",
         chat_id: 42,
-        poll_answer: {
-          poll_id: "poll-9",
-          option_ids: [1, 2],
-        },
+        poll_answer: { poll_id: "poll-9", option_ids: [1, 2] },
       });
     });
   });
 
-  it("skips corrupt or non-matching event log lines while resolving owners", async () => {
+  it("does not consult timeline history while routing poll answers", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const eventsPath = path.join(dataDir, "events.jsonl");
-      await writeFile(eventsPath, "null\nnot json\n{\"type\":\"outbox_sent\",\"pollId\":\"poll-other\",\"chat_id\":42}\n", "utf8");
-      await appendEvents(eventsPath, [{ type: "outbox_sent", requestId: "req-1", chat_id: 42, pollId: "poll-9" }]);
+      await writeFile(path.join(dataDir, "timeline.jsonl"), "not json\n", "utf8");
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      const pollOwners = new Map([["poll-9", 42]]);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, pollOwners });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1653,16 +1159,7 @@ describe("Telegram poll answers", () => {
           option_ids: [0],
         },
       } as never);
-      expect(prompt).not.toHaveBeenCalled();
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "poll_answer"));
-      expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
-        type: "poll_answer",
-        chat_id: 42,
-        poll_answer: {
-          poll_id: "poll-9",
-          option_ids: [0],
-        },
-      });
+      expect((await readLogEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(true);
     });
   });
 
@@ -1683,12 +1180,12 @@ describe("Telegram poll answers", () => {
     });
   });
 
-  it("drops poll answers for a poll owned by a chat not on the allow list", async () => {
+  it("drops poll answers owned by a chat not on the allow list", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await appendEvents(workspaceDir(dataDir), [{ type: "outbox_sent", requestId: "req-1", chat_id: 999, pollId: "poll-999" }]);
       const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
+      const pollOwners = new Map([["poll-999", 999]]);
+      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, pollOwners });
       await bot.handleUpdate({
         update_id: 3,
         poll_answer: {
@@ -1703,50 +1200,28 @@ describe("Telegram poll answers", () => {
   });
 });
 
-describe("Telegram command formatting", () => {
-  it("formats session state on one line", () => {
-    expect(formatStatus({
-      model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
-      thinkingLevel: "medium",
-      sessionFile: "42.jsonl",
-      messageCount: 7,
-      autoCompactionEnabled: true,
-    })).toBe("Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7");
-    expect(formatStatus({
-      thinkingLevel: "low",
-      messageCount: 0,
-      autoCompactionEnabled: false,
-    })).toBe("Model: unset | Thinking: low | Session: none | Messages: 0");
-    expect(formatStatus({
-      model: { provider: "anthropic", id: "claude" },
-      thinkingLevel: "high",
-      sessionFile: "42.jsonl",
-      messageCount: 3,
-      autoCompactionEnabled: true,
-      activeTasks: 2,
-      activeSchedules: 1,
-    })).toBe("Model: anthropic/claude | Thinking: high | Session: 42.jsonl | Messages: 3 | Tasks: 2 | Schedules: 1");
-  });
-});
 
 describe("Telegram commands", () => {
-  const defaultStatus: AgentStatus = {
-    thinkingLevel: "medium",
-    messageCount: 0,
-    autoCompactionEnabled: true,
-  };
+  it("publishes only the remaining commands", async () => {
+    const setMyCommands = vi.fn(async () => true);
+    await registerBotCommands({ api: { setMyCommands } } as unknown as Bot);
+    expect(setMyCommands).toHaveBeenCalledWith([
+      { command: "restart", description: "Restart all agents after settings changes" },
+      { command: "start", description: "Introduction" },
+    ]);
+  });
 
   type FakeAgents = {
     followup: Mock<(text: string) => Promise<void>>;
     interrupt: Mock<(text: string) => Promise<void>>;
-    status: Mock<() => Promise<AgentStatus>>;
+    restartAll: Mock<() => Promise<void>>;
   };
 
   function makeAgents(overrides: Partial<FakeAgents> = {}): FakeAgents {
     return {
       followup: vi.fn(async () => undefined),
       interrupt: vi.fn(async () => undefined),
-      status: vi.fn(async () => defaultStatus),
+      restartAll: vi.fn(async () => undefined),
       ...overrides,
     };
   }
@@ -1783,51 +1258,20 @@ describe("Telegram commands", () => {
       const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
       await sendCommand(bot, "/start");
       expect(replies(bot)).toEqual([
-        "Personal agent. Send text, attachments, or a location pin to continue your persistent session. /status shows the current model, thinking level, and session summary.",
+        "Personal agent. Send text, attachments, or a location pin to continue your persistent session.",
       ]);
     });
   });
 
-  it("/status on an allowed chat reports the session state via agents.status() with no args", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const agents = makeAgents({
-        status: vi.fn(async () => ({
-          model: { provider: "openrouter", id: "deepseek/deepseek-chat" },
-          thinkingLevel: "medium",
-          sessionFile: "42.jsonl",
-          messageCount: 7,
-          autoCompactionEnabled: true,
-        })),
-      });
-      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
-      await sendCommand(bot, "/status");
-      expect(agents.status).toHaveBeenCalledTimes(1);
-      expect(agents.status.mock.calls[0]).toEqual([]);
-      expect(replies(bot)).toEqual([
-        "Model: openrouter/deepseek/deepseek-chat | Thinking: medium | Session: 42.jsonl | Messages: 7",
-      ]);
-    });
-  });
-
-  it("/status reports a friendly failure", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const agents = makeAgents({ status: vi.fn(async () => { throw new Error("boom"); }) });
-      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
-      await sendCommand(bot, "/status");
-      expect(replies(bot)).toEqual(["I could not get the status. Please try again."]);
-    });
-  });
-
-  it("/status on a denied chat sends no reply at all", async () => {
+  it("/restart restarts all agents", async () => {
     await withWorkspace(async (dataDir) => {
       await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
       const agents = makeAgents();
       const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
-      await sendCommand(bot, "/status", 999);
-      expect(agents.status).not.toHaveBeenCalled();
-      expect(replies(bot)).toEqual([]);
+      await sendCommand(bot, "/restart");
+      expect(agents.restartAll).toHaveBeenCalledOnce();
+      expect(replies(bot)).toEqual(["Restarting all agents. They will resume on the next message."]);
     });
   });
+
 });

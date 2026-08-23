@@ -1,37 +1,21 @@
 import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
-import type { InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Poll } from "grammy/types";
+import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
-import type { AgentStatus } from "./agent.js";
-import { WorkspaceEventLog } from "./events.js";
-import { syncAllowlist } from "./allowlist.js";
-import { botPaths, defined } from "./util.js";
+import { WorkspaceTimeline } from "./events.js";
+import { readAllowedFile } from "./allowlist.js";
+import { botPaths } from "./util.js";
 import { SerialQueue } from "./queue.js";
-import type {
-  WorkspaceOutboxSendMessageRequest,
-  WorkspaceOutboxSendMediaGroupRequest,
-  WorkspaceOutboxSendLocationRequest,
-  WorkspaceOutboxSendPollRequest,
-  WorkspaceOutboxEditMessageRequest,
-  WorkspaceOutboxCreateForumTopicRequest,
-  WorkspaceOutboxEditForumTopicRequest,
-  WorkspaceOutboxReaction,
-  WorkspaceOutboxRequest,
-  WorkspaceOutboxDispatchResult,
-  WorkspaceOutboxFileKind,
-} from "./outbox-protocol.js";
+import type { WorkspaceOutboxRequest, WorkspaceOutboxDispatchResult } from "./outbox-protocol.js";
 
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
-const MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024;
-const MAX_MEDIA_GROUP_TOTAL_BYTES = 50 * 1024 * 1024;
-const MAX_TELEGRAM_CAPTION_LENGTH = 1_024;
+const MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
-const ATTACHMENTS_DIR = "attachments";
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
 
@@ -79,333 +63,161 @@ export class TelegramDeliveryQueue {
 }
 
 
-export function splitTelegramText(text: string, limit = 4000): string[] {
-  if (limit < 1) throw new Error("limit must be positive");
-  if (!text) return [];
-  const chunks: string[] = [];
-  let rest = text;
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf("\n\n", limit);
-    if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf("\n", limit);
-    if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf(" ", limit);
-    if (cut < 1) cut = limit;
-    else cut = Math.min(limit, cut + (rest[cut] === "\n" && rest[cut + 1] === "\n" ? 2 : 1));
-    chunks.push(rest.slice(0, cut));
-    rest = rest.slice(cut);
-  }
-  if (rest) chunks.push(rest);
-  return chunks;
-}
 
-export async function sendTelegramLocation(bot: Bot, chatId: number, request: WorkspaceOutboxSendLocationRequest): Promise<number> {
-  const shared = defined({
-    reply_to_message_id: request.reply_to_message_id,
-    message_thread_id: request.message_thread_id,
-    disable_notification: request.disable_notification,
-  });
-  if (request.venue) {
-    const extra = Object.keys(shared).length === 0 ? [] : [shared as never];
-    const sent = await bot.api.sendVenue(chatId, request.latitude, request.longitude, request.venue.title, request.venue.address, ...extra);
-    return sent.message_id;
-  }
-  const sent = await bot.api.sendLocation(chatId, request.latitude, request.longitude, {
-    ...defined({ horizontal_accuracy: request.horizontal_accuracy, heading: request.heading, live_period: request.live_period }),
-    ...shared,
-  });
-  return sent.message_id;
-}
-
-export async function sendTelegramPoll(bot: Bot, chatId: number, request: WorkspaceOutboxSendPollRequest): Promise<{ messageId: number; pollId: string }> {
-  const options = defined({
-    is_anonymous: request.is_anonymous,
-    allows_multiple_answers: request.allows_multiple_answers,
-    type: request.poll_type,
-    correct_option_id: request.correct_option_id,
-    reply_to_message_id: request.reply_to_message_id,
-    message_thread_id: request.message_thread_id,
-    disable_notification: request.disable_notification,
-  });
-  const sent = await bot.api.sendPoll(chatId, request.question, request.options, options);
-  return { messageId: sent.message_id, pollId: sent.poll.id };
-}
-
-export async function stopTelegramPoll(bot: Bot, chatId: number, messageId: number, replyMarkup?: unknown): Promise<Poll> {
-  return bot.api.stopPoll(chatId, messageId, replyMarkup === undefined ? undefined : { reply_markup: replyMarkup as never });
-}
-
-export async function sendTelegramReaction(bot: Bot, chatId: number, messageId: number, reaction: WorkspaceOutboxReaction[]): Promise<void> {
-  await bot.api.setMessageReaction(chatId, messageId, reaction as never);
-}
-
-/** Sends one rich message. */
-export async function sendTelegramRichMessage(bot: Bot, chatId: number, request: WorkspaceOutboxSendMessageRequest): Promise<number> {
-  const sent = await bot.api.sendMessage(
-    chatId,
-    request.text,
-    defined({
-      parse_mode: request.parse_mode,
-      reply_markup: request.reply_markup as never,
-      reply_to_message_id: request.reply_to_message_id,
-      message_thread_id: request.message_thread_id,
-      entities: request.entities as never,
-      link_preview_options: request.link_preview_options as never,
-      disable_notification: request.disable_notification,
-    }),
-  );
-  return sent.message_id;
-}
-
-/** Edits one message. */
-export async function sendTelegramEditMessage(bot: Bot, chatId: number, request: WorkspaceOutboxEditMessageRequest): Promise<number> {
-  const sent = await bot.api.editMessageText(
-    chatId,
-    request.message_id,
-    request.text,
-    defined({
-      parse_mode: request.parse_mode,
-      entities: request.entities as never,
-      link_preview_options: request.link_preview_options as never,
-      reply_markup: request.reply_markup as never,
-    }),
-  ) as { message_id: number };
-  return sent.message_id;
-}
-export async function deleteTelegramMessage(bot: Bot, chatId: number, messageId: number): Promise<void> {
-  await bot.api.deleteMessage(chatId, messageId);
-}
-
-export async function createTelegramForumTopic(bot: Bot, chatId: number, request: WorkspaceOutboxCreateForumTopicRequest): Promise<{ messageThreadId: number; data: unknown }> {
-  const options = defined({ icon_color: request.icon_color as never, icon_custom_emoji_id: request.icon_custom_emoji_id });
-  const topic = await bot.api.createForumTopic(chatId, request.name, options);
-  return { messageThreadId: topic.message_thread_id, data: topic };
-}
-
-export async function editTelegramForumTopic(bot: Bot, chatId: number, request: WorkspaceOutboxEditForumTopicRequest): Promise<{ messageThreadId: number }> {
-  const options = defined({ name: request.name, icon_custom_emoji_id: request.icon_custom_emoji_id });
-  await bot.api.editForumTopic(chatId, request.message_thread_id, options);
-  return { messageThreadId: request.message_thread_id };
-}
-
-export async function closeTelegramForumTopic(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
-  await bot.api.closeForumTopic(chatId, messageThreadId);
-  return { messageThreadId };
-}
-
-export async function reopenTelegramForumTopic(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
-  await bot.api.reopenForumTopic(chatId, messageThreadId);
-  return { messageThreadId };
-}
-
-export async function deleteTelegramForumTopic(bot: Bot, chatId: number, messageThreadId: number): Promise<{ messageThreadId: number }> {
-  await bot.api.deleteForumTopic(chatId, messageThreadId);
-  return { messageThreadId };
-}
-
-export async function dispatchOutboxRequest(bot: Bot, paths: { botDir: string; workspace: string }, chatId: number, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult | undefined> {
-  switch (request.type) {
-    case "send_file": return { messageId: await sendWorkspaceFile(bot, { chatId, workspace: paths.workspace, sandboxPath: request.path, ...defined({ caption: request.caption, kind: request.kind, replyToMessageId: request.reply_to_message_id, messageThreadId: request.message_thread_id, disableNotification: request.disable_notification }) }) };
-    case "send_message": return { messageId: await sendTelegramRichMessage(bot, chatId, request) };
-    case "send_media_group": return { messageId: await sendTelegramMediaGroup(bot, { chatId, workspace: paths.workspace, request }) };
-    case "send_location": return { messageId: await sendTelegramLocation(bot, chatId, request) };
-    case "send_poll": return sendTelegramPoll(bot, chatId, request);
-    case "stop_poll": return { messageId: request.message_id, data: await stopTelegramPoll(bot, chatId, request.message_id, request.reply_markup) };
-    case "send_reaction": await sendTelegramReaction(bot, chatId, request.message_id, request.reaction); return undefined;
-    case "edit_message": return { messageId: await sendTelegramEditMessage(bot, chatId, request) };
-    case "delete_message": await deleteTelegramMessage(bot, chatId, request.message_id); return undefined;
-    case "create_forum_topic": {
-      const created = await createTelegramForumTopic(bot, chatId, request);
-      return { messageThreadId: created.messageThreadId, data: created.data };
-    }
-    case "edit_forum_topic": return editTelegramForumTopic(bot, chatId, request);
-    case "close_forum_topic": return closeTelegramForumTopic(bot, chatId, request.message_thread_id);
-    case "reopen_forum_topic": return reopenTelegramForumTopic(bot, chatId, request.message_thread_id);
-    case "delete_forum_topic": return deleteTelegramForumTopic(bot, chatId, request.message_thread_id);
-    default: { const unhandled: never = request; void unhandled; throw new Error("Unhandled outbox request type"); }
-  }
-}
-
-
-type WorkspaceFileRequest = {
-  chatId: number;
-  workspace: string;
-  sandboxPath: string;
-  caption?: string | undefined;
-  kind?: WorkspaceOutboxFileKind;
-  replyToMessageId?: number | undefined;
-  messageThreadId?: number | undefined;
-  disableNotification?: boolean | undefined;
-};
-const MAX_PHOTO_UPLOAD_BYTES = 10 * 1024 * 1024;
-
-const EXTENSION_KIND: Record<string, Exclude<WorkspaceOutboxFileKind, "auto" | "voice">> = {
-  jpg: "photo", jpeg: "photo", png: "photo", gif: "photo", webp: "photo", bmp: "photo",
-  mp3: "audio", m4a: "audio", aac: "audio", flac: "audio", wav: "audio", opus: "audio",
-  mp4: "video", webm: "video", mkv: "video", mov: "video", avi: "video",
+const MEDIA_FIELDS: Partial<Record<WorkspaceOutboxRequest["method"], string>> = {
+  sendPhoto: "photo", sendAudio: "audio", sendVideo: "video", sendAnimation: "animation",
+  sendVoice: "voice", sendVideoNote: "video_note", sendDocument: "document",
 };
 
-function resolvedFileKind(name: string, size: number, override: WorkspaceOutboxFileKind | undefined): Exclude<WorkspaceOutboxFileKind, "auto"> {
-  const requested = override !== undefined && override !== "auto"
-    ? override
-    : EXTENSION_KIND[path.extname(name).slice(1).toLowerCase()];
-  if (requested === undefined) return "document";
-  // Telegram's photo upload cap is below the 20 MiB master cap; oversized images ship as documents.
-  if (requested === "photo" && size > MAX_PHOTO_UPLOAD_BYTES) return "document";
-  return requested;
+function telegramPayload(request: WorkspaceOutboxRequest): Record<string, unknown> {
+  const payload: Record<string, unknown> = { ...request };
+  delete payload.method;
+  delete payload.topic_name;
+  return payload;
 }
 
-
-function isWithinWorkspace(workspace: string, candidate: string): boolean {
-  const relative = path.relative(workspace, candidate);
+function isWithinRoot(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-function workspaceCandidate(workspace: string, sandboxPath: string): string {
-  if (path.isAbsolute(sandboxPath)) {
-    if (sandboxPath !== "/workspace" && !sandboxPath.startsWith("/workspace/")) {
-      throw new Error("File path must be relative to /workspace.");
-    }
-    const relative = sandboxPath.slice("/workspace".length).replace(/^\/+/, "");
-    return path.resolve(workspace, relative);
-  }
-  return path.resolve(workspace, sandboxPath);
+function exposedCandidate(root: string, exposedPath: string, mountPoint: string): string {
+  if (!exposedPath.startsWith(`${mountPoint}/`)) throw new Error(`Local file must be under ${mountPoint}/`);
+  return path.resolve(root, exposedPath.slice(mountPoint.length + 1));
 }
 
-async function workspaceFileInput(workspace: string, sandboxPath: string): Promise<{ bytes: Buffer; resolved: string }> {
-  const candidate = workspaceCandidate(workspace, sandboxPath);
-  if (!isWithinWorkspace(workspace, candidate)) throw new Error("File path escapes the workspace.");
-
-  let resolved: string;
+async function readLocalFile(root: string, exposedPath: string, mountPoint: string): Promise<{ bytes: Buffer; resolved: string }> {
+  const candidate = exposedCandidate(root, exposedPath, mountPoint);
+  if (!isWithinRoot(root, candidate)) throw new Error(`Local file escapes ${mountPoint}`);
+  const resolved = await realpath(candidate).catch(() => { throw new Error("Local file does not exist"); });
+  if (!isWithinRoot(root, resolved)) throw new Error(`Local file resolves outside ${mountPoint}`);
+  const handle = await open(resolved, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => { throw new Error("Local file does not exist"); });
   try {
-    resolved = await realpath(candidate);
-  } catch {
-    throw new Error("File does not exist.");
-  }
-  if (!isWithinWorkspace(workspace, resolved)) throw new Error("File path resolves outside the workspace.");
-
-  const handle = await open(resolved, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => {
-    throw new Error("File does not exist.");
-  });
-  try {
-    const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
-    if (!isWithinWorkspace(workspace, openedPath)) throw new Error("File path resolves outside the workspace.");
     const file = await handle.stat();
-    if (!file.isFile()) throw new Error("Path is not a regular file.");
-    if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
+    if (!file.isFile()) throw new Error("Local path is not a regular file");
+    if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
     const chunks: Buffer[] = [];
     let total = 0;
     while (total <= MAX_OUTBOUND_FILE_BYTES) {
-      const length = Math.min(OUTBOUND_READ_CHUNK_BYTES, MAX_OUTBOUND_FILE_BYTES + 1 - total);
-      const chunk = Buffer.allocUnsafe(length);
-      const { bytesRead } = await handle.read(chunk, 0, length, null);
+      const chunk = Buffer.allocUnsafe(Math.min(OUTBOUND_READ_CHUNK_BYTES, MAX_OUTBOUND_FILE_BYTES + 1 - total));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
       if (bytesRead === 0) break;
       chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
       total += bytesRead;
     }
-    if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error("File exceeds the 20 MiB upload limit.");
+    if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
     return { bytes: Buffer.concat(chunks, total), resolved };
   } finally {
     await handle.close();
   }
 }
 
-function boundedCaption(caption: string | undefined): string | undefined {
-  return caption === undefined
-    ? undefined
-    : Array.from(caption).slice(0, MAX_TELEGRAM_CAPTION_LENGTH).join("");
-}
-export async function sendWorkspaceFile(bot: Bot, request: WorkspaceFileRequest): Promise<number> {
-  let workspace: string;
-  try {
-    workspace = await realpath(request.workspace);
-    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace is not a directory.");
-  } catch (error) {
-    if (error instanceof Error && error.message === "Workspace is not a directory.") throw error;
-    throw new Error("Workspace is unavailable.");
-  }
+async function stageOutboundFile(
+  paths: { workspace: string; attachments: string }, chatId: number, requestId: string, exposedPath: string, index?: number,
+): Promise<{ path: string; input: InputFile }> {
+  const alreadyManaged = exposedPath.startsWith("/run/attachments/");
+  const source = await readLocalFile(
+    alreadyManaged ? paths.attachments : paths.workspace,
+    exposedPath,
+    alreadyManaged ? "/run/attachments" : "/workspace",
+  );
+  if (alreadyManaged) return { path: exposedPath, input: new InputFile(source.bytes, path.basename(source.resolved)) };
 
-  const { bytes, resolved } = await workspaceFileInput(workspace, request.sandboxPath);
-  const kind = resolvedFileKind(resolved, bytes.length, request.kind);
-  const caption = boundedCaption(request.caption);
-  const input = kind === "photo" ? new InputFile(bytes) : new InputFile(bytes, path.basename(resolved));
-  const options = {
-    ...(caption === undefined ? {} : { caption }),
-    ...(request.replyToMessageId === undefined ? {} : { reply_to_message_id: request.replyToMessageId }),
-    ...(request.messageThreadId === undefined ? {} : { message_thread_id: request.messageThreadId }),
-    ...(request.disableNotification === undefined ? {} : { disable_notification: request.disableNotification }),
-  };
-  let sent: { message_id: number };
-  if (kind === "photo") sent = await bot.api.sendPhoto(request.chatId, input, options);
-  else if (kind === "audio") sent = await bot.api.sendAudio(request.chatId, input, options);
-  else if (kind === "video") sent = await bot.api.sendVideo(request.chatId, input, options);
-  else if (kind === "voice") sent = await bot.api.sendVoice(request.chatId, input, options);
-  else sent = await bot.api.sendDocument(request.chatId, input, options);
-  return sent.message_id;
-}
-export async function sendTelegramMediaGroup(bot: Bot, request: { chatId: number; workspace: string; request: WorkspaceOutboxSendMediaGroupRequest }): Promise<number> {
-  const { chatId } = request;
-  let workspace: string;
+  const date = new Date().toISOString().slice(0, 10);
+  const directory = await ensureAttachmentDirectory(paths.attachments, chatId, date, requestId);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    workspace = await realpath(request.workspace);
-    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace is not a directory.");
-  } catch (error) {
-    if (error instanceof Error && error.message === "Workspace is not a directory.") throw error;
-    throw new Error("Workspace is unavailable.");
-  }
-  const group: Array<InputMediaPhoto | InputMediaVideo> = [];
-  let totalBytes = 0;
-  for (const item of request.request.media) {
-    const { bytes, resolved } = await workspaceFileInput(workspace, item.media);
-    totalBytes += bytes.length;
-    if (totalBytes > MAX_MEDIA_GROUP_TOTAL_BYTES) {
-      throw new Error(`Media group exceeds the ${MAX_MEDIA_GROUP_TOTAL_BYTES} byte total size limit`);
+    const base = safeFilename(path.basename(source.resolved), "file.bin");
+    const filename = index === undefined ? base : `${index + 1}-${base}`;
+    const destination = path.join(directory.path, filename);
+    try {
+      handle = await open(destination, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    if (item.type === "photo") {
-      group.push({
-        type: "photo",
-        media: new InputFile(bytes),
-        ...defined({
-          caption: boundedCaption(item.caption),
-          parse_mode: item.parse_mode,
-          caption_entities: item.caption_entities as MessageEntity[] | undefined,
-          show_caption_above_media: item.show_caption_above_media,
-          has_spoiler: item.has_spoiler,
-        }),
-      });
-    } else {
-      group.push({
-        type: "video",
-        media: new InputFile(bytes, path.basename(resolved)),
-        ...defined({
-          caption: boundedCaption(item.caption),
-          parse_mode: item.parse_mode,
-          caption_entities: item.caption_entities as MessageEntity[] | undefined,
-          show_caption_above_media: item.show_caption_above_media,
-          has_spoiler: item.has_spoiler,
-          width: item.width,
-          height: item.height,
-          duration: item.duration,
-          supports_streaming: item.supports_streaming,
-        }),
-      });
+    if (handle) {
+      const opened = handle;
+      try {
+        await opened.writeFile(source.bytes);
+        await opened.close();
+        handle = undefined;
+      } catch (error) {
+        await opened.close().catch(() => {});
+        handle = undefined;
+        await rm(destination, { force: true });
+        throw error;
+      }
     }
+    await verifyAttachmentDirectory(directory);
+    return {
+      path: `/run/attachments/${chatId}/${date}/${requestId}/${filename}`,
+      input: new InputFile(source.bytes, filename),
+    };
+  } finally {
+    await handle?.close().catch(() => {});
+    await directory.handle.close();
   }
-  const options = {
-    ...(request.request.reply_to_message_id === undefined ? {} : { reply_to_message_id: request.request.reply_to_message_id }),
-    ...(request.request.message_thread_id === undefined ? {} : { message_thread_id: request.request.message_thread_id }),
-    ...(request.request.disable_notification === undefined ? {} : { disable_notification: request.request.disable_notification }),
-  };
-  const sent = await bot.api.sendMediaGroup(chatId, group, options);
-  const first = sent[0];
-  if (!first) throw new Error("Telegram returned an empty media group");
-  return first.message_id;
 }
-/** Maps a poll id back to the chat that sent it via the host events log. */
-export async function findPollOwnerChat(events: WorkspaceEventLog, pollId: string): Promise<number | undefined> {
-  const record = await events.findLast((entry) => entry.type === "outbox_sent" && "pollId" in entry && entry.pollId === pollId && "chat_id" in entry && typeof entry.chat_id === "number");
-  if (record && record.type === "outbox_sent") {
-    return record.chat_id;
+
+async function prepareTelegramPayload(
+  paths: { workspace: string; attachments: string }, chatId: number, requestId: string, request: WorkspaceOutboxRequest,
+): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest }> {
+  const payload = telegramPayload(request);
+  const recorded = structuredClone(request);
+  const field = MEDIA_FIELDS[request.method];
+  if (field !== undefined && typeof payload[field] === "string" && (payload[field] as string).startsWith("/")) {
+    const staged = await stageOutboundFile(paths, chatId, requestId, payload[field] as string);
+    payload[field] = staged.input;
+    recorded[field] = staged.path;
   }
-  return undefined;
+  if (request.method === "sendMediaGroup" && Array.isArray(payload.media)) {
+    const recordedMedia = recorded.media as Array<Record<string, unknown>>;
+    payload.media = await Promise.all(payload.media.map(async (item, index) => {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) return item;
+      const copy = { ...(item as Record<string, unknown>) };
+      if (typeof copy.media === "string" && copy.media.startsWith("/")) {
+        const staged = await stageOutboundFile(paths, chatId, requestId, copy.media, index);
+        copy.media = staged.input;
+        recordedMedia[index] = { ...(recordedMedia[index] ?? {}), media: staged.path };
+      }
+      return copy;
+    }));
+  }
+  return { payload, recorded };
+}
+
+function dispatchResult(data: unknown, request: WorkspaceOutboxRequest): WorkspaceOutboxDispatchResult {
+  const result = data !== null && typeof data === "object" ? data as Record<string, unknown> : {};
+  const poll = result.poll !== null && typeof result.poll === "object" ? result.poll as Record<string, unknown> : undefined;
+  return {
+    request,
+    ...(typeof result.message_id === "number" ? { messageId: result.message_id } : {}),
+    ...(typeof poll?.id === "string" ? { pollId: poll.id } : {}),
+    ...(typeof result.message_thread_id === "number" ? { messageThreadId: result.message_thread_id } : {}),
+    data,
+  };
+}
+
+export async function dispatchOutboxRequest(
+  bot: Bot,
+  paths: { workspace: string; attachments: string },
+  chatId: number,
+  requestId: string,
+  request: WorkspaceOutboxRequest,
+): Promise<WorkspaceOutboxDispatchResult> {
+  const { payload, recorded } = await prepareTelegramPayload(paths, chatId, requestId, request);
+  const raw = bot.api.raw as unknown as Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
+  const call = raw[request.method];
+  if (!call) throw new Error(`Telegram Bot API method is unavailable: ${request.method}`);
+  const data = await call(payload);
+  if (request.topic_name !== undefined && request.message_thread_id !== undefined) {
+    try {
+      await raw.editForumTopic?.({ chat_id: chatId, message_thread_id: request.message_thread_id, name: request.topic_name });
+    } catch (error) {
+      console.error("Incidental topic rename failed", error);
+    }
+  }
+  return dispatchResult(data, recorded);
 }
 type AttachmentDirectory = {
   path: string;
@@ -413,23 +225,21 @@ type AttachmentDirectory = {
   handle: Awaited<ReturnType<typeof open>>;
 };
 
-async function ensureAttachmentDirectory(workspace: string, chatId: number, date: string, messageId: number): Promise<AttachmentDirectory> {
-  const expectedWorkspace = path.resolve(workspace);
+async function ensureAttachmentDirectory(rootPath: string, chatId: number, date: string, entryId: number | string): Promise<AttachmentDirectory> {
+  const expectedRoot = path.resolve(rootPath);
   try {
-    const entry = await lstat(expectedWorkspace);
-    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Attachment workspace is not safe.");
+    const entry = await lstat(expectedRoot);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Attachment root is not safe.");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await mkdir(expectedWorkspace, { recursive: true, mode: 0o700 });
+    await mkdir(expectedRoot, { recursive: true, mode: 0o700 });
   }
-  const workspaceEntry = await lstat(expectedWorkspace).catch(() => undefined);
-  if (!workspaceEntry || workspaceEntry.isSymbolicLink() || !workspaceEntry.isDirectory()) {
-    throw new Error("Attachment workspace is not safe.");
-  }
-  const root = await realpath(expectedWorkspace);
-  if (root !== expectedWorkspace) throw new Error("Attachment workspace is not safe.");
+  const rootEntry = await lstat(expectedRoot).catch(() => undefined);
+  if (!rootEntry || rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) throw new Error("Attachment root is not safe.");
+  const root = await realpath(expectedRoot);
+  if (root !== expectedRoot) throw new Error("Attachment root is not safe.");
   let directory = root;
-  for (const segment of [ATTACHMENTS_DIR, String(chatId), date, String(messageId)]) {
+  for (const segment of [String(chatId), date, String(entryId)]) {
     directory = path.join(directory, segment);
     try {
       await mkdir(directory, { mode: 0o700 });
@@ -441,9 +251,9 @@ async function ensureAttachmentDirectory(workspace: string, chatId: number, date
   }
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    handle = await open(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    handle = await open(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | NO_FOLLOW);
     const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
-    if (!isWithinWorkspace(root, openedPath)) throw new Error("Attachment directory is not safe.");
+    if (!isWithinRoot(root, openedPath)) throw new Error("Attachment directory is not safe.");
     return { path: `/proc/self/fd/${handle.fd}`, expectedPath: directory, handle };
   } catch (error) {
     await handle?.close().catch(() => {});
@@ -635,8 +445,8 @@ async function downloadAttachment(
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
-    const { workspace } = botPaths(config.dataDir, config.botId);
-    const attachmentDirectory = await ensureAttachmentDirectory(workspace, chatId, date, message.message_id);
+    const { attachments } = botPaths(config.dataDir, config.botId);
+    const attachmentDirectory = await ensureAttachmentDirectory(attachments, chatId, date, message.message_id);
     let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
     let temporary: string | undefined;
     try {
@@ -651,7 +461,7 @@ async function downloadAttachment(
       await verifyAttachmentDirectory(attachmentDirectory);
       return {
         ...common,
-        path: `/workspace/${ATTACHMENTS_DIR}/${chatId}/${date}/${message.message_id}/${filename}`,
+        path: `/run/attachments/${chatId}/${date}/${message.message_id}/${filename}`,
       };
     } finally {
       await temporaryHandle?.close().catch(() => {});
@@ -678,44 +488,13 @@ async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<S
 /** Publishes the reduced command set to Telegram's client UI. */
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
-    { command: "status", description: "Show model, thinking level, and session summary" },
     { command: "restart", description: "Restart all agents after settings changes" },
     { command: "start", description: "Introduction" },
   ]);
 }
 
 
-export function formatStatus(state: AgentStatus): string {
-  const model = state.model ? `${state.model.provider}/${state.model.id}` : "unset";
-  const session = state.sessionFile ?? "none";
-  const parts = [
-    `Model: ${model}`,
-    `Thinking: ${state.thinkingLevel}`,
-    `Session: ${session}`,
-    `Messages: ${state.messageCount}`,
-  ];
-  if (state.activeTasks !== undefined && state.activeTasks > 0) {
-    parts.push(`Tasks: ${state.activeTasks}`);
-  }
-  if (state.activeSchedules !== undefined && state.activeSchedules > 0) {
-    parts.push(`Schedules: ${state.activeSchedules}`);
-  }
-  return parts.join(" | ");
-}
 
-type TelegramChatInfo = {
-  id: number;
-  title?: string | undefined;
-  first_name?: string | undefined;
-  last_name?: string | undefined;
-};
-
-function chatTitle(chat: TelegramChatInfo): string | undefined {
-  const title = chat.title?.trim();
-  if (title) return title;
-  const name = [chat.first_name, chat.last_name].filter(Boolean).join(" ").trim();
-  return name || undefined;
-}
 
 export function isMessageDirectedToBot(message: Message, botInfo?: { id: number; username?: string }): boolean {
   if (!botInfo) return true;
@@ -751,38 +530,24 @@ export function isBotGroupAdd(value: unknown): boolean {
   return (newStatus === "member" || newStatus === "administrator") && (oldStatus === "left" || oldStatus === "kicked");
 }
 
-async function isChatAllowed(workspace: string, chatId: number, events?: WorkspaceEventLog): Promise<boolean> {
-  const allowed = await syncAllowlist(workspace, events);
-  return allowed !== null && allowed.includes(chatId);
+async function isChatAllowed(workspace: string, chatId: number): Promise<boolean> {
+  const allowed = await readAllowedFile(workspace);
+  return allowed.status === "ready" && allowed.chats.includes(chatId);
 }
 
-/**
- * The ingress gate: allowed chats pass; everything else is denied with a chat_denied
- * audit event and no reply. A missing or malformed allow list fails closed.
- */
-async function gateChat(workspace: string, events: WorkspaceEventLog, chat: TelegramChatInfo): Promise<boolean> {
+/** The ingress gate. Missing, malformed, and non-matching allow lists fail closed. */
+async function gateChat(workspace: string, chat: { id: number }): Promise<boolean> {
   const chatId = chat.id;
-  if (!Number.isSafeInteger(chatId)) return false;
-
-  const allowed = await syncAllowlist(workspace, events);
-  if (allowed && allowed.includes(chatId)) {
-    return true;
-  }
-
-  await events.publish({
-    type: "chat_denied",
-    chat_id: chatId,
-    ...defined({ title: chatTitle(chat) }),
-  });
-  return false;
+  return Number.isSafeInteger(chatId) && await isChatAllowed(workspace, chatId);
 }
-type AgentHostAccess = { status(): Promise<AgentStatus>; restartAll(): Promise<void> };
+type AgentHostAccess = { restartAll(): Promise<void> };
 
 export function createTelegramBot(
   config: Config,
-  events: WorkspaceEventLog,
+  timeline: WorkspaceTimeline,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
   agent?: AgentHostAccess,
+  pollOwners: Map<string, number> = new Map(),
 ): Bot {
   const bot = new Bot(config.token);
   const { workspace } = botPaths(config.dataDir, config.botId);
@@ -799,33 +564,18 @@ export function createTelegramBot(
     // A bot added to a brand-new group must reach the agent so it can decide whether to
     // allow the group, even before the chat is allowlisted. Messages from that group stay
     // gated until the agent allowlists it.
-    if (chat.id < 0 && ctx.myChatMember && isBotGroupAdd(ctx.myChatMember) && !(await isChatAllowed(workspace, chat.id, events))) {
+    if (chat.id < 0 && ctx.myChatMember && isBotGroupAdd(ctx.myChatMember) && !(await isChatAllowed(workspace, chat.id))) {
       await next();
       return;
     }
-    if (!(await gateChat(workspace, events, chat))) return;
+    if (!(await gateChat(workspace, chat))) return;
     await next();
   });
 
   bot.command("start", async (ctx) => {
-    await queuedReply(ctx, "Personal agent. Send text, attachments, or a location pin to continue your persistent session. /status shows the current model, thinking level, and session summary.");
+    await queuedReply(ctx, "Personal agent. Send text, attachments, or a location pin to continue your persistent session.");
   });
 
-  bot.command("status", async (ctx) => {
-    if (!agent) {
-      await queuedReply(ctx, "Status is not available.");
-      return;
-    }
-    let state: AgentStatus;
-    try {
-      state = await agent.status();
-    } catch (error) {
-      console.error("Failed to get status", error);
-      await queuedReply(ctx, "I could not get the status. Please try again.");
-      return;
-    }
-    await queuedReply(ctx, formatStatus(state));
-  });
 
   bot.command("restart", async (ctx) => {
     if (!agent) {
@@ -845,49 +595,43 @@ export function createTelegramBot(
   bot.on("message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    await events.publish({ type: "message", chat_id: chatId, message: ctx.message, attachments });
+    await timeline.publish({ type: "message", chat_id: chatId, message: ctx.message, attachments });
   });
   bot.on("edited_message", async (ctx) => {
     const chatId = ctx.chat.id;
     const attachments = await prepareMessage(bot, config, ctx);
-    await events.publish({ type: "edited_message", chat_id: chatId, message: ctx.editedMessage, attachments });
+    await timeline.publish({ type: "edited_message", chat_id: chatId, message: ctx.editedMessage, attachments });
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    // Answer promptly so Telegram does not retry the update.
     void ctx.answerCallbackQuery().catch(() => {});
-    await events.emit({ type: "callback", chat_id: chatId, callback_query: query });
+    await timeline.publish({ type: "callback", chat_id: chatId, callback_query: query });
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
-    const chatId = await findPollOwnerChat(events, answer.poll_id);
-    if (chatId === undefined) return;
-    if (!(await isChatAllowed(workspace, chatId, events))) return;
-    await events.emit({
-      type: "poll_answer",
-      chat_id: chatId,
-      poll_answer: answer,
-    });
+    const chatId = pollOwners.get(answer.poll_id);
+    if (chatId === undefined || !(await isChatAllowed(workspace, chatId))) return;
+    await timeline.publish({ type: "poll_answer", chat_id: chatId, poll_answer: answer });
   });
   bot.on("message_reaction", async (ctx) => {
     const reaction = ctx.messageReaction;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    await events.publish({ type: "message_reaction", chat_id: chatId, message_reaction: reaction });
+    await timeline.publish({ type: "message_reaction", chat_id: chatId, message_reaction: reaction });
   });
   bot.on("my_chat_member", async (ctx) => {
     const member = ctx.myChatMember;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    await events.publish({ type: "my_chat_member", chat_id: chatId, my_chat_member: member });
+    await timeline.publish({ type: "my_chat_member", chat_id: chatId, my_chat_member: member });
   });
   bot.on("chat_join_request", async (ctx) => {
     const request = ctx.chatJoinRequest;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    await events.publish({ type: "chat_join_request", chat_id: chatId, chat_join_request: request });
+    await timeline.publish({ type: "chat_join_request", chat_id: chatId, chat_join_request: request });
   });
 
   bot.catch((error) => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ const temporaryDirectories: string[] = [];
 
 const state = vi.hoisted(() => {
   const order: string[] = [];
+  const startupOrder: string[] = [];
   const agents = {
     beginShutdown: vi.fn(() => {
       order.push("agents.beginShutdown");
@@ -20,6 +21,7 @@ const state = vi.hoisted(() => {
   };
   return {
     order,
+    startupOrder,
     agents,
     bot,
     config: {
@@ -49,7 +51,7 @@ const state = vi.hoisted(() => {
       constructor(options: unknown) {
         this.options = options;
       }
-      start = vi.fn(async () => {});
+      start = vi.fn(async () => { startupOrder.push("scheduler.start"); });
       stop = vi.fn(async () => { order.push("scheduler.stop"); });
     }),
     outbox: vi.fn(class WorkspaceOutboxMock {
@@ -58,17 +60,18 @@ const state = vi.hoisted(() => {
         this.dispatch = options.dispatch;
       }
     }),
+    agentCredentials: vi.fn(class AgentCredentialsMock {}),
     bridge: vi.fn(class HostBridgeMock {
       socketPath: string;
       constructor(options: { socketPath: string }) {
         this.socketPath = options.socketPath;
       }
-      start = vi.fn(async () => {});
+      start = vi.fn(async () => { startupOrder.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.start" : "bridge.start"); });
       stop = vi.fn(async () => { order.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.stop" : "bridge.stop"); });
     }),
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
-      start = vi.fn(async () => {});
+      start = vi.fn(async () => { startupOrder.push("tasks.start"); });
       stop = vi.fn(async () => { order.push("tasks.stop"); });
     }),
     createTelegramBot: vi.fn(() => bot),
@@ -95,7 +98,7 @@ vi.mock("../src/sandbox.js", () => ({
 vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager, AgentEventRouter: state.agentEventRouter }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
 vi.mock("../src/outbox.js", () => ({ WorkspaceOutbox: state.outbox }));
-vi.mock("../src/host-bridge.js", () => ({ HostBridge: state.bridge }));
+vi.mock("../src/host-bridge.js", () => ({ HostBridge: state.bridge, AgentCredentials: state.agentCredentials }));
 vi.mock("../src/task.js", () => ({ WorkspaceTasks: state.tasks }));
 vi.mock("../src/telegram.js", () => ({
   createTelegramBot: state.createTelegramBot,
@@ -104,6 +107,7 @@ vi.mock("../src/telegram.js", () => ({
 }));
 async function importIndex(configure?: () => void): Promise<typeof import("../src/index.js")> {
   state.order.length = 0;
+  state.startupOrder.length = 0;
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-index-"));
   temporaryDirectories.push(dataDir);
   state.sandbox.dataDir = dataDir;
@@ -149,25 +153,29 @@ describe("application startup and shutdown wiring", () => {
       { workspace: workspacePath() },
       expect.objectContaining({
         appRoot: expect.any(String),
+        credentials: expect.any(Object),
         bwrapPath: "/validated/bwrap",
         hostSocketDir: path.join(state.sandbox.dataDir, "bots", "123", "run"),
-        hostEventsLog: path.join(state.sandbox.dataDir, "bots", "123", "events.jsonl"),
+        hostTimeline: path.join(state.sandbox.dataDir, "bots", "123", "timeline.jsonl"),
       }),
     );
-    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; events: unknown; fireTask: unknown }) ?? {};
+    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; statePath: string; timeline: unknown; fireTask: unknown }) ?? {};
     expect(schedulerOptions.workspace).toBe(workspacePath());
-    expect(schedulerOptions.events).toBeDefined();
+    expect(schedulerOptions.statePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "scheduler-state.json"));
+    expect(schedulerOptions.timeline).toBeDefined();
     expect(typeof schedulerOptions.fireTask).toBe("function");
-    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), events: expect.any(Object) }));
+    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), timeline: expect.any(Object), pollOwners: expect.any(Map) }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({
       workspace: workspacePath(),
       bwrapPath: "/validated/bwrap",
-      events: expect.any(Object),
+      timeline: expect.any(Object),
+      credentials: expect.any(Object),
       hostSocketDir: expect.any(String),
-      hostEventsLog: expect.any(String),
+      hostTimeline: expect.any(String),
     }));
     expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
       socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host.sock"),
+      credentials: expect.any(Object),
       handlers: expect.objectContaining({
         send: expect.any(Function),
         spawn: expect.any(Function),
@@ -177,6 +185,7 @@ describe("application startup and shutdown wiring", () => {
     }));
     expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
       socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host-task.sock"),
+      credentials: expect.any(Object),
       handlers: {
         send: expect.any(Function),
       },
@@ -194,25 +203,27 @@ describe("application startup and shutdown wiring", () => {
     }));
   });
 
-  it("creates the host-owned events log and run directory before starting services", async () => {
+  it("starts host bridges before task recovery and scheduler polling", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
     void index.main();
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const hostLog = path.join(state.sandbox.dataDir, "bots", "123", "events.jsonl");
+    expect(state.startupOrder).toEqual([
+      "bridge.start",
+      "taskBridge.start",
+      "tasks.start",
+      "scheduler.start",
+    ]);
+  });
+
+  it("creates the host-owned timeline and run directory before starting services", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+    const hostLog = path.join(state.sandbox.dataDir, "bots", "123", "timeline.jsonl");
     expect(await readFile(hostLog, "utf8")).toBe("");
     expect((await stat(path.join(state.sandbox.dataDir, "bots", "123", "run"))).isDirectory()).toBe(true);
   });
 
-  it("migrates a legacy workspace events log into the host-owned location", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    const workspace = workspacePath();
-    await mkdir(path.join(workspace, ".tg-bot"), { recursive: true });
-    await writeFile(path.join(workspace, ".tg-bot", "events.jsonl"), '{"v":1,"t":"2026-01-01","type":"chat_denied","chat_id":5}\n', "utf8");
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const hostLog = path.join(state.sandbox.dataDir, "bots", "123", "events.jsonl");
-    expect(await readFile(hostLog, "utf8")).toContain("chat_denied");
-  });
 
   it("delegates outbox dispatch to dispatchOutboxRequest via the delivery queue", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
@@ -220,10 +231,16 @@ describe("application startup and shutdown wiring", () => {
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
 
     state.dispatchOutboxRequest.mockResolvedValue({ messageId: 7 });
-    const outbox = state.outbox.mock.instances[0] as { dispatch: (chatId: number, req: unknown) => Promise<unknown> };
-    const request = { type: "send_message", version: 1, id: "x", text: "hi" };
-    const result = await outbox.dispatch(42, request);
-    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(state.bot, expect.objectContaining({ workspace: workspacePath() }), 42, request);
+    const outbox = state.outbox.mock.instances[0] as { dispatch: (chatId: number, requestId: string, req: unknown) => Promise<unknown> };
+    const request = { method: "sendMessage", text: "hi" };
+    const result = await outbox.dispatch(42, "req-1", request);
+    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(
+      state.bot,
+      expect.objectContaining({ workspace: workspacePath(), attachments: path.join(state.sandbox.dataDir, "bots", "123", "attachments") }),
+      42,
+      "req-1",
+      request,
+    );
     expect(result).toEqual({ messageId: 7 });
   });
 

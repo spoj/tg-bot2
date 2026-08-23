@@ -1,8 +1,9 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkspaceEventLog } from "../src/events.js";
+import { WorkspaceTimeline } from "../src/events.js";
+import { conversationAgent } from "../src/agent-ref.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -13,45 +14,55 @@ afterEach(async () => {
 });
 
 async function temporaryDirectory(): Promise<string> {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-events-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-timeline-"));
   temporaryDirectories.push(directory);
   return directory;
 }
 
-/** An append target that can never be created: its parent path is a regular file. */
-async function blockedLogPath(dataDir: string): Promise<string> {
+async function blockedTimelinePath(dataDir: string): Promise<string> {
   const blocked = path.join(dataDir, "blocked");
   await writeFile(blocked, "not a directory", "utf8");
-  return path.join(blocked, "events.jsonl");
+  return path.join(blocked, "timeline.jsonl");
 }
 
-describe("WorkspaceEventLog", () => {
-  it("publishes to listeners only when the append persisted", async () => {
+describe("WorkspaceTimeline", () => {
+  it("broadcasts and appends meaningful events", async () => {
     const dataDir = await temporaryDirectory();
-    const events = new WorkspaceEventLog(path.join(dataDir, "events.jsonl"));
+    const timeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
     const listener = vi.fn();
-    events.subscribe(listener);
+    timeline.subscribe(listener);
 
-    const line = await events.publish({ type: "allowlist_updated", chats: [1, 2] });
-    expect(line).toEqual(expect.any(String));
-    expect(listener).toHaveBeenCalledTimes(1);
-
-    const blocked = new WorkspaceEventLog(await blockedLogPath(dataDir), () => {});
-    const blockedListener = vi.fn();
-    blocked.subscribe(blockedListener);
-
-    const failedLine = await blocked.publish({ type: "allowlist_updated", chats: [3] });
-    expect(failedLine).toBeUndefined();
-    expect(blockedListener).not.toHaveBeenCalled();
+    const line = await timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] });
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: "message", chat_id: 1 }), line);
+    expect(await readFile(timeline.filePath, "utf8")).toBe(`${line}\n`);
   });
 
-  it("readAll and findLast log read failures instead of silently returning an empty log", async () => {
+  it("broadcasts even when persistence fails", async () => {
     const dataDir = await temporaryDirectory();
-    const logged: unknown[] = [];
-    const events = new WorkspaceEventLog(await blockedLogPath(dataDir), (error) => logged.push(error));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const timeline = new WorkspaceTimeline(await blockedTimelinePath(dataDir));
+    const listener = vi.fn();
+    timeline.subscribe(listener);
 
-    expect(await events.readAll()).toEqual([]);
-    expect(await events.findLast(() => true)).toBeUndefined();
-    expect(logged).toHaveLength(2);
+    const line = await timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] });
+    expect(line).toEqual(expect.any(String));
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it("delivers task progress without writing it to the timeline", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    const timeline = new WorkspaceTimeline(filePath);
+    const listener = vi.fn();
+    timeline.subscribe(listener);
+
+    timeline.notify({
+      type: "task_progress",
+      trigger: { kind: "agent", agent: conversationAgent(1) },
+      tasks: [{ runId: "run-1", prompt: "work", runningMs: 10, idleMs: null }],
+    });
+
+    expect(listener).toHaveBeenCalledOnce();
+    await expect(readFile(filePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

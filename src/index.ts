@@ -179,6 +179,7 @@ export async function main(): Promise<void> {
         if (message.length === 0) throw new Error("message must be a non-empty string");
         const allowed = await readAllowedFile(workspace);
         if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) throw new Error(`Chat ${chatId} is not on the allow list`);
+        // Self-targeting is safe: interrupt only queues a steer on the active worker.
         await agentManager.interrupt(`Conversation ${actor.chatId}:${actor.threadId} delegated work to you:\n${message}`, conversationAgent(chatId, threadId));
         return { status: "delivered" };
       },

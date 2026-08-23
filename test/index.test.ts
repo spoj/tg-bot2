@@ -254,7 +254,7 @@ describe("application startup and shutdown wiring", () => {
     expect(result).toEqual({ messageId: 7 });
   });
 
-  it("routes scheduled settlements and conversation steering through owners", async () => {
+  it("routes scheduled settlements and cross/self conversation steering through owners", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
     void index.main();
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
@@ -275,6 +275,13 @@ describe("application startup and shutdown wiring", () => {
     expect(state.agents.interrupt).toHaveBeenCalledWith(
       "Conversation 42:7 delegated work to you:\nHandle timeline message 120",
       conversationAgent(99, 3),
+    );
+
+    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 42, message_thread_id: 7, message: "Reconsider the current approach" }, origin))
+      .resolves.toEqual({ status: "delivered" });
+    expect(state.agents.interrupt).toHaveBeenLastCalledWith(
+      "Conversation 42:7 delegated work to you:\nReconsider the current approach",
+      origin,
     );
   });
 

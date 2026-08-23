@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
-import { conversationAgent, type TaskTrigger } from "../src/agent-ref.js";
+import { conversationAgent } from "../src/agent-ref.js";
 import { AgentEventRouter, type AgentNotifier } from "../src/agent.js";
 import { WorkspaceTimeline } from "../src/events.js";
 import { AgentCredentials } from "../src/host-bridge.js";
@@ -103,7 +103,6 @@ function gatedWorkerFactory(): { factory: Mock; tasks: GatedTask[] } {
 const success = (stdout = "final report"): PiRunResult => ({ code: 0, signal: null, stderr: "", stdout });
 
 const CHAT = conversationAgent(123);
-const TRIGGER: TaskTrigger = { kind: "agent", agent: CHAT };
 
 function setupTasks(
   workspace: string,
@@ -141,9 +140,9 @@ describe("WorkspaceTasks", () => {
     const { factory } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    await expect(service.spawn("   ", TRIGGER)).rejects.toThrow("non-empty");
-    await expect(service.spawn("x".repeat(1024 * 1024 + 1), TRIGGER)).rejects.toThrow("exceeds");
-    await expect(service.spawn("🙂".repeat(262_145), TRIGGER)).rejects.toThrow("exceeds");
+    await expect(service.spawn("   ", CHAT)).rejects.toThrow("non-empty");
+    await expect(service.spawn("x".repeat(1024 * 1024 + 1), CHAT)).rejects.toThrow("exceeds");
+    await expect(service.spawn("🙂".repeat(262_145), CHAT)).rejects.toThrow("exceeds");
     expect(factory).not.toHaveBeenCalled();
     const events = await readTimeline(eventsLog);
     expect(events).toHaveLength(0);
@@ -153,7 +152,7 @@ describe("WorkspaceTasks", () => {
     const { workspace, eventsLog } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const { service, credentials } = setupTasks(workspace, eventsLog, factory);
-    await service.spawn("inspect attachment", TRIGGER, "run-isolated");
+    await service.spawn("inspect attachment", CHAT, "run-isolated");
     const token = tasks[0]?.options.token;
     expect(credentials.authorize(token!, "annotate")).toEqual({ kind: "task", runId: "run-isolated" });
     expect(() => credentials.authorize(token!, "send")).toThrow("not allowed to call send");
@@ -167,7 +166,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const launched = await service.spawn("Investigate the parser regression.", TRIGGER);
+    const launched = await service.spawn("Investigate the parser regression.", CHAT);
     expect(tasks).toHaveLength(1);
     expect(launched.status).toBe("launched");
     expect(tasks[0]?.options).toMatchObject({ runId: launched.runId, prompt: "Investigate the parser regression." });
@@ -193,7 +192,7 @@ describe("WorkspaceTasks", () => {
     const { dataDir, workspace, eventsLog } = await fixture();
     const { factory, tasks } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
-    const launched = await service.spawn("safe artifacts", TRIGGER);
+    const launched = await service.spawn("safe artifacts", CHAT);
     const runDir = path.join(workspace, ".pi", "tasks", launched.runId);
     const sentinel = path.join(dataDir, "sentinel");
     await writeFile(sentinel, "unchanged", "utf8");
@@ -213,7 +212,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("do the thing", TRIGGER);
+    const { runId } = await service.spawn("do the thing", CHAT);
     tasks[0]?.resolveRun({ code: 3, signal: null, stderr: "boom", stdout: "" });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
 
@@ -231,7 +230,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    await service.spawn("prompt", TRIGGER);
+    await service.spawn("prompt", CHAT);
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
     const events = await readTimeline(eventsLog);
     expect(events).toMatchObject([{ type: "task_finished", status: "failed", stderr: "bwrap missing" }]);
@@ -242,7 +241,7 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    const { runId } = await service.spawn("initial prompt", TRIGGER);
+    const { runId } = await service.spawn("initial prompt", CHAT);
     expect(tasks).toHaveLength(1);
 
     await expect(service.steer(runId, "use python 3.12")).resolves.toBe("delivered");
@@ -255,7 +254,7 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = gatedWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    const { runId } = await service.spawn("initial prompt", TRIGGER);
+    const { runId } = await service.spawn("initial prompt", CHAT);
     const task = tasks[0];
     expect(task).toBeDefined();
     expect(task?.onPrompted).toHaveBeenCalledOnce();
@@ -277,7 +276,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("long prompt", TRIGGER);
+    const { runId } = await service.spawn("long prompt", CHAT);
     const task = tasks[0];
     expect(task?.onPrompted).toHaveBeenCalledOnce();
 
@@ -301,7 +300,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("long prompt", TRIGGER);
+    const { runId } = await service.spawn("long prompt", CHAT);
     const task = tasks[0];
     await expect(service.steer(runId, "too early")).resolves.toBe("delivered");
     await expect(service.cancel(runId)).resolves.toBe("stopped");
@@ -323,10 +322,10 @@ describe("WorkspaceTasks", () => {
     await service.start();
 
     for (let index = 0; index < 8; index += 1) {
-      await expect(service.spawn(`prompt ${index}`, TRIGGER)).resolves.toMatchObject({ status: "launched" });
+      await expect(service.spawn(`prompt ${index}`, CHAT)).resolves.toMatchObject({ status: "launched" });
     }
     expect(tasks).toHaveLength(8);
-    const queued = await service.spawn("prompt 8", TRIGGER);
+    const queued = await service.spawn("prompt 8", CHAT);
     expect(queued.status).toBe("queued");
     expect(tasks).toHaveLength(8);
     expect(await readTimeline(eventsLog)).toHaveLength(0);
@@ -346,7 +345,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("prompt", TRIGGER);
+    const { runId } = await service.spawn("prompt", CHAT);
     tasks[0]?.resolveRun({ code: null, signal: "SIGTERM", stderr: "", stdout: "" });
     await vi.waitFor(() => expect(followup).toHaveBeenCalledOnce());
 
@@ -361,7 +360,7 @@ describe("WorkspaceTasks", () => {
     const followup = vi.fn(async () => undefined);
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
 
-    const { runId } = await service.spawn("long prompt", TRIGGER);
+    const { runId } = await service.spawn("long prompt", CHAT);
     await expect(service.cancel(runId)).resolves.toBe("stopped");
 
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
@@ -377,9 +376,9 @@ describe("WorkspaceTasks", () => {
     await service.start();
 
     for (let index = 0; index < 8; index += 1) {
-      await service.spawn(`prompt ${index}`, TRIGGER);
+      await service.spawn(`prompt ${index}`, CHAT);
     }
-    const queued = await service.spawn("never runs", TRIGGER);
+    const queued = await service.spawn("never runs", CHAT);
     await expect(service.cancel(queued.runId)).resolves.toBe("cancelled-queued");
 
     tasks[0]?.resolveRun(success());
@@ -396,7 +395,7 @@ describe("WorkspaceTasks", () => {
     const { factory, tasks } = fakeWorkerFactory();
     const { service } = setupTasks(workspace, eventsLog, factory);
 
-    await service.spawn("real", TRIGGER);
+    await service.spawn("real", CHAT);
     await expect(service.cancel("run-missing")).resolves.toBe("not-running");
     expect(tasks[0]?.stop).not.toHaveBeenCalled();
     const events = await readTimeline(eventsLog);
@@ -434,7 +433,7 @@ describe("WorkspaceTasks", () => {
     const { service } = setupTasks(workspace, eventsLog, factory, { notifier: { followup, interrupt: vi.fn() } });
     await service.start();
 
-    const { runId } = await service.spawn("prompt", TRIGGER);
+    const { runId } = await service.spawn("prompt", CHAT);
     await vi.waitFor(() => expect(tasks).toHaveLength(1));
     await service.stop();
     expect(tasks[0]?.stop).toHaveBeenCalledOnce();
@@ -467,7 +466,7 @@ describe("WorkspaceTasks", () => {
     callbacks[0]?.();
     expect(followup).not.toHaveBeenCalled();
 
-    await service.spawn("heartbeat me", TRIGGER);
+    await service.spawn("heartbeat me", CHAT);
     tasks[0]?.activity.mockReturnValue({ at: 45_000, text: "still thinking" });
     now.mockReturnValue(300_000);
     callbacks[0]?.();

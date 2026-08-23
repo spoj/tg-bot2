@@ -37,62 +37,57 @@ function row(overrides: Partial<ScheduleRow> = {}): ScheduleRow {
     prompt: "water the plants",
     start: "2026-01-10T11:00:00.000Z",
     recurrence: null,
-    origin: { chat_id: 42, message_thread_id: 7 },
+    owner: { chat_id: 42, message_thread_id: 7 },
     ...overrides,
   };
 }
 
-function makeScheduler(dataDir: string, overrides: Partial<WorkspaceSchedulerOptions> = {}): { scheduler: WorkspaceScheduler; fireTask: ReturnType<typeof vi.fn>; errors: unknown[] } {
-  const fireTask = vi.fn(async () => {});
+function makeScheduler(dataDir: string, overrides: Partial<WorkspaceSchedulerOptions> = {}): { scheduler: WorkspaceScheduler; errors: unknown[] } {
   const errors: unknown[] = [];
   const scheduler = new WorkspaceScheduler({
     workspace: path.join(dataDir, "workspace"),
     statePath: path.join(dataDir, "scheduler-state.json"),
     timeline: new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl")),
-    fireTask,
     now: () => NOW,
     logger: (error) => errors.push(error),
     ...overrides,
   });
-  return { scheduler, fireTask, errors };
+  return { scheduler, errors };
 }
 
 describe("WorkspaceScheduler", () => {
-  it("fires a due one-shot once and records only the meaningful firing", async () => {
+  it("publishes a due one-shot to its owner once", async () => {
     const dataDir = await fixture();
     await writeSchedules(dataDir, [row()]);
     const first = makeScheduler(dataDir);
 
     await first.scheduler.poll(NOW);
-    expect(first.fireTask).toHaveBeenCalledWith(expect.any(String), "water the plants", conversationAgent(42, 7));
     expect(await timeline(dataDir)).toMatchObject([{
       type: "schedule_fired",
       occurrenceId: expect.any(String),
       prompt: "water the plants",
       dueAt: "2026-01-10T11:00:00.000Z",
-      origin: conversationAgent(42, 7),
+      owner: conversationAgent(42, 7),
     }]);
 
     await first.scheduler.poll(NOW);
     const restarted = makeScheduler(dataDir);
     await restarted.scheduler.poll(NOW);
-    expect(first.fireTask).toHaveBeenCalledOnce();
-    expect(restarted.fireTask).not.toHaveBeenCalled();
     expect(await timeline(dataDir)).toHaveLength(1);
   });
 
   it("advances a recurring row to the next future occurrence", async () => {
     const dataDir = await fixture();
     await writeSchedules(dataDir, [row({ recurrence: "daily", start: "2026-01-08T12:00:00.000Z" })]);
-    const { scheduler, fireTask } = makeScheduler(dataDir);
+    const { scheduler } = makeScheduler(dataDir);
 
     await scheduler.poll(NOW);
-    expect(fireTask).toHaveBeenCalledOnce();
+    expect(await timeline(dataDir)).toHaveLength(1);
     const state = JSON.parse(await readFile(path.join(dataDir, "scheduler-state.json"), "utf8")) as { rows: Array<{ nextDueAt: string }> };
     expect(state.rows[0]?.nextDueAt).toBe("2026-01-11T12:00:00.000Z");
 
     await scheduler.poll(Date.parse("2026-01-11T12:00:00.000Z"));
-    expect(fireTask).toHaveBeenCalledTimes(2);
+    expect(await timeline(dataDir)).toHaveLength(2);
   });
 
   it("drops state for removed rows and treats edited rows as new intent", async () => {
@@ -120,15 +115,15 @@ describe("WorkspaceScheduler", () => {
     await scheduler.poll(NOW);
     expect(errors).toHaveLength(1);
   });
-  it("rejects schedules without a conversation origin", async () => {
+  it("rejects schedules without a conversation owner", async () => {
     const dataDir = await fixture();
     await writeFile(path.join(dataDir, "workspace", ".schedules.json"), JSON.stringify({
       version: 1,
       schedules: [{ prompt: "water", start: "2026-01-10T11:00:00.000Z", recurrence: null }],
     }), "utf8");
-    const { scheduler, fireTask, errors } = makeScheduler(dataDir);
+    const { scheduler, errors } = makeScheduler(dataDir);
     await scheduler.poll(NOW);
-    expect(fireTask).not.toHaveBeenCalled();
+    expect(await timeline(dataDir)).toEqual([]);
     expect(errors).toHaveLength(1);
   });
 
@@ -137,10 +132,9 @@ describe("WorkspaceScheduler", () => {
     await writeSchedules(dataDir, [row()]);
     const blocked = path.join(dataDir, "blocked");
     await writeFile(blocked, "not a directory", "utf8");
-    const { scheduler, fireTask, errors } = makeScheduler(dataDir, { statePath: path.join(blocked, "scheduler-state.json") });
+    const { scheduler, errors } = makeScheduler(dataDir, { statePath: path.join(blocked, "scheduler-state.json") });
 
     await scheduler.poll(NOW);
-    expect(fireTask).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
     expect(await timeline(dataDir)).toEqual([]);
   });
@@ -148,9 +142,9 @@ describe("WorkspaceScheduler", () => {
   it("coalesces concurrent polls", async () => {
     const dataDir = await fixture();
     await writeSchedules(dataDir, [row()]);
-    const { scheduler, fireTask } = makeScheduler(dataDir);
+    const { scheduler } = makeScheduler(dataDir);
     await Promise.all([scheduler.poll(NOW), scheduler.poll(NOW), scheduler.poll(NOW)]);
-    expect(fireTask).toHaveBeenCalledOnce();
+    expect(await timeline(dataDir)).toHaveLength(1);
   });
 
   it("rejects invalid poll intervals", async () => {

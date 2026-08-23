@@ -378,7 +378,7 @@ it("bounds user message steering waits", async () => {
   expect(interrupt).toHaveBeenCalledWith(rawLine, conversationAgent(829096380), USER_INTERRUPT_MAX_WAIT_MS);
 });
 
-it("routes task finishes to their originating conversation", async () => {
+it("routes task finishes and schedules directly to their owners", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);
   const router = new AgentEventRouter({ followup, interrupt });
@@ -387,7 +387,7 @@ it("routes task finishes to their originating conversation", async () => {
   await router.onEvent({
     type: "task_finished",
     runId: "run-123",
-    trigger: { kind: "agent", agent: target },
+    owner: target,
     prompt: "check menu",
     status: "done",
     exitCode: 0,
@@ -396,14 +396,16 @@ it("routes task finishes to their originating conversation", async () => {
 
   followup.mockClear();
   await router.onEvent({
-    type: "task_finished",
-    runId: "run-456",
-    trigger: { kind: "schedule", occurrenceId: "occurrence-1", origin: target },
-    prompt: "scheduled check",
-    status: "done",
-    exitCode: 0,
+    type: "schedule_fired",
+    occurrenceId: "occurrence-1",
+    owner: target,
+    prompt: "create today's topic",
+    dueAt: "2026-08-24T00:00:00.000Z",
   }, "");
-  expect(followup).toHaveBeenCalledWith(expect.stringContaining('Task "scheduled check" finished'), target);
+  expect(followup).toHaveBeenCalledWith(
+    "Scheduled instruction due 2026-08-24T00:00:00.000Z:\ncreate today's topic",
+    target,
+  );
 });
 
 

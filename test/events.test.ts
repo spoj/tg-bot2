@@ -119,7 +119,7 @@ describe("WorkspaceTimeline", () => {
 
     timeline.notify({
       type: "task_progress",
-      trigger: { kind: "agent", agent: conversationAgent(1) },
+      owner: conversationAgent(1),
       tasks: [{ runId: "run-1", prompt: "work", runningMs: 10, idleMs: null }],
     });
 

@@ -132,9 +132,6 @@ function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progre
  * (interrupt vs followup vs ignore) and prompt formatting.
  */
 
-function triggerConversation(event: { trigger: Extract<BotEvent, { type: "task_finished" | "task_progress" }>["trigger"] }): ConversationAgentRef {
-  return event.trigger.kind === "agent" ? event.trigger.agent : event.trigger.origin;
-}
 
 
 export class AgentEventRouter {
@@ -163,6 +160,9 @@ export class AgentEventRouter {
       case "task_progress":
         await this.handleTaskProgress(event);
         break;
+      case "schedule_fired":
+        await this.handleScheduleFired(event);
+        break;
       case "my_chat_member":
         await this.handleMyChatMember(event);
         break;
@@ -182,11 +182,15 @@ export class AgentEventRouter {
   }
 
   private async handleTaskFinished(event: Extract<BotEvent, { type: "task_finished" }>): Promise<void> {
-    await this.notifier.followup(formatTaskFinishedMessage(event), triggerConversation(event));
+    await this.notifier.followup(formatTaskFinishedMessage(event), event.owner);
   }
 
   private async handleTaskProgress(event: Extract<BotEvent, { type: "task_progress" }>): Promise<void> {
-    if (event.tasks.length > 0) await this.notifier.followup(formatTaskProgressMessage(event.tasks), triggerConversation(event));
+    if (event.tasks.length > 0) await this.notifier.followup(formatTaskProgressMessage(event.tasks), event.owner);
+  }
+
+  private async handleScheduleFired(event: Extract<BotEvent, { type: "schedule_fired" }>): Promise<void> {
+    await this.notifier.followup(`Scheduled instruction due ${event.dueAt}:\n${event.prompt}`, event.owner);
   }
 
 

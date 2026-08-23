@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { conversationAgent, type AgentRef, type ConversationAgentRef, type TaskTrigger } from "./agent-ref.js";
+import { conversationAgent, type AgentRef, type ConversationAgentRef } from "./agent-ref.js";
 import { appendJsonl } from "./util.js";
 import { SerialQueue } from "./queue.js";
 
@@ -65,7 +65,7 @@ export type TimelineEvent =
   | {
       type: "task_finished";
       runId: string;
-      trigger: TaskTrigger;
+      owner: ConversationAgentRef;
       prompt: string;
       status: "done" | "failed" | "aborted";
       exitCode: number | null;
@@ -76,12 +76,12 @@ export type TimelineEvent =
       occurrenceId: string;
       prompt: string;
       dueAt: string;
-      origin: ConversationAgentRef;
+      owner: ConversationAgentRef;
     };
 
 export type RuntimeEvent = TimelineEvent | {
   type: "task_progress";
-  trigger: TaskTrigger;
+  owner: ConversationAgentRef;
   tasks: Array<{
     runId: string;
     prompt: string;

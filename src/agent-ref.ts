@@ -11,9 +11,6 @@ export type TaskAgentRef = {
 
 export type AgentRef = ConversationAgentRef | TaskAgentRef;
 
-export type TaskTrigger =
-  | { kind: "agent"; agent: ConversationAgentRef }
-  | { kind: "schedule"; occurrenceId: string; origin: ConversationAgentRef };
 
 export function conversationAgent(chatId: number, threadId = 0): ConversationAgentRef {
   return { kind: "conversation", chatId, threadId };

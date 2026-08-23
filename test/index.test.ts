@@ -167,11 +167,11 @@ describe("application startup and shutdown wiring", () => {
         hostTimeline: path.join(state.sandbox.dataDir, "bots", "123", "timeline.jsonl"),
       }),
     );
-    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; statePath: string; timeline: unknown; fireTask: unknown }) ?? {};
+    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; statePath: string; timeline: unknown }) ?? {};
     expect(schedulerOptions.workspace).toBe(workspacePath());
     expect(schedulerOptions.statePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "scheduler-state.json"));
     expect(schedulerOptions.timeline).toBeDefined();
-    expect(typeof schedulerOptions.fireTask).toBe("function");
+    expect(schedulerOptions).not.toHaveProperty("fireTask");
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), timeline: expect.any(Object) }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({
       workspace: workspacePath(),
@@ -254,34 +254,29 @@ describe("application startup and shutdown wiring", () => {
     expect(result).toEqual({ messageId: 7 });
   });
 
-  it("routes scheduled settlements and cross/self conversation steering through owners", async () => {
+  it("routes cross/self conversation steering through owners", async () => {
     const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
     void index.main();
     await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const origin = conversationAgent(42, 7);
-    const schedulerOptions = state.scheduler.mock.calls[0]?.[0] as {
-      fireTask: (occurrenceId: string, prompt: string, origin: ConversationAgentRef) => Promise<void>;
-    };
-    await schedulerOptions.fireTask("occurrence-1", "prepare report", origin);
-    expect(state.taskSpawn).toHaveBeenCalledWith("prepare report", { kind: "schedule", occurrenceId: "occurrence-1", origin }, "occurrence-1");
+    const actor = conversationAgent(42, 7);
 
     await mkdir(workspacePath(), { recursive: true });
     await writeFile(path.join(workspacePath(), ".allowed.json"), JSON.stringify([42, 99]), "utf8");
     const bridgeOptions = state.bridge.mock.calls[0]?.[0] as unknown as {
       handlers: { steerConversation: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>> };
     };
-    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 99, message_thread_id: 3, message: "Handle timeline message 120" }, origin))
+    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 99, message_thread_id: 3, message: "Handle timeline message 120" }, actor))
       .resolves.toEqual({ status: "delivered" });
     expect(state.agents.interrupt).toHaveBeenCalledWith(
       "Conversation 42:7 delegated work to you:\nHandle timeline message 120",
       conversationAgent(99, 3),
     );
 
-    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 42, message_thread_id: 7, message: "Reconsider the current approach" }, origin))
+    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 42, message_thread_id: 7, message: "Reconsider the current approach" }, actor))
       .resolves.toEqual({ status: "delivered" });
     expect(state.agents.interrupt).toHaveBeenLastCalledWith(
       "Conversation 42:7 delegated work to you:\nReconsider the current approach",
-      origin,
+      actor,
     );
   });
 

@@ -2,7 +2,7 @@ export const TASKS_PROMPT = `Use spawn for sustained work that should not block 
 - spawn returns a runId and starts immediately or queues behind the eight active slots.
 - steer_task adjusts a running task; cancel stops a running task or removes a queued one.
 - Anonymous tasks cannot send Telegram messages or steer conversations. Their files live under /workspace/.pi/tasks/<runId>/.
-- task_finished returns to the originating conversation. Scheduled tasks return to the explicit schedule origin.
+- task_finished returns to the conversation that spawned the task.
 `;
 
 export const TASK_RUNNER_PROMPT = `Complete the assigned task autonomously in /workspace. Your final response becomes output.md.

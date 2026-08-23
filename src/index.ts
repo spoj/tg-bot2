@@ -156,9 +156,6 @@ export async function main(): Promise<void> {
       workspace,
       statePath: paths.schedulerState,
       timeline,
-      fireTask: async (occurrenceId, prompt, origin) => {
-        await tasksInstance.spawn(prompt, { kind: "schedule", occurrenceId, origin }, occurrenceId);
-      },
     });
     const hostHandlers = {
       send: (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => outboxInstance.send(params.request, actor),
@@ -167,7 +164,7 @@ export async function main(): Promise<void> {
       }),
       spawn: async (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => {
         if (actor.kind !== "conversation") throw new Error("Only conversation agents can spawn tasks");
-        return tasksInstance.spawn(stringField(params, "prompt"), { kind: "agent", agent: actor });
+        return tasksInstance.spawn(stringField(params, "prompt"), actor);
       },
       cancel: async (params: Record<string, unknown>) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
       steerTask: async (params: Record<string, unknown>) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),

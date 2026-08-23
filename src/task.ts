@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, opendir, rename, rm, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
-import type { TaskTrigger } from "./agent-ref.js";
+import type { ConversationAgentRef } from "./agent-ref.js";
 import type { WorkspaceTimeline } from "./events.js";
 import type { AgentCredentials } from "./host-bridge.js";
 import { PiWorker, type PiRunResult } from "./pi-worker.js";
@@ -63,7 +63,7 @@ const MAX_QUOTE_LENGTH = 120;
 type InFlightTask = {
   worker: WorkspaceTaskWorker;
   runId: string;
-  trigger: TaskTrigger;
+  owner: ConversationAgentRef;
   token: string;
   prompt: string;
   startedAt: number;
@@ -75,13 +75,13 @@ type InFlightTask = {
 type QueuedSpawn = {
   runId: string;
   prompt: string;
-  trigger: TaskTrigger;
+  owner: ConversationAgentRef;
 };
 
 type TaskRun = {
   runId: string;
   prompt: string;
-  trigger: TaskTrigger;
+  owner: ConversationAgentRef;
   token: string;
 };
 
@@ -265,14 +265,14 @@ export class WorkspaceTasks {
   }
 
   /** Launches a background task for one spawn request; queues when all slots are busy. */
-  async spawn(prompt: string, trigger: TaskTrigger, runId: string = randomUUID()): Promise<SpawnResult> {
+  async spawn(prompt: string, owner: ConversationAgentRef, runId: string = randomUUID()): Promise<SpawnResult> {
     if (prompt.trim().length === 0) throw new Error(TASK_PROMPT_EMPTY_MESSAGE);
     if (Buffer.byteLength(prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Task prompt exceeds ${MAX_TASK_BYTES} bytes`);
     if (this.inFlight.length >= MAX_CONCURRENT_TASKS) {
-      this.queued.push({ runId, prompt, trigger });
+      this.queued.push({ runId, prompt, owner });
       return { runId, status: "queued" };
     }
-    await this.claimAndLaunch(this.workspace, runId, prompt, trigger);
+    await this.claimAndLaunch(this.workspace, runId, prompt, owner);
     return { runId, status: "launched" };
   }
 
@@ -304,12 +304,12 @@ export class WorkspaceTasks {
     return "delivered";
   }
 
-  private async claimAndLaunch(workspace: string, runId: string, prompt: string, trigger: TaskTrigger): Promise<void> {
+  private async claimAndLaunch(workspace: string, runId: string, prompt: string, owner: ConversationAgentRef): Promise<void> {
     const runDirectory = path.join(workspace, TASKS_DIR, runId);
     await mkdir(path.join(runDirectory, SESSIONS_DIR), { recursive: true, mode: 0o700 });
     await writeTaskArtifact(runDirectory, PROMPT_FILE, prompt);
     const token = this.credentials.issue({ kind: "task", runId }, ["annotate"]);
-    const task: TaskRun = { runId, prompt, trigger, token };
+    const task: TaskRun = { runId, prompt, owner, token };
     let worker: WorkspaceTaskWorker;
     try {
       worker = await this.workerFactory({ workspace, runId, prompt, token });
@@ -330,7 +330,7 @@ export class WorkspaceTasks {
     const entry: InFlightTask = {
       worker,
       runId: task.runId,
-      trigger: task.trigger,
+      owner: task.owner,
       token: task.token,
       prompt: task.prompt,
       startedAt: this.now(),
@@ -377,7 +377,7 @@ export class WorkspaceTasks {
     await this.settleTask(workspace, task, runDirectory, result);
     if (this.running) {
       const next = this.queued.shift();
-      if (next) await this.claimAndLaunch(workspace, next.runId, next.prompt, next.trigger).catch((error) => this.report(error));
+      if (next) await this.claimAndLaunch(workspace, next.runId, next.prompt, next.owner).catch((error) => this.report(error));
     }
   }
 
@@ -436,7 +436,7 @@ export class WorkspaceTasks {
     await this.timeline.publish({
       type: "task_finished",
       runId: task.runId,
-      trigger: task.trigger,
+      owner: task.owner,
       prompt: task.prompt,
       status,
       exitCode: result.code,
@@ -447,16 +447,15 @@ export class WorkspaceTasks {
   private heartbeat(): void {
     if (this.inFlight.length === 0) return;
     const now = this.now();
-    const groups = new Map<string, { trigger: Extract<TaskTrigger, { kind: "agent" }>; tasks: InFlightTask[] }>();
+    const groups = new Map<string, { owner: ConversationAgentRef; tasks: InFlightTask[] }>();
     for (const task of this.inFlight) {
-      if (task.trigger.kind !== "agent") continue;
-      const { chatId, threadId } = task.trigger.agent;
+      const { chatId, threadId } = task.owner;
       const key = `${chatId}:${threadId}`;
-      const group = groups.get(key) ?? { trigger: task.trigger, tasks: [] };
+      const group = groups.get(key) ?? { owner: task.owner, tasks: [] };
       group.tasks.push(task);
       groups.set(key, group);
     }
-    for (const { trigger, tasks: running } of groups.values()) {
+    for (const { owner, tasks: running } of groups.values()) {
       const tasks = running.map((task) => {
         const { at, text } = task.worker.activity();
         const runningMs = Math.max(0, now - task.startedAt);
@@ -464,7 +463,7 @@ export class WorkspaceTasks {
         const lastOutput = text.trim().length > 0 ? truncate(text.trim(), MAX_QUOTE_LENGTH) : undefined;
         return { runId: task.runId, prompt: task.prompt, runningMs, idleMs, ...defined({ lastOutput }) };
       });
-      this.timeline.notify({ type: "task_progress", trigger, tasks });
+      this.timeline.notify({ type: "task_progress", owner, tasks });
     }
   }
 

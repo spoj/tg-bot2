@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as realSetTimeout } from "node:timers";
@@ -250,6 +250,37 @@ describe("raw Telegram Bot API dispatch", () => {
     expect(bot.api.raw.sendDocument).toHaveBeenCalledWith({ chat_id: 42, document: expect.any(InputFile), caption: "Report" });
   });
 
+  it("resolves connector-managed paths without duplicating their prefix", async () => {
+    const test = await fixture();
+    const relative = path.join("42", "2024-01-02", "7", "managed.txt");
+    await mkdir(path.dirname(path.join(test.config.attachments, relative)), { recursive: true });
+    await writeFile(path.join(test.config.attachments, relative), "managed", "utf8");
+    const managed = `/run/attachments/${ATTACHMENT_PREFIX}/${relative.split(path.sep).join("/")}`;
+
+    const result = await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-managed", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: managed,
+    });
+
+    expect(result.request?.document).toBe(managed);
+    expect(result.attachmentPaths).toEqual([managed]);
+  });
+
+  it("rejects symlinked intermediate workspace paths", async () => {
+    const test = await fixture();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "telegram-outside-"));
+    temporaryDirectories.push(outside);
+    await writeFile(path.join(outside, "secret.txt"), "secret", "utf8");
+    await symlink(outside, path.join(test.config.workspace, "linked"), "dir");
+
+    await expect(dispatchOutboxRequest(fakeBot(), test.config, 42, "req-link", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/linked/secret.txt",
+    })).rejects.toThrow();
+  });
+
   it("rejects local files outside the workspace", async () => {
     const test = await fixture();
     await expect(dispatchOutboxRequest(fakeBot(), test.config, 42, "req-bad", {
@@ -304,6 +335,46 @@ describe("TelegramConnector send", () => {
     expect(test.requests.filter((request) => request.url.endsWith("/editMessageText"))).toHaveLength(1);
   });
 
+  it("returns and owns every message from a media group", async () => {
+    const test = await fixture({
+      responses: [{ ok: true, result: [{ message_id: 9101 }, { message_id: 9102 }, { message_id: 9103 }] }],
+    });
+    const owner = telegramConversation(CONNECTOR_ID, 42, 7);
+
+    const result = await test.connector.send({
+      method: "sendMediaGroup",
+      media: [
+        { type: "photo", media: "telegram-file-1" },
+        { type: "photo", media: "telegram-file-2" },
+        { type: "video", media: "telegram-file-3" },
+      ],
+    }, owner);
+
+    expect(result).toMatchObject({
+      response: [{ message_id: 9101 }, { message_id: 9102 }, { message_id: 9103 }],
+      summary: { method: "sendMediaGroup", messageIds: [9101, 9102, 9103] },
+    });
+    for (const messageId of [9101, 9102, 9103]) {
+      expect(test.resources.owner(CONNECTOR_ID, "message", `42:${messageId}`)).toEqual(owner);
+    }
+  });
+
+  it("reports uncertain delivery when ownership persistence fails after Telegram accepts a send", async () => {
+    const test = await fixture({ fetchResult: { message_id: 9104 } });
+    vi.spyOn(test.resources, "setMany").mockRejectedValue(new Error("resource state unavailable"));
+
+    const result = await test.connector.send({ method: "sendMessage", text: "delivered" }, telegramConversation(CONNECTOR_ID, 42));
+
+    expect(result).toMatchObject({
+      summary: {
+        uncertain: true,
+        deliveryStatus: "delivered_persistence_failed",
+        persistenceError: expect.stringContaining("resource state unavailable"),
+      },
+    });
+    expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(1);
+  });
+
   it("retries Telegram rate limits and returns one successful result", async () => {
     const test = await fixture({
       responses: [
@@ -321,6 +392,33 @@ describe("TelegramConnector send", () => {
     await vi.advanceTimersByTimeAsync(1_000);
 
     await expect(pending).resolves.toMatchObject({ summary: { messageId: 9001 } });
+    expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(3);
+  });
+  it("keeps later same-chat sends behind retry backoff and drains sleeping retries", async () => {
+    const test = await fixture({
+      responses: [
+        { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 5 } },
+        { ok: true, result: { message_id: 9201 } },
+        { ok: true, result: { message_id: 9202 } },
+      ],
+    });
+    vi.useFakeTimers();
+
+    const first = test.connector.send({ method: "sendMessage", text: "first" }, telegramConversation(CONNECTOR_ID, 42));
+    await waitForRetryTimer();
+    const second = test.connector.send({ method: "sendMessage", text: "second" }, telegramConversation(CONNECTOR_ID, 42));
+    for (let attempts = 0; attempts < 10; attempts++) await Promise.resolve();
+    expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(1);
+
+    let drained = false;
+    const drain = test.connector.delivery.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(first).resolves.toMatchObject({ summary: { messageId: 9201 } });
+    await expect(second).resolves.toMatchObject({ summary: { messageId: 9202 } });
+    await drain;
+    expect(drained).toBe(true);
     expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(3);
   });
 });
@@ -346,6 +444,37 @@ describe("Telegram ingress and native event preservation", () => {
     });
     expect(interruptEnvelope(test.interrupt)).toEqual(event);
     expect(test.resources.owner(CONNECTOR_ID, "message", "42:7")).toEqual(telegramConversation(CONNECTOR_ID, 42));
+  });
+
+  it("persists channel posts and edited channel posts through message ingestion", async () => {
+    const test = await fixture({ allowed: [-100] });
+    await test.bot.handleUpdate({
+      update_id: 30,
+      channel_post: {
+        message_id: 300,
+        date: 1_700_000_000,
+        chat: { id: -100, type: "channel", title: "News" },
+        sender_chat: { id: -100, type: "channel", title: "News" },
+        text: "channel post",
+      },
+    } as never);
+    await test.bot.handleUpdate({
+      update_id: 31,
+      edited_channel_post: {
+        message_id: 300,
+        date: 1_700_000_000,
+        edit_date: 1_700_000_100,
+        chat: { id: -100, type: "channel", title: "News" },
+        sender_chat: { id: -100, type: "channel", title: "News" },
+        text: "edited channel post",
+      },
+    } as never);
+
+    expect(await timelineEvents(test.paths)).toMatchObject([
+      { type: "telegram.message", conversation: telegramConversation(CONNECTOR_ID, -100), payload: { message_id: 300, text: "channel post" } },
+      { type: "telegram.edited_message", conversation: telegramConversation(CONNECTOR_ID, -100), payload: { message_id: 300, text: "edited channel post" } },
+    ]);
+    expect(test.resources.owner(CONNECTOR_ID, "message", "-100:300")).toEqual(telegramConversation(CONNECTOR_ID, -100));
   });
 
   it("preserves edited messages, callbacks, reactions, membership, and join requests as native payloads", async () => {
@@ -439,6 +568,42 @@ describe("Telegram ingress and native event preservation", () => {
       expect(JSON.stringify(events[0])).not.toContain("secret content");
       expect(JSON.stringify(events[0])).not.toContain("different secret");
     }
+  });
+  it("allows a later rejection event after an allowlist add and removal", async () => {
+    const test = await fixture({ allowed: [42] });
+    await test.bot.handleUpdate(messageUpdate(99, "first rejection") as never);
+    await writeAllowedChats(test.config, [42, 99]);
+    await test.bot.handleUpdate(messageUpdate(99, "now allowed", { message_id: 8 }) as never);
+    await writeAllowedChats(test.config, [42]);
+    await test.bot.handleUpdate(messageUpdate(99, "second rejection", { message_id: 9 }) as never);
+
+    const events = await timelineEvents(test.paths);
+    const accessRequests = events.filter((event) => event.type === "telegram.access_request");
+    expect(accessRequests).toHaveLength(2);
+    expect(accessRequests.map((event) => (event.payload as Record<string, unknown>).reason)).toEqual(["chat_not_allowed", "chat_not_allowed"]);
+  });
+  it("attributes forum reactions to the reacted message owner", async () => {
+    const test = await fixture({ allowed: [-100] });
+    const owner = telegramConversation(CONNECTOR_ID, -100, 77);
+    await test.resources.set({ connectorId: CONNECTOR_ID, kind: "message", key: "-100:88", owner });
+
+    await test.bot.handleUpdate({
+      update_id: 8,
+      message_reaction: {
+        chat: { id: -100, type: "supergroup", title: "Work" },
+        message_id: 88,
+        user: { id: 42, is_bot: false, first_name: "Alice" },
+        date: 1_700_000_100,
+        old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "👍" }],
+      },
+    } as never);
+
+    expect(await timelineEvents(test.paths)).toMatchObject([{
+      type: "telegram.message_reaction",
+      conversation: owner,
+      payload: { message_id: 88 },
+    }]);
   });
 
   it("retains an unlisted group identity without retaining its sender or message", async () => {
@@ -615,6 +780,34 @@ describe("Telegram gates and commands", () => {
     expect(isBotGroupAdd({ old_chat_member: { status: "left" }, new_chat_member: { status: "member" } })).toBe(true);
     expect(isBotGroupAdd({ old_chat_member: { status: "kicked" }, new_chat_member: { status: "administrator" } })).toBe(true);
     expect(isBotGroupAdd({ old_chat_member: { status: "member" }, new_chat_member: { status: "administrator" } })).toBe(false);
+  });
+  it("describes an allowed chat when the bot is added", async () => {
+    const test = await fixture({ allowed: [-100123] });
+    const record = {
+      v: 2,
+      id: "group-add",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.my_chat_member",
+      connectorId: CONNECTOR_ID,
+      conversation: telegramConversation(CONNECTOR_ID, -100123),
+      meta: { group_add: true },
+    } as never;
+
+    const text = test.connector.notificationText(record, "raw event");
+
+    expect(text).toContain("already allowed");
+    expect(text).not.toContain("To allow");
+  });
+  it("requests channel post updates from Telegram", async () => {
+    const test = await fixture();
+    const start = vi.spyOn(test.bot, "start").mockResolvedValue(undefined);
+
+    await test.connector.run();
+
+    expect(start).toHaveBeenCalledWith(expect.objectContaining({
+      allowed_updates: expect.arrayContaining(["channel_post", "edited_channel_post"]),
+    }));
   });
 
   it("publishes only current commands", async () => {

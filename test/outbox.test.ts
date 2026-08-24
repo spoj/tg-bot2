@@ -33,7 +33,7 @@ async function fixture(send: WorkspaceConnector["send"]) {
   };
   const connectors = new ConnectorRegistry();
   connectors.register(connector);
-  return { outbox: new WorkspaceOutbox({ connectors, timeline }), timelinePath };
+  return { outbox: new WorkspaceOutbox({ connectors, timeline }), timeline, timelinePath };
 }
 
 async function events(timelinePath: string): Promise<Array<Record<string, unknown>>> {
@@ -105,6 +105,27 @@ describe("WorkspaceOutbox", () => {
 
     await expect(outbox.send({ method: "sendMessage", text: "hello" }, actor)).rejects.toThrow("delivery failed");
     expect(await events(timelinePath)).toEqual([]);
+  });
+  it("returns an uncertain delivered outcome when timeline persistence fails", async () => {
+    const send = vi.fn<WorkspaceConnector["send"]>(async () => ({
+      request: { method: "sendMessage", chat_id: 42, text: "hello" },
+      response: { message_id: 9002 },
+      summary: { method: "sendMessage", messageId: 9002 },
+    }));
+    const { outbox, timeline } = await fixture(send);
+    vi.spyOn(timeline, "publish").mockRejectedValue(new Error("timeline disk full"));
+
+    const result = await outbox.send({ method: "sendMessage", text: "hello" }, actor);
+
+    expect(result).toMatchObject({
+      requestId: expect.any(String),
+      method: "sendMessage",
+      messageId: 9002,
+      uncertain: true,
+      deliveryStatus: "delivered_timeline_persistence_failed",
+      persistenceError: expect.stringContaining("timeline disk full"),
+    });
+    expect(send).toHaveBeenCalledOnce();
   });
 
   it("fails when the actor's connector is not registered", async () => {

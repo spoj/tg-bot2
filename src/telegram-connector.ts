@@ -5,11 +5,11 @@ import { readAllowedFile } from "./allowlist.js";
 import type { WorkspaceConnector, ConnectorSendResult } from "./connector.js";
 import type { Config } from "./config.js";
 import type { TimelineRecord, WorkspaceTimeline } from "./events.js";
-import { validateRequest, type WorkspaceOutboxDispatchResult, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
+import { validateRequest, type WorkspaceOutboxRequest } from "./outbox-protocol.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
 import type { WorkspaceResources } from "./resource-state.js";
 import { telegramAddress, telegramConversation } from "./telegram-ref.js";
-import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
+import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue, type TelegramDispatchResult } from "./telegram.js";
 import { errorMessage } from "./util.js";
 
 const MAX_OUTBOX_ATTEMPTS = 3;
@@ -40,7 +40,7 @@ function applyOwnerTarget(request: Record<string, unknown>, actor: ConversationA
   };
 }
 
-function connectorSendResult(result: WorkspaceOutboxDispatchResult, recorded: WorkspaceOutboxRequest): ConnectorSendResult {
+function connectorSendResult(result: TelegramDispatchResult, recorded: WorkspaceOutboxRequest, persistenceError?: string): ConnectorSendResult {
   const attachmentPaths = result.attachmentPaths ?? [];
   const response = result.data ?? {
     ...(typeof result.messageId === "number" ? { message_id: result.messageId } : {}),
@@ -54,8 +54,14 @@ function connectorSendResult(result: WorkspaceOutboxDispatchResult, recorded: Wo
     summary: {
       method: recorded.method,
       ...(typeof result.messageId === "number" ? { messageId: result.messageId } : {}),
+      ...(result.messageIds === undefined ? {} : { messageIds: result.messageIds }),
       ...(typeof result.pollId === "string" ? { pollId: result.pollId } : {}),
       ...(attachmentPaths.length > 0 ? { attachments: attachmentPaths } : {}),
+      ...(persistenceError === undefined ? {} : {
+        uncertain: true,
+        deliveryStatus: "delivered_persistence_failed",
+        persistenceError,
+      }),
     },
   };
 }
@@ -91,7 +97,7 @@ export class TelegramConnector implements WorkspaceConnector {
     this.running = true;
     try {
       await this.bot.start({
-        allowed_updates: ["message", "edited_message", "callback_query", "poll_answer", "message_reaction", "my_chat_member", "chat_join_request"],
+        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "poll_answer", "message_reaction", "my_chat_member", "chat_join_request"],
         onStart: (info) => console.log(`Telegram connector ${this.id} @${info.username} started`),
       });
     } finally {
@@ -125,7 +131,7 @@ export class TelegramConnector implements WorkspaceConnector {
   notificationText(record: TimelineRecord, rawLine: string): string {
     if (record.type === "telegram.my_chat_member" && (record.meta as { group_add?: unknown } | undefined)?.group_add === true) {
       const chatId = record.conversation?.address.chat_id;
-      return `Bot was added to group or channel ${String(chatId)}. To allow it, add ${String(chatId)} to /workspace/.allowed.json.`;
+      return `Bot was added to group or channel ${String(chatId)}. This chat is already allowed.`;
     }
     return rawLine;
   }
@@ -152,27 +158,34 @@ export class TelegramConnector implements WorkspaceConnector {
     this.assertMutationOwner(validated, actor);
 
     const requestId = randomUUID();
-    let result: WorkspaceOutboxDispatchResult;
+    let result: TelegramDispatchResult;
     try {
       result = await this.dispatchWithRetry(address.chat_id, requestId, validated);
     } catch (error) {
       throw new Error(errorMessage(error));
     }
     const recorded = result.request ?? validated;
-    await this.persistSendResources(result, recorded, actor, address.chat_id);
-    return connectorSendResult(result, recorded);
+    let persistenceError: string | undefined;
+    try {
+      await this.persistSendResources(result, recorded, actor, address.chat_id);
+    } catch (error) {
+      persistenceError = `Failed to persist Telegram delivery ownership: ${errorMessage(error)}`;
+    }
+    return connectorSendResult(result, recorded, persistenceError);
   }
 
   private async persistSendResources(
-    result: WorkspaceOutboxDispatchResult,
+    result: TelegramDispatchResult,
     recorded: WorkspaceOutboxRequest,
     actor: ConversationAgentRef,
     chatId: number,
   ): Promise<void> {
+    const messageIds = [
+      ...(typeof result.messageId === "number" ? [result.messageId] : []),
+      ...(result.messageIds ?? []).filter((messageId) => Number.isSafeInteger(messageId)),
+    ];
     await this.resources.setMany([
-      ...(typeof result.messageId === "number"
-        ? [{ connectorId: this.id, kind: "message" as const, key: `${chatId}:${result.messageId}`, owner: actor }]
-        : []),
+      ...messageIds.map((messageId) => ({ connectorId: this.id, kind: "message" as const, key: `${chatId}:${messageId}`, owner: actor })),
       ...(typeof result.pollId === "string"
         ? [{ connectorId: this.id, kind: "poll" as const, key: result.pollId, owner: actor }]
         : []),
@@ -193,16 +206,17 @@ export class TelegramConnector implements WorkspaceConnector {
     const owner = this.resources.owner(this.id, "message", `${address.chat_id}:${request.message_id}`);
     if (!owner || !sameConversation(owner, actor)) throw new Error(`Message ${request.message_id} is not owned by this conversation`);
   }
-
-  private async dispatchWithRetry(chatId: number, requestId: string, request: WorkspaceOutboxRequest): Promise<WorkspaceOutboxDispatchResult> {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await this.delivery.enqueue(chatId, () => dispatchOutboxRequest(this.bot, this.config, chatId, requestId, request));
-      } catch (error) {
-        const retryAfter = retryDelaySeconds(error);
-        if (retryAfter === undefined || attempt >= MAX_OUTBOX_ATTEMPTS) throw error;
-        await sleep(retryAfter * 1000);
+  private async dispatchWithRetry(chatId: number, requestId: string, request: WorkspaceOutboxRequest): Promise<TelegramDispatchResult> {
+    return this.delivery.enqueue(chatId, async () => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await dispatchOutboxRequest(this.bot, this.config, chatId, requestId, request);
+        } catch (error) {
+          const retryAfter = retryDelaySeconds(error);
+          if (retryAfter === undefined || attempt >= MAX_OUTBOX_ATTEMPTS) throw error;
+          await sleep(retryAfter * 1000);
+        }
       }
-    }
+    });
   }
 }

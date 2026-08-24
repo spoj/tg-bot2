@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentRef } from "./agent-ref.js";
 import type { ConnectorRegistry } from "./connector.js";
+import { errorMessage } from "./util.js";
 import type { WorkspaceTimeline } from "./events.js";
 
 export type WorkspaceOutboxOptions = {
@@ -31,15 +32,35 @@ export class WorkspaceOutbox {
     const connector = this.connectors.get(actor.connectorId);
     const requestId = randomUUID();
     const result = await connector.send(request, actor);
-    await this.timeline.publish({
-      type: "connector.sent",
-      connectorId: connector.id,
-      actor,
-      conversation: actor,
-      request: result.request,
-      ...(result.response === undefined ? {} : { response: result.response }),
-      ...(result.attachments === undefined ? {} : { attachments: result.attachments }),
-    });
-    return { requestId, ...(result.summary ?? {}) };
+    const summary = result.summary ?? {};
+    const connectorPersistenceError = typeof summary.persistenceError === "string" ? summary.persistenceError : undefined;
+    try {
+      await this.timeline.publish({
+        type: "connector.sent",
+        connectorId: connector.id,
+        actor,
+        conversation: actor,
+        request: result.request,
+        ...(result.response === undefined ? {} : { response: result.response }),
+        ...(result.attachments === undefined ? {} : { attachments: result.attachments }),
+        ...(connectorPersistenceError === undefined ? {} : {
+          uncertain: true,
+          deliveryStatus: "delivered_persistence_failed",
+          persistenceError: connectorPersistenceError,
+        }),
+      });
+    } catch (error) {
+      const timelinePersistenceError = `Failed to persist connector timeline event: ${errorMessage(error)}`;
+      return {
+        requestId,
+        ...summary,
+        uncertain: true,
+        deliveryStatus: "delivered_timeline_persistence_failed",
+        persistenceError: connectorPersistenceError === undefined
+          ? timelinePersistenceError
+          : `${connectorPersistenceError}; ${timelinePersistenceError}`,
+      };
+    }
+    return { requestId, ...summary };
   }
 }

@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
@@ -18,6 +18,8 @@ const MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
+const REJECTED_INGRESS_TTL_MS = 10 * 60 * 1_000;
+const MAX_REJECTED_INGRESS = 1_024;
 
 type AttachmentSource = {
   type: string;
@@ -86,29 +88,71 @@ function exposedCandidate(root: string, exposedPath: string, mountPoint: string)
   return path.resolve(root, exposedPath.slice(mountPoint.length + 1));
 }
 
+function localFileOpenError(error: unknown, mountPoint: string): Error {
+  const code = error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+  if (code === "ELOOP") return new Error(`Local file resolves outside ${mountPoint}`);
+  if (code === "ENOTDIR") return new Error("Local path is not a regular file");
+  if (code === "ENOENT") return new Error("Local file does not exist");
+  return error instanceof Error ? error : new Error("Local file does not exist");
+}
+
+/**
+ * Reads a local file through directory handles pinned one component at a time.
+ * Checking realpath and then reopening the pathname would let an attacker swap
+ * an intermediate directory between those operations.
+ */
 async function readLocalFile(root: string, exposedPath: string, mountPoint: string): Promise<{ bytes: Buffer; resolved: string }> {
-  const candidate = exposedCandidate(root, exposedPath, mountPoint);
-  if (!isWithinRoot(root, candidate)) throw new Error(`Local file escapes ${mountPoint}`);
-  const resolved = await realpath(candidate).catch(() => { throw new Error("Local file does not exist"); });
-  if (!isWithinRoot(root, resolved)) throw new Error(`Local file resolves outside ${mountPoint}`);
-  const handle = await open(resolved, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING).catch(() => { throw new Error("Local file does not exist"); });
+  const expectedRoot = path.resolve(root);
+  const candidate = exposedCandidate(expectedRoot, exposedPath, mountPoint);
+  if (!isWithinRoot(expectedRoot, candidate)) throw new Error(`Local file escapes ${mountPoint}`);
+  const relative = path.relative(expectedRoot, candidate);
+  const segments = relative === "" ? [] : relative.split(path.sep);
+  let rootHandle: Awaited<ReturnType<typeof open>> | undefined;
+  const directoryHandles: Array<Awaited<ReturnType<typeof open>>> = [];
+  let fileHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const file = await handle.stat();
+    const rootRealPath = await realpath(expectedRoot).catch(() => { throw new Error("Local file does not exist"); });
+    if (rootRealPath !== expectedRoot) throw new Error(`Local file resolves outside ${mountPoint}`);
+    rootHandle = await open(expectedRoot, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | NO_FOLLOW);
+    directoryHandles.push(rootHandle);
+    const openedRoot = await realpath(`/proc/self/fd/${rootHandle.fd}`);
+    if (openedRoot !== expectedRoot) throw new Error(`Local file resolves outside ${mountPoint}`);
+
+    let parent = rootHandle;
+    for (const segment of segments.slice(0, -1)) {
+      const child = await open(`/proc/self/fd/${parent.fd}/${segment}`, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | NO_FOLLOW);
+      directoryHandles.push(child);
+      parent = child;
+    }
+    if (segments.length > 0) {
+      const name = segments[segments.length - 1]!;
+      fileHandle = await open(`/proc/self/fd/${parent.fd}/${name}`, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+    } else {
+      fileHandle = rootHandle;
+    }
+    if (!fileHandle) throw new Error("Local file does not exist");
+    const resolved = await realpath(`/proc/self/fd/${fileHandle.fd}`);
+    if (!isWithinRoot(expectedRoot, resolved)) throw new Error(`Local file resolves outside ${mountPoint}`);
+    const file = await fileHandle.stat();
     if (!file.isFile()) throw new Error("Local path is not a regular file");
     if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
     const chunks: Buffer[] = [];
     let total = 0;
     while (total <= MAX_OUTBOUND_FILE_BYTES) {
       const chunk = Buffer.allocUnsafe(Math.min(OUTBOUND_READ_CHUNK_BYTES, MAX_OUTBOUND_FILE_BYTES + 1 - total));
-      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      const { bytesRead } = await fileHandle.read(chunk, 0, chunk.length, null);
       if (bytesRead === 0) break;
       chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
       total += bytesRead;
     }
     if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
     return { bytes: Buffer.concat(chunks, total), resolved };
+  } catch (error) {
+    if (error instanceof Error && (error.message.startsWith("Local ") || error.message.startsWith("Directory "))) throw error;
+    throw localFileOpenError(error, mountPoint);
   } finally {
-    await handle.close();
+    if (fileHandle && fileHandle !== rootHandle) await fileHandle.close().catch(() => {});
+    for (const handle of [...directoryHandles].reverse()) await handle.close().catch(() => {});
   }
 }
 
@@ -119,7 +163,7 @@ async function stageOutboundFile(
   const source = await readLocalFile(
     alreadyManaged ? paths.attachments : paths.workspace,
     exposedPath,
-    alreadyManaged ? "/run/attachments" : "/workspace",
+    alreadyManaged ? `/run/attachments/${paths.attachmentPrefix}` : "/workspace",
   );
   if (alreadyManaged) return { path: exposedPath, input: new InputFile(source.bytes, path.basename(source.resolved)) };
 
@@ -159,6 +203,7 @@ async function stageOutboundFile(
   }
 }
 
+
 async function prepareTelegramPayload(
   paths: { workspace: string; attachments: string; attachmentPrefix: string }, chatId: number, requestId: string, request: WorkspaceOutboxRequest,
 ): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest; attachmentPaths: string[] }> {
@@ -189,12 +234,22 @@ async function prepareTelegramPayload(
   return { payload, recorded, attachmentPaths };
 }
 
-function dispatchResult(data: unknown, request: WorkspaceOutboxRequest, attachmentPaths: string[]): WorkspaceOutboxDispatchResult {
+export type TelegramDispatchResult = WorkspaceOutboxDispatchResult & { messageIds?: number[] };
+
+function dispatchResult(data: unknown, request: WorkspaceOutboxRequest, attachmentPaths: string[]): TelegramDispatchResult {
   const result = data !== null && typeof data === "object" ? data as Record<string, unknown> : {};
   const poll = result.poll !== null && typeof result.poll === "object" ? result.poll as Record<string, unknown> : undefined;
+  const messageIds = request.method === "sendMediaGroup" && Array.isArray(data)
+    ? data.flatMap((item) => {
+      if (item === null || typeof item !== "object") return [];
+      const messageId = (item as Record<string, unknown>).message_id;
+      return typeof messageId === "number" && Number.isSafeInteger(messageId) ? [messageId] : [];
+    })
+    : [];
   return {
     request,
     ...(attachmentPaths.length > 0 ? { attachmentPaths } : {}),
+    ...(messageIds.length > 0 ? { messageIds } : {}),
     ...(typeof result.message_id === "number" ? { messageId: result.message_id } : {}),
     ...(typeof poll?.id === "string" ? { pollId: poll.id } : {}),
     ...(typeof result.message_thread_id === "number" ? { messageThreadId: result.message_thread_id } : {}),
@@ -208,7 +263,7 @@ export async function dispatchOutboxRequest(
   chatId: number,
   requestId: string,
   request: WorkspaceOutboxRequest,
-): Promise<WorkspaceOutboxDispatchResult> {
+): Promise<TelegramDispatchResult> {
   const { payload, recorded, attachmentPaths } = await prepareTelegramPayload(paths, chatId, requestId, request);
   const raw = bot.api.raw as unknown as Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
   const call = raw[request.method];
@@ -537,6 +592,9 @@ async function isChatAllowed(workspace: string, chatId: number): Promise<boolean
   const allowed = await readAllowedFile(workspace);
   return allowed.status === "ready" && allowed.chats.includes(chatId);
 }
+function allowlistFingerprint(allowed: Awaited<ReturnType<typeof readAllowedFile>>): string {
+  return createHash("sha256").update(JSON.stringify(allowed)).digest("hex");
+}
 const SERVICE_MESSAGE_FIELDS = new Set([
   "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited",
   "general_forum_topic_hidden", "general_forum_topic_unhidden", "new_chat_members", "left_chat_member",
@@ -606,7 +664,7 @@ export function createTelegramBot(
   const bot = new Bot(config.token);
   const workspace = config.workspace;
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
-  const rejectedIngress = new Set<string>();
+  const rejectedIngress = new Map<string, { state: string; expiresAt: number }>();
 
   bot.use(async (ctx, next) => {
     // poll_answer updates carry no chat; their handler resolves ownership and gates them.
@@ -618,13 +676,29 @@ export function createTelegramBot(
     const updateType = Object.keys(ctx.update).find((key) => key !== "update_id") ?? "unknown";
     const allowed = Number.isSafeInteger(chat.id) ? await readAllowedFile(workspace) : { status: "malformed" as const };
     if (allowed.status === "ready" && allowed.chats.includes(chat.id)) {
+      const chatRejectionPrefix = `[${String(chat.id)},`;
+      for (const key of rejectedIngress.keys()) {
+        if (key.startsWith(chatRejectionPrefix)) rejectedIngress.delete(key);
+      }
       await next();
       return;
     }
     const reason = allowed.status === "ready" ? "chat_not_allowed" : `allowlist_${allowed.status}`;
-    const rejectionKey = JSON.stringify([reason, chat.id, updateType]);
-    if (rejectedIngress.has(rejectionKey)) return;
-    rejectedIngress.add(rejectionKey);
+    const now = Date.now();
+    for (const [key, { expiresAt }] of rejectedIngress) {
+      if (expiresAt <= now) rejectedIngress.delete(key);
+    }
+    const rejectionKey = JSON.stringify([chat.id, updateType]);
+    const rejectionState = `${reason}:${allowlistFingerprint(allowed)}`;
+    const previous = rejectedIngress.get(rejectionKey);
+    if (previous?.state === rejectionState && previous.expiresAt > now) return;
+    while (rejectedIngress.size >= MAX_REJECTED_INGRESS) {
+      const oldest = rejectedIngress.keys().next().value;
+      if (typeof oldest !== "string") break;
+      rejectedIngress.delete(oldest);
+    }
+    const entry = { state: rejectionState, expiresAt: now + REJECTED_INGRESS_TTL_MS };
+    rejectedIngress.set(rejectionKey, entry);
     try {
       await timeline.publish({
         type: "telegram.access_request",
@@ -632,7 +706,7 @@ export function createTelegramBot(
         payload: accessRequestPayload(ctx, reason, updateType),
       });
     } catch (error) {
-      rejectedIngress.delete(rejectionKey);
+      if (rejectedIngress.get(rejectionKey) === entry) rejectedIngress.delete(rejectionKey);
       throw error;
     }
   });
@@ -657,35 +731,44 @@ export function createTelegramBot(
     await queuedReply(ctx, "Restarting all agents. They will resume on the next message.");
   });
 
-  bot.on("message", async (ctx) => {
-    const message = ctx.message as unknown as Record<string, unknown>;
-    const chatId = ctx.chat.id;
+  const persistMessage = async (ctx: Context): Promise<void> => {
+    const incoming = ctx.msg;
+    const chat = ctx.chat;
+    if (!incoming || !chat) return;
+    const message = incoming as unknown as Record<string, unknown>;
+    const chatId = chat.id;
     const threadId = typeof message.message_thread_id === "number" ? message.message_thread_id : 0;
     const conversation = telegramConversation(config.id, chatId, threadId);
     const attachments = await prepareMessage(bot, config, ctx);
     const ownership = [
-      { connectorId: config.id, kind: "message" as const, key: `${chatId}:${ctx.message.message_id}`, owner: conversation },
-      ...(ctx.message.poll?.id ? [{ connectorId: config.id, kind: "poll" as const, key: ctx.message.poll.id, owner: conversation }] : []),
+      { connectorId: config.id, kind: "message" as const, key: `${chatId}:${incoming.message_id}`, owner: conversation },
+      ...(incoming.poll?.id ? [{ connectorId: config.id, kind: "poll" as const, key: incoming.poll.id, owner: conversation }] : []),
     ];
     await resources.setMany(ownership);
     await timeline.publish({
       type: "telegram.message",
       connectorId: config.id,
       conversation,
-      payload: ctx.message,
+      payload: incoming,
       attachments,
-      meta: { private: chatId > 0, directed: isMessageDirectedToBot(ctx.message, bot.botInfo), user_content: hasUserContent(message) },
+      meta: { private: chatId > 0, directed: isMessageDirectedToBot(incoming, bot.botInfo), user_content: hasUserContent(message) },
     });
-  });
-  bot.on("edited_message", async (ctx) => {
-    const message = ctx.editedMessage as unknown as Record<string, unknown>;
-    const chatId = ctx.chat.id;
+  };
+  bot.on(["message", "channel_post"], persistMessage);
+
+  const persistEditedMessage = async (ctx: Context): Promise<void> => {
+    const incoming = ctx.msg;
+    const chat = ctx.chat;
+    if (!incoming || !chat) return;
+    const message = incoming as unknown as Record<string, unknown>;
+    const chatId = chat.id;
     const threadId = typeof message.message_thread_id === "number" ? message.message_thread_id : 0;
     const conversation = telegramConversation(config.id, chatId, threadId);
     const attachments = await prepareMessage(bot, config, ctx);
-    await resources.set({ connectorId: config.id, kind: "message", key: `${chatId}:${ctx.editedMessage.message_id}`, owner: conversation });
-    await timeline.publish({ type: "telegram.edited_message", connectorId: config.id, conversation, payload: ctx.editedMessage, attachments });
-  });
+    await resources.set({ connectorId: config.id, kind: "message", key: `${chatId}:${incoming.message_id}`, owner: conversation });
+    await timeline.publish({ type: "telegram.edited_message", connectorId: config.id, conversation, payload: incoming, attachments });
+  };
+  bot.on(["edited_message", "edited_channel_post"], persistEditedMessage);
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
@@ -707,8 +790,10 @@ export function createTelegramBot(
     const reaction = ctx.messageReaction;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
+    const owner = resources.owner(config.id, "message", `${chatId}:${reaction.message_id}`);
     const threadId = "message_thread_id" in reaction && typeof reaction.message_thread_id === "number" ? reaction.message_thread_id : 0;
-    await timeline.publish({ type: "telegram.message_reaction", connectorId: config.id, conversation: telegramConversation(config.id, chatId, threadId), payload: reaction });
+    const conversation = owner ?? telegramConversation(config.id, chatId, threadId);
+    await timeline.publish({ type: "telegram.message_reaction", connectorId: config.id, conversation, payload: reaction });
   });
   bot.on("my_chat_member", async (ctx) => {
     const member = ctx.myChatMember;

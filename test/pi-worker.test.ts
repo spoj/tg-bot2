@@ -121,7 +121,46 @@ describe("PiWorker", () => {
     }
   });
 
-  it("aborts and queues a continuation when a steer exceeds its maximum wait", async () => {
+  it("waits for the matching RPC response before accepting a prompt", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+      child.stdin.write.mockImplementation(() => true);
+
+      let accepted = false;
+      const pending = worker.prompt("complete instruction", "steer").then(() => { accepted = true; });
+      await Promise.resolve();
+      expect(accepted).toBe(false);
+      const command = JSON.parse(child.stdin.write.mock.calls.at(-1)?.[0] ?? "{}") as { id: string };
+      child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", success: true })}\n`);
+      await pending;
+      expect(accepted).toBe(true);
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a prompt when the RPC worker rejects it", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+      child.stdin.write.mockImplementation((chunk: string) => {
+        const command = JSON.parse(chunk) as { id: string };
+        queueMicrotask(() => child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", success: false, error: "prompt rejected" })}\n`));
+        return true;
+      });
+
+      await expect(worker.prompt("complete instruction", "steer")).rejects.toThrow("prompt rejected");
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts a queued steer that exceeds its maximum wait without replacing its instruction", async () => {
     vi.useFakeTimers();
     const f = await fixture();
     try {
@@ -139,11 +178,8 @@ describe("PiWorker", () => {
       await vi.advanceTimersByTimeAsync(120_000);
 
       const commands = child.stdin.write.mock.calls.map(([line]) => JSON.parse(line) as Record<string, unknown>);
-      expect(commands).toMatchObject([
-        { type: "abort" },
-        { type: "prompt", streamingBehavior: "steer" },
-      ]);
-      expect(commands[1]?.message).toContain("latest user instruction");
+      expect(commands).toMatchObject([{ type: "abort" }]);
+      expect(commands).toHaveLength(1);
     } finally {
       vi.useRealTimers();
       await rm(f.root, { recursive: true, force: true });
@@ -509,7 +545,7 @@ describe("PiWorker", () => {
       const stopping = worker.stop();
       child.emit("close", null, "SIGTERM");
       await stopping;
-      await worker.prompt("late steer", "steer");
+      await expect(worker.prompt("late steer", "steer")).rejects.toThrow("worker is stopped");
       expect(spawn).toHaveBeenCalledOnce();
       expect(child.stdin.write).not.toHaveBeenCalledWith(
         expect.stringContaining('"type":"prompt"'),

@@ -16,7 +16,7 @@ type BridgeRequest = {
 /** One response line to the agent tool: `{id, ok, result | error}`. */
 type BridgeResponse = { id: string } & ({ ok: true; result: Record<string, unknown> } | { ok: false; error: string });
 
-export type HostCapability = "send" | "annotate" | "spawn" | "cancel" | "steer_task" | "steer_conversation";
+export type HostCapability = "send" | "annotate" | "spawn" | "cancel" | "steer_task" | "steer_conversation" | "schedule";
 
 export type BridgeHandler = (params: Record<string, unknown>, actor: AgentRef) => Promise<Record<string, unknown>>;
 
@@ -27,6 +27,10 @@ export type HostBridgeHandlers = {
   cancel: BridgeHandler;
   steerTask: BridgeHandler;
   steerConversation: BridgeHandler;
+  scheduleAdd: BridgeHandler;
+  scheduleReplace: BridgeHandler;
+  scheduleRemove: BridgeHandler;
+  scheduleTake: BridgeHandler;
 };
 
 type AgentCredential = {
@@ -184,7 +188,19 @@ export class HostBridge {
     }
   }
 
+  private scheduleHandlerFor(type: string): BridgeHandler | undefined {
+    switch (type) {
+      case "schedule_add": return this.handlers.scheduleAdd;
+      case "schedule_replace": return this.handlers.scheduleReplace;
+      case "schedule_remove": return this.handlers.scheduleRemove;
+      case "schedule_take": return this.handlers.scheduleTake;
+      default: return undefined;
+    }
+  }
+
   private handlerFor(type: string): { handler: BridgeHandler; capability: HostCapability } | undefined {
+    const scheduleHandler = this.scheduleHandlerFor(type);
+    if (scheduleHandler) return { handler: scheduleHandler, capability: "schedule" };
     switch (type) {
       case "send": return this.handlers.send ? { handler: this.handlers.send, capability: "send" } : undefined;
       case "annotate": return this.handlers.annotate ? { handler: this.handlers.annotate, capability: "annotate" } : undefined;

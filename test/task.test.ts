@@ -183,8 +183,9 @@ describe("WorkspaceTasks", () => {
       { type: "task_finished", runId: launched.runId },
     ]);
     expect(followup).toHaveBeenCalledWith(
-      `Task "Investigate the parser regression." finished. Run files: /workspace/.pi/tasks/${launched.runId}/`,
+      `Task ${launched.runId} finished. Complete instruction and results: /workspace/.pi/tasks/${launched.runId}/prompt.txt, output.md, result.json`,
       CHAT,
+      expect.objectContaining({ id: expect.any(String), sequence: expect.any(Number) }),
     );
   });
 
@@ -219,7 +220,11 @@ describe("WorkspaceTasks", () => {
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "failed", exitCode: 3, stderr: "boom" });
     await expect(readFile(path.join(runDir, "output.md"), "utf8")).rejects.toThrow();
-    expect(followup).toHaveBeenCalledWith(`Task "do the thing" failed (exit 3). Run files: /workspace/.pi/tasks/${runId}/`, CHAT);
+    expect(followup).toHaveBeenCalledWith(
+      `Task ${runId} failed (exit 3). Complete instruction and results: /workspace/.pi/tasks/${runId}/prompt.txt, output.md, result.json`,
+      CHAT,
+      expect.objectContaining({ id: expect.any(String), sequence: expect.any(Number) }),
+    );
   });
 
   it("reports a worker that fails to spawn as a failed task", async () => {
@@ -351,7 +356,11 @@ describe("WorkspaceTasks", () => {
 
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted", signal: "SIGTERM" });
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/${runId}/`, CHAT);
+    expect(followup).toHaveBeenCalledWith(
+      `Task ${runId} aborted. Complete instruction and results: /workspace/.pi/tasks/${runId}/prompt.txt, output.md, result.json`,
+      CHAT,
+      expect.objectContaining({ id: expect.any(String), sequence: expect.any(Number) }),
+    );
   });
 
   it("cancels a running task mid-run and settles as aborted", async () => {
@@ -440,7 +449,11 @@ describe("WorkspaceTasks", () => {
 
     const runDir = path.join(workspace, ".pi", "tasks", runId);
     expect(await readJson(path.join(runDir, "result.json"))).toMatchObject({ status: "aborted" });
-    expect(followup).toHaveBeenCalledWith(`Task "prompt" aborted. Run files: /workspace/.pi/tasks/${runId}/`, CHAT);
+    expect(followup).toHaveBeenCalledWith(
+      `Task ${runId} aborted. Complete instruction and results: /workspace/.pi/tasks/${runId}/prompt.txt, output.md, result.json`,
+      CHAT,
+      expect.objectContaining({ id: expect.any(String), sequence: expect.any(Number) }),
+    );
   });
 
   it("sends a heartbeat followup while tasks run and stays silent when idle", async () => {
@@ -473,9 +486,11 @@ describe("WorkspaceTasks", () => {
     await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(1));
     const message = (followup.mock.calls as unknown[][])[0]?.[0] as string;
     expect(message).toContain("1 task(s) running");
-    expect(message).toContain('"heartbeat me"');
+    expect(message).toContain(`/workspace/.pi/tasks/`);
+    expect(message).toContain("/prompt.txt");
     expect(message).toContain("running 4m");
-    expect(message).toContain('last output: "still thinking"');
+    expect(message).toContain('activity preview: "still thinking"');
+    expect(message).toContain("preview only");
 
     tasks[0]?.resolveRun(success());
     await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(2));

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { conversationAgent, type AgentRef, type ConversationAgentRef } from "./agent-ref.js";
@@ -73,9 +74,16 @@ export type TimelineEvent =
     }
   | {
       type: "schedule_fired";
+      scheduleId: string;
       occurrenceId: string;
       prompt: string;
       dueAt: string;
+      owner: ConversationAgentRef;
+    }
+  | {
+      type: "schedule_taken";
+      scheduleId: string;
+      previousOwner: ConversationAgentRef;
       owner: ConversationAgentRef;
     };
 
@@ -95,6 +103,8 @@ export type BotEvent = RuntimeEvent;
 
 export type TimelineEnvelope = {
   v: 1;
+  id: string;
+  seq?: number | undefined;
   t: string;
 };
 
@@ -108,6 +118,7 @@ export class WorkspaceTimeline {
   private readonly writes = new SerialQueue();
   private readonly messageOwners = new Map<string, ConversationAgentRef>();
   private readonly pollOwners = new Map<string, ConversationAgentRef>();
+  private nextSequence = 1;
 
   constructor(
     readonly filePath: string,
@@ -124,10 +135,15 @@ export class WorkspaceTimeline {
     await this.writes.run(async () => {
       this.messageOwners.clear();
       this.pollOwners.clear();
+      let sequence = 0;
       const lines = (await readFile(this.filePath, "utf8")).split("\n");
       for (const line of lines) {
-        if (line) this.recordOwnership(JSON.parse(line) as TimelineRecord);
+        if (!line) continue;
+        const record = JSON.parse(line) as TimelineRecord;
+        sequence = Math.max(sequence, typeof record.seq === "number" ? record.seq : sequence + 1);
+        this.recordOwnership(record);
       }
+      this.nextSequence = sequence + 1;
     });
   }
 
@@ -141,12 +157,17 @@ export class WorkspaceTimeline {
 
 
   async publish(event: TimelineEvent): Promise<string> {
-    const rawLine = timelineLine(event);
-    const record = JSON.parse(rawLine) as TimelineRecord;
-    this.recordOwnership(record);
-    this.broadcast(record, rawLine);
-    await this.writes.run(() => appendTimelineEvents(this.filePath, [record]));
-    return rawLine;
+    return this.writes.run(async () => {
+      const rawLine = timelineLine(event, this.nextSequence);
+      const record = JSON.parse(rawLine) as TimelineRecord;
+      if (!(await appendTimelineRecords(this.filePath, [record]))) {
+        throw new Error("Failed to persist timeline event");
+      }
+      this.nextSequence += 1;
+      this.recordOwnership(record);
+      this.broadcast(record, rawLine);
+      return rawLine;
+    });
   }
 
   async annotateAttachment(attachmentPath: string, description: string): Promise<number> {
@@ -213,9 +234,13 @@ export class WorkspaceTimeline {
 }
 
 export async function appendTimelineEvents(filePath: string, events: RuntimeEvent[]): Promise<boolean> {
+  return appendTimelineRecords(filePath, events.map((event) => JSON.parse(timelineLine(event)) as TimelineEnvelope & RuntimeEvent));
+}
+
+async function appendTimelineRecords(filePath: string, records: Array<TimelineEnvelope & RuntimeEvent>): Promise<boolean> {
   try {
     await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-    await appendJsonl(filePath, events.map(timelineLine));
+    await appendJsonl(filePath, records.map((record) => JSON.stringify(record)));
     return true;
   } catch (error) {
     console.error("Failed to append timeline.jsonl", error);
@@ -223,12 +248,12 @@ export async function appendTimelineEvents(filePath: string, events: RuntimeEven
   }
 }
 
-export function timelineLine(event: object): string {
-  return JSON.stringify({ v: 1, t: new Date().toISOString(), ...event });
+export function timelineLine(event: object, sequence?: number): string {
+  return JSON.stringify({ v: 1, id: randomUUID(), ...(sequence === undefined ? {} : { seq: sequence }), t: new Date().toISOString(), ...event });
 }
 
-export const TIMELINE_PROMPT = `/run/timeline.jsonl is read-only shared context across all chats. Each JSON line has {v:1,t,type,...}.
+export const TIMELINE_PROMPT = `/run/timeline.jsonl is read-only shared context across all chats. Each JSON line has {v:1,id,seq,t,type,...}; id is stable and seq is monotonic for persisted events.
 - Inbound: message, edited_message, callback, poll_answer, message_reaction, my_chat_member, chat_join_request. Attachment objects may include a searchable description added later by annotate.
-- Completed actions: sent {actor,target,request,...}, task_finished, schedule_fired. Sent events include host-managed attachment paths when applicable.
-Use chat_id and message_thread_id to narrow context before searching globally. Treat sent actions as already complete. The host does not read this file for commands, recovery, or state.
+- Completed actions: sent {actor,target,request,...}, task_finished, schedule_fired, schedule_taken. Sent events include host-managed attachment paths when applicable.
+Use chat_id and message_thread_id to narrow context before searching globally. Treat sent actions as already complete. Repeated notification IDs are delivery replay, not new user input.
 `;

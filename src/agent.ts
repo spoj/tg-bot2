@@ -1,13 +1,14 @@
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SerialQueue } from "./queue.js";
 import { conversationAgent, type ConversationAgentRef } from "./agent-ref.js";
 import type { AgentCredentials } from "./host-bridge.js";
-import { defined } from "./util.js";
+import { appendJsonl, defined, isMissing, readJsonl } from "./util.js";
 import { OUTBOX_PROMPT } from "./outbox-protocol.js";
-import { TIMELINE_PROMPT, type BotEvent } from "./events.js";
+import { TIMELINE_PROMPT, type BotEvent, type TimelineEnvelope } from "./events.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
 import { TASKS_PROMPT } from "./task-protocol.js";
 import { isMessageDirectedToBot, isBotGroupAdd } from "./telegram.js";
@@ -24,6 +25,8 @@ Install project extensions with pi install <pkg> -l --approve. Project settings 
   SCHEDULES_PROMPT,
   TASKS_PROMPT,
   `Behavior:
+- Every host notification starts with a stable notification ID and, for persisted timeline events, a sequence number. Treat repeated IDs as replay of the same notification.
+- User-message notifications contain the complete raw Telegram event. Task and progress notifications name authoritative files; read those files rather than treating status text as the complete instruction or result.
 - Keep Telegram replies concise unless the user asks for detail. Prefer HTML parse mode and Telegram-safe tags.
 - Keep chats responsive. If work needs sustained multi-step execution, acknowledge it, spawn a complete background task, then end the turn. Handle task_finished when it arrives.
 - Let a topic's subject emerge through conversation. When a short, useful name becomes clear—or materially changes—include topic_name in a normal sendMessage call. The host renames this agent's topic in that same tool call. Never spend a separate tool call searching for or changing a topic name.
@@ -92,12 +95,17 @@ export type AgentManagerOptions = {
   clearInterval?: typeof clearInterval;
 };
 
-export type AgentNotifier = {
-  interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number): Promise<void>;
-  followup(text: string, target: ConversationAgentRef): Promise<void>;
+export type NotificationIdentity = {
+  id: string;
+  sequence?: number | undefined;
 };
 
-function truncate(text: string, maxLength: number): string {
+export type AgentNotifier = {
+  interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number, identity?: NotificationIdentity): Promise<void>;
+  followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void>;
+};
+
+function preview(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
 function formatDuration(milliseconds: number): string {
@@ -114,17 +122,37 @@ function formatTaskFinishedMessage(event: Extract<BotEvent, { type: "task_finish
     : event.status === "failed"
       ? `failed (exit ${event.exitCode ?? "unknown"})`
       : "aborted";
-  return `Task "${truncate(event.prompt, 100)}" ${outcome}. Run files: /workspace/.pi/tasks/${event.runId}/`;
+  return `Task ${event.runId} ${outcome}. Complete instruction and results: /workspace/.pi/tasks/${event.runId}/prompt.txt, output.md, result.json`;
 }
 
 function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progress" }>["tasks"]): string {
   const lines = tasks.map((task) => {
     const running = formatDuration(task.runningMs);
     const idle = task.idleMs !== null ? formatDuration(task.idleMs) : "unknown";
-    const snippet = task.lastOutput ? `; last output: "${truncate(task.lastOutput, 120)}"` : "";
-    return `- ${task.runId} "${truncate(task.prompt, 80)}" running ${running}, last activity ${idle} ago${snippet}`;
+    const activity = task.lastOutput ? `; activity preview: "${preview(task.lastOutput, 120)}"` : "";
+    return `- ${task.runId} running ${running}, last activity ${idle} ago${activity}; complete instruction: /workspace/.pi/tasks/${task.runId}/prompt.txt`;
   });
-  return `Task heartbeat: ${tasks.length} task(s) running.\n${lines.join("\n")}`;
+  return `Task heartbeat: ${tasks.length} task(s) running. Activity text is a preview only.\n${lines.join("\n")}`;
+}
+const SERVICE_MESSAGE_FIELDS = [
+  "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited",
+  "general_forum_topic_hidden", "general_forum_topic_unhidden", "new_chat_members", "left_chat_member",
+  "new_chat_title", "new_chat_photo", "delete_chat_photo", "group_chat_created", "supergroup_chat_created",
+  "channel_chat_created", "message_auto_delete_timer_changed", "migrate_to_chat_id", "migrate_from_chat_id",
+  "pinned_message", "video_chat_scheduled", "video_chat_started", "video_chat_ended", "video_chat_participants_invited",
+] as const;
+
+function hasUserContent(event: Extract<BotEvent, { type: "message" }>): boolean {
+  if (event.attachments.length > 0) return true;
+  if (event.message === null || typeof event.message !== "object") return false;
+  const message = event.message as Record<string, unknown>;
+  return !SERVICE_MESSAGE_FIELDS.some((field) => field in message);
+}
+
+function eventIdentity(event: Partial<TimelineEnvelope>): NotificationIdentity | undefined {
+  return typeof event.id === "string"
+    ? { id: event.id, ...(typeof event.seq === "number" ? { sequence: event.seq } : {}) }
+    : undefined;
 }
 
 /**
@@ -146,7 +174,7 @@ export class AgentEventRouter {
     this.botInfoProvider = options.botInfo;
   }
 
-  async onEvent(event: BotEvent, rawLine: string): Promise<void> {
+  async onEvent(event: BotEvent & Partial<TimelineEnvelope>, rawLine: string): Promise<void> {
     switch (event.type) {
       case "message":
         await this.handleMessage(event, rawLine);
@@ -171,30 +199,32 @@ export class AgentEventRouter {
     }
   }
 
-  private async handleMyChatMember(event: Extract<BotEvent, { type: "my_chat_member" }>): Promise<void> {
+  private async handleMyChatMember(event: Extract<BotEvent, { type: "my_chat_member" }> & Partial<TimelineEnvelope>): Promise<void> {
     // Only surface group adds; private-chat membership is not a self-provisioning signal.
     if (event.chat_id >= 0) return;
     if (!isBotGroupAdd(event.my_chat_member)) return;
     await this.notifier.followup(
       `Bot was added to group or channel ${event.chat_id}. To allow it, add ${event.chat_id} to /workspace/.allowed.json.`,
       conversationAgent(event.chat_id),
+      eventIdentity(event),
     );
   }
 
-  private async handleTaskFinished(event: Extract<BotEvent, { type: "task_finished" }>): Promise<void> {
-    await this.notifier.followup(formatTaskFinishedMessage(event), event.owner);
+  private async handleTaskFinished(event: Extract<BotEvent, { type: "task_finished" }> & Partial<TimelineEnvelope>): Promise<void> {
+    await this.notifier.followup(formatTaskFinishedMessage(event), event.owner, eventIdentity(event));
   }
 
-  private async handleTaskProgress(event: Extract<BotEvent, { type: "task_progress" }>): Promise<void> {
-    if (event.tasks.length > 0) await this.notifier.followup(formatTaskProgressMessage(event.tasks), event.owner);
+  private async handleTaskProgress(event: Extract<BotEvent, { type: "task_progress" }> & Partial<TimelineEnvelope>): Promise<void> {
+    if (event.tasks.length > 0) await this.notifier.followup(formatTaskProgressMessage(event.tasks), event.owner, eventIdentity(event));
   }
 
-  private async handleScheduleFired(event: Extract<BotEvent, { type: "schedule_fired" }>): Promise<void> {
-    await this.notifier.followup(`Scheduled instruction due ${event.dueAt}:\n${event.prompt}`, event.owner);
+  private async handleScheduleFired(event: Extract<BotEvent, { type: "schedule_fired" }> & Partial<TimelineEnvelope>): Promise<void> {
+    await this.notifier.followup(`Scheduled instruction due ${event.dueAt}:\n${event.prompt}`, event.owner, eventIdentity(event));
   }
 
 
-  private async handleMessage(event: Extract<BotEvent, { type: "message" }>, rawLine: string): Promise<void> {
+  private async handleMessage(event: Extract<BotEvent, { type: "message" }> & Partial<TimelineEnvelope>, rawLine: string): Promise<void> {
+    if (!hasUserContent(event)) return;
     const isPrivate = event.chat_id > 0;
     const botInfo = this.botInfoProvider?.();
     const msg = event.message as Parameters<typeof isMessageDirectedToBot>[0];
@@ -202,14 +232,14 @@ export class AgentEventRouter {
       const threadId = msg && typeof msg === "object" && "message_thread_id" in msg && typeof msg.message_thread_id === "number"
         ? msg.message_thread_id
         : 0;
-      await this.notifier.interrupt(rawLine, conversationAgent(event.chat_id, threadId), USER_INTERRUPT_MAX_WAIT_MS);
+      await this.notifier.interrupt(rawLine, conversationAgent(event.chat_id, threadId), USER_INTERRUPT_MAX_WAIT_MS, eventIdentity(event));
     }
   }
 
-  private async handleCallback(event: Extract<BotEvent, { type: "callback" }>, rawLine: string): Promise<void> {
+  private async handleCallback(event: Extract<BotEvent, { type: "callback" }> & Partial<TimelineEnvelope>, rawLine: string): Promise<void> {
     const query = event.callback_query as { message?: { message_thread_id?: number } } | undefined;
     const threadId = query?.message?.message_thread_id ?? 0;
-    await this.notifier.interrupt(rawLine, conversationAgent(event.chat_id, threadId), USER_INTERRUPT_MAX_WAIT_MS);
+    await this.notifier.interrupt(rawLine, conversationAgent(event.chat_id, threadId), USER_INTERRUPT_MAX_WAIT_MS, eventIdentity(event));
   }
 
 }
@@ -237,6 +267,26 @@ type ConversationWorkerEntry = {
   token: string | undefined;
   serial: SerialQueue;
 };
+type PendingNotification = {
+  id: string;
+  sequence?: number | undefined;
+  target: ConversationAgentRef;
+  text: string;
+  behavior: "steer" | "followUp";
+  maxWaitMs?: number | undefined;
+};
+
+type NotificationLogRecord =
+  | { type: "queued"; notification: PendingNotification }
+  | { type: "delivered"; id: string };
+
+const NOTIFICATIONS_FILE = path.join(".pi", "notifications.jsonl");
+
+function notificationPrompt(notification: PendingNotification): string {
+  const sequence = notification.sequence === undefined ? "" : ` seq=${notification.sequence}`;
+  return `[notification id=${notification.id}${sequence}]\n${notification.text}`;
+}
+
 
 function conversationKey(actor: ConversationAgentRef): string {
   return `${actor.chatId}:${actor.threadId}`;
@@ -261,6 +311,11 @@ export class AgentManager {
   private readonly hostTimeline: string | undefined;
   private readonly hostAttachments: string | undefined;
   private readonly workers = new Map<string, ConversationWorkerEntry>();
+  private readonly notificationWrites = new SerialQueue();
+  private readonly pendingNotifications = new Map<string, PendingNotification>();
+  private readonly deliveredNotifications = new Set<string>();
+  private readonly notificationsPath: string;
+  private notificationsLoaded: Promise<void> | undefined;
   private shuttingDown = false;
 
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
@@ -281,6 +336,7 @@ export class AgentManager {
     this.hostSocketDir = options.hostSocketDir;
     this.hostTimeline = options.hostTimeline;
     this.hostAttachments = options.hostAttachments;
+    this.notificationsPath = path.join(this.workspace, NOTIFICATIONS_FILE);
   }
 
   private getOrCreateEntry(actor: ConversationAgentRef): ConversationWorkerEntry {
@@ -293,23 +349,101 @@ export class AgentManager {
     return entry;
   }
 
-  async followup(text: string, target: ConversationAgentRef): Promise<void> {
-    if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = this.getOrCreateEntry(target);
-    return entry.serial.run(async () => {
-      if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-      const worker = await this.ensureWorker(entry);
-      await worker.prompt(text, "followUp");
+  async start(): Promise<void> {
+    await this.loadPendingNotifications();
+    const targets = new Map<string, ConversationAgentRef>();
+    for (const notification of this.pendingNotifications.values()) {
+      targets.set(conversationKey(notification.target), notification.target);
+    }
+    await Promise.all([...targets.values()].map(async (target) => {
+      const entry = this.getOrCreateEntry(target);
+      await entry.serial.run(() => this.deliverPending(entry)).catch((error) => {
+        console.error("Pending notification replay failed", error);
+      });
+    }));
+  }
+
+  async followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void> {
+    return this.enqueueAndDeliver({
+      id: identity?.id ?? randomUUID(),
+      ...(identity?.sequence === undefined ? {} : { sequence: identity.sequence }),
+      target,
+      text,
+      behavior: "followUp",
     });
   }
 
-  async interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number): Promise<void> {
+  async interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number, identity?: NotificationIdentity): Promise<void> {
+    return this.enqueueAndDeliver({
+      id: identity?.id ?? randomUUID(),
+      ...(identity?.sequence === undefined ? {} : { sequence: identity.sequence }),
+      target,
+      text,
+      behavior: "steer",
+      ...(maxWaitMs === undefined ? {} : { maxWaitMs }),
+    });
+  }
+
+  private async enqueueAndDeliver(notification: PendingNotification): Promise<void> {
     if (this.shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = this.getOrCreateEntry(target);
+    await this.enqueueNotification(notification);
+    const entry = this.getOrCreateEntry(notification.target);
     return entry.serial.run(async () => {
       if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+      await this.deliverPending(entry);
+    });
+  }
+
+  private async deliverPending(entry: ConversationWorkerEntry): Promise<void> {
+    for (;;) {
+      const notification = [...this.pendingNotifications.values()].find((candidate) =>
+        conversationKey(candidate.target) === conversationKey(entry.actor));
+      if (!notification) return;
       const worker = await this.ensureWorker(entry);
-      await worker.prompt(text, "steer", maxWaitMs);
+      await worker.prompt(notificationPrompt(notification), notification.behavior, notification.maxWaitMs);
+      await this.acknowledgeNotification(notification.id);
+    }
+  }
+
+  private async loadPendingNotifications(): Promise<void> {
+    this.notificationsLoaded ??= (async () => {
+      await mkdir(path.dirname(this.notificationsPath), { recursive: true, mode: 0o700 });
+      let lines: string[];
+      try {
+        lines = await readJsonl(this.notificationsPath);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        lines = [];
+      }
+      for (const line of lines) {
+        const record = JSON.parse(line) as NotificationLogRecord;
+        if (record.type === "queued") {
+          if (!this.deliveredNotifications.has(record.notification.id)) {
+            this.pendingNotifications.set(record.notification.id, record.notification);
+          }
+        } else if (record.type === "delivered") {
+          this.pendingNotifications.delete(record.id);
+          this.deliveredNotifications.add(record.id);
+        }
+      }
+    })();
+    await this.notificationsLoaded;
+  }
+
+  private async enqueueNotification(notification: PendingNotification): Promise<void> {
+    await this.loadPendingNotifications();
+    await this.notificationWrites.run(async () => {
+      if (this.pendingNotifications.has(notification.id) || this.deliveredNotifications.has(notification.id)) return;
+      await appendJsonl(this.notificationsPath, JSON.stringify({ type: "queued", notification } satisfies NotificationLogRecord));
+      this.pendingNotifications.set(notification.id, notification);
+    });
+  }
+
+  private async acknowledgeNotification(id: string): Promise<void> {
+    await this.notificationWrites.run(async () => {
+      await appendJsonl(this.notificationsPath, JSON.stringify({ type: "delivered", id } satisfies NotificationLogRecord));
+      this.pendingNotifications.delete(id);
+      this.deliveredNotifications.add(id);
     });
   }
 
@@ -370,7 +504,7 @@ export class AgentManager {
     this.release(entry, entry.worker);
 
     const actor = entry.actor;
-    const token = this.credentials.issue(actor, ["send", "annotate", "spawn", "steer_conversation", "steer_task", "cancel"]);
+    const token = this.credentials.issue(actor, ["send", "annotate", "spawn", "steer_conversation", "steer_task", "cancel", "schedule"]);
     entry.token = token;
     const settings = await loadUserSettings(this.workspace);
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
@@ -399,7 +533,7 @@ export class AgentManager {
         clearInterval: this.clearIntervalFn,
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel",
+      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
       taskRun: false,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,

@@ -10,6 +10,7 @@ const state = vi.hoisted(() => {
   const order: string[] = [];
   const startupOrder: string[] = [];
   const agents = {
+    start: vi.fn(async () => { startupOrder.push("agents.start"); }),
     beginShutdown: vi.fn(() => {
       order.push("agents.beginShutdown");
       return Promise.resolve();
@@ -22,6 +23,10 @@ const state = vi.hoisted(() => {
     stop: vi.fn(async () => { order.push("bot.stop"); }),
   };
   const taskSpawn = vi.fn(async () => ({ runId: "scheduled-run", status: "launched" }));
+  const scheduleAdd = vi.fn(async () => ({ id: "schedule-1" }));
+  const scheduleReplace = vi.fn(async () => ({ id: "schedule-1" }));
+  const scheduleRemove = vi.fn(async () => "schedule-1");
+  const scheduleTake = vi.fn(async () => ({ id: "schedule-1" }));
   return {
     order,
     startupOrder,
@@ -43,6 +48,7 @@ const state = vi.hoisted(() => {
     signalHandlers: {} as Record<string, () => void>,
     checkSandboxEnvironment: vi.fn(),
     agentManager: vi.fn(class AgentManagerMock {
+      start = agents.start;
       beginShutdown = agents.beginShutdown;
       disposeAll = agents.disposeAll;
       interrupt = agents.interrupt;
@@ -56,6 +62,10 @@ const state = vi.hoisted(() => {
         this.options = options;
       }
       start = vi.fn(async () => { startupOrder.push("scheduler.start"); });
+      add = scheduleAdd;
+      replace = scheduleReplace;
+      remove = scheduleRemove;
+      take = scheduleTake;
       stop = vi.fn(async () => { order.push("scheduler.stop"); });
     }),
     outbox: vi.fn(class WorkspaceOutboxMock {
@@ -74,6 +84,10 @@ const state = vi.hoisted(() => {
       stop = vi.fn(async () => { order.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.stop" : "bridge.stop"); });
     }),
     taskSpawn,
+    scheduleAdd,
+    scheduleReplace,
+    scheduleRemove,
+    scheduleTake,
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
       spawn = taskSpawn;
@@ -126,10 +140,15 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   state.createTelegramBot.mockClear();
   state.dispatchOutboxRequest.mockClear();
   state.terminateActiveSandboxes.mockClear();
+  state.agents.start.mockClear();
   state.agents.beginShutdown.mockClear();
   state.agents.disposeAll.mockClear();
   state.agents.interrupt.mockClear();
   state.taskSpawn.mockClear();
+  state.scheduleAdd.mockClear();
+  state.scheduleReplace.mockClear();
+  state.scheduleRemove.mockClear();
+  state.scheduleTake.mockClear();
   state.bot.stop.mockClear();
   state.bot.start.mockReset();
   configure?.();
@@ -167,11 +186,11 @@ describe("application startup and shutdown wiring", () => {
         hostTimeline: path.join(state.sandbox.dataDir, "bots", "123", "timeline.jsonl"),
       }),
     );
-    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; statePath: string; timeline: unknown }) ?? {};
+    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; schedulePath: string; legacyStatePath: string; timeline: unknown }) ?? {};
     expect(schedulerOptions.workspace).toBe(workspacePath());
-    expect(schedulerOptions.statePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "scheduler-state.json"));
+    expect(schedulerOptions.schedulePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "run", "schedules.json"));
+    expect(schedulerOptions.legacyStatePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "scheduler-state.json"));
     expect(schedulerOptions.timeline).toBeDefined();
-    expect(schedulerOptions).not.toHaveProperty("fireTask");
     expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), timeline: expect.any(Object) }));
     expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({
       workspace: workspacePath(),
@@ -191,6 +210,10 @@ describe("application startup and shutdown wiring", () => {
         cancel: expect.any(Function),
         steerTask: expect.any(Function),
         steerConversation: expect.any(Function),
+        scheduleAdd: expect.any(Function),
+        scheduleReplace: expect.any(Function),
+        scheduleRemove: expect.any(Function),
+        scheduleTake: expect.any(Function),
       }),
     }));
     expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
@@ -222,6 +245,7 @@ describe("application startup and shutdown wiring", () => {
       "taskBridge.start",
       "tasks.start",
       "scheduler.start",
+      "agents.start",
     ]);
   });
 
@@ -278,6 +302,31 @@ describe("application startup and shutdown wiring", () => {
       "Conversation 42:7 delegated work to you:\nReconsider the current approach",
       actor,
     );
+  });
+
+  it("routes schedule mutations through the authenticated conversation", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+    const actor = conversationAgent(42, 7);
+    const handlers = (state.bridge.mock.calls[0]?.[0] as unknown as {
+      handlers: {
+        scheduleAdd: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        scheduleReplace: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        scheduleRemove: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        scheduleTake: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+      };
+    }).handlers;
+    const definition = { prompt: "report", start: "2026-08-25T09:00:00.000Z", recurrence: "daily" };
+
+    await expect(handlers.scheduleAdd(definition, actor)).resolves.toEqual({ schedule: { id: "schedule-1" } });
+    await expect(handlers.scheduleReplace({ id: "schedule-1", ...definition }, actor)).resolves.toEqual({ schedule: { id: "schedule-1" } });
+    await expect(handlers.scheduleTake({ id: "schedule-1" }, actor)).resolves.toEqual({ schedule: { id: "schedule-1" } });
+    await expect(handlers.scheduleRemove({ id: "schedule-1" }, actor)).resolves.toEqual({ id: "schedule-1" });
+    expect(state.scheduleAdd).toHaveBeenCalledWith(definition, actor);
+    expect(state.scheduleReplace).toHaveBeenCalledWith({ id: "schedule-1", ...definition }, actor);
+    expect(state.scheduleTake).toHaveBeenCalledWith({ id: "schedule-1" }, actor);
+    expect(state.scheduleRemove).toHaveBeenCalledWith({ id: "schedule-1" }, actor);
   });
 
   it("raises the shutdown gate, disposes every service, and treats signal abort as graceful", async () => {

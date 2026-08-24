@@ -25,7 +25,7 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   stopGraceMs?: number;
   idleTimeoutMs?: number;
   now?: () => number;
-  /** Invoked once, after the first prompt JSON-RPC write (the worker's initial prompt). */
+  /** Invoked once, after the first prompt is accepted by the RPC worker. */
   onInitialPromptWritten?: () => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -38,7 +38,6 @@ const DEFAULT_STOP_GRACE_MS = 1_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
 const MAX_ACTIVITY_TEXT = 240;
-const STEER_CONTINUATION = "Continue from the latest user instruction without repeating completed work.";
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -132,6 +131,7 @@ export class PiWorker {
   private startPromise: Promise<void> | undefined;
   private exitPromise: Promise<PiRunResult> | undefined;
   private readonly settledResolvers = new Set<(result: PiRunResult) => void>();
+  private readonly pendingResponses = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private reapedCallback: (() => void) | undefined;
   private closing = false;
   private stopped = false;
@@ -275,6 +275,9 @@ export class PiWorker {
         this.clearSteerWaitTimer();
         this.isBusyState = false;
         this.process = undefined;
+        const exitError = new Error(`Pi RPC exited before responding (code ${code ?? "unknown"}, signal ${signal ?? "none"})`);
+        for (const pending of this.pendingResponses.values()) pending.reject(exitError);
+        this.pendingResponses.clear();
         const result: PiRunResult = { code, signal, stderr: this.stderr, stdout: this.stdout };
         this.resolveSettled(result);
         resolve(result);
@@ -287,8 +290,8 @@ export class PiWorker {
       return;
     }
 
-    this.writeJson({ id: "init-steer", type: "set_steering_mode", mode: "all" });
-    this.writeJson({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
+    await this.request({ id: "init-steer", type: "set_steering_mode", mode: "all" });
+    await this.request({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
 
     this.armIdleTimer();
   }
@@ -296,7 +299,15 @@ export class PiWorker {
   private handleStdoutLine(line: string): void {
     try {
       const event = JSON.parse(line) as { id?: unknown; type?: unknown; success?: unknown; error?: unknown; steering?: unknown };
-      if (event.type === "response") return;
+      if (event.type === "response") {
+        if (typeof event.id !== "string") return;
+        const pending = this.pendingResponses.get(event.id);
+        if (!pending) return;
+        this.pendingResponses.delete(event.id);
+        if (event.success === true) pending.resolve();
+        else pending.reject(new Error(typeof event.error === "string" ? event.error : "Pi RPC request failed"));
+        return;
+      }
       if (event.type === "queue_update" && Array.isArray(event.steering) && event.steering.length === 0) {
         this.clearSteerWaitTimer();
       }
@@ -334,26 +345,45 @@ export class PiWorker {
       return false;
     }
   }
+  private request(command: { id: string; type: string; [key: string]: unknown }): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.pendingResponses.set(command.id, { resolve, reject });
+      if (this.writeJson(command)) return;
+      this.pendingResponses.delete(command.id);
+      reject(new Error("Pi RPC stdin is unavailable"));
+    });
+  }
+
 
 
 
   async prompt(message: string, streamingBehavior?: "steer" | "followUp", maxWaitMs?: number): Promise<void> {
     if (!this.isAlive()) {
-      if (this.stopped) return;
+      if (this.stopped) throw new Error("Pi RPC worker is stopped");
       await this.start();
     }
-    const queued = this.isBusyState && streamingBehavior === "steer";
+    const wasBusy = this.isBusyState;
+    const queued = wasBusy && streamingBehavior === "steer";
     this.isBusyState = true;
     this.clearIdleTimer();
     this.noteActivity(message);
-    const wrote = this.writeJson({
-      id: randomUUID(),
-      type: "prompt",
-      message,
-      ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
-    });
-    if (wrote && queued && maxWaitMs !== undefined) this.armSteerWaitTimer(maxWaitMs);
-    if (wrote && !this.initialPromptWritten) {
+    const id = randomUUID();
+    try {
+      await this.request({
+        id,
+        type: "prompt",
+        message,
+        ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
+      });
+    } catch (error) {
+      if (!wasBusy) {
+        this.isBusyState = false;
+        this.armIdleTimer();
+      }
+      throw error;
+    }
+    if (queued && maxWaitMs !== undefined) this.armSteerWaitTimer(maxWaitMs);
+    if (!this.initialPromptWritten) {
       this.initialPromptWritten = true;
       this.options.onInitialPromptWritten?.();
     }
@@ -369,8 +399,7 @@ export class PiWorker {
       this.steerWaitTimer = undefined;
       this.steerWaitExpiresAt = undefined;
       if (this.process !== child || !this.isBusyState || !this.isAlive()) return;
-      this.writeJson({ id: randomUUID(), type: "abort" });
-      this.writeJson({ id: randomUUID(), type: "prompt", message: STEER_CONTINUATION, streamingBehavior: "steer" });
+      void this.request({ id: randomUUID(), type: "abort" }).catch(() => {});
     }, maxWaitMs);
     this.steerWaitTimer.unref?.();
   }

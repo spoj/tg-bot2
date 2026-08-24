@@ -61,16 +61,18 @@ export async function requireRealDirectory(candidate: string, label: string, exp
 
 
 /** Derives canonical directories for one bot: its workspace and host-owned state. */
-export function botPaths(dataDir: string, botId: number): { botDir: string; workspace: string; attachments: string; timeline: string; schedulerState: string; runDir: string } {
+export function botPaths(dataDir: string, botId: number): { botDir: string; workspace: string; attachments: string; timeline: string; schedules: string; schedulerState: string; runDir: string } {
   if (!Number.isSafeInteger(botId)) throw new Error("Telegram bot ID must be a safe integer");
   const botDir = path.join(dataDir, "bots", String(botId));
+  const runDir = path.join(botDir, "run");
   return {
     botDir,
     workspace: path.join(botDir, "workspace"),
     attachments: path.join(botDir, "attachments"),
     timeline: path.join(botDir, "timeline.jsonl"),
+    schedules: path.join(runDir, "schedules.json"),
     schedulerState: path.join(botDir, "scheduler-state.json"),
-    runDir: path.join(botDir, "run"),
+    runDir,
   };
 }
 

@@ -8,7 +8,7 @@ import { WorkspaceTasks } from "./task.js";
 import type { Bot } from "grammy";
 import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
 import { WorkspaceTimeline } from "./events.js";
-import { conversationAgent } from "./agent-ref.js";
+import { conversationAgent, type AgentRef, type ConversationAgentRef } from "./agent-ref.js";
 import { readAllowedFile } from "./allowlist.js";
 import { appendJsonl, botPaths } from "./util.js";
 import { mkdir } from "node:fs/promises";
@@ -52,6 +52,10 @@ function integerField(record: Record<string, unknown>, field: string): number {
   const value = record[field];
   if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new Error(`${field} must be a safe integer`);
   return value;
+}
+function conversationActor(actor: AgentRef): ConversationAgentRef {
+  if (actor.kind !== "conversation") throw new Error("Only conversation agents can manage schedules");
+  return actor;
 }
 
 
@@ -154,7 +158,8 @@ export async function main(): Promise<void> {
     });
     const schedulerInstance = new WorkspaceScheduler({
       workspace,
-      statePath: paths.schedulerState,
+      schedulePath: paths.schedules,
+      legacyStatePath: paths.schedulerState,
       timeline,
     });
     const hostHandlers = {
@@ -180,6 +185,18 @@ export async function main(): Promise<void> {
         await agentManager.interrupt(`Conversation ${actor.chatId}:${actor.threadId} delegated work to you:\n${message}`, conversationAgent(chatId, threadId));
         return { status: "delivered" };
       },
+      scheduleAdd: async (params: Record<string, unknown>, actor: AgentRef) => ({
+        schedule: await schedulerInstance.add(params, conversationActor(actor)),
+      }),
+      scheduleReplace: async (params: Record<string, unknown>, actor: AgentRef) => ({
+        schedule: await schedulerInstance.replace(params, conversationActor(actor)),
+      }),
+      scheduleRemove: async (params: Record<string, unknown>, actor: AgentRef) => ({
+        id: await schedulerInstance.remove(params, conversationActor(actor)),
+      }),
+      scheduleTake: async (params: Record<string, unknown>, actor: AgentRef) => ({
+        schedule: await schedulerInstance.take(params, conversationActor(actor)),
+      }),
     };
     const bridge: HostBridge = new HostBridge({
       socketPath: path.join(hostSocketDir, "host.sock"),
@@ -254,6 +271,11 @@ export async function main(): Promise<void> {
         return;
       }
       await instance.scheduler.start();
+      if (shuttingDown) {
+        await shutdown("startup interrupted");
+        return;
+      }
+      await instance.agents.start();
       if (shuttingDown) {
         await shutdown("startup interrupted");
         return;

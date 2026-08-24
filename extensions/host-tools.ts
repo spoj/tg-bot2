@@ -4,18 +4,28 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * Host-tools extension: send/annotate/spawn/steer_conversation/steer_task/cancel tools that call
- * the host synchronously over the bridge socket mounted at PI_HOST_SOCKET. The host
- * authenticates PI_AGENT_TOKEN, validates each request, executes it, and returns the
- * result directly. PI_HOST_TOOLS selects which tools a run exposes (chat runs:
- * send,annotate,spawn,steer_conversation,steer_task,cancel; task runs: annotate).
+ * Host-tools extension: authenticated tools that synchronously call the host over
+ * the bridge socket mounted at PI_HOST_SOCKET. PI_HOST_TOOLS selects the tools a
+ * run exposes; conversation runs receive messaging, task, steering, and schedule
+ * tools while background task runs receive annotate only.
  */
 
 const SEND_SCHEMA = Type.Object({
   method: Type.String({ description: "Telegram Bot API method name, such as sendMessage, sendDocument, or editMessageText" }),
   topic_name: Type.Optional(Type.String({ description: "Host convenience for sendMessage: rename this topic after delivery" })),
 }, { additionalProperties: true });
+const RECURRENCE_SCHEMA = Type.Union([
+  Type.Literal("hourly"),
+  Type.Literal("daily"),
+  Type.Literal("weekly"),
+  Type.Null(),
+]);
 
+const SCHEDULE_FIELDS = {
+  prompt: Type.String({ minLength: 1, maxLength: 16 * 1024, description: "Complete instruction delivered to the owning conversation when due" }),
+  start: Type.String({ description: "First run as a UTC ISO-8601 timestamp ending in Z" }),
+  recurrence: RECURRENCE_SCHEMA,
+};
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -26,7 +36,7 @@ function text(content: string): ToolResult {
 }
 
 function failure(error: unknown): ToolResult {
-  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl before retrying.`);
+  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl and /run/schedules.json as applicable before retrying.`);
 }
 
 /** Sends one request line to the host bridge and resolves with the response result. */
@@ -138,6 +148,62 @@ const HOST_TOOLS = {
           return text(`Queued background task ${runId} (all task slots busy); it will start automatically. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
         }
         return text(`Launched background task ${runId}. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  schedule_add: {
+    label: "Add schedule",
+    description: "Create a host-managed schedule owned by this conversation. Inspect all current schedules in /run/schedules.json.",
+    parameters: Type.Object(SCHEDULE_FIELDS),
+    execute: async (params: { prompt: string; start: string; recurrence: "hourly" | "daily" | "weekly" | null }): Promise<ToolResult> => {
+      try {
+        const result = await callHost("schedule_add", params);
+        const schedule = result.schedule;
+        const id = schedule !== null && typeof schedule === "object" && !Array.isArray(schedule) && typeof (schedule as Record<string, unknown>).id === "string"
+          ? (schedule as Record<string, unknown>).id as string
+          : "unknown";
+        return text(`Created schedule ${id}. Current state: /run/schedules.json.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  schedule_replace: {
+    label: "Replace schedule",
+    description: "Fully replace an owned schedule. A changed start resets its next due time; other changes preserve the pending occurrence.",
+    parameters: Type.Object({ id: Type.String({ minLength: 1, description: "Schedule ID from /run/schedules.json" }), ...SCHEDULE_FIELDS }),
+    execute: async (params: { id: string; prompt: string; start: string; recurrence: "hourly" | "daily" | "weekly" | null }): Promise<ToolResult> => {
+      try {
+        await callHost("schedule_replace", params);
+        return text(`Replaced schedule ${params.id}. Current state: /run/schedules.json.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  schedule_remove: {
+    label: "Remove schedule",
+    description: "Permanently remove a schedule owned by this conversation.",
+    parameters: Type.Object({ id: Type.String({ minLength: 1, description: "Schedule ID from /run/schedules.json" }) }),
+    execute: async (params: { id: string }): Promise<ToolResult> => {
+      try {
+        await callHost("schedule_remove", params);
+        return text(`Removed schedule ${params.id}.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  schedule_take: {
+    label: "Take schedule",
+    description: "Make this conversation the owner of any existing schedule without changing its timing.",
+    parameters: Type.Object({ id: Type.String({ minLength: 1, description: "Schedule ID from /run/schedules.json" }) }),
+    execute: async (params: { id: string }): Promise<ToolResult> => {
+      try {
+        await callHost("schedule_take", params);
+        return text(`This conversation now owns schedule ${params.id}. Current state: /run/schedules.json.`);
       } catch (error) {
         return failure(error);
       }

@@ -33,7 +33,9 @@ describe("WorkspaceTimeline", () => {
     timeline.subscribe(listener);
 
     const line = await timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] });
-    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: "message", chat_id: 1 }), line);
+    const record = JSON.parse(line) as { id: string; seq: number };
+    expect(record).toMatchObject({ id: expect.any(String), seq: 1 });
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: "message", chat_id: 1, id: record.id, seq: 1 }), line);
     expect(await readFile(timeline.filePath, "utf8")).toBe(`${line}\n`);
   });
 
@@ -98,16 +100,16 @@ describe("WorkspaceTimeline", () => {
     expect(restored.pollOwner("poll-30")).toEqual(pollOwner);
   });
 
-  it("broadcasts even when persistence fails", async () => {
+  it("does not broadcast an event that could not be persisted", async () => {
     const dataDir = await temporaryDirectory();
     vi.spyOn(console, "error").mockImplementation(() => {});
     const timeline = new WorkspaceTimeline(await blockedTimelinePath(dataDir));
     const listener = vi.fn();
     timeline.subscribe(listener);
 
-    const line = await timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] });
-    expect(line).toEqual(expect.any(String));
-    expect(listener).toHaveBeenCalledOnce();
+    await expect(timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] }))
+      .rejects.toThrow("Failed to persist timeline event");
+    expect(listener).not.toHaveBeenCalled();
   });
 
   it("delivers task progress without writing it to the timeline", async () => {

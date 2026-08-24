@@ -31,7 +31,9 @@ type FakeWorker = AgentWorker & {
   stop: Mock<() => Promise<void>>;
 };
 
-function fakeWorkerFactory(): {
+function fakeWorkerFactory(
+  onPrompt?: (message: string, streamingBehavior?: "steer" | "followUp", maxWaitMs?: number) => Promise<void>,
+): {
   factory: Mock<(options: AgentWorkerOptions) => Promise<AgentWorker>>;
   workers: FakeWorker[];
 } {
@@ -48,6 +50,7 @@ function fakeWorkerFactory(): {
         ...(maxWaitMs !== undefined ? { maxWaitMs } : {}),
       });
       busy = true;
+      await onPrompt?.(message, streamingBehavior, maxWaitMs);
     });
     let settleHold = false;
     let settleWaiters: Array<() => void> = [];
@@ -138,6 +141,8 @@ it("composes a concise behavior-oriented SYSTEM_PROMPT", () => {
   expect(SYSTEM_PROMPT).toContain("Never spend a separate tool call");
   expect(SYSTEM_PROMPT).not.toContain("around message 2-3");
   expect(SYSTEM_PROMPT).toContain("/restart applies settings changes");
+  expect(SYSTEM_PROMPT).toContain("complete raw Telegram event");
+  expect(SYSTEM_PROMPT).toContain("stable notification ID");
 });
 
 it("loadUserSettings tolerates missing, empty, and malformed files", async () => {
@@ -160,9 +165,9 @@ it("followup starts a fresh worker and sends prompt with followUp streaming beha
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel",
+      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
     });
-    expect(workers[0]?.prompt).toHaveBeenCalledWith("scheduled work", "followUp");
+    expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("\nscheduled work"), "followUp", undefined);
   });
 });
 
@@ -174,7 +179,7 @@ it("interrupt sends prompt with steer streaming behavior to the active worker", 
     expect(workers).toHaveLength(1);
     await manager.interrupt("stop and do this", CHAT, 120_000);
     expect(workers).toHaveLength(1);
-    expect(workers[0]?.prompt).toHaveBeenLastCalledWith("stop and do this", "steer", 120_000);
+    expect(workers[0]?.prompt).toHaveBeenLastCalledWith(expect.stringContaining("\nstop and do this"), "steer", 120_000);
   });
 });
 
@@ -184,7 +189,63 @@ it("interrupt while idle starts a worker immediately", async () => {
     const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.interrupt("user instruction", CHAT);
     expect(workers).toHaveLength(1);
-    expect(workers[0]?.prompt).toHaveBeenCalledWith("user instruction", "steer", undefined);
+    expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("\nuser instruction"), "steer", undefined);
+  });
+});
+
+it("waits for prompt acceptance before delivering the next notification", async () => {
+  await withDataDir(async (dataDir) => {
+    let releaseFirst!: () => void;
+    const firstAccepted = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let promptCount = 0;
+    const { factory, workers } = fakeWorkerFactory(async () => {
+      promptCount += 1;
+      if (promptCount === 1) await firstAccepted;
+    });
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+
+    const first = manager.interrupt("first", CHAT, undefined, { id: "event-1", sequence: 1 });
+    await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledOnce());
+    const second = manager.interrupt("second", CHAT, undefined, { id: "event-2", sequence: 2 });
+    await Promise.resolve();
+    expect(workers[0]?.prompt).toHaveBeenCalledOnce();
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(workers[0]?.prompt).toHaveBeenNthCalledWith(2, expect.stringContaining("id=event-2 seq=2"), "steer", undefined);
+  });
+});
+
+it("replays a notification that was persisted but not accepted", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const failed = fakeWorkerFactory(async () => { throw new Error("RPC rejected prompt"); });
+    const firstManager = new AgentManager({ workspace }, managerOptions({ workerFactory: failed.factory }));
+    await expect(firstManager.interrupt("complete user instruction", CHAT, undefined, { id: "event-replay", sequence: 4 }))
+      .rejects.toThrow("RPC rejected prompt");
+
+    const replayed = fakeWorkerFactory();
+    const secondManager = new AgentManager({ workspace }, managerOptions({ workerFactory: replayed.factory }));
+    await secondManager.start();
+
+    expect(replayed.workers[0]?.prompt).toHaveBeenCalledWith(
+      "[notification id=event-replay seq=4]\ncomplete user instruction",
+      "steer",
+      undefined,
+    );
+  });
+});
+
+it("does not redeliver an acknowledged notification ID", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    const identity = { id: "event-once", sequence: 5 };
+
+    await manager.interrupt("instruction", CHAT, undefined, identity);
+    await manager.interrupt("instruction", CHAT, undefined, identity);
+
+    expect(workers[0]?.prompt).toHaveBeenCalledOnce();
   });
 });
 
@@ -200,7 +261,7 @@ it("reaped idle worker triggers fresh worker creation on next message", async ()
 
     await manager.followup("second", CHAT);
     expect(workers).toHaveLength(2);
-    expect(workers[1]?.prompt).toHaveBeenCalledWith("second", "followUp");
+    expect(workers[1]?.prompt).toHaveBeenCalledWith(expect.stringContaining("\nsecond"), "followUp", undefined);
   });
 });
 
@@ -356,7 +417,7 @@ it("restartAll keeps the entry when close rejects so exit detection can clean up
       // The entry still owns the worker: the next message reuses it instead of respawning
       await manager.followup("two", CHAT);
       expect(workers).toHaveLength(1);
-      expect(workers[0]?.prompt).toHaveBeenCalledWith("two", "followUp");
+      expect(workers[0]?.prompt).toHaveBeenLastCalledWith(expect.stringContaining("\ntwo"), "followUp", undefined);
     } finally {
       errorSpy.mockRestore();
     }
@@ -369,13 +430,49 @@ it("bounds user message steering waits", async () => {
   const rawLine = JSON.stringify({ type: "message" });
 
   await router.onEvent({
+    id: "event-1",
+    seq: 7,
     type: "message",
     chat_id: 829096380,
-    message: { message_id: 1, date: 1_700_000_000, chat: { id: 829096380, type: "private" } },
+    message: { message_id: 1, date: 1_700_000_000, text: "hello", chat: { id: 829096380, type: "private" } },
     attachments: [],
   }, rawLine);
 
-  expect(interrupt).toHaveBeenCalledWith(rawLine, conversationAgent(829096380), USER_INTERRUPT_MAX_WAIT_MS);
+  expect(interrupt).toHaveBeenCalledWith(
+    rawLine,
+    conversationAgent(829096380),
+    USER_INTERRUPT_MAX_WAIT_MS,
+    { id: "event-1", sequence: 7 },
+  );
+});
+
+it("ignores a topic service event and delivers the complete first post", async () => {
+  const interrupt = vi.fn(async () => undefined);
+  const router = new AgentEventRouter({ interrupt, followup: vi.fn(async () => undefined) });
+  const target = conversationAgent(829096380, 9751);
+  await router.onEvent({
+    id: "topic-created",
+    seq: 10,
+    type: "message",
+    chat_id: 829096380,
+    message: { message_id: 9652, message_thread_id: 9751, forum_topic_created: { name: "My conception of..." } },
+    attachments: [],
+  }, "service-event");
+
+  const text = "My conception of harness is ".repeat(50);
+  const rawLine = JSON.stringify({ id: "first-post", seq: 11, type: "message", message: { text } });
+  await router.onEvent({
+    id: "first-post",
+    seq: 11,
+    type: "message",
+    chat_id: 829096380,
+    message: { message_id: 9653, message_thread_id: 9751, text },
+    attachments: [],
+  }, rawLine);
+
+  expect(interrupt).toHaveBeenCalledOnce();
+  expect(interrupt).toHaveBeenCalledWith(rawLine, target, USER_INTERRUPT_MAX_WAIT_MS, { id: "first-post", sequence: 11 });
+  expect(rawLine).toContain(text);
 });
 
 it("routes task finishes and schedules directly to their owners", async () => {
@@ -385,6 +482,8 @@ it("routes task finishes and schedules directly to their owners", async () => {
   const target = conversationAgent(829096380, 9534);
 
   await router.onEvent({
+    id: "task-event",
+    seq: 8,
     type: "task_finished",
     runId: "run-123",
     owner: target,
@@ -392,10 +491,17 @@ it("routes task finishes and schedules directly to their owners", async () => {
     status: "done",
     exitCode: 0,
   }, "");
-  expect(followup).toHaveBeenCalledWith(expect.stringContaining('Task "check menu" finished'), target);
+  expect(followup).toHaveBeenCalledWith(
+    "Task run-123 finished. Complete instruction and results: /workspace/.pi/tasks/run-123/prompt.txt, output.md, result.json",
+    target,
+    { id: "task-event", sequence: 8 },
+  );
 
   followup.mockClear();
   await router.onEvent({
+    scheduleId: "schedule-1",
+    id: "schedule-event",
+    seq: 9,
     type: "schedule_fired",
     occurrenceId: "occurrence-1",
     owner: target,
@@ -405,6 +511,7 @@ it("routes task finishes and schedules directly to their owners", async () => {
   expect(followup).toHaveBeenCalledWith(
     "Scheduled instruction due 2026-08-24T00:00:00.000Z:\ncreate today's topic",
     target,
+    { id: "schedule-event", sequence: 9 },
   );
 });
 

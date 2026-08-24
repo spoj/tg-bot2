@@ -309,35 +309,54 @@ export class AgentManager {
       this.notificationRecordCount = lines.length;
       let hasCheckpoint = false;
       for (const line of lines) {
-        const parsed: unknown = JSON.parse(line);
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed notification log record");
-        const record = parsed as NotificationLogRecord;
-        if (record.type === "queued") {
-          if (record.notification === null || typeof record.notification !== "object" || Array.isArray(record.notification)) {
-            throw new Error("Malformed queued notification");
-          }
-          const notification = { ...record.notification, target: validateNotificationTarget(record.notification.target) };
-          if (typeof notification.id !== "string" || notification.id.length === 0) throw new Error("Malformed queued notification ID");
-          if (!this.deliveredNotifications.has(notification.id)) this.pendingNotifications.set(notification.id, notification);
-        } else if (record.type === "delivered") {
-          if (typeof record.id !== "string" || record.id.length === 0) throw new Error("Malformed delivered notification ID");
-          this.pendingNotifications.delete(record.id);
-          const sequence = record.sequence === undefined ? undefined : record.sequence;
-          if (sequence !== undefined && (!Number.isSafeInteger(sequence) || sequence < 1)) throw new Error("Malformed delivered notification sequence");
-          this.rememberDelivered(record.id, sequence);
-        } else if (record.type === "checkpoint") {
-          if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) throw new Error("Malformed notification checkpoint");
-          hasCheckpoint = true;
-          this.timelineCursor = Math.max(this.timelineCursor, record.sequence);
-        } else {
-          throw new Error("Unknown notification log record");
-        }
+        const record = this.parseNotificationLogRecord(line);
+        if (this.applyNotificationLogRecord(record)) hasCheckpoint = true;
       }
       this.pruneDeliveredThrough(this.timelineCursor);
       if (exists && !hasCheckpoint) await this.establishLegacyTimelineBaseline();
       if (exists) await this.compactNotifications();
     })();
     await this.notificationsLoaded;
+  }
+
+  private parseNotificationLogRecord(line: string): NotificationLogRecord {
+    const parsed: unknown = JSON.parse(line);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed notification log record");
+    const record = parsed as NotificationLogRecord;
+    if (record.type === "queued") {
+      if (record.notification === null || typeof record.notification !== "object" || Array.isArray(record.notification)) {
+        throw new Error("Malformed queued notification");
+      }
+      const notification = { ...record.notification, target: validateNotificationTarget(record.notification.target) };
+      if (typeof notification.id !== "string" || notification.id.length === 0) throw new Error("Malformed queued notification ID");
+      return { type: "queued", notification };
+    }
+    if (record.type === "delivered") {
+      if (typeof record.id !== "string" || record.id.length === 0) throw new Error("Malformed delivered notification ID");
+      if (record.sequence !== undefined && (!Number.isSafeInteger(record.sequence) || record.sequence < 1)) {
+        throw new Error("Malformed delivered notification sequence");
+      }
+      return record;
+    }
+    if (record.type === "checkpoint") {
+      if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) throw new Error("Malformed notification checkpoint");
+      return record;
+    }
+    throw new Error("Unknown notification log record");
+  }
+
+  private applyNotificationLogRecord(record: NotificationLogRecord): boolean {
+    if (record.type === "queued") {
+      if (!this.deliveredNotifications.has(record.notification.id)) this.pendingNotifications.set(record.notification.id, record.notification);
+      return false;
+    }
+    if (record.type === "delivered") {
+      this.pendingNotifications.delete(record.id);
+      this.rememberDelivered(record.id, record.sequence);
+      return false;
+    }
+    this.timelineCursor = Math.max(this.timelineCursor, record.sequence);
+    return true;
   }
 
   /** Establishes the first cursor at the current timeline tail for pre-checkpoint journals. */

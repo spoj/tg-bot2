@@ -96,6 +96,29 @@ function localFileOpenError(error: unknown, mountPoint: string): Error {
   return error instanceof Error ? error : new Error("Local file does not exist");
 }
 
+async function readPinnedFinalFile(
+  fileHandle: Awaited<ReturnType<typeof open>>,
+  expectedRoot: string,
+  mountPoint: string,
+): Promise<{ bytes: Buffer; resolved: string }> {
+  const resolved = await realpath(`/proc/self/fd/${fileHandle.fd}`);
+  if (!isWithinRoot(expectedRoot, resolved)) throw new Error(`Local file resolves outside ${mountPoint}`);
+  const file = await fileHandle.stat();
+  if (!file.isFile()) throw new Error("Local path is not a regular file");
+  if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total <= MAX_OUTBOUND_FILE_BYTES) {
+    const chunk = Buffer.allocUnsafe(Math.min(OUTBOUND_READ_CHUNK_BYTES, MAX_OUTBOUND_FILE_BYTES + 1 - total));
+    const { bytesRead } = await fileHandle.read(chunk, 0, chunk.length, null);
+    if (bytesRead === 0) break;
+    chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
+  return { bytes: Buffer.concat(chunks, total), resolved };
+}
+
 /**
  * Reads a local file through directory handles pinned one component at a time.
  * Checking realpath and then reopening the pathname would let an attacker swap
@@ -131,22 +154,7 @@ async function readLocalFile(root: string, exposedPath: string, mountPoint: stri
       fileHandle = rootHandle;
     }
     if (!fileHandle) throw new Error("Local file does not exist");
-    const resolved = await realpath(`/proc/self/fd/${fileHandle.fd}`);
-    if (!isWithinRoot(expectedRoot, resolved)) throw new Error(`Local file resolves outside ${mountPoint}`);
-    const file = await fileHandle.stat();
-    if (!file.isFile()) throw new Error("Local path is not a regular file");
-    if (file.size > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
-    const chunks: Buffer[] = [];
-    let total = 0;
-    while (total <= MAX_OUTBOUND_FILE_BYTES) {
-      const chunk = Buffer.allocUnsafe(Math.min(OUTBOUND_READ_CHUNK_BYTES, MAX_OUTBOUND_FILE_BYTES + 1 - total));
-      const { bytesRead } = await fileHandle.read(chunk, 0, chunk.length, null);
-      if (bytesRead === 0) break;
-      chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
-      total += bytesRead;
-    }
-    if (total > MAX_OUTBOUND_FILE_BYTES) throw new Error(`Local file exceeds ${MAX_OUTBOUND_FILE_BYTES} bytes`);
-    return { bytes: Buffer.concat(chunks, total), resolved };
+    return await readPinnedFinalFile(fileHandle, expectedRoot, mountPoint);
   } catch (error) {
     if (error instanceof Error && (error.message.startsWith("Local ") || error.message.startsWith("Directory "))) throw error;
     throw localFileOpenError(error, mountPoint);

@@ -133,7 +133,7 @@ async function disposeInstances(instances: readonly WorkspaceInstance[]): Promis
 
 async function createInstance(config: WorkspaceConfig, bwrapPath: string | undefined): Promise<WorkspaceInstance> {
   const paths = config.paths;
-  let connectors: TelegramConnector[] = [];
+  const connectors: TelegramConnector[] = [];
   let agentManager: AgentManager | undefined;
   let scheduler: WorkspaceScheduler | undefined;
   let bridge: HostBridge | undefined;

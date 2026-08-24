@@ -6,12 +6,17 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import type { Api, AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
 import multimodalExtension, { executeMultimodal, resolveMultimodalModel } from "../extensions/multimodal.js";
 
-function fakeModel(provider: string, id: string, input: ("text" | "image")[] = ["text", "image"]): Model<Api> {
+function fakeModel(
+  provider: string,
+  id: string,
+  input: ("text" | "image")[] = ["text", "image"],
+  api: Api = "google-generative-ai",
+): Model<Api> {
   return {
     provider,
     id,
     name: `${provider}/${id}`,
-    api: "google-generative-ai" as Api,
+    api,
     baseUrl: "https://generativelanguage.googleapis.com",
     input,
     reasoning: false,
@@ -57,6 +62,7 @@ function fakeContext(options: {
   const modelRegistry = {
     find: vi.fn((provider: string, modelId: string) => {
       if (options.findModel) return options.findModel(provider, modelId);
+      if (options.model?.provider === provider && options.model.id === modelId) return options.model;
       return fakeModel(provider, modelId);
     }),
     getAvailable: vi.fn(() => options.availableModels ?? [fakeModel("google", "gemini-2.5-flash")]),
@@ -149,6 +155,59 @@ describe("multimodal extension", () => {
       await rm(tmp, { recursive: true, force: true });
     }
   });
+  it("routes media only through adapters with valid encodings", async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
+    try {
+      await writeFile(path.join(tmp, "image.png"), Buffer.from("fake-png-data"));
+      await writeFile(path.join(tmp, "voice.oga"), Buffer.from("fake-oga-data"));
+      await writeFile(path.join(tmp, "clip.mp4"), Buffer.from("fake-mp4-data"));
+
+      const cases: Array<{
+        provider: string;
+        id: string;
+        api: Api;
+        input?: ("text" | "image")[];
+        file: string;
+        kind: "image" | "audio" | "video";
+        supported: boolean;
+      }> = [
+        { provider: "google", id: "gemini-2.5-flash", api: "google-generative-ai", file: "voice.oga", kind: "audio", supported: true },
+        { provider: "google-vertex", id: "gemini-2.5-flash", api: "google-vertex", file: "clip.mp4", kind: "video", supported: true },
+        { provider: "openai", id: "gpt-4o", api: "openai-responses", file: "image.png", kind: "image", supported: true },
+        { provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", file: "image.png", kind: "image", supported: true },
+        { provider: "openai", id: "gpt-4o", api: "openai-responses", file: "voice.oga", kind: "audio", supported: false },
+        { provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", file: "clip.mp4", kind: "video", supported: false },
+        { provider: "google", id: "text-only", api: "google-generative-ai", input: ["text"], file: "voice.oga", kind: "audio", supported: false },
+      ];
+
+      for (const testCase of cases) {
+        const model = fakeModel(testCase.provider, testCase.id, testCase.input, testCase.api);
+        const { ctx, completeSpy } = fakeContext({ cwd: tmp, model });
+        const result = await executeMultimodal(
+          { model: `${testCase.provider}/${testCase.id}`, prompt: "Analyze", files: [testCase.file] },
+          undefined,
+          ctx,
+        );
+
+        if (!testCase.supported) {
+          expect(result.content[0]?.text).toContain(`Unsupported ${testCase.kind} modality`);
+          expect(completeSpy).not.toHaveBeenCalled();
+          continue;
+        }
+
+        expect(result.content[0]?.text).toBe("Analysis result");
+        expect(completeSpy).toHaveBeenCalledTimes(1);
+        const contextArg = completeSpy.mock.calls[0]?.[1] as Context;
+        const contentParts = contextArg.messages[0]?.content as Array<{ type: string; mimeType?: string }>;
+        expect(contentParts[1]?.type).toBe("image");
+        expect(contentParts[1]?.mimeType).toBe(
+          testCase.kind === "image" ? "image/png" : testCase.kind === "audio" ? "audio/ogg" : "video/mp4",
+        );
+      }
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
 
   it("handles missing file cleanly", async () => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
@@ -219,7 +278,7 @@ describe("multimodal extension", () => {
       let capturedPayload: { messages: Array<{ content: Array<{ type: string }> }> } | undefined;
       const { ctx, completeSpy } = fakeContext({
         cwd: tmp,
-        model: fakeModel("anthropic", "claude-3-7-sonnet"),
+        model: fakeModel("anthropic", "claude-3-7-sonnet", ["text", "image"], "anthropic-messages"),
       });
 
       completeSpy.mockImplementation(async (_model, _context, options) => {
@@ -250,6 +309,50 @@ describe("multimodal extension", () => {
 
       expect(result.content[0]?.text).toBe("PDF Analysis");
       expect(capturedPayload?.messages[0]?.content[1]?.type).toBe("document");
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+  it("normalizes OpenAI Responses PDF input to a file block", async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
+    try {
+      const pdfPath = path.join(tmp, "test.pdf");
+      await writeFile(pdfPath, Buffer.from("fake-pdf"));
+
+      let capturedPayload: {
+        input: Array<{ content: Array<{ type: string; file_data?: string }> }>;
+      } | undefined;
+      const model = fakeModel("openai", "gpt-4o", ["text", "image"], "openai-responses");
+      const { ctx, completeSpy } = fakeContext({ cwd: tmp, model });
+
+      completeSpy.mockImplementation(async (_model, _context, options) => {
+        const rawPayload = {
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [
+                { type: "input_text", text: "Analyze" },
+                { type: "input_image", image_url: "data:application/pdf;base64,..." },
+              ],
+            },
+          ],
+        };
+        capturedPayload = options?.onPayload?.(rawPayload, model) as {
+          input: Array<{ content: Array<{ type: string; file_data?: string }> }>;
+        };
+        return fakeAssistantMessage();
+      });
+
+      const result = await executeMultimodal(
+        { model: "openai/gpt-4o", prompt: "Analyze", files: ["test.pdf"] },
+        undefined,
+        ctx,
+      );
+
+      expect(result.content[0]?.text).toBe("Analysis result");
+      expect(capturedPayload?.input[0]?.content[1]?.type).toBe("input_file");
+      expect(capturedPayload?.input[0]?.content[1]?.file_data).toBe("data:application/pdf;base64,...");
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }

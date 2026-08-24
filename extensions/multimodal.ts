@@ -10,7 +10,10 @@ const MULTIMODAL_SCHEMA = Type.Object({
   files: Type.Array(Type.String(), { description: "Workspace file paths to inspect (images, audio notes, video, PDFs, text)" }),
 });
 
-const MIME_MAP: Record<string, { mime: string; kind: "image" | "audio" | "video" | "pdf" }> = {
+type MediaKind = "image" | "audio" | "video" | "pdf";
+type MediaInfo = { mime: string; kind: MediaKind };
+
+const MIME_MAP: Record<string, MediaInfo> = {
   // Images
   ".png": { mime: "image/png", kind: "image" },
   ".jpg": { mime: "image/jpeg", kind: "image" },
@@ -32,7 +35,6 @@ const MIME_MAP: Record<string, { mime: string; kind: "image" | "audio" | "video"
   ".webm": { mime: "video/webm", kind: "video" },
   ".mov": { mime: "video/quicktime", kind: "video" },
 };
-
 const TEXT_EXTS = new Set([
   ".txt", ".md", ".json", ".jsonl", ".csv", ".ts", ".js", ".py", ".rs", ".sh",
   ".html", ".xml", ".yaml", ".yml", ".toml", ".sql", ".css", ".log", ".env",
@@ -58,6 +60,166 @@ export function resolveMultimodalModel(ctx: ExtensionContext, spec: string): Mod
   return model;
 }
 
+function isAnthropicAdapter(model: Model<Api>): boolean {
+  return model.provider === "anthropic" || model.api === "anthropic-messages";
+}
+
+function isOpenAIAdapter(model: Model<Api>): boolean {
+  return model.provider === "openai" ||
+    model.provider === "openai-codex" ||
+    model.provider === "azure-openai-responses" ||
+    model.api === "openai-completions" ||
+    model.api === "openai-responses" ||
+    model.api === "openai-codex-responses" ||
+    model.api === "azure-openai-responses";
+}
+
+function isOpenAIResponsesAdapter(model: Model<Api>): boolean {
+  return model.api === "openai-responses" ||
+    model.api === "openai-codex-responses" ||
+    model.api === "azure-openai-responses";
+}
+
+/**
+ * pi-ai's chat content union has only ImageContent for binary input. The
+ * Google adapters translate that block to inlineData, whose MIME field also
+ * supports audio, video, and PDF. Other installed adapters translate it to an
+ * image-specific wire block, so those modalities need an explicit route.
+ */
+function isGoogleAdapter(model: Model<Api>): boolean {
+  if (isAnthropicAdapter(model) || isOpenAIAdapter(model)) return false;
+  return model.api === "google-generative-ai" || model.api === "google-vertex";
+}
+
+function supportsMedia(model: Model<Api>, media: MediaInfo): boolean {
+  if (!model.input.includes("image")) return false;
+
+  switch (media.kind) {
+    case "image":
+      return true;
+    case "pdf":
+      return isGoogleAdapter(model) || isAnthropicAdapter(model) || isOpenAIResponsesAdapter(model);
+    case "audio":
+    case "video":
+      return isGoogleAdapter(model);
+  }
+}
+
+function unsupportedMediaMessage(model: Model<Api>, media: Pick<MediaInfo, "kind" | "mime">): string {
+  const modelName = `${model.provider}/${model.id}`;
+  if (!model.input.includes("image")) {
+    return `Error: Unsupported ${media.kind} modality for ${modelName}: model metadata does not advertise binary media input.`;
+  }
+  return `Error: Unsupported ${media.kind} modality for ${modelName}: the installed ${model.api} adapter has no valid ${media.kind} input encoding for ${media.mime}; it cannot be sent as an image.`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function dataUrlMimeType(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return /^data:([^;,]+)[;,]/i.exec(value)?.[1]?.toLowerCase();
+}
+
+function mediaKindForMime(mime: string): MediaKind | undefined {
+  const normalized = mime.toLowerCase();
+  if (normalized.startsWith("audio/")) return "audio";
+  if (normalized.startsWith("video/")) return "video";
+  return undefined;
+}
+
+function findUnsupportedImageMime(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const mime = findUnsupportedImageMime(item);
+      if (mime !== undefined) return mime;
+    }
+    return undefined;
+  }
+
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+
+  let mime: string | undefined;
+  if (record.type === "image" && typeof record.mimeType === "string") {
+    mime = record.mimeType;
+  } else if (record.type === "image" && asRecord(record.source)?.media_type !== undefined) {
+    const source = asRecord(record.source);
+    if (typeof source?.media_type === "string") mime = source.media_type;
+  } else if (record.type === "image_url") {
+    const imageUrl = asRecord(record.image_url);
+    mime = dataUrlMimeType(typeof record.image_url === "string" ? record.image_url : imageUrl?.url);
+  } else if (record.type === "input_image") {
+    const imageUrl = asRecord(record.image_url);
+    mime = dataUrlMimeType(typeof record.image_url === "string" ? record.image_url : imageUrl?.url);
+  }
+
+  if (mime !== undefined && mediaKindForMime(mime) !== undefined) return mime;
+  for (const nested of Object.values(record)) {
+    const nestedMime = findUnsupportedImageMime(nested);
+    if (nestedMime !== undefined) return nestedMime;
+  }
+  return undefined;
+}
+
+function normalizeAnthropicPdfPayload(payload: unknown, model: Model<Api>): unknown {
+  if (!isAnthropicAdapter(model)) return payload;
+  const body = asRecord(payload);
+  const messages = body?.messages;
+  if (!Array.isArray(messages)) return payload;
+
+  for (const messageValue of messages) {
+    const message = asRecord(messageValue);
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const blockValue of content) {
+      const block = asRecord(blockValue);
+      const source = asRecord(block?.source);
+      if (block?.type === "image" && source?.media_type === "application/pdf") {
+        block.type = "document";
+      }
+    }
+  }
+  return payload;
+}
+
+function normalizeOpenAIPdfPayload(payload: unknown, model: Model<Api>): unknown {
+  if (!isOpenAIResponsesAdapter(model)) return payload;
+  const body = asRecord(payload);
+  const input = body?.input;
+  if (!Array.isArray(input)) return payload;
+
+  for (const itemValue of input) {
+    const item = asRecord(itemValue);
+    if (item === undefined || !Array.isArray(item.content)) continue;
+    const content = item.content;
+    item.content = content.map((partValue) => {
+      const part = asRecord(partValue);
+      if (part?.type !== "input_image") return partValue;
+      const imageUrl = asRecord(part.image_url);
+      const dataUrl = typeof part.image_url === "string" ? part.image_url : imageUrl?.url;
+      if (dataUrlMimeType(dataUrl) !== "application/pdf") return partValue;
+      return { type: "input_file", file_data: dataUrl };
+    });
+  }
+  return payload;
+}
+
+function normalizePayload(payload: unknown, model: Model<Api>): unknown {
+  const normalizedAnthropic = normalizeAnthropicPdfPayload(payload, model);
+  const normalized = normalizeOpenAIPdfPayload(normalizedAnthropic, model);
+  if (!isGoogleAdapter(model)) {
+    const mime = findUnsupportedImageMime(normalized);
+    const kind = mime === undefined ? undefined : mediaKindForMime(mime);
+    if (mime !== undefined && kind !== undefined) {
+      throw new Error(unsupportedMediaMessage(model, { kind, mime }).slice("Error: ".length));
+    }
+  }
+  return normalized;
+}
+
 export async function executeMultimodal(
   params: { model: string; prompt: string; files: string[] },
   signal: AbortSignal | undefined,
@@ -79,8 +241,14 @@ export async function executeMultimodal(
       const media = MIME_MAP[ext];
 
       if (media !== undefined) {
+        if (!supportsMedia(model, media)) {
+          return text(unsupportedMediaMessage(model, media));
+        }
         const data = readFileSync(filePath).toString("base64");
         parts.push({
+          // ImageContent is pi-ai's only binary chat content type. Google
+          // adapters turn this into inlineData; unsupported adapters are
+          // rejected above instead of receiving an image block with a wrong MIME.
           type: "image",
           data,
           mimeType: media.mime,
@@ -103,23 +271,7 @@ export async function executeMultimodal(
 
     const options = {
       ...(signal !== undefined ? { signal } : {}),
-      onPayload: (payload: unknown, m: Model<Api>): unknown => {
-        if (m.provider === "anthropic" && typeof payload === "object" && payload !== null) {
-          const body = payload as { messages?: Array<{ content?: Array<{ type?: string; source?: { media_type?: string } }> }> };
-          if (Array.isArray(body.messages)) {
-            for (const msg of body.messages) {
-              if (Array.isArray(msg.content)) {
-                for (const block of msg.content) {
-                  if (block.type === "image" && block.source?.media_type === "application/pdf") {
-                    block.type = "document";
-                  }
-                }
-              }
-            }
-          }
-        }
-        return payload;
-      },
+      onPayload: (payload: unknown, m: Model<Api>): unknown => normalizePayload(payload, m),
     };
 
     const response = await ctx.modelRegistry.complete(model, completionContext, options);

@@ -34,7 +34,7 @@ describe("appendJsonl", () => {
     expect(lines[4_999]).toBe(records[4_999]);
   });
 
-  it("throws when the store reports zero write progress", async () => {
+  it("throws and rolls back when the first write makes no progress", async () => {
     const dataDir = await temporaryDirectory();
     const filePath = path.join(dataDir, "store.jsonl");
     const handle = await open(filePath, "a");
@@ -42,6 +42,31 @@ describe("appendJsonl", () => {
       const prototype = Object.getPrototypeOf(handle) as unknown as { write: HandleWrite };
       vi.spyOn(prototype, "write").mockResolvedValue({ bytesWritten: 0, bytesRead: 0, buffer: Buffer.alloc(0) });
       await expect(appendJsonl(filePath, "line")).rejects.toThrow("accepted only 0 of 5 bytes");
+      await expect(readFile(filePath, "utf8")).resolves.toBe("");
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  });
+
+  it("rolls back a complete record when the trailing newline write fails", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "store.jsonl");
+    const handle = await open(filePath, "a");
+    try {
+      const prototype = Object.getPrototypeOf(handle) as unknown as { write: HandleWrite };
+      const originalWrite = prototype.write.bind(handle);
+      let calls = 0;
+      vi.spyOn(prototype, "write").mockImplementation(async (buffer, offset, length, position) => {
+        calls += 1;
+        if (calls === 1) {
+          const completeRecordBytes = length - 1;
+          const result = await originalWrite(buffer, offset, completeRecordBytes, position);
+          return { ...result, bytesWritten: completeRecordBytes };
+        }
+        return { bytesWritten: 0, bytesRead: 0, buffer: Buffer.alloc(0) };
+      });
+      await expect(appendJsonl(filePath, "line")).rejects.toThrow("accepted only 4 of 5 bytes");
+      await expect(readFile(filePath, "utf8")).resolves.toBe("");
     } finally {
       await handle.close().catch(() => {});
     }

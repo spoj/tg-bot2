@@ -36,8 +36,13 @@ async function timeline(dataDir: string): Promise<Array<Record<string, unknown>>
   return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-async function schedules(dataDir: string): Promise<{ schedules: Array<Record<string, unknown>> }> {
-  return JSON.parse(await readFile(path.join(dataDir, "run", "schedules.json"), "utf8")) as { schedules: Array<Record<string, unknown>> };
+type SchedulerState = {
+  schedules: Array<Record<string, unknown>>;
+  pending?: Array<Record<string, unknown>>;
+};
+
+async function schedules(dataDir: string): Promise<SchedulerState> {
+  return JSON.parse(await readFile(path.join(dataDir, "run", "schedules.json"), "utf8")) as SchedulerState;
 }
 
 function makeScheduler(dataDir: string, overrides: Partial<WorkspaceSchedulerOptions> = {}): { scheduler: WorkspaceScheduler; errors: unknown[] } {
@@ -81,6 +86,19 @@ describe("WorkspaceScheduler", () => {
     await makeScheduler(dataDir).scheduler.poll(NOW);
     expect(await timeline(dataDir)).toHaveLength(1);
   });
+  it("loads legacy schedule state without a pending journal", async () => {
+    const dataDir = await fixture();
+    await writeFile(path.join(dataDir, "run", "schedules.json"), JSON.stringify({
+      version: 1,
+      schedules: [{ id: "legacy", ...input, owner: OWNER, next_due_at: input.start }],
+    }), "utf8");
+    const scheduler = makeScheduler(dataDir).scheduler;
+
+    await scheduler.poll(NOW);
+
+    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: "legacy", occurrenceId: expect.any(String) }]);
+    expect((await schedules(dataDir)).pending).toEqual([]);
+  });
 
   it("restores a due one-shot when timeline publication fails", async () => {
     const dataDir = await fixture();
@@ -94,11 +112,16 @@ describe("WorkspaceScheduler", () => {
 
     expect(errors).toHaveLength(1);
     expect(await timeline(dataDir)).toEqual([]);
-    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: input.start });
+    const failedState = await schedules(dataDir);
+    expect(failedState.schedules[0]).toMatchObject({ id: created.id, next_due_at: input.start });
+    expect(failedState.pending).toHaveLength(1);
+    const occurrenceId = failedState.pending?.[0]?.occurrenceId;
+    expect(occurrenceId).toEqual(expect.any(String));
 
     await scheduler.poll(NOW);
-    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, dueAt: input.start }]);
+    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, occurrenceId, dueAt: input.start }]);
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: null });
+    expect((await schedules(dataDir)).pending).toEqual([]);
   });
 
   it("restores a due recurring schedule when timeline publication fails", async () => {
@@ -113,13 +136,94 @@ describe("WorkspaceScheduler", () => {
 
     expect(errors).toHaveLength(1);
     expect(await timeline(dataDir)).toEqual([]);
-    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: created.start });
+    const failedState = await schedules(dataDir);
+    expect(failedState.schedules[0]).toMatchObject({ id: created.id, next_due_at: created.start });
+    expect(failedState.pending).toHaveLength(1);
+    const occurrenceId = failedState.pending?.[0]?.occurrenceId;
+    expect(occurrenceId).toEqual(expect.any(String));
 
     await scheduler.poll(NOW);
-    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, dueAt: created.start }]);
+    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, occurrenceId, dueAt: created.start }]);
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: "2026-01-11T12:00:00.000Z" });
+    expect((await schedules(dataDir)).pending).toEqual([]);
+  });
+  it("recovers a published-but-unacknowledged occurrence with its stable identity", async () => {
+    const dataDir = await fixture();
+    const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    const originalPublish = workspaceTimeline.publish.bind(workspaceTimeline);
+    let failAcknowledgement = true;
+    vi.spyOn(workspaceTimeline, "publish").mockImplementation(async (event) => {
+      const line = await originalPublish(event);
+      if (failAcknowledgement) {
+        failAcknowledgement = false;
+        throw new Error("process interrupted after publication");
+      }
+      return line;
+    });
+    const { scheduler, errors } = makeScheduler(dataDir, { timeline: workspaceTimeline });
+    const created = await scheduler.add(input, OWNER);
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    const firstRecord = (await timeline(dataDir))[0];
+    expect(firstRecord).toMatchObject({ type: "schedule_fired", scheduleId: created.id, occurrenceId: expect.any(String) });
+    const failedState = await schedules(dataDir);
+    expect(failedState.pending).toMatchObject([{ scheduleId: created.id, occurrenceId: firstRecord?.occurrenceId }]);
+
+    const restartedTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    await restartedTimeline.start();
+    const restarted = makeScheduler(dataDir, { timeline: restartedTimeline }).scheduler;
+    await restarted.poll(NOW);
+
+    const records = await timeline(dataDir);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      type: "schedule_fired",
+      scheduleId: created.id,
+      occurrenceId: firstRecord?.occurrenceId,
+      id: firstRecord?.id,
+    });
+    expect((await schedules(dataDir)).pending).toEqual([]);
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: null });
   });
 
+  it("acknowledges successful batch entries before retrying a failed entry", async () => {
+    const dataDir = await fixture();
+    const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    const originalPublish = workspaceTimeline.publish.bind(workspaceTimeline);
+    let failSecond = true;
+    const { scheduler, errors } = makeScheduler(dataDir, { timeline: workspaceTimeline });
+    const first = await scheduler.add({ ...input, prompt: "a" }, OWNER);
+    const second = await scheduler.add({ ...input, prompt: "b" }, OWNER);
+    vi.spyOn(workspaceTimeline, "publish").mockImplementation(async (event) => {
+      if (event.scheduleId === second.id && failSecond) {
+        failSecond = false;
+        throw new Error("timeline unavailable");
+      }
+      return originalPublish(event);
+    });
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    const firstBatch = await timeline(dataDir);
+    expect(firstBatch.filter((record) => record.type === "schedule_fired")).toHaveLength(1);
+    const failedState = await schedules(dataDir);
+    expect(failedState.schedules).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: first.id, next_due_at: null }),
+      expect.objectContaining({ id: second.id, next_due_at: input.start }),
+    ]));
+    const pending = failedState.pending?.find((occurrence) => occurrence.scheduleId === second.id);
+    expect(pending).toEqual(expect.objectContaining({ scheduleId: second.id, occurrenceId: expect.any(String), dueAt: input.start }));
+
+    await scheduler.poll(NOW);
+
+    const records = await timeline(dataDir);
+    expect(records.filter((record) => record.type === "schedule_fired")).toHaveLength(2);
+    expect(records[1]).toMatchObject({ scheduleId: second.id, occurrenceId: pending?.occurrenceId, id: pending?.occurrenceId });
+    expect((await schedules(dataDir)).pending).toEqual([]);
+  });
   it("reactivates a completed one-shot when replaced with recurrence at the same start", async () => {
     const dataDir = await fixture();
     const scheduler = makeScheduler(dataDir).scheduler;

@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { conversationAgent } from "../src/agent-ref.js";
 import { WorkspaceTimeline } from "../src/events.js";
 
+type WriteResult = { bytesWritten: number; bytesRead: number; buffer: Uint8Array };
+type HandleWrite = (buffer: Uint8Array, offset: number, length: number, position: number | null) => Promise<WriteResult>;
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -66,6 +69,20 @@ describe("WorkspaceTimeline", () => {
     expect(listener).toHaveBeenNthCalledWith(1, first, firstLine);
     expect(listener).toHaveBeenNthCalledWith(2, second, secondLine);
     await expect(readFile(timeline.filePath, "utf8")).resolves.toBe(`${firstLine}\n${secondLine}\n`);
+  });
+  it("finds a persisted notification identity after restart", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    const timeline = new WorkspaceTimeline(filePath);
+
+    const line = await timeline.publish({ type: "schedule_fired", id: "occurrence-1" });
+    await expect(timeline.hasRecordId("occurrence-1")).resolves.toBe(true);
+    await expect(timeline.hasRecordId("missing")).resolves.toBe(false);
+
+    const restarted = new WorkspaceTimeline(filePath);
+    await restarted.start();
+    await expect(restarted.hasRecordId("occurrence-1")).resolves.toBe(true);
+    await expect(readFile(filePath, "utf8")).resolves.toBe(`${line}\n`);
   });
 
   it("continues sequence numbers after existing v2 records", async () => {
@@ -150,6 +167,35 @@ describe("WorkspaceTimeline", () => {
       payload: { text: "hello" },
     })).rejects.toThrow("Failed to persist timeline event");
     expect(listener).not.toHaveBeenCalled();
+  });
+  it("rolls back a complete failed append before reusing its sequence", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    const timeline = new WorkspaceTimeline(filePath);
+    const handle = await open(filePath, "a");
+    try {
+      const prototype = Object.getPrototypeOf(handle) as unknown as { write: HandleWrite };
+      const originalWrite = prototype.write.bind(handle);
+      let calls = 0;
+      const writeSpy = vi.spyOn(prototype, "write").mockImplementation(async (buffer, offset, length, position) => {
+        calls += 1;
+        if (calls === 1) {
+          const completeRecordBytes = length - 1;
+          const result = await originalWrite(buffer, offset, completeRecordBytes, position);
+          return { ...result, bytesWritten: completeRecordBytes };
+        }
+        return { bytesWritten: 0, bytesRead: 0, buffer: Buffer.alloc(0) };
+      });
+
+      await expect(timeline.publish({ type: "custom.failed" })).rejects.toThrow("Failed to persist timeline event");
+      writeSpy.mockRestore();
+      const line = await timeline.publish({ type: "custom.next" });
+
+      expect(JSON.parse(line)).toMatchObject({ type: "custom.next", seq: 1 });
+      await expect(readFile(filePath, "utf8")).resolves.toBe(`${line}\n`);
+    } finally {
+      await handle.close().catch(() => {});
+    }
   });
 
   it("starts past an unterminated tail and keeps subsequent appends valid", async () => {

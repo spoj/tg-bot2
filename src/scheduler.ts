@@ -8,7 +8,13 @@ import { SerialQueue } from "./queue.js";
 import type { Recurrence, Schedule, ScheduleInput } from "./schedule-protocol.js";
 import { isMissing, readFileBounded } from "./util.js";
 
-type ScheduleFile = { version: 1; schedules: Schedule[] };
+type PendingOccurrence = {
+  occurrenceId: string;
+  scheduleId: string;
+  dueAt: string;
+};
+
+type ScheduleFile = { version: 1; schedules: Schedule[]; pending?: PendingOccurrence[] };
 
 export type WorkspaceSchedulerOptions = {
   schedulePath: string;
@@ -64,7 +70,6 @@ function validateInput(value: unknown, context: string): ScheduleInput {
   }
   return { prompt: input.prompt, start: input.start, recurrence: input.recurrence as Recurrence | null };
 }
-
 function validateId(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) invalid("id must be a non-empty string");
   return value;
@@ -90,7 +95,26 @@ function validateScheduleFile(value: unknown): ScheduleFile {
       next_due_at: row.next_due_at as string | null,
     };
   });
-  return { version: 1, schedules };
+
+  const rawPending = root.pending;
+  if (rawPending !== undefined && !Array.isArray(rawPending)) throw new Error("Invalid schedules state: pending must be an array");
+  const pendingIds = new Set<string>();
+  const pending = (rawPending ?? []).map((value, index): PendingOccurrence => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid schedules state: pending row ${index}`);
+    const row = value as Record<string, unknown>;
+    if (typeof row.occurrenceId !== "string" || row.occurrenceId.length === 0) throw new Error(`Invalid schedules state: pending row ${index} has an invalid occurrenceId`);
+    if (typeof row.scheduleId !== "string" || row.scheduleId.length === 0 || !ids.has(row.scheduleId)) throw new Error(`Invalid schedules state: pending row ${index} has an invalid scheduleId`);
+    if (!isUtcIso(row.dueAt)) throw new Error(`Invalid schedules state: pending row ${index} has an invalid dueAt`);
+    if (pendingIds.has(row.occurrenceId)) throw new Error(`Invalid schedules state: duplicate occurrenceId ${row.occurrenceId}`);
+    pendingIds.add(row.occurrenceId);
+    return { occurrenceId: row.occurrenceId, scheduleId: row.scheduleId, dueAt: row.dueAt };
+  });
+  const pendingScheduleIds = new Set<string>();
+  for (const occurrence of pending) {
+    if (pendingScheduleIds.has(occurrence.scheduleId)) throw new Error(`Invalid schedules state: duplicate pending schedule ${occurrence.scheduleId}`);
+    pendingScheduleIds.add(occurrence.scheduleId);
+  }
+  return { version: 1, schedules, pending };
 }
 
 
@@ -133,6 +157,7 @@ export class WorkspaceScheduler {
   private readonly logger: (error: unknown) => void;
   private readonly schedules = new Map<string, Schedule>();
   private readonly writes = new SerialQueue();
+  private readonly pending = new Map<string, PendingOccurrence>();
   private stateLoaded = false;
   private timer: ReturnType<typeof setInterval> | undefined;
   private pollInFlight: Promise<void> | undefined;
@@ -173,7 +198,10 @@ export class WorkspaceScheduler {
           ? advanceRecurring(input.start, input.recurrence, this.now())
           : current.next_due_at;
       const replacement: Schedule = { id, ...input, owner: current.owner, next_due_at: nextDueAt };
-      await this.commit(() => this.schedules.set(id, replacement));
+      await this.commit(() => {
+        this.schedules.set(id, replacement);
+        if (input.start !== current.start) this.pending.delete(id);
+      });
       return cloneSchedule(replacement);
     });
   }
@@ -184,7 +212,10 @@ export class WorkspaceScheduler {
       await this.loadState();
       const id = validateId(params.id);
       this.ownedSchedule(id, actor);
-      await this.commit(() => this.schedules.delete(id));
+      await this.commit(() => {
+        this.schedules.delete(id);
+        this.pending.delete(id);
+      });
       return id;
     });
   }
@@ -246,42 +277,64 @@ export class WorkspaceScheduler {
   private async runPoll(now: number): Promise<void> {
     try {
       await this.loadState();
-      const previous = new Map(this.schedules);
-      const due: Array<{ occurrenceId: string; schedule: Schedule; dueAt: string }> = [];
+      const previousSchedules = new Map(this.schedules);
+      const previousPending = new Map(this.pending);
+      let addedPending = false;
       for (const [id, schedule] of this.schedules) {
         const dueAt = schedule.next_due_at;
-        if (dueAt === null || Date.parse(dueAt) > now) continue;
-        due.push({ occurrenceId: randomUUID(), schedule, dueAt });
-        this.schedules.set(id, { ...schedule, next_due_at: schedule.recurrence === null ? null : advanceRecurring(dueAt, schedule.recurrence, now) });
+        if (dueAt === null || Date.parse(dueAt) > now || this.pending.has(id)) continue;
+        const occurrence: PendingOccurrence = { occurrenceId: randomUUID(), scheduleId: id, dueAt };
+        this.pending.set(id, occurrence);
+        addedPending = true;
       }
-      if (due.length > 0) {
+      if (addedPending) {
         try {
           await this.saveState();
         } catch (error) {
-          this.restore(previous);
+          this.restore(previousSchedules, previousPending);
           throw error;
         }
       }
-      due.sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt) || left.schedule.prompt.localeCompare(right.schedule.prompt));
-      try {
-        for (const occurrence of due) {
+
+      const due = [...this.pending.values()].map((pending) => {
+        const schedule = this.schedules.get(pending.scheduleId);
+        if (!schedule) throw new Error(`Pending occurrence references missing schedule ${pending.scheduleId}`);
+        return { pending, schedule };
+      });
+      due.sort((left, right) => Date.parse(left.pending.dueAt) - Date.parse(right.pending.dueAt)
+        || left.schedule.prompt.localeCompare(right.schedule.prompt)
+        || left.pending.occurrenceId.localeCompare(right.pending.occurrenceId));
+
+      for (const occurrence of due) {
+        if (!(await this.timeline.hasRecordId(occurrence.pending.occurrenceId))) {
           await this.timeline.publish({
+            id: occurrence.pending.occurrenceId,
             type: "schedule_fired",
             conversation: occurrence.schedule.owner,
             scheduleId: occurrence.schedule.id,
-            occurrenceId: occurrence.occurrenceId,
+            occurrenceId: occurrence.pending.occurrenceId,
             prompt: occurrence.schedule.prompt,
-            dueAt: occurrence.dueAt,
+            dueAt: occurrence.pending.dueAt,
           });
         }
-      } catch (error) {
-        this.restore(previous);
+
+        const beforeAcknowledgementSchedules = new Map(this.schedules);
+        const beforeAcknowledgementPending = new Map(this.pending);
+        this.pending.delete(occurrence.pending.scheduleId);
+        const current = this.schedules.get(occurrence.pending.scheduleId);
+        if (!current) throw new Error(`Pending occurrence references missing schedule ${occurrence.pending.scheduleId}`);
+        this.schedules.set(current.id, {
+          ...current,
+          next_due_at: current.recurrence === null
+            ? null
+            : advanceRecurring(occurrence.pending.dueAt, current.recurrence, now),
+        });
         try {
           await this.saveState();
-        } catch (restoreError) {
-          this.report(restoreError);
+        } catch (error) {
+          this.restore(beforeAcknowledgementSchedules, beforeAcknowledgementPending);
+          throw error;
         }
-        throw error;
       }
     } catch (error) {
       if (!isMissing(error)) this.report(error);
@@ -292,12 +345,14 @@ export class WorkspaceScheduler {
     if (this.stateLoaded) return;
     const raw = await readOptionalFile(this.schedulePath);
     this.schedules.clear();
+    this.pending.clear();
     if (raw !== undefined) {
       const file = validateScheduleFile(JSON.parse(raw) as unknown);
       for (const schedule of file.schedules) this.schedules.set(schedule.id, schedule);
+      for (const occurrence of file.pending ?? []) this.pending.set(occurrence.scheduleId, occurrence);
     }
-    this.stateLoaded = true;
     if (raw === undefined) await this.saveState();
+    this.stateLoaded = true;
   }
 
   private requiredSchedule(id: string): Schedule {
@@ -313,25 +368,29 @@ export class WorkspaceScheduler {
   }
 
   private async commit(change: () => unknown): Promise<void> {
-    const previous = new Map(this.schedules);
+    const previousSchedules = new Map(this.schedules);
+    const previousPending = new Map(this.pending);
     change();
     try {
       await this.saveState();
     } catch (error) {
-      this.restore(previous);
+      this.restore(previousSchedules, previousPending);
       throw error;
     }
   }
 
-  private restore(previous: Map<string, Schedule>): void {
+  private restore(previousSchedules: Map<string, Schedule>, previousPending: Map<string, PendingOccurrence>): void {
     this.schedules.clear();
-    for (const [id, schedule] of previous) this.schedules.set(id, schedule);
+    for (const [id, schedule] of previousSchedules) this.schedules.set(id, schedule);
+    this.pending.clear();
+    for (const [scheduleId, occurrence] of previousPending) this.pending.set(scheduleId, occurrence);
   }
+
 
   private async saveState(): Promise<void> {
     await mkdir(path.dirname(this.schedulePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.schedulePath}.${randomUUID()}.tmp`;
-    const payload = `${JSON.stringify({ version: 1, schedules: [...this.schedules.values()] } satisfies ScheduleFile, null, 2)}\n`;
+    const payload = `${JSON.stringify({ version: 1, schedules: [...this.schedules.values()], pending: [...this.pending.values()] } satisfies ScheduleFile, null, 2)}\n`;
     if (Buffer.byteLength(payload, "utf8") > MAX_SCHEDULE_FILE_BYTES) throw new Error(`Schedules state exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
     try {
       await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });

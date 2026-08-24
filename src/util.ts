@@ -207,7 +207,7 @@ export async function replaceFileAtomic(filePath: string, contents: string): Pro
  * Appends serialized records to a JSONL store (filePath), creating and validating the store even when the array is empty. A symlink planted
  * at the path is unlinked and the open retried (ELOOP defense). Writes loop until the
  * whole payload is on disk; zero write progress throws instead of reporting success
- * with a partial record.
+ * with a partial record, and failed writes are rolled back to the append boundary.
  */
 export async function appendJsonl(
   filePath: string,
@@ -220,24 +220,34 @@ export async function appendJsonl(
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
     const completeTail = await discardUnterminatedTail(handle, stat.size);
-    if (completeTail && payload.length > 0) {
-      const separator = Buffer.from("\n", "utf8");
-      let separatorWritten = 0;
-      while (separatorWritten < separator.length) {
-        const result = await handle.write(separator, separatorWritten, separator.length - separatorWritten, null);
-        if (result.bytesWritten === 0) {
-          throw new Error(`JSONL store accepted only ${separatorWritten} of ${separator.length} bytes`);
+    const appendStart = (await handle.stat()).size;
+    try {
+      if (completeTail && payload.length > 0) {
+        const separator = Buffer.from("\n", "utf8");
+        let separatorWritten = 0;
+        while (separatorWritten < separator.length) {
+          const result = await handle.write(separator, separatorWritten, separator.length - separatorWritten, null);
+          if (result.bytesWritten === 0) {
+            throw new Error(`JSONL store accepted only ${separatorWritten} of ${separator.length} bytes`);
+          }
+          separatorWritten += result.bytesWritten;
         }
-        separatorWritten += result.bytesWritten;
       }
-    }
-    let written = 0;
-    while (written < payload.length) {
-      const result = await handle.write(payload, written, payload.length - written, null);
-      if (result.bytesWritten === 0) {
-        throw new Error(`JSONL store accepted only ${written} of ${payload.length} bytes`);
+      let written = 0;
+      while (written < payload.length) {
+        const result = await handle.write(payload, written, payload.length - written, null);
+        if (result.bytesWritten === 0) {
+          throw new Error(`JSONL store accepted only ${written} of ${payload.length} bytes`);
+        }
+        written += result.bytesWritten;
       }
-      written += result.bytesWritten;
+    } catch (error) {
+      try {
+        await handle.truncate(appendStart);
+      } catch (rollbackError) {
+        throw new Error("Failed to roll back partial JSONL append", { cause: rollbackError });
+      }
+      throw error;
     }
   } finally {
     await handle.close().catch(() => {});

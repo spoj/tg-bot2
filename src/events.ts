@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendJsonl, readJsonl } from "./util.js";
+import { appendJsonl, isMissing, readJsonl } from "./util.js";
 import type { ConversationAgentRef } from "./agent-ref.js";
 import { SerialQueue } from "./queue.js";
 
@@ -13,6 +13,8 @@ export type TimelineAttachment = {
 };
 
 export type TimelineEvent = {
+  /** Optional stable envelope identity used when a persisted event is retried. */
+  id?: string | undefined;
   type: string;
   connectorId?: string | undefined;
   conversation?: ConversationAgentRef | undefined;
@@ -69,6 +71,25 @@ export class WorkspaceTimeline {
     });
   }
 
+  /** Checks a retry identity on demand without retaining a timeline-sized index. */
+  async hasRecordId(id: string): Promise<boolean> {
+    if (typeof id !== "string" || id.length === 0) throw new Error("Timeline record ID must not be empty");
+    return this.writes.run(async () => {
+      let lines: string[];
+      try {
+        lines = await readJsonl(this.filePath);
+      } catch (error) {
+        if (isMissing(error)) return false;
+        throw error;
+      }
+      for (const line of lines) {
+        const parsed: unknown = JSON.parse(line);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed timeline record");
+        if ((parsed as Record<string, unknown>).id === id) return true;
+      }
+      return false;
+    });
+  }
   async publish(event: TimelineEvent): Promise<string> {
     const persistence = this.writes.run(async () => {
       const rawLine = timelineLine(event, this.nextSequence);
@@ -140,7 +161,8 @@ export class WorkspaceTimeline {
 }
 
 export function timelineLine(event: TimelineEvent, sequence: number): string {
-  return JSON.stringify({ v: 2, id: randomUUID(), seq: sequence, t: new Date().toISOString(), ...event });
+  const { id, ...payload } = event;
+  return JSON.stringify({ v: 2, id: id ?? randomUUID(), seq: sequence, t: new Date().toISOString(), ...payload });
 }
 
 export const TIMELINE_PROMPT = `/run/timeline.jsonl is read-only shared memory for this workspace. Each JSON line has {v:2,id,seq,t,type,...}; id is stable and seq is monotonic.

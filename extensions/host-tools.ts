@@ -4,16 +4,11 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * Host-tools extension: authenticated tools that synchronously call the host over
- * the bridge socket mounted at PI_HOST_SOCKET. PI_HOST_TOOLS selects the tools a
- * run exposes; conversation runs receive messaging, task, steering, and schedule
- * tools while background task runs receive annotate only.
+ * Authenticated connector, timeline, steering, and schedule tools that call the
+ * host synchronously over PI_HOST_SOCKET. PI_HOST_TOOLS selects exposed tools.
  */
 
-const SEND_SCHEMA = Type.Object({
-  method: Type.String({ description: "Telegram Bot API method name, such as sendMessage, sendDocument, or editMessageText" }),
-  topic_name: Type.Optional(Type.String({ description: "Host convenience for sendMessage: rename this topic after delivery" })),
-}, { additionalProperties: true });
+const SEND_SCHEMA = Type.Object({}, { additionalProperties: true });
 const RECURRENCE_SCHEMA = Type.Union([
   Type.Literal("hourly"),
   Type.Literal("daily"),
@@ -26,11 +21,6 @@ const SCHEDULE_FIELDS = {
   start: Type.String({ description: "First run as a UTC ISO-8601 timestamp ending in Z" }),
   recurrence: RECURRENCE_SCHEMA,
 };
-const TASK_FIELDS = {
-  prompt: Type.String({ minLength: 1, description: "Complete instruction for the background task agent" }),
-  model: Type.Optional(Type.String({ minLength: 1, description: "Exact provider/model ID for this run" })),
-  thinking: Type.Optional(Type.String({ minLength: 1, description: "Thinking level for this run" })),
-};
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -41,7 +31,7 @@ function text(content: string): ToolResult {
 }
 
 function failure(error: unknown): ToolResult {
-  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl, /run/schedules.json, and /run/tasks.json as applicable before retrying.`);
+  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl and /run/schedules.json as applicable before retrying.`);
 }
 
 /** Sends one request line to the host bridge and resolves with the response result. */
@@ -107,18 +97,18 @@ function callHost(type: string, params: Record<string, unknown>, timeoutMs = DEF
 
 const HOST_TOOLS = {
   send: {
-    label: "Send Telegram message",
-    description: "Call an allowed Telegram Bot API method in this agent's owning chat and thread. Omit chat_id and message_thread_id; the host derives both from the authenticated session.",
+    label: "Send through connector",
+    description: "Execute one connector-native request in this agent's owning conversation. The host derives the destination from the authenticated session.",
     parameters: SEND_SCHEMA,
     execute: async (request: Record<string, unknown>): Promise<ToolResult> => {
       try {
         const result = await callHost("send", { request }, SEND_TIMEOUT_MS);
-        const method = typeof result.method === "string" ? result.method : "Telegram request";
-        const messageId = typeof result.messageId === "number" ? ` (message_id ${result.messageId})` : "";
+        const operation = typeof result.method === "string" ? result.method : "Connector request";
+        const resource = typeof result.messageId === "number" ? ` (message_id ${result.messageId})` : "";
         const attachments = Array.isArray(result.attachments)
           ? result.attachments.filter((value): value is string => typeof value === "string").map((value) => `\nAttachment: ${value}`).join("")
           : "";
-        return text(`${method} succeeded${messageId}.${attachments}`);
+        return text(`${operation} succeeded${resource}.${attachments}`);
       } catch (error) {
         return failure(error);
       }
@@ -136,37 +126,6 @@ const HOST_TOOLS = {
         const result = await callHost("annotate", params);
         const occurrences = typeof result.occurrences === "number" ? result.occurrences : 1;
         return text(`Annotated ${occurrences} timeline occurrence${occurrences === 1 ? "" : "s"} of ${params.attachment}.`);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-  },
-  spawn: {
-    label: "Spawn background task",
-    description: "Start a background task from a complete prompt, with optional model and thinking overrides. Returns its runId and whether it started or queued; task_finished follows up when it settles.",
-    parameters: Type.Object(TASK_FIELDS),
-    execute: async (params: { prompt: string; model?: string; thinking?: string }): Promise<ToolResult> => {
-      try {
-        const result = await callHost("spawn", params);
-        const runId = typeof result.runId === "string" ? result.runId : "unknown";
-        if (result.status === "queued") {
-          return text(`Queued background task ${runId} (all task slots busy); it will start automatically. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
-        }
-        return text(`Launched background task ${runId}. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-  },
-  continue_task: {
-    label: "Continue background task",
-    description: "Resume an owned settled task in its existing session with an additional prompt and optional model and thinking overrides.",
-    parameters: Type.Object({ runId: Type.String({ minLength: 1, description: "Task run UUID" }), ...TASK_FIELDS }),
-    execute: async (params: { runId: string; prompt: string; model?: string; thinking?: string }): Promise<ToolResult> => {
-      try {
-        const result = await callHost("continue_task", params);
-        if (result.status === "queued") return text(`Queued continuation of task ${params.runId}; it will resume when a task slot is free.`);
-        return text(`Continued task ${params.runId} in its existing session.`);
       } catch (error) {
         return failure(error);
       }
@@ -230,49 +189,19 @@ const HOST_TOOLS = {
   },
   steer_conversation: {
     label: "Steer conversation agent",
-    description: "Wake another allowed conversation agent and give it an instruction. This does not send a Telegram message.",
+    description: "Wake another allowed conversation agent and give it an instruction. This does not send a connector message.",
     parameters: Type.Object({
-      chat_id: Type.Number({ description: "Owning chat ID of the conversation agent to wake" }),
-      message_thread_id: Type.Optional(Type.Number({ description: "Owning topic ID; defaults to 0" })),
+      conversation: Type.Object({
+        connectorId: Type.String(),
+        conversationKey: Type.String(),
+        address: Type.Record(Type.String(), Type.Unknown()),
+      }),
       message: Type.String({ minLength: 1, description: "Instruction for the target conversation agent" }),
     }),
-    execute: async (params: { chat_id: number; message_thread_id?: number; message: string }): Promise<ToolResult> => {
+    execute: async (params: { conversation: { connectorId: string; conversationKey: string; address: Record<string, unknown> }; message: string }): Promise<ToolResult> => {
       try {
         await callHost("steer_conversation", params);
-        return text(`Steering delivered to conversation ${params.chat_id}:${params.message_thread_id ?? 0}.`);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-  },
-  steer_task: {
-    label: "Steer background task",
-    description: "Guide a running background task between tool calls. Returns whether the task was running.",
-    parameters: Type.Object({
-      runId: Type.String({ description: "The task run UUID returned by the spawn tool" }),
-      message: Type.String({ description: "Steering instruction or clarification to inject into the task agent" }),
-    }),
-    execute: async (params: { runId: string; message: string }): Promise<ToolResult> => {
-      try {
-        const result = await callHost("steer_task", { runId: params.runId, message: params.message });
-        return result.status === "delivered"
-          ? text(`Steering delivered to task ${params.runId}.`)
-          : text(`Task ${params.runId} is not running (settled, queued, or unknown); steering was not delivered.`);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-  },
-  cancel: {
-    label: "Cancel background task",
-    description: "Stop a running task or remove a queued task by runId. Returns what happened.",
-    parameters: Type.Object({ runId: Type.String({ description: "The task run UUID returned by the spawn tool" }) }),
-    execute: async (params: { runId: string }): Promise<ToolResult> => {
-      try {
-        const result = await callHost("cancel", { runId: params.runId });
-        if (result.status === "stopped") return text(`Task ${params.runId} is stopping; its settle followup will arrive with aborted status.`);
-        if (result.status === "cancelled-queued") return text(`Queued task ${params.runId} was cancelled before it started.`);
-        return text(`Task ${params.runId} is not running (settled or unknown); nothing to cancel.`);
+        return text(`Steering delivered to ${params.conversation.connectorId}/${params.conversation.conversationKey}.`);
       } catch (error) {
         return failure(error);
       }

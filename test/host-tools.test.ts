@@ -4,12 +4,13 @@ import path from "node:path";
 import { expect, it, vi } from "vitest";
 import hostTools from "../extensions/host-tools.js";
 import { conversationAgent } from "../src/agent-ref.js";
+import { telegramConversation } from "../src/telegram-ref.js";
 import { AgentCredentials, HostBridge } from "../src/host-bridge.js";
 import { deferred } from "./helpers.js";
 
-
 type RegisteredTool = {
   name: string;
+  parameters: { properties?: Record<string, unknown> };
   execute(toolCallId: string, params: Record<string, unknown>): Promise<{ content: Array<{ text: string }> }>;
 };
 
@@ -19,7 +20,7 @@ it("keeps send calls open through the outbox retry window", async () => {
   const handlerStarted = deferred<void>();
   const response = deferred<Record<string, unknown>>();
   const credentials = new AgentCredentials();
-  const token = credentials.issue(conversationAgent(42), ["send"]);
+  const token = credentials.issue(telegramConversation("telegram:1", 42), ["send"]);
   const bridge = new HostBridge({
     socketPath,
     credentials,
@@ -45,7 +46,7 @@ it("keeps send calls open through the outbox retry window", async () => {
     } as never);
     if (!sendTool) throw new Error("send tool was not registered");
 
-    const pending = sendTool.execute("tool-1", { method: "sendDocument", chat_id: 42, document: "/workspace/report.pdf" });
+    const pending = sendTool.execute("tool-1", { method: "sendDocument", document: "/workspace/report.pdf" });
     await handlerStarted.promise;
     await vi.advanceTimersByTimeAsync(30_001);
     response.resolve({ method: "sendDocument", attachments: [attachment] });
@@ -65,7 +66,7 @@ it("retroactively annotates an attachment through the host bridge", async () => 
   const socketPath = path.join(root, "host.sock");
   const annotate = vi.fn(async () => ({ occurrences: 2 }));
   const credentials = new AgentCredentials();
-  const token = credentials.issue(conversationAgent(42), ["annotate"]);
+  const token = credentials.issue(telegramConversation("telegram:1", 42), ["annotate"]);
   const bridge = new HostBridge({ socketPath, credentials, handlers: { annotate } });
   await bridge.start();
   vi.stubEnv("PI_HOST_SOCKET", socketPath);
@@ -87,7 +88,7 @@ it("retroactively annotates an attachment through the host bridge", async () => 
     await expect(annotateTool.execute("tool-2", params)).resolves.toMatchObject({
       content: [{ text: `Annotated 2 timeline occurrences of ${params.attachment}.` }],
     });
-    expect(annotate).toHaveBeenCalledWith(params, conversationAgent(42));
+    expect(annotate).toHaveBeenCalledWith(params, telegramConversation("telegram:1", 42));
   } finally {
     vi.unstubAllEnvs();
     await bridge.stop();
@@ -100,7 +101,8 @@ it("steers another conversation through the host bridge", async () => {
   const socketPath = path.join(root, "host.sock");
   const steerConversation = vi.fn(async () => ({ status: "delivered" }));
   const credentials = new AgentCredentials();
-  const token = credentials.issue(conversationAgent(42, 7), ["steer_conversation"]);
+  const actor = telegramConversation("telegram:1", 42, 7);
+  const token = credentials.issue(actor, ["steer_conversation"]);
   const bridge = new HostBridge({ socketPath, credentials, handlers: { steerConversation } });
   await bridge.start();
   vi.stubEnv("PI_HOST_SOCKET", socketPath);
@@ -114,11 +116,15 @@ it("steers another conversation through the host bridge", async () => {
       },
     } as never);
     if (!steerTool) throw new Error("steer_conversation tool was not registered");
-    const params = { chat_id: 99, message_thread_id: 3, message: "Handle timeline message 120" };
+    const steerProperties = Object.keys(steerTool.parameters.properties ?? {});
+    expect(steerProperties).toHaveLength(2);
+    expect(steerProperties).toEqual(expect.arrayContaining(["conversation", "message"]));
+    const target = conversationAgent("matrix:main", "room:99", { roomId: "99" });
+    const params = { conversation: target, message: "Handle timeline message 120" };
     await expect(steerTool.execute("tool-3", params)).resolves.toMatchObject({
-      content: [{ text: "Steering delivered to conversation 99:3." }],
+      content: [{ text: expect.stringContaining("Steering delivered") }],
     });
-    expect(steerConversation).toHaveBeenCalledWith(params, conversationAgent(42, 7));
+    expect(steerConversation).toHaveBeenCalledWith(params, actor);
   } finally {
     vi.unstubAllEnvs();
     await bridge.stop();
@@ -134,7 +140,7 @@ it("manages schedules through the authenticated host bridge", async () => {
   const scheduleRemove = vi.fn(async () => ({ id: "schedule-1" }));
   const scheduleTake = vi.fn(async () => ({ schedule: { id: "schedule-1" } }));
   const credentials = new AgentCredentials();
-  const actor = conversationAgent(42, 7);
+  const actor = conversationAgent("connector:test", "conversation:42", { channel: 42, thread: 7 });
   const token = credentials.issue(actor, ["schedule"]);
   const bridge = new HostBridge({ socketPath, credentials, handlers: { scheduleAdd, scheduleReplace, scheduleRemove, scheduleTake } });
   await bridge.start();
@@ -162,45 +168,6 @@ it("manages schedules through the authenticated host bridge", async () => {
     expect(scheduleReplace).toHaveBeenCalledWith({ id: "schedule-1", ...definition }, actor);
     expect(scheduleTake).toHaveBeenCalledWith({ id: "schedule-1" }, actor);
     expect(scheduleRemove).toHaveBeenCalledWith({ id: "schedule-1" }, actor);
-  } finally {
-    vi.unstubAllEnvs();
-    await bridge.stop();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-it("launches and continues owned tasks with model and thinking overrides", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "host-tools-test-"));
-  const socketPath = path.join(root, "host.sock");
-  const spawn = vi.fn(async () => ({ runId: "run-1", status: "launched" }));
-  const continueTask = vi.fn(async () => ({ runId: "run-1", status: "launched" }));
-  const steerTask = vi.fn(async () => ({ status: "delivered" }));
-  const cancel = vi.fn(async () => ({ status: "stopped" }));
-  const credentials = new AgentCredentials();
-  const actor = conversationAgent(42, 7);
-  const token = credentials.issue(actor, ["spawn", "continue_task", "steer_task", "cancel"]);
-  const bridge = new HostBridge({ socketPath, credentials, handlers: { spawn, continueTask, steerTask, cancel } });
-  await bridge.start();
-  vi.stubEnv("PI_HOST_SOCKET", socketPath);
-  vi.stubEnv("PI_AGENT_TOKEN", token);
-  vi.stubEnv("PI_HOST_TOOLS", "spawn,continue_task,steer_task,cancel");
-  try {
-    const registered = new Map<string, RegisteredTool>();
-    hostTools({ registerTool: (tool: RegisteredTool) => registered.set(tool.name, tool) } as never);
-    const launch = { prompt: "Investigate", model: "openrouter/model", thinking: "high" };
-
-    await expect(registered.get("spawn")?.execute("spawn", launch)).resolves.toMatchObject({
-      content: [{ text: "Launched background task run-1. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool." }],
-    });
-    await expect(registered.get("continue_task")?.execute("continue", { runId: "run-1", ...launch })).resolves.toMatchObject({
-      content: [{ text: "Continued task run-1 in its existing session." }],
-    });
-    await registered.get("steer_task")?.execute("steer", { runId: "run-1", message: "adjust" });
-    await registered.get("cancel")?.execute("cancel", { runId: "run-1" });
-    expect(spawn).toHaveBeenCalledWith(launch, actor);
-    expect(continueTask).toHaveBeenCalledWith({ runId: "run-1", ...launch }, actor);
-    expect(steerTask).toHaveBeenCalledWith({ runId: "run-1", message: "adjust" }, actor);
-    expect(cancel).toHaveBeenCalledWith({ runId: "run-1" }, actor);
   } finally {
     vi.unstubAllEnvs();
     await bridge.stop();

@@ -16,17 +16,13 @@ type BridgeRequest = {
 /** One response line to the agent tool: `{id, ok, result | error}`. */
 type BridgeResponse = { id: string } & ({ ok: true; result: Record<string, unknown> } | { ok: false; error: string });
 
-export type HostCapability = "send" | "annotate" | "spawn" | "continue_task" | "cancel" | "steer_task" | "steer_conversation" | "schedule";
+export type HostCapability = "send" | "annotate" | "steer_conversation" | "schedule";
 
 export type BridgeHandler = (params: Record<string, unknown>, actor: AgentRef) => Promise<Record<string, unknown>>;
 
 export type HostBridgeHandlers = {
   send: BridgeHandler;
   annotate: BridgeHandler;
-  spawn: BridgeHandler;
-  continueTask: BridgeHandler;
-  cancel: BridgeHandler;
-  steerTask: BridgeHandler;
   steerConversation: BridgeHandler;
   scheduleAdd: BridgeHandler;
   scheduleReplace: BridgeHandler;
@@ -205,10 +201,6 @@ export class HostBridge {
     switch (type) {
       case "send": return this.handlers.send ? { handler: this.handlers.send, capability: "send" } : undefined;
       case "annotate": return this.handlers.annotate ? { handler: this.handlers.annotate, capability: "annotate" } : undefined;
-      case "spawn": return this.handlers.spawn ? { handler: this.handlers.spawn, capability: "spawn" } : undefined;
-      case "continue_task": return this.handlers.continueTask ? { handler: this.handlers.continueTask, capability: "continue_task" } : undefined;
-      case "cancel": return this.handlers.cancel ? { handler: this.handlers.cancel, capability: "cancel" } : undefined;
-      case "steer_task": return this.handlers.steerTask ? { handler: this.handlers.steerTask, capability: "steer_task" } : undefined;
       case "steer_conversation": return this.handlers.steerConversation ? { handler: this.handlers.steerConversation, capability: "steer_conversation" } : undefined;
       default: return undefined;
     }

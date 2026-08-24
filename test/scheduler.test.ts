@@ -2,13 +2,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { conversationAgent } from "../src/agent-ref.js";
+import { telegramConversation } from "../src/telegram-ref.js";
 import { WorkspaceTimeline } from "../src/events.js";
 import { WorkspaceScheduler, type WorkspaceSchedulerOptions } from "../src/scheduler.js";
 
 const temporaryDirectories: string[] = [];
 const NOW = Date.parse("2026-01-10T12:00:00.000Z");
-const OWNER = conversationAgent(42, 7);
+const CONNECTOR_ID = "telegram:123";
+const OWNER = telegramConversation(CONNECTOR_ID, 42, 7);
 
 const input = {
   prompt: "water the plants",
@@ -42,9 +43,7 @@ async function schedules(dataDir: string): Promise<{ schedules: Array<Record<str
 function makeScheduler(dataDir: string, overrides: Partial<WorkspaceSchedulerOptions> = {}): { scheduler: WorkspaceScheduler; errors: unknown[] } {
   const errors: unknown[] = [];
   const scheduler = new WorkspaceScheduler({
-    workspace: path.join(dataDir, "workspace"),
     schedulePath: path.join(dataDir, "run", "schedules.json"),
-    legacyStatePath: path.join(dataDir, "scheduler-state.json"),
     timeline: new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl")),
     now: () => NOW,
     logger: (error) => errors.push(error),
@@ -62,7 +61,7 @@ describe("WorkspaceScheduler", () => {
     expect(created).toMatchObject({
       id: expect.any(String),
       ...input,
-      owner: { chat_id: 42, message_thread_id: 7 },
+      owner: OWNER,
       next_due_at: input.start,
     });
     expect((await schedules(dataDir)).schedules).toEqual([created]);
@@ -74,7 +73,7 @@ describe("WorkspaceScheduler", () => {
       occurrenceId: expect.any(String),
       prompt: input.prompt,
       dueAt: input.start,
-      owner: OWNER,
+      conversation: OWNER,
     }]);
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: null });
 
@@ -109,8 +108,8 @@ describe("WorkspaceScheduler", () => {
 
     const rescheduled = await scheduler.replace({ ...cadenceChanged, start: "2026-01-10T13:00:00.000Z" }, OWNER);
     expect(rescheduled.next_due_at).toBe("2026-01-10T13:00:00.000Z");
-    await expect(scheduler.replace({ ...rescheduled, prompt: "stolen" }, conversationAgent(99))).rejects.toThrow("not owned by this conversation");
-    await expect(scheduler.remove({ id: created.id }, conversationAgent(99))).rejects.toThrow("not owned by this conversation");
+    await expect(scheduler.replace({ ...rescheduled, prompt: "stolen" }, telegramConversation(CONNECTOR_ID, 99))).rejects.toThrow("not owned by this conversation");
+    await expect(scheduler.remove({ id: created.id }, telegramConversation(CONNECTOR_ID, 99))).rejects.toThrow("not owned by this conversation");
 
     await scheduler.remove({ id: created.id }, OWNER);
     expect((await schedules(dataDir)).schedules).toEqual([]);
@@ -120,15 +119,15 @@ describe("WorkspaceScheduler", () => {
     const dataDir = await fixture();
     const scheduler = makeScheduler(dataDir).scheduler;
     const created = await scheduler.add({ ...input, start: "2026-01-11T12:00:00.000Z" }, OWNER);
-    const taker = conversationAgent(99, 3);
+    const taker = telegramConversation(CONNECTOR_ID, 99, 3);
 
     const taken = await scheduler.take({ id: created.id }, taker);
-    expect(taken).toEqual({ ...created, owner: { chat_id: 99, message_thread_id: 3 } });
+    expect(taken).toEqual({ ...created, owner: taker });
     expect(await timeline(dataDir)).toMatchObject([{
       type: "schedule_taken",
       scheduleId: created.id,
       previousOwner: OWNER,
-      owner: taker,
+      conversation: taker,
     }]);
     await expect(scheduler.remove({ id: created.id }, OWNER)).rejects.toThrow("not owned by this conversation");
     await expect(scheduler.remove({ id: created.id }, taker)).resolves.toBe(created.id);
@@ -138,33 +137,13 @@ describe("WorkspaceScheduler", () => {
     const dataDir = await fixture();
     const scheduler = makeScheduler(dataDir).scheduler;
     const created = await scheduler.add(input, OWNER);
-    const taker = conversationAgent(99);
+    const taker = telegramConversation(CONNECTOR_ID, 99);
 
     await scheduler.take({ id: created.id }, taker);
     await scheduler.poll(NOW);
-    expect((await timeline(dataDir)).filter((event) => event.type === "schedule_fired")).toMatchObject([{ owner: taker }]);
+    expect((await timeline(dataDir)).filter((event) => event.type === "schedule_fired")).toMatchObject([{ conversation: taker }]);
   });
 
-  it("migrates the writable schedule file and legacy checkpoint once", async () => {
-    const dataDir = await fixture();
-    const legacy = { ...input, recurrence: "daily" as const, owner: { chat_id: 42, message_thread_id: 7 } };
-    const key = JSON.stringify([legacy.prompt, legacy.start, legacy.recurrence, 42, 7]);
-    await writeFile(path.join(dataDir, "workspace", ".schedules.json"), JSON.stringify({ version: 1, schedules: [legacy] }), "utf8");
-    await writeFile(path.join(dataDir, "scheduler-state.json"), JSON.stringify({
-      version: 1,
-      rows: [{ key, nextDueAt: "2026-01-11T11:00:00.000Z" }],
-    }), "utf8");
-
-    await makeScheduler(dataDir).scheduler.poll(NOW);
-    expect((await schedules(dataDir)).schedules).toMatchObject([{
-      id: expect.any(String),
-      prompt: legacy.prompt,
-      owner: legacy.owner,
-      next_due_at: "2026-01-11T11:00:00.000Z",
-    }]);
-    await expect(readFile(path.join(dataDir, "workspace", ".schedules.json"), "utf8")).rejects.toThrow();
-    await expect(readFile(path.join(dataDir, "scheduler-state.json"), "utf8")).rejects.toThrow();
-  });
 
   it("reports malformed host state without replacing it", async () => {
     const dataDir = await fixture();
@@ -188,7 +167,6 @@ describe("WorkspaceScheduler", () => {
   it("rejects invalid poll intervals", async () => {
     const dataDir = await fixture();
     const base = {
-      workspace: path.join(dataDir, "workspace"),
       schedulePath: path.join(dataDir, "run", "schedules.json"),
       timeline: new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl")),
     };

@@ -36,9 +36,8 @@ integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
       await worker.start();
       expect(worker.isAlive()).toBe(true);
 
-      // Prompt without credentials will either fail preflight or emit error response
-      await worker.prompt("hi");
-      expect(worker.isBusy()).toBe(true);
+      await expect(worker.prompt("hi")).rejects.toThrow("No API key found");
+      expect(worker.isBusy()).toBe(false);
 
       await worker.close();
       expect(worker.isAlive()).toBe(false);

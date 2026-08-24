@@ -20,19 +20,16 @@ async function fixture(): Promise<{ socketPath: string }> {
 
 function makeBridge(
   socketPath: string,
-  capabilities: HostCapability[] = ["send", "spawn", "cancel", "steer_task"],
+  capabilities: HostCapability[] = ["send"],
   overrides: Partial<ConstructorParameters<typeof HostBridge>[0]["handlers"]> = {},
 ): { bridge: HostBridge; token: string; credentials: AgentCredentials } {
   const credentials = new AgentCredentials();
-  const token = credentials.issue(conversationAgent(123, 4), capabilities);
+  const token = credentials.issue(conversationAgent("connector:test", "conversation:123", { id: 123, thread: 4 }), capabilities);
   const bridge = new HostBridge({
     socketPath,
     credentials,
     handlers: {
       send: async () => ({}),
-      spawn: async () => ({ status: "launched", runId: "run-1" }),
-      cancel: async () => ({ status: "not-running" }),
-      steerTask: async () => ({ status: "delivered" }),
       ...overrides,
     },
   });
@@ -65,7 +62,7 @@ describe("HostBridge", () => {
     await bridge.start();
     try {
       await expect(call(socketPath, token, "send", { request: {} })).resolves.toEqual({});
-      expect(send).toHaveBeenCalledWith({ request: {} }, conversationAgent(123, 4));
+      expect(send).toHaveBeenCalledWith({ request: {} }, conversationAgent("connector:test", "conversation:123", { id: 123, thread: 4 }));
     } finally {
       await bridge.stop();
     }
@@ -73,11 +70,11 @@ describe("HostBridge", () => {
 
   it("rejects unknown tokens and capabilities", async () => {
     const { socketPath } = await fixture();
-    const { bridge, token } = makeBridge(socketPath, ["send"]);
+    const { bridge, token } = makeBridge(socketPath, ["send"], { annotate: async () => ({}) });
     await bridge.start();
     try {
       await expect(call(socketPath, "unknown", "send")).rejects.toThrow("Unknown agent token");
-      await expect(call(socketPath, token, "spawn")).rejects.toThrow("not allowed to call spawn");
+      await expect(call(socketPath, token, "annotate")).rejects.toThrow("not allowed to call annotate");
     } finally {
       await bridge.stop();
     }
@@ -117,10 +114,10 @@ describe("HostBridge", () => {
 
   it("reports handler failures and unknown request types", async () => {
     const { socketPath } = await fixture();
-    const { bridge, token } = makeBridge(socketPath, ["spawn"], { spawn: async () => { throw new Error("prompt too large"); } });
+    const { bridge, token } = makeBridge(socketPath, ["annotate"], { annotate: async () => { throw new Error("description too large"); } });
     await bridge.start();
     try {
-      await expect(call(socketPath, token, "spawn", { prompt: "x" })).rejects.toThrow("prompt too large");
+      await expect(call(socketPath, token, "annotate", { attachment: "/run/attachments/example", description: "x" })).rejects.toThrow("description too large");
       await expect(call(socketPath, token, "teleport")).rejects.toThrow("Unknown request type");
     } finally {
       await bridge.stop();
@@ -130,12 +127,12 @@ describe("HostBridge", () => {
   it("rejects request types whose handlers are not exposed", async () => {
     const { socketPath } = await fixture();
     const credentials = new AgentCredentials();
-    const token = credentials.issue(conversationAgent(123), ["send", "spawn"]);
+    const token = credentials.issue(conversationAgent("connector:test", "conversation:123", { id: 123 }), ["send", "annotate"]);
     const bridge = new HostBridge({ socketPath, credentials, handlers: { send: async () => ({}) } });
     await bridge.start();
     try {
       await expect(call(socketPath, token, "send", { request: {} })).resolves.toEqual({});
-      await expect(call(socketPath, token, "spawn", { prompt: "work" })).rejects.toThrow("Unknown request type: spawn");
+      await expect(call(socketPath, token, "annotate", { attachment: "/run/attachments/example", description: "work" })).rejects.toThrow("Unknown request type: annotate");
     } finally {
       await bridge.stop();
     }

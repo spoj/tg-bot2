@@ -7,10 +7,10 @@ import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
 import { WorkspaceTimeline } from "./events.js";
 import { readAllowedFile } from "./allowlist.js";
-import { botPaths } from "./util.js";
 import { SerialQueue } from "./queue.js";
 import type { WorkspaceOutboxRequest, WorkspaceOutboxDispatchResult } from "./outbox-protocol.js";
-
+import { WorkspaceResources } from "./resource-state.js";
+import { telegramAddress, telegramConversation } from "./telegram-ref.js";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 
@@ -113,7 +113,7 @@ async function readLocalFile(root: string, exposedPath: string, mountPoint: stri
 }
 
 async function stageOutboundFile(
-  paths: { workspace: string; attachments: string }, chatId: number, requestId: string, exposedPath: string, index?: number,
+  paths: { workspace: string; attachments: string; attachmentPrefix: string }, chatId: number, requestId: string, exposedPath: string, index?: number,
 ): Promise<{ path: string; input: InputFile }> {
   const alreadyManaged = exposedPath.startsWith("/run/attachments/");
   const source = await readLocalFile(
@@ -150,7 +150,7 @@ async function stageOutboundFile(
     }
     await verifyAttachmentDirectory(directory);
     return {
-      path: `/run/attachments/${chatId}/${date}/${requestId}/${filename}`,
+      path: `/run/attachments/${paths.attachmentPrefix}/${chatId}/${date}/${requestId}/${filename}`,
       input: new InputFile(source.bytes, filename),
     };
   } finally {
@@ -160,7 +160,7 @@ async function stageOutboundFile(
 }
 
 async function prepareTelegramPayload(
-  paths: { workspace: string; attachments: string }, chatId: number, requestId: string, request: WorkspaceOutboxRequest,
+  paths: { workspace: string; attachments: string; attachmentPrefix: string }, chatId: number, requestId: string, request: WorkspaceOutboxRequest,
 ): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest; attachmentPaths: string[] }> {
   const payload = telegramPayload(request);
   const recorded = structuredClone(request);
@@ -204,7 +204,7 @@ function dispatchResult(data: unknown, request: WorkspaceOutboxRequest, attachme
 
 export async function dispatchOutboxRequest(
   bot: Bot,
-  paths: { workspace: string; attachments: string },
+  paths: { workspace: string; attachments: string; attachmentPrefix: string },
   chatId: number,
   requestId: string,
   request: WorkspaceOutboxRequest,
@@ -449,8 +449,7 @@ async function downloadAttachment(
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
     const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
-    const { attachments } = botPaths(config.dataDir, config.botId);
-    const attachmentDirectory = await ensureAttachmentDirectory(attachments, chatId, date, message.message_id);
+    const attachmentDirectory = await ensureAttachmentDirectory(config.attachments, chatId, date, message.message_id);
     let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
     let temporary: string | undefined;
     try {
@@ -465,7 +464,7 @@ async function downloadAttachment(
       await verifyAttachmentDirectory(attachmentDirectory);
       return {
         ...common,
-        path: `/run/attachments/${chatId}/${date}/${message.message_id}/${filename}`,
+        path: `/run/attachments/${config.attachmentPrefix}/${chatId}/${date}/${message.message_id}/${filename}`,
       };
     } finally {
       await temporaryHandle?.close().catch(() => {});
@@ -538,41 +537,104 @@ async function isChatAllowed(workspace: string, chatId: number): Promise<boolean
   const allowed = await readAllowedFile(workspace);
   return allowed.status === "ready" && allowed.chats.includes(chatId);
 }
+const SERVICE_MESSAGE_FIELDS = new Set([
+  "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited",
+  "general_forum_topic_hidden", "general_forum_topic_unhidden", "new_chat_members", "left_chat_member",
+  "new_chat_title", "new_chat_photo", "delete_chat_photo", "group_chat_created", "supergroup_chat_created",
+  "channel_chat_created", "message_auto_delete_timer_changed", "migrate_to_chat_id", "migrate_from_chat_id",
+  "pinned_message", "video_chat_scheduled", "video_chat_started", "video_chat_ended", "video_chat_participants_invited",
+]);
 
-/** The ingress gate. Missing, malformed, and non-matching allow lists fail closed. */
-async function gateChat(workspace: string, chat: { id: number }): Promise<boolean> {
-  const chatId = chat.id;
-  return Number.isSafeInteger(chatId) && await isChatAllowed(workspace, chatId);
+function hasUserContent(message: Record<string, unknown>): boolean {
+  return ![...SERVICE_MESSAGE_FIELDS].some((field) => field in message);
 }
+
+const MAX_ACCESS_IDENTITY_TEXT = 128;
+
+function accessIdentityText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/[\p{Cc}\p{Cf}]+/gu, " ").replace(/\s+/gu, " ").trim();
+  if (normalized.length === 0) return undefined;
+  return normalized.slice(0, MAX_ACCESS_IDENTITY_TEXT);
+}
+
+function accessRequester(value: unknown): Record<string, unknown> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const user = value as Record<string, unknown>;
+  if (typeof user.id !== "number" || !Number.isSafeInteger(user.id)) return undefined;
+  const username = accessIdentityText(user.username);
+  const firstName = accessIdentityText(user.first_name);
+  const lastName = accessIdentityText(user.last_name);
+  return {
+    id: user.id,
+    ...(username === undefined ? {} : { username }),
+    ...(firstName === undefined ? {} : { first_name: firstName }),
+    ...(lastName === undefined ? {} : { last_name: lastName }),
+  };
+}
+
+function accessRequestPayload(ctx: Context, reason: string, updateType: string): Record<string, unknown> {
+  const chat = ctx.chat!;
+  const title = "title" in chat ? accessIdentityText(chat.title) : undefined;
+  const requester = chat.id > 0
+    ? accessRequester(ctx.from)
+    : ctx.myChatMember && isBotGroupAdd(ctx.myChatMember)
+      ? accessRequester(ctx.myChatMember.from)
+      : undefined;
+  return {
+    reason,
+    update_type: updateType,
+    chat: {
+      id: chat.id,
+      type: chat.type,
+      ...(title === undefined ? {} : { title }),
+    },
+    ...(requester === undefined ? {} : { requester }),
+  };
+}
+
+
 type AgentHostAccess = { restartAll(): Promise<void> };
 
 export function createTelegramBot(
   config: Config,
   timeline: WorkspaceTimeline,
+  resources: WorkspaceResources,
   deliveryQueue: TelegramDeliveryQueue = new TelegramDeliveryQueue(),
   agent?: AgentHostAccess,
 ): Bot {
   const bot = new Bot(config.token);
-  const { workspace } = botPaths(config.dataDir, config.botId);
-
+  const workspace = config.workspace;
   const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
+  const rejectedIngress = new Set<string>();
 
   bot.use(async (ctx, next) => {
-    // poll_answer updates carry no chat; their handler routes and gates them.
+    // poll_answer updates carry no chat; their handler resolves ownership and gates them.
     const chat = ctx.chat;
     if (!chat) {
       await next();
       return;
     }
-    // A bot added to a brand-new group must reach the agent so it can decide whether to
-    // allow the group, even before the chat is allowlisted. Messages from that group stay
-    // gated until the agent allowlists it.
-    if (chat.id < 0 && ctx.myChatMember && isBotGroupAdd(ctx.myChatMember) && !(await isChatAllowed(workspace, chat.id))) {
+    const updateType = Object.keys(ctx.update).find((key) => key !== "update_id") ?? "unknown";
+    const allowed = Number.isSafeInteger(chat.id) ? await readAllowedFile(workspace) : { status: "malformed" as const };
+    if (allowed.status === "ready" && allowed.chats.includes(chat.id)) {
       await next();
       return;
     }
-    if (!(await gateChat(workspace, chat))) return;
-    await next();
+    const reason = allowed.status === "ready" ? "chat_not_allowed" : `allowlist_${allowed.status}`;
+    const rejectionKey = JSON.stringify([reason, chat.id, updateType]);
+    if (rejectedIngress.has(rejectionKey)) return;
+    rejectedIngress.add(rejectionKey);
+    try {
+      await timeline.publish({
+        type: "telegram.access_request",
+        connectorId: config.id,
+        payload: accessRequestPayload(ctx, reason, updateType),
+      });
+    } catch (error) {
+      rejectedIngress.delete(rejectionKey);
+      throw error;
+    }
   });
 
   bot.command("start", async (ctx) => {
@@ -596,47 +658,76 @@ export function createTelegramBot(
   });
 
   bot.on("message", async (ctx) => {
+    const message = ctx.message as unknown as Record<string, unknown>;
     const chatId = ctx.chat.id;
+    const threadId = typeof message.message_thread_id === "number" ? message.message_thread_id : 0;
+    const conversation = telegramConversation(config.id, chatId, threadId);
     const attachments = await prepareMessage(bot, config, ctx);
-    await timeline.publish({ type: "message", chat_id: chatId, message: ctx.message, attachments });
+    const ownership = [
+      { connectorId: config.id, kind: "message" as const, key: `${chatId}:${ctx.message.message_id}`, owner: conversation },
+      ...(ctx.message.poll?.id ? [{ connectorId: config.id, kind: "poll" as const, key: ctx.message.poll.id, owner: conversation }] : []),
+    ];
+    await resources.setMany(ownership);
+    await timeline.publish({
+      type: "telegram.message",
+      connectorId: config.id,
+      conversation,
+      payload: ctx.message,
+      attachments,
+      meta: { private: chatId > 0, directed: isMessageDirectedToBot(ctx.message, bot.botInfo), user_content: hasUserContent(message) },
+    });
   });
   bot.on("edited_message", async (ctx) => {
+    const message = ctx.editedMessage as unknown as Record<string, unknown>;
     const chatId = ctx.chat.id;
+    const threadId = typeof message.message_thread_id === "number" ? message.message_thread_id : 0;
+    const conversation = telegramConversation(config.id, chatId, threadId);
     const attachments = await prepareMessage(bot, config, ctx);
-    await timeline.publish({ type: "edited_message", chat_id: chatId, message: ctx.editedMessage, attachments });
+    await resources.set({ connectorId: config.id, kind: "message", key: `${chatId}:${ctx.editedMessage.message_id}`, owner: conversation });
+    await timeline.publish({ type: "telegram.edited_message", connectorId: config.id, conversation, payload: ctx.editedMessage, attachments });
   });
   bot.on("callback_query", async (ctx) => {
     const query = ctx.callbackQuery;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
+    const threadId = query.message?.message_thread_id ?? 0;
+    const conversation = telegramConversation(config.id, chatId, threadId);
     void ctx.answerCallbackQuery().catch(() => {});
-    await timeline.publish({ type: "callback", chat_id: chatId, callback_query: query });
+    await timeline.publish({ type: "telegram.callback", connectorId: config.id, conversation, payload: query });
   });
   bot.on("poll_answer", async (ctx) => {
     const answer = ctx.pollAnswer;
-    const owner = timeline.pollOwner(answer.poll_id);
-    if (owner === undefined || !(await isChatAllowed(workspace, owner.chatId))) return;
-    await timeline.publish({ type: "poll_answer", chat_id: owner.chatId, poll_answer: answer });
+    const owner = resources.owner(config.id, "poll", answer.poll_id);
+    if (owner === undefined) return;
+    const address = telegramAddress(owner, config.id);
+    if (!(await isChatAllowed(workspace, address.chat_id))) return;
+    await timeline.publish({ type: "telegram.poll_answer", connectorId: config.id, conversation: owner, payload: answer });
   });
   bot.on("message_reaction", async (ctx) => {
     const reaction = ctx.messageReaction;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    await timeline.publish({ type: "message_reaction", chat_id: chatId, message_reaction: reaction });
+    const threadId = "message_thread_id" in reaction && typeof reaction.message_thread_id === "number" ? reaction.message_thread_id : 0;
+    await timeline.publish({ type: "telegram.message_reaction", connectorId: config.id, conversation: telegramConversation(config.id, chatId, threadId), payload: reaction });
   });
   bot.on("my_chat_member", async (ctx) => {
     const member = ctx.myChatMember;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    await timeline.publish({ type: "my_chat_member", chat_id: chatId, my_chat_member: member });
+    await timeline.publish({
+      type: "telegram.my_chat_member",
+      connectorId: config.id,
+      conversation: telegramConversation(config.id, chatId),
+      payload: member,
+      meta: { group_add: chatId < 0 && isBotGroupAdd(member) },
+    });
   });
   bot.on("chat_join_request", async (ctx) => {
     const request = ctx.chatJoinRequest;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    await timeline.publish({ type: "chat_join_request", chat_id: chatId, chat_join_request: request });
+    await timeline.publish({ type: "telegram.chat_join_request", connectorId: config.id, conversation: telegramConversation(config.id, chatId), payload: request });
   });
-
   bot.catch((error) => {
     const cause = error.error;
     if (cause instanceof GrammyError) console.error("Telegram API error", cause.description);

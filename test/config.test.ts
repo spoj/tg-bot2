@@ -1,9 +1,27 @@
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { defaultDataDir, loadConfig, parseAuthToken, parseBotId } from "../src/config.js";
-import { botPaths } from "../src/util.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  const directories = temporaryDirectories.splice(0);
+  await Promise.all(directories.map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-config-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+async function connectorFile(dataDir: string, workspaceId: string, name: string, token: string): Promise<void> {
+  const connectorsDir = path.join(dataDir, "workspaces", workspaceId, "connectors");
+  await mkdir(connectorsDir, { recursive: true });
+  await writeFile(path.join(connectorsDir, `${name}.json`), JSON.stringify({ token }));
+}
 
 describe("configuration", () => {
   it("parses bot ID from valid token prefixes", () => {
@@ -22,136 +40,82 @@ describe("configuration", () => {
     expect(() => parseBotId(token)).toThrow();
   });
 
-  it("derives bot paths from safe-integer bot IDs", () => {
-    expect(botPaths("/data", 123)).toEqual({
-      botDir: "/data/bots/123",
-      workspace: "/data/bots/123/workspace",
-      attachments: "/data/bots/123/attachments",
-      timeline: "/data/bots/123/timeline.jsonl",
-      schedules: "/data/bots/123/run/schedules.json",
-      tasks: "/data/bots/123/run/tasks.json",
-      schedulerState: "/data/bots/123/scheduler-state.json",
-      runDir: "/data/bots/123/run",
-    });
-    expect(() => botPaths("/data", Number.NaN)).toThrow();
-  });
-
   describe("parseAuthToken", () => {
-    it("reads token from JSON token property", async () => {
-      const tmp = path.join(os.tmpdir(), `auth-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-      try {
-        await writeFile(tmp, JSON.stringify({ token: "123:abc" }));
-        expect(await parseAuthToken(tmp)).toBe("123:abc");
-      } finally {
-        await rm(tmp, { force: true });
-      }
+    it.each([
+      [JSON.stringify({ token: "123:abc" }), "123:abc"],
+      [JSON.stringify({ key: "456:def" }), "456:def"],
+      ["789:ghi\n", "789:ghi"],
+    ])("reads supported auth file format", async (contents, expected) => {
+      const dataDir = await temporaryDirectory();
+      const filePath = path.join(dataDir, "auth.json");
+      await writeFile(filePath, contents);
+      await expect(parseAuthToken(filePath)).resolves.toBe(expected);
     });
 
-    it("reads key property as alias", async () => {
-      const tmp = path.join(os.tmpdir(), `auth-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-      try {
-        await writeFile(tmp, JSON.stringify({ key: "456:def" }));
-        expect(await parseAuthToken(tmp)).toBe("456:def");
-      } finally {
-        await rm(tmp, { force: true });
-      }
-    });
-
-    it("reads raw token string", async () => {
-      const tmp = path.join(os.tmpdir(), `auth-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-      try {
-        await writeFile(tmp, "789:ghi\n");
-        expect(await parseAuthToken(tmp)).toBe("789:ghi");
-      } finally {
-        await rm(tmp, { force: true });
-      }
-    });
-
-    it("throws if auth file has empty or missing token", async () => {
-      const tmp = path.join(os.tmpdir(), `auth-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-      try {
-        await writeFile(tmp, JSON.stringify({ other: "value" }));
-        await expect(parseAuthToken(tmp)).rejects.toThrow("No token or key found");
-      } finally {
-        await rm(tmp, { force: true });
-      }
+    it("rejects an auth file without a token", async () => {
+      const dataDir = await temporaryDirectory();
+      const filePath = path.join(dataDir, "auth.json");
+      await writeFile(filePath, JSON.stringify({ other: "value" }));
+      await expect(parseAuthToken(filePath)).rejects.toThrow("No token or key found");
     });
   });
 
   describe("loadConfig", () => {
-    it("discovers multiple bots in DATA_DIR/bots", async () => {
-      const dataDir = path.join(os.tmpdir(), `tg-bot2-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-      try {
-        await mkdir(path.join(dataDir, "bots", "100"), { recursive: true });
-        await writeFile(path.join(dataDir, "bots", "100", "auth.json"), JSON.stringify({ token: "100:token100" }));
+    it("loads and sorts workspace connector files", async () => {
+      const dataDir = await temporaryDirectory();
+      await connectorFile(dataDir, "zeta", "telegram", "300:token300");
+      await connectorFile(dataDir, "alpha", "secondary", "200:token200");
+      await connectorFile(dataDir, "alpha", "primary", "100:token100");
 
-        await mkdir(path.join(dataDir, "bots", "200"), { recursive: true });
-        await writeFile(path.join(dataDir, "bots", "200", "auth.json"), JSON.stringify({ token: "200:token200" }));
+      const config = await loadConfig({ dataDir });
 
-        const config = await loadConfig({ dataDir });
-        expect(config.dataDir).toBe(dataDir);
-        expect(config.bots).toHaveLength(2);
-        expect(config.bots[0]).toEqual({
+      expect(config.dataDir).toBe(dataDir);
+      expect(config.workspaces.map((workspace) => workspace.id)).toEqual(["alpha", "zeta"]);
+      expect(config.workspaces[0]?.paths).toEqual({
+        root: path.join(dataDir, "workspaces", "alpha"),
+        workspace: path.join(dataDir, "workspaces", "alpha", "workspace"),
+        attachments: path.join(dataDir, "workspaces", "alpha", "attachments"),
+        timeline: path.join(dataDir, "workspaces", "alpha", "timeline.jsonl"),
+        notifications: path.join(dataDir, "workspaces", "alpha", "notifications.jsonl"),
+        schedules: path.join(dataDir, "workspaces", "alpha", "run", "schedules.json"),
+        resources: path.join(dataDir, "workspaces", "alpha", "run", "resources.json"),
+        runDir: path.join(dataDir, "workspaces", "alpha", "run"),
+        connectorsDir: path.join(dataDir, "workspaces", "alpha", "connectors"),
+      });
+      expect(config.workspaces[0]?.connectors).toEqual([
+        {
+          type: "telegram",
+          id: "telegram:100",
           token: "100:token100",
           botId: 100,
+          workspaceId: "alpha",
           dataDir,
-          botDir: path.join(dataDir, "bots", "100"),
-          workspace: path.join(dataDir, "bots", "100", "workspace"),
-        });
-        expect(config.bots[1]).toEqual({
-          token: "200:token200",
-          botId: 200,
-          dataDir,
-          botDir: path.join(dataDir, "bots", "200"),
-          workspace: path.join(dataDir, "bots", "200", "workspace"),
-        });
-      } finally {
-        await rm(dataDir, { recursive: true, force: true });
-      }
+          workspace: path.join(dataDir, "workspaces", "alpha", "workspace"),
+          attachments: path.join(dataDir, "workspaces", "alpha", "attachments", Buffer.from("telegram:100").toString("base64url")),
+          attachmentPrefix: Buffer.from("telegram:100").toString("base64url"),
+        },
+        expect.objectContaining({ id: "telegram:200", botId: 200, workspaceId: "alpha" }),
+      ]);
+      expect(config.workspaces[1]?.connectors).toEqual([
+        expect.objectContaining({ id: "telegram:300", botId: 300, workspaceId: "zeta" }),
+      ]);
     });
 
-    it("throws if no bots are configured", async () => {
-      const dataDir = path.join(os.tmpdir(), `tg-bot2-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-      try {
-        await expect(loadConfig({ dataDir })).rejects.toThrow("No configured bots found");
-      } finally {
-        await rm(dataDir, { recursive: true, force: true });
-      }
+
+    it("rejects symlinked workspace directories", async () => {
+      const dataDir = await temporaryDirectory();
+      const target = path.join(dataDir, "outside");
+      await mkdir(path.join(target, "connectors"), { recursive: true });
+      await writeFile(path.join(target, "connectors", "telegram.json"), JSON.stringify({ token: "100:token100" }));
+      await mkdir(path.join(dataDir, "workspaces"), { recursive: true });
+      await symlink(target, path.join(dataDir, "workspaces", "linked"), "dir");
+
+      await expect(loadConfig({ dataDir })).rejects.toThrow(/Workspace directory.*real directory/u);
     });
 
-    it("throws if token bot ID does not match directory name", async () => {
-      const dataDir = path.join(os.tmpdir(), `tg-bot2-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-      try {
-        await mkdir(path.join(dataDir, "bots", "123"), { recursive: true });
-        await writeFile(path.join(dataDir, "bots", "123", "auth.json"), JSON.stringify({ token: "456:wrong_token" }));
-        await expect(loadConfig({ dataDir })).rejects.toThrow("does not match directory name");
-      } finally {
-        await rm(dataDir, { recursive: true, force: true });
-      }
-    });
-
-    it("rejects symlinked bot directories and still loads real ones", async () => {
-      const dataDir = path.join(os.tmpdir(), `tg-bot2-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-      try {
-        await mkdir(path.join(dataDir, "bots"), { recursive: true });
-        const target = path.join(dataDir, "real-bot-100");
-        await mkdir(target);
-        await writeFile(path.join(target, "auth.json"), JSON.stringify({ token: "100:token100" }));
-        await symlink(target, path.join(dataDir, "bots", "100"), "dir");
-
-        await expect(loadConfig({ dataDir })).rejects.toThrow(/bots\/100/);
-        await expect(loadConfig({ dataDir })).rejects.toThrow(/symlink/);
-
-        await rm(path.join(dataDir, "bots", "100"), { force: true });
-        await mkdir(path.join(dataDir, "bots", "100"));
-        await writeFile(path.join(dataDir, "bots", "100", "auth.json"), JSON.stringify({ token: "100:token100" }));
-
-        const config = await loadConfig({ dataDir });
-        expect(config.bots).toHaveLength(1);
-        expect(config.bots[0]?.botDir).toBe(path.join(dataDir, "bots", "100"));
-      } finally {
-        await rm(dataDir, { recursive: true, force: true });
-      }
+    it("throws if no workspaces are configured", async () => {
+      const dataDir = await temporaryDirectory();
+      await expect(loadConfig({ dataDir })).rejects.toThrow("No configured workspaces found");
     });
 
     it("defaults data directory to ~/.local/share/tg-bot2", () => {

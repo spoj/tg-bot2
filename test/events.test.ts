@@ -2,8 +2,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkspaceTimeline } from "../src/events.js";
 import { conversationAgent } from "../src/agent-ref.js";
+import { WorkspaceTimeline } from "../src/events.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -25,37 +25,87 @@ async function blockedTimelinePath(dataDir: string): Promise<string> {
   return path.join(blocked, "timeline.jsonl");
 }
 
+
 describe("WorkspaceTimeline", () => {
-  it("broadcasts and appends meaningful events", async () => {
+  it("publishes generic connector envelopes, appends them, and broadcasts persisted records", async () => {
     const dataDir = await temporaryDirectory();
     const timeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
     const listener = vi.fn();
+    const conversation = conversationAgent("matrix:primary", "!room:thread", { room_id: "!room", thread_id: "thread" });
     timeline.subscribe(listener);
 
-    const line = await timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] });
-    const record = JSON.parse(line) as { id: string; seq: number };
-    expect(record).toMatchObject({ id: expect.any(String), seq: 1 });
-    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: "message", chat_id: 1, id: record.id, seq: 1 }), line);
-    expect(await readFile(timeline.filePath, "utf8")).toBe(`${line}\n`);
+    const firstLine = await timeline.publish({
+      type: "matrix.message",
+      connectorId: conversation.connectorId,
+      conversation,
+      payload: { event_id: "$one", body: "hello" },
+      attachments: [],
+    });
+    const secondLine = await timeline.publish({
+      type: "connector.sent",
+      connectorId: conversation.connectorId,
+      actor: conversation,
+      conversation,
+      request: { method: "send", text: "hi" },
+      response: { event_id: "$two" },
+    });
+    const first = JSON.parse(firstLine) as Record<string, unknown>;
+    const second = JSON.parse(secondLine) as Record<string, unknown>;
+
+    expect(first).toMatchObject({
+      v: 2,
+      id: expect.any(String),
+      seq: 1,
+      t: expect.any(String),
+      type: "matrix.message",
+      connectorId: "matrix:primary",
+      conversation,
+      payload: { event_id: "$one", body: "hello" },
+    });
+    expect(second).toMatchObject({ v: 2, seq: 2, type: "connector.sent", connectorId: "matrix:primary", conversation });
+    expect(listener).toHaveBeenNthCalledWith(1, first, firstLine);
+    expect(listener).toHaveBeenNthCalledWith(2, second, secondLine);
+    await expect(readFile(timeline.filePath, "utf8")).resolves.toBe(`${firstLine}\n${secondLine}\n`);
   });
 
-  it("retroactively annotates received and sent attachments in place", async () => {
+  it("continues sequence numbers after existing v2 records", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    await writeFile(filePath, `${JSON.stringify({
+      v: 2,
+      id: "existing",
+      seq: 8,
+      t: "2026-08-23T10:00:00.000Z",
+      type: "schedule_fired",
+      payload: { scheduleId: "daily" },
+    })}\n`);
+    const timeline = new WorkspaceTimeline(filePath);
+
+    await timeline.start();
+    const line = await timeline.publish({ type: "schedule_fired", payload: { scheduleId: "weekly" } });
+
+    expect(JSON.parse(line)).toMatchObject({ v: 2, seq: 9, type: "schedule_fired" });
+  });
+
+  it("retroactively annotates connector attachment records in place", async () => {
     const dataDir = await temporaryDirectory();
     const timeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
-    const received = "/run/attachments/1/2026-08-23/10/photo.jpg";
-    const sent = "/run/attachments/1/2026-08-23/request-1/chart.png";
+    const conversation = conversationAgent("files:primary", "channel-7", { channel: "channel-7" });
+    const received = "/run/attachments/files-primary/received/photo.jpg";
+    const sent = "/run/attachments/files-primary/sent/chart.png";
     await timeline.publish({
-      type: "message",
-      chat_id: 1,
-      message: { message_id: 10 },
+      type: "files.message",
+      connectorId: conversation.connectorId,
+      conversation,
+      payload: { id: "message-1" },
       attachments: [{ type: "photo", path: received, mimeType: "image/jpeg" }],
     });
     await timeline.publish({
-      type: "sent",
-      requestId: "request-1",
-      actor: conversationAgent(1),
-      target: conversationAgent(1),
-      request: { method: "sendPhoto", photo: sent },
+      type: "connector.sent",
+      connectorId: conversation.connectorId,
+      actor: conversation,
+      conversation,
+      request: { method: "sendFile" },
       attachments: [{ path: sent }],
     });
 
@@ -68,36 +118,6 @@ describe("WorkspaceTimeline", () => {
     expect(records).toHaveLength(2);
     expect(records[0]).toMatchObject({ attachments: [{ path: received, description: "Updated whiteboard description" }] });
     expect(records[1]).toMatchObject({ attachments: [{ path: sent, description: "Latency chart comparing two queue designs" }] });
-    expect(raw).toContain("Latency chart comparing two queue designs");
-  });
-
-  it("rebuilds message and poll ownership from persisted timeline events", async () => {
-    const dataDir = await temporaryDirectory();
-    const filePath = path.join(dataDir, "timeline.jsonl");
-    const writer = new WorkspaceTimeline(filePath);
-    const inboundOwner = conversationAgent(1, 7);
-    const pollOwner = conversationAgent(2, 9);
-    await writer.publish({
-      type: "message",
-      chat_id: 1,
-      message: { message_id: 12, message_thread_id: 7 },
-      attachments: [],
-    });
-    await writer.publish({
-      type: "sent",
-      requestId: "request-poll",
-      actor: pollOwner,
-      target: pollOwner,
-      request: { method: "sendPoll", chat_id: 2, message_thread_id: 9 },
-      messageId: 30,
-      pollId: "poll-30",
-    });
-
-    const restored = new WorkspaceTimeline(filePath);
-    await restored.loadOwnership();
-    expect(restored.messageOwner(1, 12)).toEqual(inboundOwner);
-    expect(restored.messageOwner(2, 30)).toEqual(pollOwner);
-    expect(restored.pollOwner("poll-30")).toEqual(pollOwner);
   });
 
   it("does not broadcast an event that could not be persisted", async () => {
@@ -105,27 +125,15 @@ describe("WorkspaceTimeline", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const timeline = new WorkspaceTimeline(await blockedTimelinePath(dataDir));
     const listener = vi.fn();
+    const conversation = conversationAgent("custom:primary", "room-1", { room: "room-1" });
     timeline.subscribe(listener);
 
-    await expect(timeline.publish({ type: "message", chat_id: 1, message: { text: "hello" }, attachments: [] }))
-      .rejects.toThrow("Failed to persist timeline event");
+    await expect(timeline.publish({
+      type: "custom.message",
+      connectorId: conversation.connectorId,
+      conversation,
+      payload: { text: "hello" },
+    })).rejects.toThrow("Failed to persist timeline event");
     expect(listener).not.toHaveBeenCalled();
-  });
-
-  it("delivers task progress without writing it to the timeline", async () => {
-    const dataDir = await temporaryDirectory();
-    const filePath = path.join(dataDir, "timeline.jsonl");
-    const timeline = new WorkspaceTimeline(filePath);
-    const listener = vi.fn();
-    timeline.subscribe(listener);
-
-    timeline.notify({
-      type: "task_progress",
-      owner: conversationAgent(1),
-      tasks: [{ runId: "run-1", prompt: "work", runningMs: 10, idleMs: null }],
-    });
-
-    expect(listener).toHaveBeenCalledOnce();
-    await expect(readFile(filePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

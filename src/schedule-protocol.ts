@@ -1,3 +1,5 @@
+import type { ConversationAgentRef } from "./agent-ref.js";
+
 export type Recurrence = "hourly" | "daily" | "weekly";
 
 export type ScheduleInput = {
@@ -6,14 +8,9 @@ export type ScheduleInput = {
   recurrence: Recurrence | null;
 };
 
-export type ScheduleOwner = {
-  chat_id: number;
-  message_thread_id?: number | undefined;
-};
-
 export type Schedule = ScheduleInput & {
   id: string;
-  owner: ScheduleOwner;
+  owner: ConversationAgentRef;
   next_due_at: string | null;
 };
 
@@ -25,5 +22,5 @@ export const SCHEDULES_PROMPT = `Schedules are host-managed. Inspect the read-on
 - prompt: complete instructions for the owning conversation agent.
 - start: first run as a UTC ISO-8601 timestamp ending in Z.
 - recurrence: hourly, daily, weekly, or null for one run.
-When due, the host records schedule_fired and wakes the current owner. The owner acts directly or delegates with spawn or steer_conversation.
+When due, the host records schedule_fired and wakes the current owner.
 `;

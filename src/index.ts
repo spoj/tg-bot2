@@ -1,19 +1,18 @@
-import { loadConfig, type BotConfig } from "./config.js";
-import { AgentManager, AgentEventRouter } from "./agent.js";
-import { WorkspaceOutbox } from "./outbox.js";
-import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
-import { WorkspaceScheduler } from "./scheduler.js";
-import { AgentCredentials, HostBridge } from "./host-bridge.js";
-import { WorkspaceTasks } from "./task.js";
-import type { Bot } from "grammy";
-import { createTelegramBot, dispatchOutboxRequest, registerBotCommands, TelegramDeliveryQueue } from "./telegram.js";
-import { WorkspaceTimeline } from "./events.js";
-import { conversationAgent, type AgentRef, type ConversationAgentRef } from "./agent-ref.js";
-import { readAllowedFile } from "./allowlist.js";
-import { appendJsonl, botPaths } from "./util.js";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { AgentEventRouter, AgentManager } from "./agent.js";
+import { type AgentRef, type ConversationAgentRef } from "./agent-ref.js";
+import { loadConfig, type WorkspaceConfig } from "./config.js";
+import { ConnectorRegistry } from "./connector.js";
+import { WorkspaceTimeline } from "./events.js";
+import { AgentCredentials, HostBridge } from "./host-bridge.js";
+import { WorkspaceOutbox } from "./outbox.js";
+import { WorkspaceResources } from "./resource-state.js";
+import { checkSandboxEnvironment, spawnProcess, terminateActiveSandboxes, terminateProcessGroup } from "./sandbox.js";
+import { WorkspaceScheduler } from "./scheduler.js";
+import { TelegramConnector } from "./telegram-connector.js";
+import { appendJsonl } from "./util.js";
 
 export function isIntentionalSignalAbort(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -26,47 +25,32 @@ export interface DisposableServices {
   agents: Pick<AgentManager, "disposeAll">;
   scheduler: Pick<WorkspaceScheduler, "stop">;
   bridge: Pick<HostBridge, "stop">;
-  taskBridge: Pick<HostBridge, "stop">;
-  tasks: Pick<WorkspaceTasks, "stop">;
-  delivery: Pick<TelegramDeliveryQueue, "drain">;
+  connectors: Array<Pick<TelegramConnector, "stop">>;
 }
 
-export interface BotInstance {
-  config: BotConfig;
-  paths: { botDir: string; workspace: string };
-  bot: Bot;
+export interface WorkspaceInstance {
+  config: WorkspaceConfig;
   agents: AgentManager;
   scheduler: WorkspaceScheduler;
   bridge: HostBridge;
-  taskBridge: HostBridge;
-  tasks: WorkspaceTasks;
-  delivery: TelegramDeliveryQueue;
+  connectors: TelegramConnector[];
 }
 
-/** Type guard for a record holding a string field; returns the field or "". */
 function stringField(record: Record<string, unknown> | undefined, field: string): string {
   const value = record?.[field];
   return typeof value === "string" ? value : "";
 }
-function integerField(record: Record<string, unknown>, field: string): number {
-  const value = record[field];
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new Error(`${field} must be a safe integer`);
-  return value;
-}
+
 function conversationActor(actor: AgentRef): ConversationAgentRef {
   if (actor.kind !== "conversation") throw new Error("Only conversation agents can manage schedules");
   return actor;
 }
-
 
 export async function ensureTimeline(timelinePath: string): Promise<void> {
   await mkdir(path.dirname(timelinePath), { recursive: true, mode: 0o700 });
   await appendJsonl(timelinePath, []);
 }
 
-// Stops the scheduler, bridge, and tasks, disposes agents, terminates
-// sandboxes, and drains the delivery queue. Each step is guarded so a failure
-// in one never skips the rest.
 export async function finishDisposal(services: DisposableServices): Promise<void> {
   try {
     await services.scheduler.stop();
@@ -79,152 +63,91 @@ export async function finishDisposal(services: DisposableServices): Promise<void
     console.error("Host bridge shutdown failed", error);
   }
   try {
-    await services.taskBridge.stop();
-  } catch (error) {
-    console.error("Host task bridge shutdown failed", error);
-  }
-  try {
-    await services.tasks.stop();
-  } catch (error) {
-    console.error("Task shutdown failed", error);
-  }
-  try {
     await services.agents.disposeAll();
   } catch (error) {
     console.error("Agent shutdown failed", error);
+  }
+  for (const connector of services.connectors) {
+    try {
+      await connector.stop();
+    } catch (error) {
+      console.error("Connector shutdown failed", error);
+    }
   }
   try {
     terminateActiveSandboxes();
   } catch (error) {
     console.error("Sandbox shutdown failed", error);
   }
-  try {
-    await services.delivery.drain();
-  } catch (error) {
-    console.error("Telegram delivery drain failed", error);
-  }
+}
+
+async function createInstance(config: WorkspaceConfig, bwrapPath: string | undefined): Promise<WorkspaceInstance> {
+  const paths = config.paths;
+  await ensureTimeline(paths.timeline);
+  await mkdir(paths.runDir, { recursive: true, mode: 0o700 });
+  await mkdir(paths.attachments, { recursive: true, mode: 0o700 });
+
+  const telegramConfigs = config.connectors.filter((connector) => connector.type === "telegram");
+
+  const timeline = new WorkspaceTimeline(path.resolve(paths.timeline));
+  const resources = new WorkspaceResources(path.resolve(paths.resources));
+  await timeline.start();
+  await resources.start();
+
+  const registry = new ConnectorRegistry();
+  const connectors = telegramConfigs.map((connectorConfig) => new TelegramConnector(connectorConfig, timeline, resources));
+  for (const connector of connectors) registry.register(connector);
+
+  const credentials = new AgentCredentials();
+  const hostSocketDir = path.resolve(paths.runDir);
+  const agentManager = new AgentManager({ workspace: paths.workspace }, {
+    appRoot: process.cwd(),
+    credentials,
+    notificationsPath: paths.notifications,
+    connectorPrompt: (connectorId) => registry.prompt(connectorId),
+    hostSocketDir,
+    spawnProcess,
+    terminateProcessGroup,
+    ...(bwrapPath === undefined ? {} : { bwrapPath }),
+    hostTimeline: path.resolve(paths.timeline),
+    hostAttachments: path.resolve(paths.attachments),
+  });
+  for (const connector of connectors) connector.setAgent(agentManager);
+  const router = new AgentEventRouter(agentManager, { workspace: paths.workspace, connectors: registry });
+  timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
+
+  const outbox = new WorkspaceOutbox({ connectors: registry, timeline });
+  const scheduler = new WorkspaceScheduler({
+    schedulePath: paths.schedules,
+    timeline,
+  });
+  const handlers = {
+    send: (params: Record<string, unknown>, actor: AgentRef) => outbox.send(params.request, conversationActor(actor)),
+    annotate: async (params: Record<string, unknown>) => ({
+      occurrences: await timeline.annotateAttachment(stringField(params, "attachment"), stringField(params, "description")),
+    }),
+    steerConversation: async (params: Record<string, unknown>, actor: AgentRef) => {
+      const source = conversationActor(actor);
+      const target = registry.parseConversation(params.conversation);
+      const message = stringField(params, "message").trim();
+      await registry.authorizeConversation(target);
+      if (message.length === 0) throw new Error("message must be a non-empty string");
+      await agentManager.interrupt(`Conversation ${source.connectorId}/${source.conversationKey} delegated work to you:\n${message}`, target);
+      return { status: "delivered" };
+    },
+    scheduleAdd: async (params: Record<string, unknown>, actor: AgentRef) => ({ schedule: await scheduler.add(params, conversationActor(actor)) }),
+    scheduleReplace: async (params: Record<string, unknown>, actor: AgentRef) => ({ schedule: await scheduler.replace(params, conversationActor(actor)) }),
+    scheduleRemove: async (params: Record<string, unknown>, actor: AgentRef) => ({ id: await scheduler.remove(params, conversationActor(actor)) }),
+    scheduleTake: async (params: Record<string, unknown>, actor: AgentRef) => ({ schedule: await scheduler.take(params, conversationActor(actor)) }),
+  };
+  const bridge = new HostBridge({ socketPath: path.join(hostSocketDir, "host.sock"), credentials, handlers });
+  return { config, agents: agentManager, scheduler, bridge, connectors };
 }
 
 export async function main(): Promise<void> {
   const config = await loadConfig();
   const sandbox = await checkSandboxEnvironment(config.dataDir);
-  const { dataDir, bwrapPath } = sandbox;
-
-  const instances: BotInstance[] = await Promise.all(config.bots.map(async (botConfig) => {
-    const paths = botPaths(dataDir, botConfig.botId);
-    const { workspace } = paths;
-    const runtimeConfig = { ...botConfig, dataDir, ...paths };
-
-    await ensureTimeline(paths.timeline);
-    await mkdir(paths.runDir, { recursive: true, mode: 0o700 });
-    await mkdir(paths.attachments, { recursive: true, mode: 0o700 });
-    const hostSocketDir = path.resolve(paths.runDir);
-    const hostTimeline = path.resolve(paths.timeline);
-    const hostAttachments = path.resolve(paths.attachments);
-    const credentials = new AgentCredentials();
-    const timeline = new WorkspaceTimeline(hostTimeline);
-    await timeline.loadOwnership();
-    const agentManager = new AgentManager({ workspace }, {
-      appRoot: process.cwd(),
-      credentials,
-      bwrapPath,
-      spawnProcess,
-      terminateProcessGroup,
-      hostSocketDir,
-      hostTimeline,
-      hostAttachments,
-    });
-    const deliveryQueue = new TelegramDeliveryQueue();
-    const bot = createTelegramBot(runtimeConfig, timeline, deliveryQueue, agentManager);
-    const agentRouter = new AgentEventRouter(agentManager, { botInfo: () => bot.botInfo });
-    timeline.subscribe((record, rawLine) => agentRouter.onEvent(record, rawLine));
-
-    const outboxInstance = new WorkspaceOutbox({
-      workspace,
-      timeline,
-      dispatch: (chatId, requestId, request) => deliveryQueue.enqueue(chatId, () => dispatchOutboxRequest(bot, paths, chatId, requestId, request)),
-    });
-    const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
-      workspace,
-      statePath: paths.tasks,
-      timeline,
-      credentials,
-      appRoot: process.cwd(),
-      bwrapPath,
-      spawnProcess,
-      terminateProcessGroup,
-      hostSocketDir,
-      hostTimeline,
-      hostAttachments,
-    });
-    const schedulerInstance = new WorkspaceScheduler({
-      workspace,
-      schedulePath: paths.schedules,
-      legacyStatePath: paths.schedulerState,
-      timeline,
-    });
-    const hostHandlers = {
-      send: (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => outboxInstance.send(params.request, actor),
-      annotate: async (params: Record<string, unknown>) => ({
-        occurrences: await timeline.annotateAttachment(stringField(params, "attachment"), stringField(params, "description")),
-      }),
-      spawn: async (params: Record<string, unknown>, actor: AgentRef) => tasksInstance.spawn(params, conversationActor(actor)),
-      continueTask: async (params: Record<string, unknown>, actor: AgentRef) => tasksInstance.continueTask(params, conversationActor(actor)),
-      cancel: async (params: Record<string, unknown>, actor: AgentRef) => ({
-        status: await tasksInstance.cancel(stringField(params, "runId"), conversationActor(actor)),
-      }),
-      steerTask: async (params: Record<string, unknown>, actor: AgentRef) => ({
-        status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message"), conversationActor(actor)),
-      }),
-      steerConversation: async (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => {
-        if (actor.kind !== "conversation") throw new Error("Only conversation agents can steer conversations");
-        const chatId = integerField(params, "chat_id");
-        const threadId = params.message_thread_id === undefined ? 0 : integerField(params, "message_thread_id");
-        const message = stringField(params, "message").trim();
-        if (message.length === 0) throw new Error("message must be a non-empty string");
-        const allowed = await readAllowedFile(workspace);
-        if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) throw new Error(`Chat ${chatId} is not on the allow list`);
-        // Self-targeting is safe: interrupt only queues a steer on the active worker.
-        await agentManager.interrupt(`Conversation ${actor.chatId}:${actor.threadId} delegated work to you:\n${message}`, conversationAgent(chatId, threadId));
-        return { status: "delivered" };
-      },
-      scheduleAdd: async (params: Record<string, unknown>, actor: AgentRef) => ({
-        schedule: await schedulerInstance.add(params, conversationActor(actor)),
-      }),
-      scheduleReplace: async (params: Record<string, unknown>, actor: AgentRef) => ({
-        schedule: await schedulerInstance.replace(params, conversationActor(actor)),
-      }),
-      scheduleRemove: async (params: Record<string, unknown>, actor: AgentRef) => ({
-        id: await schedulerInstance.remove(params, conversationActor(actor)),
-      }),
-      scheduleTake: async (params: Record<string, unknown>, actor: AgentRef) => ({
-        schedule: await schedulerInstance.take(params, conversationActor(actor)),
-      }),
-    };
-    const bridge: HostBridge = new HostBridge({
-      socketPath: path.join(hostSocketDir, "host.sock"),
-      credentials,
-      handlers: hostHandlers,
-    });
-    const taskBridge: HostBridge = new HostBridge({
-      socketPath: path.join(hostSocketDir, "host-task.sock"),
-      credentials,
-      handlers: { annotate: hostHandlers.annotate },
-    });
-    return {
-      config: runtimeConfig,
-      paths,
-      bot,
-      agents: agentManager,
-      scheduler: schedulerInstance,
-      bridge,
-      taskBridge,
-      tasks: tasksInstance,
-      delivery: deliveryQueue,
-    };
-  }));
-
-
+  const instances = await Promise.all(config.workspaces.map((workspace) => createInstance(workspace, sandbox.bwrapPath)));
 
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -233,23 +156,8 @@ export async function main(): Promise<void> {
     shuttingDown = true;
     shutdownPromise = (async () => {
       console.log(`Received ${signal}; shutting down`);
-      for (const instance of instances) {
-        try {
-          await instance.bot.stop();
-        } catch (error) {
-          console.error(`Telegram stop failed for bot ${instance.config.botId}`, error);
-        }
-      }
-      for (const instance of instances) {
-        try {
-          await instance.agents.beginShutdown();
-        } catch (error) {
-          console.error(`Agent abort failed for bot ${instance.config.botId}`, error);
-        }
-      }
-      for (const instance of instances) {
-        await finishDisposal(instance);
-      }
+      for (const instance of instances) await instance.agents.beginShutdown().catch((error) => console.error("Agent abort failed", error));
+      for (const instance of instances) await finishDisposal(instance);
     })();
     return shutdownPromise;
   };
@@ -259,63 +167,24 @@ export async function main(): Promise<void> {
   try {
     for (const instance of instances) {
       await instance.bridge.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
-      await instance.taskBridge.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
-      await instance.tasks.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
+      if (shuttingDown) return void await shutdown("startup interrupted");
       await instance.scheduler.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
+      if (shuttingDown) return void await shutdown("startup interrupted");
       await instance.agents.start();
-      if (shuttingDown) {
-        await shutdown("startup interrupted");
-        return;
-      }
+      if (shuttingDown) return void await shutdown("startup interrupted");
     }
-    console.log(`Starting Telegram long polling for ${instances.length} bot(s)`);
-    await Promise.all(
-      instances.map((instance) =>
-        instance.bot.start({
-          allowed_updates: [
-            "message",
-            "edited_message",
-            "callback_query",
-            "poll_answer",
-            "message_reaction",
-            "my_chat_member",
-            "chat_join_request",
-          ],
-          onStart: (info) => {
-            console.log(`Telegram bot @${info.username} (id: ${instance.config.botId}) started`);
-            void registerBotCommands(instance.bot).catch((error) =>
-              console.error(`Telegram command registration failed for bot ${instance.config.botId}`, error),
-            );
-          },
-        }),
-      ),
-    );
+    const connectors = instances.flatMap((instance) => instance.connectors);
+    console.log(`Starting ${connectors.length} connector(s) across ${instances.length} workspace(s)`);
+    await Promise.all(connectors.map((connector) => connector.run()));
   } catch (error) {
-    await shutdown("startup or polling failure");
-    if (shuttingDown && isIntentionalSignalAbort(error)) return;
-    throw error;
+    if (!(shuttingDown && isIntentionalSignalAbort(error))) throw error;
   }
 }
-const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (isMainModule) {
-  main().catch((error) => {
-    console.error("Fatal startup/polling failure", error);
+
+const entrypoint = process.argv[1];
+if (entrypoint && import.meta.url === pathToFileURL(entrypoint).href) {
+  void main().catch((error) => {
+    console.error(error);
     process.exitCode = 1;
   });
 }

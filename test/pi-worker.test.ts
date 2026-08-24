@@ -558,37 +558,23 @@ describe("PiWorker", () => {
     }
   });
 
-  it("points PI_HOST_SOCKET at host-task.sock for task runs and host.sock otherwise", async () => {
+  it("points PI_HOST_SOCKET at the workspace host bridge", async () => {
     const f = await fixture();
     try {
       const runDir = path.join(f.root, "run");
       await mkdir(runDir, { recursive: true });
-
-      const taskFixture = fakeChildFixture();
-      const taskWorker = new PiWorker({
+      const { spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
         hostSocketDir: runDir,
-        taskRun: true,
-        spawnProcess: taskFixture.spawn,
-        terminateProcessGroup: taskFixture.terminate,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
       });
-      await taskWorker.start();
-      const taskArgs = taskFixture.spawn.mock.calls[0]?.[1] ?? [];
-      expect(taskArgs[taskArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/run/host-task.sock");
 
-      const chatFixture = fakeChildFixture();
-      const chatWorker = new PiWorker({
-        workspace: f.workspace,
-        appRoot: f.appRoot,
-        hostSocketDir: runDir,
-        taskRun: false,
-        spawnProcess: chatFixture.spawn,
-        terminateProcessGroup: chatFixture.terminate,
-      });
-      await chatWorker.start();
-      const chatArgs = chatFixture.spawn.mock.calls[0]?.[1] ?? [];
-      expect(chatArgs[chatArgs.indexOf("PI_HOST_SOCKET") + 1]).toBe("/run/host.sock");
+      await worker.start();
+      const args = spawn.mock.calls[0]?.[1] ?? [];
+      expect(args[args.indexOf("PI_HOST_SOCKET") + 1]).toBe("/run/host.sock");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

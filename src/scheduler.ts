@@ -2,25 +2,16 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { conversationAgent, sameConversation, type ConversationAgentRef } from "./agent-ref.js";
+import { sameConversation, type ConversationAgentRef } from "./agent-ref.js";
 import type { WorkspaceTimeline } from "./events.js";
 import { SerialQueue } from "./queue.js";
-import type { Recurrence, Schedule, ScheduleInput, ScheduleOwner } from "./schedule-protocol.js";
+import type { Recurrence, Schedule, ScheduleInput } from "./schedule-protocol.js";
 import { isMissing, readFileBounded } from "./util.js";
 
-type ScheduleFile = {
-  version: 1;
-  schedules: Schedule[];
-};
-
-type LegacyScheduleRow = ScheduleInput & { owner: ScheduleOwner };
-type LegacyScheduleFile = { version: 1; schedules: LegacyScheduleRow[] };
-type LegacyStateFile = { version: 1; rows: Array<{ key: string; nextDueAt: string | null }> };
+type ScheduleFile = { version: 1; schedules: Schedule[] };
 
 export type WorkspaceSchedulerOptions = {
-  workspace: string;
   schedulePath: string;
-  legacyStatePath?: string;
   timeline: WorkspaceTimeline;
   pollIntervalMs?: number;
   now?: () => number;
@@ -35,7 +26,6 @@ const HOUR_MS = 60 * 60 * 1_000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const READ_FILE = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
-const LEGACY_SCHEDULES_FILE = ".schedules.json";
 const MAX_SCHEDULE_PROMPT_LENGTH = 16 * 1024;
 const MAX_SCHEDULE_FILE_BYTES = 1024 * 1024;
 const UTC_ISO = /Z$/u;
@@ -48,22 +38,26 @@ function invalid(message: string): never {
   throw new Error(`Invalid schedule: ${message}`);
 }
 
-function validateOwner(value: unknown, context: string): ScheduleOwner {
+function validateConversation(value: unknown, context: string): ConversationAgentRef {
   if (value === null || typeof value !== "object" || Array.isArray(value)) invalid(`${context} has an invalid owner`);
   const owner = value as Record<string, unknown>;
-  if (typeof owner.chat_id !== "number" || !Number.isSafeInteger(owner.chat_id)) invalid(`${context} has an invalid owner.chat_id`);
-  if (owner.message_thread_id !== undefined && (typeof owner.message_thread_id !== "number" || !Number.isSafeInteger(owner.message_thread_id))) {
-    invalid(`${context} has an invalid owner.message_thread_id`);
+  if (owner.kind !== "conversation" || typeof owner.connectorId !== "string" || typeof owner.conversationKey !== "string") {
+    invalid(`${context} has an invalid owner`);
   }
-  return { chat_id: owner.chat_id, ...(typeof owner.message_thread_id === "number" ? { message_thread_id: owner.message_thread_id } : {}) };
+  if (owner.address === null || typeof owner.address !== "object" || Array.isArray(owner.address)) invalid(`${context} has an invalid owner address`);
+  return {
+    kind: "conversation",
+    connectorId: owner.connectorId,
+    conversationKey: owner.conversationKey,
+    address: owner.address as Record<string, unknown>,
+  };
 }
+
 
 function validateInput(value: unknown, context: string): ScheduleInput {
   if (value === null || typeof value !== "object" || Array.isArray(value)) invalid(`${context} must be an object`);
   const input = value as Record<string, unknown>;
-  if (typeof input.prompt !== "string" || input.prompt.length === 0 || input.prompt.length > MAX_SCHEDULE_PROMPT_LENGTH) {
-    invalid(`${context} has an invalid prompt`);
-  }
+  if (typeof input.prompt !== "string" || input.prompt.length === 0 || input.prompt.length > MAX_SCHEDULE_PROMPT_LENGTH) invalid(`${context} has an invalid prompt`);
   if (!isUtcIso(input.start)) invalid(`${context} has an invalid start`);
   if (input.recurrence !== null && input.recurrence !== "hourly" && input.recurrence !== "daily" && input.recurrence !== "weekly") {
     invalid(`${context} has an invalid recurrence`);
@@ -78,10 +72,10 @@ function validateId(value: unknown): string {
 
 function validateScheduleFile(value: unknown): ScheduleFile {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid schedules state");
-  const file = value as Record<string, unknown>;
-  if (file.version !== 1 || !Array.isArray(file.schedules)) throw new Error("Invalid schedules state");
+  const root = value as Record<string, unknown>;
+  if (root.version !== 1 || !Array.isArray(root.schedules)) throw new Error("Invalid schedules state");
   const ids = new Set<string>();
-  const schedules = file.schedules.map((value, index) => {
+  const schedules = root.schedules.map((value, index): Schedule => {
     const context = `row ${index}`;
     const input = validateInput(value, context);
     const row = value as Record<string, unknown>;
@@ -89,46 +83,16 @@ function validateScheduleFile(value: unknown): ScheduleFile {
     if (ids.has(id)) throw new Error(`Invalid schedules state: duplicate id ${id}`);
     ids.add(id);
     if (row.next_due_at !== null && !isUtcIso(row.next_due_at)) throw new Error(`Invalid schedules state: ${context} has an invalid next_due_at`);
-    return { id, ...input, owner: validateOwner(row.owner, context), next_due_at: row.next_due_at as string | null };
+    return {
+      id,
+      ...input,
+      owner: validateConversation(row.owner, context),
+      next_due_at: row.next_due_at as string | null,
+    };
   });
   return { version: 1, schedules };
 }
 
-function validateLegacyScheduleFile(value: unknown): LegacyScheduleFile {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid legacy schedules file");
-  const file = value as Record<string, unknown>;
-  if (file.version !== 1 || !Array.isArray(file.schedules)) throw new Error("Invalid legacy schedules file");
-  return {
-    version: 1,
-    schedules: file.schedules.map((value, index) => ({
-      ...validateInput(value, `legacy row ${index}`),
-      owner: validateOwner((value as Record<string, unknown>).owner, `legacy row ${index}`),
-    })),
-  };
-}
-
-function validateLegacyStateFile(value: unknown): LegacyStateFile {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid legacy scheduler state");
-  const file = value as Record<string, unknown>;
-  if (file.version !== 1 || !Array.isArray(file.rows)) throw new Error("Invalid legacy scheduler state");
-  return {
-    version: 1,
-    rows: file.rows.map((value) => {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid legacy scheduler state row");
-      const row = value as Record<string, unknown>;
-      if (typeof row.key !== "string" || (row.nextDueAt !== null && !isUtcIso(row.nextDueAt))) throw new Error("Invalid legacy scheduler state row");
-      return { key: row.key, nextDueAt: row.nextDueAt as string | null };
-    }),
-  };
-}
-
-function legacyRowKey(row: LegacyScheduleRow): string {
-  return JSON.stringify([row.prompt, row.start, row.recurrence, row.owner.chat_id, row.owner.message_thread_id ?? 0]);
-}
-
-function oldLegacyRowKey(row: LegacyScheduleRow): string {
-  return JSON.stringify([row.prompt, row.start, row.recurrence]);
-}
 
 function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): string {
   const due = Date.parse(dueAt);
@@ -138,16 +102,8 @@ function advanceRecurring(dueAt: string, recurrence: Recurrence, now: number): s
   return new Date(due + periods * period).toISOString();
 }
 
-function scheduleOwner(owner: ConversationAgentRef): ScheduleOwner {
-  return { chat_id: owner.chatId, ...(owner.threadId === 0 ? {} : { message_thread_id: owner.threadId }) };
-}
-
-function ownerRef(owner: ScheduleOwner): ConversationAgentRef {
-  return conversationAgent(owner.chat_id, owner.message_thread_id ?? 0);
-}
-
 function cloneSchedule(schedule: Schedule): Schedule {
-  return { ...schedule, owner: { ...schedule.owner } };
+  return { ...schedule, owner: { ...schedule.owner, address: { ...schedule.owner.address } } };
 }
 
 async function readOptionalFile(filePath: string): Promise<string | undefined> {
@@ -168,9 +124,7 @@ async function readOptionalFile(filePath: string): Promise<string | undefined> {
 }
 
 export class WorkspaceScheduler {
-  private readonly legacySchedulesPath: string;
   private readonly schedulePath: string;
-  private readonly legacyStatePath: string | undefined;
   private readonly timeline: WorkspaceTimeline;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
@@ -187,12 +141,8 @@ export class WorkspaceScheduler {
 
   constructor(options: WorkspaceSchedulerOptions) {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > MAX_TIMER_MS) {
-      throw new Error("Scheduler poll interval must be a positive timer-safe integer");
-    }
-    this.legacySchedulesPath = path.join(path.resolve(options.workspace), LEGACY_SCHEDULES_FILE);
+    if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > MAX_TIMER_MS) throw new Error("Scheduler poll interval must be a positive timer-safe integer");
     this.schedulePath = path.resolve(options.schedulePath);
-    this.legacyStatePath = options.legacyStatePath === undefined ? undefined : path.resolve(options.legacyStatePath);
     this.timeline = options.timeline;
     this.pollIntervalMs = pollIntervalMs;
     this.now = options.now ?? Date.now;
@@ -205,7 +155,7 @@ export class WorkspaceScheduler {
     return this.writes.run(async () => {
       await this.loadState();
       const input = validateInput(params, "schedule_add");
-      const schedule: Schedule = { id: randomUUID(), ...input, owner: scheduleOwner(owner), next_due_at: input.start };
+      const schedule: Schedule = { id: randomUUID(), ...input, owner, next_due_at: input.start };
       await this.commit(() => this.schedules.set(schedule.id, schedule));
       return cloneSchedule(schedule);
     });
@@ -217,12 +167,7 @@ export class WorkspaceScheduler {
       const id = validateId(params.id);
       const input = validateInput(params, "schedule_replace");
       const current = this.ownedSchedule(id, actor);
-      const replacement: Schedule = {
-        id,
-        ...input,
-        owner: current.owner,
-        next_due_at: input.start === current.start ? current.next_due_at : input.start,
-      };
+      const replacement: Schedule = { id, ...input, owner: current.owner, next_due_at: input.start === current.start ? current.next_due_at : input.start };
       await this.commit(() => this.schedules.set(id, replacement));
       return cloneSchedule(replacement);
     });
@@ -243,11 +188,11 @@ export class WorkspaceScheduler {
       await this.loadState();
       const id = validateId(params.id);
       const current = this.requiredSchedule(id);
-      const previousOwner = ownerRef(current.owner);
-      if (sameConversation(previousOwner, actor)) return cloneSchedule(current);
-      const taken = { ...current, owner: scheduleOwner(actor) };
+      if (sameConversation(current.owner, actor)) return cloneSchedule(current);
+      const previousOwner = current.owner;
+      const taken = { ...current, owner: actor };
       await this.commit(() => this.schedules.set(id, taken));
-      await this.timeline.publish({ type: "schedule_taken", scheduleId: id, previousOwner, owner: actor });
+      await this.timeline.publish({ type: "schedule_taken", conversation: actor, scheduleId: id, previousOwner });
       return cloneSchedule(taken);
     });
   }
@@ -276,10 +221,8 @@ export class WorkspaceScheduler {
       this.cancelTimer(this.timer);
       this.timer = undefined;
     }
-    const pendingStart = this.startInFlight;
-    if (pendingStart) await pendingStart.catch(() => {});
-    const pendingPoll = this.pollInFlight;
-    if (pendingPoll) await pendingPoll.catch(() => {});
+    if (this.startInFlight) await this.startInFlight.catch(() => {});
+    if (this.pollInFlight) await this.pollInFlight.catch(() => {});
     await this.writes.idle().catch(() => {});
   }
 
@@ -303,10 +246,7 @@ export class WorkspaceScheduler {
         const dueAt = schedule.next_due_at;
         if (dueAt === null || Date.parse(dueAt) > now) continue;
         due.push({ occurrenceId: randomUUID(), schedule, dueAt });
-        this.schedules.set(id, {
-          ...schedule,
-          next_due_at: schedule.recurrence === null ? null : advanceRecurring(dueAt, schedule.recurrence, now),
-        });
+        this.schedules.set(id, { ...schedule, next_due_at: schedule.recurrence === null ? null : advanceRecurring(dueAt, schedule.recurrence, now) });
       }
       if (due.length > 0) {
         try {
@@ -320,11 +260,11 @@ export class WorkspaceScheduler {
       for (const occurrence of due) {
         await this.timeline.publish({
           type: "schedule_fired",
+          conversation: occurrence.schedule.owner,
           scheduleId: occurrence.schedule.id,
           occurrenceId: occurrence.occurrenceId,
           prompt: occurrence.schedule.prompt,
           dueAt: occurrence.dueAt,
-          owner: ownerRef(occurrence.schedule.owner),
         });
       }
     } catch (error) {
@@ -335,41 +275,13 @@ export class WorkspaceScheduler {
   private async loadState(): Promise<void> {
     if (this.stateLoaded) return;
     const raw = await readOptionalFile(this.schedulePath);
+    this.schedules.clear();
     if (raw !== undefined) {
       const file = validateScheduleFile(JSON.parse(raw) as unknown);
-      this.schedules.clear();
       for (const schedule of file.schedules) this.schedules.set(schedule.id, schedule);
-      this.stateLoaded = true;
-      return;
     }
-
-    const migrated = await this.readLegacySchedules();
-    this.schedules.clear();
-    for (const schedule of migrated) this.schedules.set(schedule.id, schedule);
-    await this.saveState();
     this.stateLoaded = true;
-    await rm(this.legacySchedulesPath, { force: true }).catch((error) => this.report(error));
-    if (this.legacyStatePath !== undefined) await rm(this.legacyStatePath, { force: true }).catch((error) => this.report(error));
-  }
-
-  private async readLegacySchedules(): Promise<Schedule[]> {
-    const raw = await readOptionalFile(this.legacySchedulesPath);
-    if (raw === undefined) return [];
-    const legacy = validateLegacyScheduleFile(JSON.parse(raw) as unknown);
-    const state = await this.readLegacyState();
-    const unique = new Map(legacy.schedules.map((row) => [legacyRowKey(row), row]));
-    return [...unique].map(([key, row]) => ({
-      id: randomUUID(),
-      ...row,
-      next_due_at: state.get(key) ?? state.get(oldLegacyRowKey(row)) ?? row.start,
-    }));
-  }
-
-  private async readLegacyState(): Promise<Map<string, string | null>> {
-    if (this.legacyStatePath === undefined) return new Map();
-    const raw = await readOptionalFile(this.legacyStatePath);
-    if (raw === undefined) return new Map();
-    return new Map(validateLegacyStateFile(JSON.parse(raw) as unknown).rows.map((row) => [row.key, row.nextDueAt]));
+    if (raw === undefined) await this.saveState();
   }
 
   private requiredSchedule(id: string): Schedule {
@@ -380,7 +292,7 @@ export class WorkspaceScheduler {
 
   private ownedSchedule(id: string, actor: ConversationAgentRef): Schedule {
     const schedule = this.requiredSchedule(id);
-    if (!sameConversation(ownerRef(schedule.owner), actor)) throw new Error(`Schedule ${id} is not owned by this conversation`);
+    if (!sameConversation(schedule.owner, actor)) throw new Error(`Schedule ${id} is not owned by this conversation`);
     return schedule;
   }
 

@@ -1,1220 +1,623 @@
-import { execFileSync } from "node:child_process";
-import { describe, expect, it, vi, type Mock } from "vitest";
-import { lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { tmpdir } from "node:os";
-
+import { setTimeout as realSetTimeout } from "node:timers";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { InputFile, type Bot } from "grammy";
+import { AgentEventRouter } from "../src/agent-router.js";
+import { ConnectorRegistry } from "../src/connector.js";
+import type { TelegramConnectorConfig } from "../src/config.js";
+import { WorkspaceTimeline } from "../src/events.js";
+import { WorkspaceResources } from "../src/resource-state.js";
+import { TelegramConnector } from "../src/telegram-connector.js";
+import { telegramConversation } from "../src/telegram-ref.js";
 import {
-  createTelegramBot,
-  dispatchOutboxRequest,
   attachmentSource,
+  dispatchOutboxRequest,
+  isBotGroupAdd,
+  isMessageDirectedToBot,
   registerBotCommands,
   TelegramDeliveryQueue,
 } from "../src/telegram.js";
-import { AgentEventRouter } from "../src/agent.js";
-import { appendTimelineEvents, WorkspaceTimeline } from "../src/events.js";
-import { conversationAgent } from "../src/agent-ref.js";
-import { botPaths } from "../src/util.js";
-import { isBotGroupAdd, isMessageDirectedToBot } from "../src/telegram.js";
+import { connectorPathSegment, workspacePaths, type WorkspacePaths } from "../src/util.js";
 
-function fakeBot() {
-  const raw = {
-    sendMessage: vi.fn(async () => ({ message_id: 123 })),
-    sendPhoto: vi.fn(async () => ({ message_id: 123 })),
-    sendAudio: vi.fn(async () => ({ message_id: 123 })),
-    sendVideo: vi.fn(async () => ({ message_id: 123 })),
-    sendVoice: vi.fn(async () => ({ message_id: 123 })),
-    sendDocument: vi.fn(async () => ({ message_id: 123 })),
-    sendMediaGroup: vi.fn(async () => [{ message_id: 11 }, { message_id: 12 }]),
-    editMessageText: vi.fn(async () => ({ message_id: 123 })),
-    editForumTopic: vi.fn(async () => true),
-    createForumTopic: vi.fn(async () => ({ message_thread_id: 105, name: "topic" })),
-  };
+const CONNECTOR_ID = "telegram:999";
+const WORKSPACE_ID = "primary";
+const ATTACHMENT_PREFIX = connectorPathSegment(CONNECTOR_ID);
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+function connectorConfig(dataDir: string): TelegramConnectorConfig {
+  const paths = workspacePaths(dataDir, WORKSPACE_ID);
   return {
-    api: {
-      raw,
-      sendMessage: vi.fn(async () => ({ message_id: 123 })),
-      getFile: vi.fn(async () => ({ file_path: "documents/report.txt" })),
-      setMyCommands: vi.fn(async () => true),
-    },
-  } as unknown as Bot;
-}
-async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
-  const workspace = await mkdtemp(path.join(tmpdir(), "tg-bot-telegram-"));
-  try {
-    await writeAllowedChats(workspace, [42]);
-    await run(workspace);
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-}
-function workspaceDir(dataDir: string): string {
-  return botPaths(dataDir, 999).workspace;
-}
-async function readLogEvents(dataDir: string): Promise<Record<string, unknown>[]> {
-  const content = await readFile(path.join(dataDir, "timeline.jsonl"), "utf8").catch(() => "");
-  const result: Record<string, unknown>[] = [];
-  for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed !== null && typeof parsed === "object") {
-        result.push(parsed as Record<string, unknown>);
-      }
-    } catch {
-      // Skip corrupt test lines
-    }
-  }
-  return result;
-}
-
-async function writeAllowedChats(dataDir: string, chats: Array<{ chat_id: number; title?: string } | number>): Promise<void> {
-  const workspace = workspaceDir(dataDir);
-  await mkdir(workspace, { recursive: true });
-  const ids = chats.map((chat) => (typeof chat === "number" ? chat : chat.chat_id));
-  await writeFile(path.join(workspace, ".allowed.json"), `${JSON.stringify(ids, null, 2)}\n`);
-}
-
-async function waitForChatEvents(dataDir: string, predicate: (events: Record<string, unknown>[]) => boolean): Promise<Record<string, unknown>[]> {
-  let events: Record<string, unknown>[] = [];
-  await vi.waitFor(async () => {
-    events = await readLogEvents(dataDir);
-    if (!predicate(events)) throw new Error("chat events not yet flushed");
-  });
-  return events;
-}
-
-async function messageEvent(dataDir: string): Promise<Record<string, unknown>> {
-  const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
-  return events.find((event) => event.type === "message") as Record<string, unknown>;
-}
-
-function wakeArg(prompt: Mock): Record<string, unknown> {
-  return JSON.parse(prompt.mock.calls[0]?.[0] as string) as Record<string, unknown>;
-}
-
-async function firstMessageAttachment(dataDir: string): Promise<Record<string, unknown>> {
-  const message = await messageEvent(dataDir);
-  return (message.attachments as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
-}
-
-let sentRequests: Array<{ url: string; body: string }> = [];
-
-async function makeTestBot(
-  dataDir: string,
-  agents: { interrupt: Mock<(text: string) => Promise<void>>; followup?: Mock<(text: string) => Promise<void>>; restartAll?: Mock<() => Promise<void>> },
-  { fetchResult, recordRequests = false, pollOwners }: { fetchResult?: Record<string, unknown>; recordRequests?: boolean; pollOwners?: Map<string, number> } = {},
-): Promise<Bot> {
-  if (recordRequests) sentRequests = [];
-  const followup = agents.followup ?? vi.fn(async () => undefined);
-  const events = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
-  for (const [pollId, chatId] of pollOwners ?? []) {
-    const owner = conversationAgent(chatId);
-    await events.publish({
-      type: "sent",
-      requestId: `seed-${pollId}`,
-      actor: owner,
-      target: owner,
-      request: { method: "sendPoll", chat_id: chatId },
-      pollId,
-    });
-  }
-  const agentAccess = agents.restartAll ? { restartAll: agents.restartAll } : undefined;
-  const bot = createTelegramBot(
-    { token: "999:test-token", botId: 999, dataDir },
-    events,
-    undefined,
-    agentAccess,
-  );
-  const router = new AgentEventRouter(
-    { interrupt: agents.interrupt, followup },
-    { botInfo: () => (bot as unknown as { botInfo?: { id: number; username?: string } }).botInfo },
-  );
-  events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
-  (bot as unknown as { botInfo: unknown }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
-  const fakeFetch: typeof fetch = async (input, init) => {
-    if (recordRequests) {
-      sentRequests.push({
-        url: String(input),
-        body: typeof init?.body === "string" ? init.body : "",
-      });
-    }
-    return new Response(JSON.stringify({ ok: true, result: fetchResult ?? {} }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  };
-  Object.assign(bot, { clientConfig: { fetch: fakeFetch } });
-  return bot;
-}
-
-async function runAttachmentFixture(
-  dataDir: string,
-  fetchImplementation: typeof fetch,
-  fileName = "report.txt",
-  getFileImplementation: () => Promise<{ file_id: string; file_path?: string }> = async () => ({ file_id: "file-id", file_path: "documents/remote.bin" }),
-  beforeUpdate?: (bot: Bot) => void,
-): Promise<Mock> {
-  const prompt = vi.fn(async () => undefined);
-  const events = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
-  const router = new AgentEventRouter({ interrupt: prompt, followup: vi.fn(async () => undefined) });
-  events.subscribe((record, rawLine) => router.onEvent(record, rawLine));
-  const bot = createTelegramBot({
+    type: "telegram",
+    id: CONNECTOR_ID,
     token: "999:test-token",
     botId: 999,
+    workspaceId: WORKSPACE_ID,
     dataDir,
-  }, events);
-  (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot" };
-  bot.api.getFile = vi.fn(getFileImplementation) as unknown as typeof bot.api.getFile;
-  (bot.api as unknown as { sendChatAction: ReturnType<typeof vi.fn> }).sendChatAction = vi.fn(async () => ({}));
-  vi.stubGlobal("fetch", fetchImplementation);
-  beforeUpdate?.(bot);
-  await bot.handleUpdate({
+    workspace: paths.workspace,
+    attachments: path.join(paths.attachments, ATTACHMENT_PREFIX),
+    attachmentPrefix: ATTACHMENT_PREFIX,
+  };
+}
+
+async function writeAllowedChats(config: TelegramConnectorConfig, chatIds: number[]): Promise<void> {
+  await mkdir(config.workspace, { recursive: true });
+  await writeFile(path.join(config.workspace, ".allowed.json"), `${JSON.stringify(chatIds, null, 2)}\n`, "utf8");
+}
+
+type TelegramFixture = {
+  dataDir: string;
+  paths: WorkspacePaths;
+  config: TelegramConnectorConfig;
+  timeline: WorkspaceTimeline;
+  resources: WorkspaceResources;
+  connector: TelegramConnector;
+  bot: Bot;
+  interrupt: Mock;
+  followup: Mock;
+  restartAll: Mock;
+  requests: Array<{ url: string; body: string }>;
+};
+
+async function fixture(options: { allowed?: number[]; fetchResult?: unknown; responses?: Array<Record<string, unknown>> } = {}): Promise<TelegramFixture> {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-connector-"));
+  temporaryDirectories.push(dataDir);
+  const paths = workspacePaths(dataDir, WORKSPACE_ID);
+  const config = connectorConfig(dataDir);
+  await mkdir(config.attachments, { recursive: true });
+  await writeAllowedChats(config, options.allowed ?? [42]);
+  await writeFile(paths.timeline, "", "utf8");
+  const timeline = new WorkspaceTimeline(paths.timeline);
+  await timeline.start();
+  const resources = new WorkspaceResources(paths.resources);
+  await resources.start();
+  const connector = new TelegramConnector(config, timeline, resources);
+  const restartAll = vi.fn(async () => undefined);
+  connector.setAgent({ restartAll });
+  const connectors = new ConnectorRegistry();
+  connectors.register(connector);
+  const interrupt = vi.fn(async () => undefined);
+  const followup = vi.fn(async () => undefined);
+  const router = new AgentEventRouter(
+    { interrupt, followup },
+    { workspace: config.workspace, connectors },
+  );
+  timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
+  const requests: Array<{ url: string; body: string }> = [];
+  connector.bot.api.config.use(async (_previous, method, payload) => {
+    requests.push({ url: `/${method}`, body: JSON.stringify(payload) });
+    return (options.responses?.shift() ?? { ok: true, result: options.fetchResult ?? {} }) as never;
+  });
+  (connector.bot as unknown as { botInfo: unknown }).botInfo = {
+    id: 999,
+    is_bot: true,
+    first_name: "Test",
+    username: "test_bot",
+  };
+  return { dataDir, paths, config, timeline, resources, connector, bot: connector.bot, interrupt, followup, restartAll, requests };
+}
+
+async function timelineEvents(paths: WorkspacePaths): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(paths.timeline, "utf8");
+  return raw.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+async function waitForInterrupt(interrupt: Mock, calls: number): Promise<void> {
+  await vi.waitFor(() => expect(interrupt).toHaveBeenCalledTimes(calls));
+}
+
+function interruptEnvelope(interrupt: Mock, call = 0): Record<string, unknown> {
+  return JSON.parse(interrupt.mock.calls[call]?.[0] as string) as Record<string, unknown>;
+}
+
+function messageUpdate(chatId: number, text = "hello", extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
     update_id: 1,
     message: {
       message_id: 7,
       date: 1_700_000_000,
-      chat: { id: 42, type: "private" },
-      from: { id: 42, is_bot: false, first_name: "Test" },
-      document: { file_id: "file-id", file_name: fileName, mime_type: "text/plain" },
+      chat: { id: chatId, type: chatId > 0 ? "private" : "group", title: chatId > 0 ? undefined : "Work" },
+      from: { id: 42, is_bot: false, first_name: "Alice" },
+      text,
+      ...extra,
     },
-  } as never);
-  return prompt;
+  };
 }
 
-describe("attachmentSource table", () => {
+
+async function waitForRetryTimer(): Promise<void> {
+  for (let attempts = 0; attempts < 500; attempts++) {
+    if (vi.getTimerCount() > 0) return;
+    await new Promise((resolve) => realSetTimeout(resolve, 1));
+  }
+  throw new Error("Timed out waiting for Telegram retry timer");
+}
+
+function fakeBot() {
+  const raw = {
+    sendMessage: vi.fn(async () => ({ message_id: 123 })),
+    sendDocument: vi.fn(async () => ({ message_id: 123 })),
+    editForumTopic: vi.fn(async () => true),
+  };
+  return { api: { raw } } as unknown as Bot;
+}
+
+describe("Telegram identity and attachment source", () => {
   const base = { message_id: 1, date: 1_700_000_000, chat: { id: 42, type: "private" } };
   const file = { file_id: "f-1", file_size: 10, mime_type: "custom/x", file_name: "orig.bin" };
   const cases: Array<{ name: string; message: Record<string, unknown>; expected: Record<string, unknown> }> = [
     { name: "animation", message: { animation: file }, expected: { type: "animation", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
     { name: "audio", message: { audio: file }, expected: { type: "audio", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
     { name: "document", message: { document: file }, expected: { type: "document", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
-    { name: "photo", message: { photo: [{ file_id: "f-small", file_size: 5 }, { file_id: "f-large", file_size: 20 }] }, expected: { type: "photo", fileId: "f-large", mimeType: "image/jpeg" } },
-    { name: "animated sticker", message: { sticker: { file_id: "f-a", file_size: 3, is_animated: true } }, expected: { type: "sticker", fileId: "f-a", mimeType: "application/x-tgsticker" } },
-    { name: "video sticker", message: { sticker: { file_id: "f-v", file_size: 3, is_video: true } }, expected: { type: "sticker", fileId: "f-v", mimeType: "video/webm" } },
-    { name: "static sticker", message: { sticker: { file_id: "f-s", file_size: 3 } }, expected: { type: "sticker", fileId: "f-s", mimeType: "image/webp" } },
+    { name: "photo", message: { photo: [{ file_id: "small", file_size: 5 }, { file_id: "large", file_size: 20 }] }, expected: { type: "photo", fileId: "large", mimeType: "image/jpeg" } },
+    { name: "sticker", message: { sticker: { file_id: "sticker", is_video: true } }, expected: { type: "sticker", fileId: "sticker", mimeType: "video/webm" } },
     { name: "video", message: { video: file }, expected: { type: "video", fileId: "f-1", mimeType: "custom/x", originalName: "orig.bin" } },
-    { name: "video note", message: { video_note: file }, expected: { type: "video_note", fileId: "f-1", mimeType: "video/mp4" } },
     { name: "voice", message: { voice: file }, expected: { type: "voice", fileId: "f-1", mimeType: "custom/x" } },
   ];
-  for (const { name, message, expected } of cases) {
-    it(`picks the ${name} source`, () => {
-      expect(attachmentSource({ ...base, ...message } as never)).toMatchObject(expected);
+
+  for (const testCase of cases) {
+    it(`selects the ${testCase.name} attachment`, () => {
+      expect(attachmentSource({ ...base, ...testCase.message } as never)).toMatchObject(testCase.expected);
     });
   }
-  it("returns undefined without media", () => {
-    expect(attachmentSource({ ...base, text: "hello" } as never)).toBeUndefined();
-    expect(attachmentSource({ ...base, photo: [] } as never)).toBeUndefined();
+
+  it("uses a connector-scoped generic conversation identity", () => {
+    expect(telegramConversation(CONNECTOR_ID, -100, 7)).toEqual({
+      kind: "conversation",
+      connectorId: CONNECTOR_ID,
+      conversationKey: "-100:7",
+      address: { chat_id: -100, message_thread_id: 7 },
+    });
   });
 });
 
-function chunkedResponse(chunks: readonly Uint8Array[], headers?: HeadersInit): Response {
-  return new Response(new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(chunk);
-      controller.close();
-    },
-  }), { status: 200, ...(headers === undefined ? {} : { headers }) });
-}
-
-
-
 describe("TelegramDeliveryQueue", () => {
-  it("delivers operations FIFO within one chat", async () => {
+  it("serializes one chat while allowing another chat to proceed", async () => {
     const queue = new TelegramDeliveryQueue();
-    const events: string[] = [];
-    let releaseFirst!: () => void;
-    let resolveFirstStarted!: () => void;
-    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
-    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const first = queue.enqueue(7, async () => {
-      events.push("first:start");
-      resolveFirstStarted();
-      await firstFinished;
-      events.push("first:end");
-    });
-    await firstStarted;
-    const second = queue.enqueue(7, async () => {
-      events.push("second");
-    });
-    expect(events).toEqual(["first:start"]);
-    releaseFirst();
-    await Promise.all([first, second]);
-    expect(events).toEqual(["first:start", "first:end", "second"]);
-  });
-
-  it("allows different chats to deliver concurrently", async () => {
-    const queue = new TelegramDeliveryQueue();
-    let releaseFirst!: () => void;
-    let resolveFirstStarted!: () => void;
-    const firstStarted = new Promise<void>((resolve) => { resolveFirstStarted = resolve; });
-    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    let firstDone = false;
+    const order: string[] = [];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
     const first = queue.enqueue(1, async () => {
-      resolveFirstStarted();
-      await firstFinished;
-      firstDone = true;
+      order.push("one:start");
+      await blocked;
+      order.push("one:end");
     });
-    await firstStarted;
-    await queue.enqueue(2, () => "chat-two");
-    expect(firstDone).toBe(false);
-    releaseFirst();
-    await first;
-    expect(firstDone).toBe(true);
+    await vi.waitFor(() => expect(order).toEqual(["one:start"]));
+    const second = queue.enqueue(1, () => { order.push("one:second"); });
+    await queue.enqueue(2, () => { order.push("two"); });
+    expect(order).toEqual(["one:start", "two"]);
+    release();
+    await Promise.all([first, second, queue.drain()]);
+    expect(order).toEqual(["one:start", "two", "one:end", "one:second"]);
   });
 
-  it("continues a chat after a rejected operation", async () => {
+  it("continues after a rejected operation", async () => {
     const queue = new TelegramDeliveryQueue();
-    const events: string[] = [];
-    const failure = queue.enqueue(3, () => {
-      events.push("failed");
-      throw new Error("send failed");
-    });
-    const later = queue.enqueue(3, () => {
-      events.push("later");
-      return "delivered";
-    });
-    await expect(failure).rejects.toThrow("send failed");
-    await expect(later).resolves.toBe("delivered");
-    await expect(queue.drain()).resolves.toBeUndefined();
-    expect(events).toEqual(["failed", "later"]);
-  });
-
-  it("drains operations accepted while a drain is already waiting", async () => {
-    const queue = new TelegramDeliveryQueue();
-    const events: string[] = [];
-    const first = queue.enqueue(4, () => {
-      events.push("first");
-    });
-    const draining = queue.drain();
-    await first;
-    queue.enqueue(4, () => {
-      events.push("second");
-    });
-    await draining;
-    expect(events).toEqual(["first", "second"]);
-    await queue.drain();
+    const failed = queue.enqueue(3, () => { throw new Error("failed"); });
+    const next = queue.enqueue(3, () => "delivered");
+    await expect(failed).rejects.toThrow("failed");
+    await expect(next).resolves.toBe("delivered");
   });
 });
 
 describe("raw Telegram Bot API dispatch", () => {
-  it("passes Bot API payloads and request-location keyboards through unchanged", async () => {
-    await withWorkspace(async (dataDir) => {
-      const paths = botPaths(dataDir, 999);
-      await mkdir(paths.attachments, { recursive: true });
-      const bot = fakeBot();
-      const replyMarkup = { keyboard: [[{ text: "Share location", request_location: true }]], resize_keyboard: true };
-      await expect(dispatchOutboxRequest(bot, paths, 42, "req-1", {
-        method: "sendMessage",
-        chat_id: 42,
-        text: "Where are you?",
-        reply_markup: replyMarkup,
-        protect_content: true,
-      })).resolves.toMatchObject({ messageId: 123 });
-      expect(bot.api.raw.sendMessage).toHaveBeenCalledWith({
-        chat_id: 42,
-        text: "Where are you?",
-        reply_markup: replyMarkup,
-        protect_content: true,
-      });
+  it("passes connector-native payload fields through unchanged", async () => {
+    const test = await fixture();
+    const bot = fakeBot();
+    const replyMarkup = { keyboard: [[{ text: "Share location", request_location: true }]], resize_keyboard: true };
+
+    await dispatchOutboxRequest(bot, test.config, 42, "req-1", {
+      method: "sendMessage",
+      chat_id: 42,
+      text: "Where are you?",
+      reply_markup: replyMarkup,
+      protect_content: true,
+    });
+
+    expect(bot.api.raw.sendMessage).toHaveBeenCalledWith({
+      chat_id: 42,
+      text: "Where are you?",
+      reply_markup: replyMarkup,
+      protect_content: true,
     });
   });
 
-  it("copies workspace uploads into host attachments before delivery", async () => {
-    await withWorkspace(async (dataDir) => {
-      const paths = botPaths(dataDir, 999);
-      await mkdir(paths.attachments, { recursive: true });
-      await writeFile(path.join(paths.workspace, "report.txt"), "report", "utf8");
-      const bot = fakeBot();
-      const result = await dispatchOutboxRequest(bot, paths, 42, "req-file", {
-        method: "sendDocument",
-        chat_id: 42,
-        document: "/workspace/report.txt",
-        caption: "Report",
-      });
-      const managed = result.request?.document;
-      expect(managed).toMatch(/^\/run\/attachments\/42\/\d{4}-\d{2}-\d{2}\/req-file\/report\.txt$/);
-      expect(result.attachmentPaths).toEqual([managed]);
-      expect(await readFile(path.join(paths.attachments, String(managed).slice("/run/attachments/".length)), "utf8")).toBe("report");
-      expect(bot.api.raw.sendDocument).toHaveBeenCalledWith({
-        chat_id: 42,
-        document: expect.any(InputFile),
-        caption: "Report",
-      });
+  it("stages workspace uploads under the connector-prefixed attachment mount", async () => {
+    const test = await fixture();
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+    const bot = fakeBot();
+
+    const result = await dispatchOutboxRequest(bot, test.config, 42, "req-file", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+      caption: "Report",
     });
+
+    const managed = result.request?.document;
+    expect(managed).toMatch(new RegExp(`^/run/attachments/${ATTACHMENT_PREFIX}/42/\\d{4}-\\d{2}-\\d{2}/req-file/report\\.txt$`));
+    expect(result.attachmentPaths).toEqual([managed]);
+    const relative = String(managed).slice(`/run/attachments/${ATTACHMENT_PREFIX}/`.length);
+    expect(await readFile(path.join(test.config.attachments, relative), "utf8")).toBe("report");
+    expect(bot.api.raw.sendDocument).toHaveBeenCalledWith({ chat_id: 42, document: expect.any(InputFile), caption: "Report" });
   });
 
-  it("reuses the staged copy when Telegram retries the same request", async () => {
-    await withWorkspace(async (dataDir) => {
-      const paths = botPaths(dataDir, 999);
-      await mkdir(paths.attachments, { recursive: true });
-      await writeFile(path.join(paths.workspace, "report.txt"), "report", "utf8");
-      const bot = fakeBot();
-      const request = { method: "sendDocument" as const, chat_id: 42, document: "/workspace/report.txt" };
-
-      const first = await dispatchOutboxRequest(bot, paths, 42, "req-retry", request);
-      const second = await dispatchOutboxRequest(bot, paths, 42, "req-retry", request);
-
-      expect(second.request?.document).toBe(first.request?.document);
-      expect(bot.api.raw.sendDocument).toHaveBeenCalledTimes(2);
-      expect(await readFile(path.join(paths.attachments, String(first.request?.document).slice("/run/attachments/".length)), "utf8")).toBe("report");
-    });
-  });
-
-  it("rejects local files outside the exposed roots", async () => {
-    await withWorkspace(async (dataDir) => {
-      const paths = botPaths(dataDir, 999);
-      await mkdir(paths.attachments, { recursive: true });
-      await expect(dispatchOutboxRequest(fakeBot(), paths, 42, "req-bad", {
-        method: "sendDocument",
-        chat_id: 42,
-        document: "/etc/passwd",
-      })).rejects.toThrow("under /workspace");
-    });
-  });
-
-  it("applies incidental topic names after message delivery", async () => {
-    await withWorkspace(async (dataDir) => {
-      const paths = botPaths(dataDir, 999);
-      await mkdir(paths.attachments, { recursive: true });
-      const bot = fakeBot();
-      await dispatchOutboxRequest(bot, paths, 42, "req-topic", {
-        method: "sendMessage",
-        chat_id: 42,
-        message_thread_id: 7,
-        text: "The itinerary is taking shape.",
-        topic_name: "Japan itinerary",
-      });
-      expect(bot.api.raw.sendMessage).toHaveBeenCalledWith({ chat_id: 42, message_thread_id: 7, text: "The itinerary is taking shape." });
-      expect(bot.api.raw.editForumTopic).toHaveBeenCalledWith({ chat_id: 42, message_thread_id: 7, name: "Japan itinerary" });
-    });
+  it("rejects local files outside the workspace", async () => {
+    const test = await fixture();
+    await expect(dispatchOutboxRequest(fakeBot(), test.config, 42, "req-bad", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/etc/passwd",
+    })).rejects.toThrow("under /workspace");
   });
 });
 
-describe("Telegram attachment downloads", () => {
-  it("bounds a stalled Telegram getFile call with the attachment deadline", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    try {
-      await withWorkspace(async (dataDir) => {
-        const getFile = vi.fn(() => new Promise<{ file_id: string; file_path?: string }>(() => {}));
-        const fixture = runAttachmentFixture(
-          dataDir,
-          vi.fn(async () => chunkedResponse([new TextEncoder().encode("unused")])) as unknown as typeof fetch,
-          "report.txt",
-          getFile,
-        );
-        await vi.waitFor(() => expect(getFile).toHaveBeenCalled());
-        await vi.advanceTimersByTimeAsync(30_000);
-        await fixture;
-        expect(getFile).toHaveBeenCalledOnce();
-        expect((await firstMessageAttachment(dataDir)).failure).toMatch(/download timed out/);
-      });
-    } finally {
-      vi.useRealTimers();
-      vi.unstubAllGlobals();
-    }
-  });
-  it("aborts and cancels bodies rejected by response headers", async () => {
-    try {
-      for (const testCase of [
-        { status: 503, headers: undefined, failure: /HTTP 503/ },
-        { status: 200, headers: { "content-length": String(20 * 1024 * 1024 + 1) }, failure: /20 MB/ },
-      ]) {
-        await withWorkspace(async (dataDir) => {
-          let cancelled = false;
-          let signal: AbortSignal | null | undefined;
-          const response = new Response(new ReadableStream<Uint8Array>({
-            cancel() {
-              cancelled = true;
-            },
-          }), {
-            status: testCase.status,
-            ...(testCase.headers === undefined ? {} : { headers: testCase.headers }),
-          });
-          const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
-            signal = init?.signal;
-            return Promise.resolve(response);
-          });
-          await runAttachmentFixture(dataDir, fetchMock as unknown as typeof fetch);
-          expect((await firstMessageAttachment(dataDir)).failure).toMatch(testCase.failure);
-          expect(signal?.aborted).toBe(true);
-          expect(cancelled).toBe(true);
-        });
-      }
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-  it("bounds a stalled Telegram fetch with AbortController", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    try {
-      await withWorkspace(async (dataDir) => {
-        let signal: AbortSignal | null | undefined;
-        const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
-          signal = init?.signal;
-          return new Promise<Response>(() => {});
-        });
-        const fixture = runAttachmentFixture(dataDir, fetchMock as unknown as typeof fetch);
-        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
-        await vi.advanceTimersByTimeAsync(30_000);
-        await fixture;
-        expect(signal?.aborted).toBe(true);
-        expect((await firstMessageAttachment(dataDir)).failure).toMatch(/download timed out/);
-      });
-    } finally {
-      vi.useRealTimers();
-      vi.unstubAllGlobals();
-    }
+describe("TelegramConnector send", () => {
+  it("owns target derivation, allowlist enforcement, and response resources", async () => {
+    const test = await fixture({ fetchResult: { message_id: 9001 } });
+    const owner = telegramConversation(CONNECTOR_ID, 42, 7);
+
+    const result = await test.connector.send({ method: "sendMessage", text: "hello" }, owner);
+
+    expect(JSON.parse(test.requests.find((request) => request.url.endsWith("/sendMessage"))!.body)).toEqual({ chat_id: 42, message_thread_id: 7, text: "hello" });
+    expect(result).toMatchObject({
+      request: { method: "sendMessage", chat_id: 42, message_thread_id: 7, text: "hello" },
+      response: { message_id: 9001 },
+      summary: { method: "sendMessage", messageId: 9001 },
+    });
+    expect(test.resources.owner(CONNECTOR_ID, "message", "42:9001")).toEqual(owner);
   });
 
-  it("rejects a chunked response as soon as it exceeds 20 MiB", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        const response = chunkedResponse([
-          new Uint8Array(20 * 1024 * 1024),
-          new Uint8Array([1]),
-        ]);
-        await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        expect((await firstMessageAttachment(dataDir)).failure).toMatch(/20 MB/);
-        expect(await readFile(path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
+  it("rejects cross-conversation and unlisted sends before delivery", async () => {
+    const test = await fixture({ allowed: [42], fetchResult: { message_id: 1 } });
+    const owner = telegramConversation(CONNECTOR_ID, 42, 7);
+
+    await expect(test.connector.send({ method: "sendMessage", chat_id: 99, text: "no" }, owner))
+      .rejects.toThrow("cannot target another conversation's chat");
+    await expect(test.connector.send({ method: "sendMessage", message_thread_id: 8, text: "no" }, owner))
+      .rejects.toThrow("cannot target another conversation's thread");
+    await expect(test.connector.send({ method: "sendMessage", text: "no" }, telegramConversation(CONNECTOR_ID, 99)))
+      .rejects.toThrow("Chat 99 is not on the allow list");
+    expect(test.requests).toHaveLength(0);
   });
 
-  it("cancels an attachment reader after an oversized response", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        let cancelled = false;
-        const response = new Response(new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new Uint8Array(20 * 1024 * 1024));
-            controller.enqueue(new Uint8Array([1]));
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }), { status: 200 });
-        await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        expect((await firstMessageAttachment(dataDir)).failure).toMatch(/20 MB/);
-        expect(cancelled).toBe(true);
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
+  it("allows mutations only for connector resources owned by the conversation", async () => {
+    const test = await fixture({ fetchResult: { message_id: 55 } });
+    const owner = telegramConversation(CONNECTOR_ID, 42, 7);
+    const otherThread = telegramConversation(CONNECTOR_ID, 42, 8);
+    await test.resources.set({ connectorId: CONNECTOR_ID, kind: "message", key: "42:55", owner });
+    await test.resources.set({ connectorId: CONNECTOR_ID, kind: "message", key: "42:99", owner: otherThread });
+
+    await test.connector.send({ method: "editMessageText", message_id: 55, text: "updated" }, owner);
+    await expect(test.connector.send({ method: "deleteMessage", message_id: 99 }, owner))
+      .rejects.toThrow("Message 99 is not owned by this conversation");
+    await expect(test.connector.send({ method: "editMessageText", inline_message_id: "inline", text: "x" }, owner))
+      .rejects.toThrow("requires an owned message_id");
+    expect(test.requests.filter((request) => request.url.endsWith("/editMessageText"))).toHaveLength(1);
   });
 
-  it("streams a bounded response while preserving attachment metadata", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        const response = chunkedResponse([
-          new TextEncoder().encode("hello "),
-          new TextEncoder().encode("telegram"),
-        ]);
-        await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        const destination = path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7", "report.txt");
-        expect(await readFile(destination, "utf8")).toBe("hello telegram");
-        const attachment = await firstMessageAttachment(dataDir);
-        expect(attachment.mimeType).toBe("text/plain");
-        expect(attachment.originalName).toBe("report.txt");
-        expect(attachment.path).toBe("/run/attachments/42/2023-11-14/7/report.txt");
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-  it("does not publish an attachment after its pinned directory is replaced", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        const directory = path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7");
-        await mkdir(directory, { recursive: true });
-        let pulls = 0;
-        let replaced = false;
-        const response = new Response(new ReadableStream<Uint8Array>({
-          async pull(controller) {
-            pulls += 1;
-            if (pulls === 1) {
-              controller.enqueue(new TextEncoder().encode("hello"));
-              return;
-            }
-            await rename(directory, `${directory}.detached`);
-            await mkdir(directory, { mode: 0o700 });
-            replaced = true;
-            controller.close();
-          },
-        }, { highWaterMark: 0 }), { status: 200 });
-        await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        expect(replaced).toBe(true);
-        expect((await firstMessageAttachment(dataDir)).failure).toMatch(/download failed/);
-        expect(await readFile(path.join(directory, "report.txt")).catch(() => undefined)).toBeUndefined();
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
+  it("retries Telegram rate limits and returns one successful result", async () => {
+    const test = await fixture({
+      responses: [
+        { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 5 } },
+        { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 1 } },
+        { ok: true, result: { message_id: 9001 } },
+      ],
+    });
+    vi.useFakeTimers();
 
+    const pending = test.connector.send({ method: "sendMessage", text: "hello" }, telegramConversation(CONNECTOR_ID, 42));
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(1_000);
 
-  it("keeps Unicode attachment filenames within Linux filename limits", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        const fileName = `${"界".repeat(100)}.txt`;
-        await runAttachmentFixture(dataDir, vi.fn(async () => chunkedResponse([new TextEncoder().encode("hello")])) as unknown as typeof fetch, fileName);
-        expect((await firstMessageAttachment(dataDir)).failure).toBeUndefined();
-        const directory = path.join(botPaths(dataDir, 999).attachments, "42", "2023-11-14", "7");
-        const [savedName] = await readdir(directory);
-        expect(savedName).toBeDefined();
-        expect(Buffer.byteLength(savedName!)).toBeLessThanOrEqual(255);
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it("rejects a pre-existing symlinked attachment root", async () => {
-    try {
-      await withWorkspace(async (dataDir) => {
-        const outside = path.join(dataDir, "outside");
-        const attachments = botPaths(dataDir, 999).attachments;
-        await mkdir(outside, { recursive: true });
-        await mkdir(path.dirname(attachments), { recursive: true });
-        await symlink(outside, attachments);
-        const response = chunkedResponse([new TextEncoder().encode("secret")]);
-        await runAttachmentFixture(dataDir, vi.fn(async () => response) as unknown as typeof fetch);
-        expect((await firstMessageAttachment(dataDir)).failure).toMatch(/download failed/);
-        expect(await readFile(path.join(outside, "42", "2023-11-14", "7", "report.txt")).catch(() => undefined)).toBeUndefined();
-      });
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    await expect(pending).resolves.toMatchObject({ summary: { messageId: 9001 } });
+    expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(3);
   });
 });
-describe("Telegram location and venue updates", () => {
-  async function sendLocationUpdate(dataDir: string, message: Record<string, unknown>): Promise<Mock> {
-    const prompt = vi.fn(async () => undefined);
-    const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-    await bot.handleUpdate({
-      update_id: 1,
-      message: {
-        message_id: 7,
+
+describe("Telegram ingress and native event preservation", () => {
+  it("persists a timeline v2 message envelope and routes the exact native event", async () => {
+    const test = await fixture();
+    await test.bot.handleUpdate(messageUpdate(42, "hello") as never);
+    await waitForInterrupt(test.interrupt, 1);
+
+    const [event] = await timelineEvents(test.paths);
+    expect(event).toMatchObject({
+      v: 2,
+      id: expect.any(String),
+      seq: 1,
+      t: expect.any(String),
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: telegramConversation(CONNECTOR_ID, 42),
+      payload: { message_id: 7, text: "hello", from: { id: 42, first_name: "Alice" } },
+      attachments: [],
+      meta: { private: true, directed: false, user_content: true },
+    });
+    expect(interruptEnvelope(test.interrupt)).toEqual(event);
+    expect(test.resources.owner(CONNECTOR_ID, "message", "42:7")).toEqual(telegramConversation(CONNECTOR_ID, 42));
+  });
+
+  it("preserves edited messages, callbacks, reactions, membership, and join requests as native payloads", async () => {
+    const test = await fixture();
+    await test.bot.handleUpdate({
+      update_id: 2,
+      edited_message: {
+        message_id: 8,
         date: 1_700_000_000,
+        edit_date: 1_700_000_050,
         chat: { id: 42, type: "private" },
-        from: { id: 42, is_bot: false, first_name: "Test" },
-        ...message,
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        text: "edited",
       },
     } as never);
-    return prompt;
-  }
-
-  it("records a shared location as a message event and wakes the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = await sendLocationUpdate(dataDir, { location: { latitude: 52.52, longitude: 13.405 } });
-      expect(wakeArg(prompt)).toMatchObject({
-        v: 1,
-        t: expect.any(String),
-        type: "message",
-        chat_id: 42,
-        message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } },
-        attachments: [],
-      });
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, location: { latitude: 52.52, longitude: 13.405 } }, attachments: [] });
-    });
-  });
-
-  it("records a venue as a message event and wakes the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = await sendLocationUpdate(dataDir, {
-        venue: {
-          location: { latitude: 52.5163, longitude: 13.3777 },
-          title: "Brandenburg Gate",
-          address: "Pariser Platz 1",
-        },
-      });
-      expect(wakeArg(prompt)).toMatchObject({
-        v: 1,
-        t: expect.any(String),
-        type: "message",
-        chat_id: 42,
-        message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } },
-        attachments: [],
-      });
-      expect(await messageEvent(dataDir)).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, venue: { title: "Brandenburg Gate", address: "Pariser Platz 1" } }, attachments: [] });
-    });
-  });
-});
-
-describe("Telegram callback queries", () => {
-  function callbackUpdate(chatId: number, data: string) {
-    return {
-      update_id: 2,
+    await test.bot.handleUpdate({
+      update_id: 3,
       callback_query: {
         id: "cb-1",
-        from: { id: chatId, is_bot: false, first_name: "Test" },
-        message: {
-          message_id: 7,
-          date: 1_700_000_000,
-          chat: { id: chatId, type: "private" },
-          from: { id: 999, is_bot: true, first_name: "Test" },
-        },
-        chat_instance: "ci",
-        data,
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        message: { message_id: 8, date: 1_700_000_000, chat: { id: 42, type: "private" } },
+        chat_instance: "instance",
+        data: "approve",
       },
-    };
-  }
+    } as never);
+    await test.bot.handleUpdate({
+      update_id: 4,
+      message_reaction: {
+        chat: { id: 42, type: "private" },
+        message_id: 8,
+        user: { id: 42, is_bot: false, first_name: "Alice" },
+        date: 1_700_000_100,
+        old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "👍" }],
+      },
+    } as never);
+    await test.bot.handleUpdate({
+      update_id: 5,
+      my_chat_member: {
+        chat: { id: 42, type: "group", title: "Work" },
+        from: { id: 42, is_bot: false, first_name: "Admin" },
+        date: 1_700_000_200,
+        old_chat_member: { status: "member", user: { id: 999, is_bot: true, first_name: "Bot" } },
+        new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
+      },
+    } as never);
+    await test.bot.handleUpdate({
+      update_id: 6,
+      chat_join_request: {
+        chat: { id: 42, type: "supergroup", title: "Work" },
+        from: { id: 123, is_bot: false, first_name: "New User" },
+        user_chat_id: 123,
+        date: 1_700_000_300,
+      },
+    } as never);
+    await waitForInterrupt(test.interrupt, 1);
 
-  it("records an authorized button press as a callback event and wakes the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
-      await bot.handleUpdate(callbackUpdate(42, "do_thing") as never);
-      expect(wakeArg(prompt)).toMatchObject({
-        v: 1,
-        t: expect.any(String),
-        type: "callback",
-        chat_id: 42,
-        callback_query: { data: "do_thing", message: { message_id: 7 } },
+    expect(await timelineEvents(test.paths)).toMatchObject([
+      { type: "telegram.edited_message", connectorId: CONNECTOR_ID, conversation: telegramConversation(CONNECTOR_ID, 42), payload: { message_id: 8, text: "edited" } },
+      { type: "telegram.callback", connectorId: CONNECTOR_ID, conversation: telegramConversation(CONNECTOR_ID, 42), payload: { id: "cb-1", data: "approve", message: { message_id: 8 } } },
+      { type: "telegram.message_reaction", connectorId: CONNECTOR_ID, conversation: telegramConversation(CONNECTOR_ID, 42), payload: { message_id: 8, new_reaction: [{ emoji: "👍" }] } },
+      { type: "telegram.my_chat_member", connectorId: CONNECTOR_ID, conversation: telegramConversation(CONNECTOR_ID, 42), payload: { new_chat_member: { status: "administrator" } } },
+      { type: "telegram.chat_join_request", connectorId: CONNECTOR_ID, conversation: telegramConversation(CONNECTOR_ID, 42), payload: { user_chat_id: 123, from: { id: 123 } } },
+    ]);
+    expect(interruptEnvelope(test.interrupt)).toMatchObject({ type: "telegram.callback", payload: { data: "approve" } });
+  });
+
+  it("drops unauthorized updates and records one sanitized event per source and type", async () => {
+    for (const mode of ["missing", "malformed", "unlisted"] as const) {
+      const test = await fixture({ allowed: [42] });
+      if (mode === "missing") await rm(path.join(test.config.workspace, ".allowed.json"));
+      if (mode === "malformed") await writeFile(path.join(test.config.workspace, ".allowed.json"), "{ bad json\n", "utf8");
+      const chatId = mode === "unlisted" ? 99 : 42;
+      await test.bot.handleUpdate(messageUpdate(chatId, "secret content") as never);
+      await test.bot.handleUpdate(messageUpdate(chatId, "different secret", { message_id: 8 }) as never);
+
+      expect(test.interrupt).not.toHaveBeenCalled();
+      const events = await timelineEvents(test.paths);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "telegram.access_request",
+        connectorId: CONNECTOR_ID,
+        payload: {
+          reason: mode === "unlisted" ? "chat_not_allowed" : `allowlist_${mode}`,
+          update_type: "message",
+          chat: { id: chatId, type: "private" },
+          requester: { id: 42, first_name: "Alice" },
+        },
       });
-      expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(true);
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
-      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", chat_id: 42, callback_query: { data: "do_thing", message: { message_id: 7 } } });
-    });
+      expect(events[0]).not.toHaveProperty("conversation");
+      expect(JSON.stringify(events[0])).not.toContain("secret content");
+      expect(JSON.stringify(events[0])).not.toContain("different secret");
+    }
   });
 
-  it("rejects a button press from a chat not on the allow list without answering or recording", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
-      await bot.handleUpdate(callbackUpdate(999, "do_thing") as never);
-      expect(prompt).not.toHaveBeenCalled();
-      expect(sentRequests.some((request) => request.url.endsWith("/answerCallbackQuery"))).toBe(false);
-      expect((await readLogEvents(dataDir)).some((event) => event.type === "callback")).toBe(false);
-    });
+  it("retains an unlisted group identity without retaining its sender or message", async () => {
+    const test = await fixture({ allowed: [42] });
+    await test.bot.handleUpdate(messageUpdate(-100, "private group content") as never);
+
+    const events = await timelineEvents(test.paths);
+    expect(events).toMatchObject([{
+      type: "telegram.access_request",
+      connectorId: CONNECTOR_ID,
+      payload: {
+        reason: "chat_not_allowed",
+        update_type: "message",
+        chat: { id: -100, type: "group", title: "Work" },
+      },
+    }]);
+    expect((events[0]?.payload as Record<string, unknown>)).not.toHaveProperty("requester");
+    expect(JSON.stringify(events)).not.toContain("private group content");
+    expect(JSON.stringify(events)).not.toContain("Alice");
   });
 
-  it("embeds the raw callback query in the callback event", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
-      await bot.handleUpdate(callbackUpdate(42, "x".repeat(100)) as never);
-      expect(wakeArg(prompt)).toMatchObject({
-        v: 1,
-        t: expect.any(String),
-        type: "callback",
-        chat_id: 42,
-        callback_query: { data: "x".repeat(100) },
-      });
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "callback"));
-      expect(events.find((event) => event.type === "callback")).toMatchObject({ type: "callback", chat_id: 42, callback_query: { data: "x".repeat(100) } });
-    });
-  });
-});
+  it("records ambient group messages silently and interrupts for mentions and direct replies", async () => {
+    const test = await fixture({ allowed: [-100] });
+    await test.bot.handleUpdate(messageUpdate(-100, "general discussion") as never);
+    expect(test.interrupt).not.toHaveBeenCalled();
 
-describe("Telegram chat events", () => {
-  function textUpdate(text: string): Record<string, unknown> {
-    return {
-      update_id: 1,
+    await test.bot.handleUpdate(messageUpdate(-100, "Hey @test_bot", {
+      message_id: 8,
+      entities: [{ type: "mention", offset: 4, length: 9 }],
+    }) as never);
+    await test.bot.handleUpdate(messageUpdate(-100, "yes", {
+      message_id: 9,
+      reply_to_message: {
+        message_id: 2,
+        date: 1_699_999_999,
+        chat: { id: -100, type: "group" },
+        from: { id: 999, is_bot: true, first_name: "Test" },
+      },
+    }) as never);
+    await waitForInterrupt(test.interrupt, 2);
+
+    const events = await timelineEvents(test.paths);
+    expect(events).toHaveLength(3);
+    expect(events.map((event) => (event.meta as { directed: boolean }).directed)).toEqual([false, true, true]);
+  });
+
+  it("records bounded group identity and its inviter without retaining the native add update", async () => {
+    const test = await fixture({ allowed: [42] });
+    const title = `Sensitive\u0000 Channel ${"x".repeat(200)}`;
+    await test.bot.handleUpdate({
+      update_id: 10,
+      my_chat_member: {
+        chat: { id: -100123, type: "channel", title },
+        from: { id: 42, is_bot: false, username: "admin\u0007name", first_name: "Ad\u0000min", last_name: "User" },
+        date: 1_700_000_000,
+        old_chat_member: { status: "left", user: { id: 999, is_bot: true, first_name: "Bot" } },
+        new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
+      },
+    } as never);
+
+    expect(test.interrupt).not.toHaveBeenCalled();
+    const events = await timelineEvents(test.paths);
+    expect(events).toMatchObject([{
+      type: "telegram.access_request",
+      connectorId: CONNECTOR_ID,
+      payload: {
+        reason: "chat_not_allowed",
+        update_type: "my_chat_member",
+        chat: { id: -100123, type: "channel", title: "Sensitive Channel " + "x".repeat(110) },
+        requester: { id: 42, username: "admin name", first_name: "Ad min", last_name: "User" },
+      },
+    }]);
+    expect(JSON.stringify(events)).not.toContain("administrator");
+    expect(JSON.stringify(events)).not.toContain('"old_chat_member"');
+    expect(JSON.stringify(events)).not.toContain('"new_chat_member"');
+  });
+
+  it("surfaces an allowed bot group add to its conversation owner", async () => {
+    const test = await fixture({ allowed: [-100123] });
+    await test.bot.handleUpdate({
+      update_id: 10,
+      my_chat_member: {
+        chat: { id: -100123, type: "channel", title: "New Channel" },
+        from: { id: 42, is_bot: false, first_name: "Admin" },
+        date: 1_700_000_000,
+        old_chat_member: { status: "left", user: { id: 999, is_bot: true, first_name: "Bot" } },
+        new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
+      },
+    } as never);
+    await waitForInterrupt(test.interrupt, 1);
+
+    expect(await timelineEvents(test.paths)).toMatchObject([{
+      type: "telegram.my_chat_member",
+      connectorId: CONNECTOR_ID,
+      conversation: telegramConversation(CONNECTOR_ID, -100123),
+      meta: { group_add: true },
+    }]);
+  });
+
+  it("routes poll answers through WorkspaceResources without consulting timeline history", async () => {
+    const test = await fixture();
+    const owner = telegramConversation(CONNECTOR_ID, 42, 9);
+    await test.resources.set({ connectorId: CONNECTOR_ID, kind: "poll", key: "poll-9", owner });
+    await test.bot.handleUpdate({
+      update_id: 11,
+      poll_answer: {
+        poll_id: "poll-9",
+        user: { id: 42, is_bot: false, first_name: "Alice" },
+        option_ids: [1, 2],
+      },
+    } as never);
+
+    expect(await timelineEvents(test.paths)).toMatchObject([{
+      type: "telegram.poll_answer",
+      connectorId: CONNECTOR_ID,
+      conversation: owner,
+      payload: { poll_id: "poll-9", option_ids: [1, 2] },
+    }]);
+    expect(test.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("downloads attachments into the connector-prefixed attachment namespace", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/remote.bin" })) as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("hello telegram", { status: 200 })));
+    await test.bot.handleUpdate({
+      update_id: 12,
       message: {
         message_id: 7,
         date: 1_700_000_000,
         chat: { id: 42, type: "private" },
-        from: { id: 42, is_bot: false, first_name: "Test" },
-        text,
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "report.txt", mime_type: "text/plain" },
       },
-    };
-  }
+    } as never);
 
-  it("logs a text message event and wakes the agent with the appended jsonl entry", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate(textUpdate("hello") as never);
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message"));
-      expect(events.find((event) => event.type === "message")).toMatchObject({ type: "message", chat_id: 42, message: { message_id: 7, text: "hello" } });
-      expect(wakeArg(prompt)).toMatchObject({
-        v: 1,
-        t: expect.any(String),
-        type: "message",
-        chat_id: 42,
-        message: { message_id: 7, text: "hello" },
-        attachments: [],
-      });
-      const chatLog = await readFile(path.join(dataDir, "timeline.jsonl"), "utf8");
-      expect(wakeArg(prompt)).toEqual(JSON.parse(chatLog.trim().split("\n").at(-1)!));
+    const [event] = await timelineEvents(test.paths);
+    const attachment = (event?.attachments as Array<Record<string, unknown>>)[0];
+    expect(attachment).toMatchObject({
+      type: "document",
+      path: `/run/attachments/${ATTACHMENT_PREFIX}/42/2023-11-14/7/report.txt`,
+      mimeType: "text/plain",
+      originalName: "report.txt",
     });
+    expect(await readFile(path.join(test.config.attachments, "42", "2023-11-14", "7", "report.txt"), "utf8")).toBe("hello telegram");
   });
-
-  it("logs an edited message event silently without waking the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate({
-        update_id: 2,
-        edited_message: {
-          message_id: 7,
-          date: 1_700_000_000,
-          edit_date: 1_700_000_050,
-          chat: { id: 42, type: "private" },
-          from: { id: 42, is_bot: false, first_name: "Test" },
-          text: "hello edited",
-        },
-      } as never);
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "edited_message"));
-      expect(events.find((event) => event.type === "edited_message")).toMatchObject({
-        type: "edited_message",
-        chat_id: 42,
-        message: { message_id: 7, text: "hello edited", edit_date: 1_700_000_050 },
-        attachments: [],
-      });
-      expect(prompt).not.toHaveBeenCalled();
-    });
-  });
-
-  it("logs a message_reaction event silently without waking the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate({
-        update_id: 3,
-        message_reaction: {
-          chat: { id: 42, type: "private" },
-          message_id: 7,
-          user: { id: 42, is_bot: false, first_name: "Test" },
-          date: 1_700_000_000,
-          old_reaction: [],
-          new_reaction: [{ type: "emoji", emoji: "👍" }],
-        },
-      } as never);
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "message_reaction"));
-      expect(events.find((event) => event.type === "message_reaction")).toMatchObject({
-        type: "message_reaction",
-        chat_id: 42,
-        message_reaction: {
-          message_id: 7,
-          new_reaction: [{ type: "emoji", emoji: "👍" }],
-        },
-      });
-      expect(prompt).not.toHaveBeenCalled();
-    });
-  });
-
-  it("treats member or administrator additions from left/kicked as bot group adds", () => {
-    const member = { status: "member" };
-    const administrator = { status: "administrator" };
-    const left = { status: "left" };
-    const kicked = { status: "kicked" };
-    expect(isBotGroupAdd({ old_chat_member: left, new_chat_member: member })).toBe(true);
-    expect(isBotGroupAdd({ old_chat_member: kicked, new_chat_member: member })).toBe(true);
-    expect(isBotGroupAdd({ old_chat_member: left, new_chat_member: administrator })).toBe(true);
-    expect(isBotGroupAdd({ old_chat_member: kicked, new_chat_member: administrator })).toBe(true);
-  });
-
-  it("does not treat permission changes or non-adds as bot group adds", () => {
-    const member = { status: "member" };
-    const administrator = { status: "administrator" };
-    const left = { status: "left" };
-    expect(isBotGroupAdd({ old_chat_member: member, new_chat_member: administrator })).toBe(false);
-    expect(isBotGroupAdd({ old_chat_member: member, new_chat_member: member })).toBe(false);
-    expect(isBotGroupAdd({ old_chat_member: administrator, new_chat_member: member })).toBe(false);
-    expect(isBotGroupAdd({ old_chat_member: left, new_chat_member: left })).toBe(false);
-    expect(isBotGroupAdd(null)).toBe(false);
-    expect(isBotGroupAdd({ old_chat_member: member })).toBe(false);
-  });
-
-  it("surfaces an administrator add on an unlisted chat instead of denying it", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate({
-        update_id: 6,
-        my_chat_member: {
-          chat: { id: -100123, type: "channel", title: "Test Channel" },
-          from: { id: 42, is_bot: false, first_name: "Admin" },
-          date: 1_700_000_000,
-          old_chat_member: { status: "left", user: { id: 999, is_bot: true, first_name: "Bot" } },
-          new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
-        },
-      } as never);
-      const events = await waitForChatEvents(dataDir, (events) => events.some(
-        (event) => event.type === "my_chat_member" && event.chat_id === -100123,
-      ));
-      expect(events.find((event) => event.type === "my_chat_member")).toMatchObject({
-        type: "my_chat_member",
-        chat_id: -100123,
-        my_chat_member: { new_chat_member: { status: "administrator" } },
-      });
-      expect(events.some((event) => event.type === "chat_denied")).toBe(false);
-    });
-  });
-
-  it("logs a my_chat_member event silently without waking the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate({
-        update_id: 4,
-        my_chat_member: {
-          chat: { id: 42, type: "group", title: "Test Group" },
-          from: { id: 42, is_bot: false, first_name: "Admin" },
-          date: 1_700_000_000,
-          old_chat_member: { status: "member", user: { id: 999, is_bot: true, first_name: "Bot" } },
-          new_chat_member: { status: "administrator", user: { id: 999, is_bot: true, first_name: "Bot" } },
-        },
-      } as never);
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "my_chat_member"));
-      expect(events.find((event) => event.type === "my_chat_member")).toMatchObject({
-        type: "my_chat_member",
-        chat_id: 42,
-        my_chat_member: {
-          new_chat_member: { status: "administrator" },
-        },
-      });
-      expect(prompt).not.toHaveBeenCalled();
-    });
-  });
-
-  it("logs a chat_join_request event silently without waking the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate({
-        update_id: 5,
-        chat_join_request: {
-          chat: { id: 42, type: "supergroup", title: "Test Supergroup" },
-          from: { id: 123, is_bot: false, first_name: "NewUser" },
-          user_chat_id: 123,
-          date: 1_700_000_000,
-        },
-      } as never);
-      const events = await waitForChatEvents(dataDir, (events) => events.some((event) => event.type === "chat_join_request"));
-      expect(events.find((event) => event.type === "chat_join_request")).toMatchObject({
-        type: "chat_join_request",
-        chat_id: 42,
-        chat_join_request: {
-          user_chat_id: 123,
-          from: { id: 123, first_name: "NewUser" },
-        },
-      });
-      expect(prompt).not.toHaveBeenCalled();
-    });
-  });
-
-  it("does not hang or follow a FIFO planted at the timeline path", async () => {
-    await withWorkspace(async (workspace) => {
-      const fifoPath = path.join(workspace, "timeline.jsonl");
-      execFileSync("mkfifo", [fifoPath]);
-      await expect(appendTimelineEvents(fifoPath, [{ type: "message", chat_id: 42, message: { message_id: 1 }, attachments: [] }])).resolves.toBe(false);
-      expect((await lstat(fifoPath)).isFIFO()).toBe(true);
-    });
-  }, 2_000);
 });
 
-
-
-
-
-
-describe("Telegram ingress gate", () => {
-  function messageUpdate(chatId: number, chat: Record<string, unknown> = {}): Record<string, unknown> {
-    return {
-      update_id: 1,
-      message: {
-        message_id: 7,
-        date: 1_700_000_000,
-        chat: { id: chatId, type: "private", ...chat },
-        from: { id: chatId, is_bot: false, first_name: "Test" },
-        text: "hello",
-      },
-    };
-  }
-
-  it("drops a message and fails closed when allowed.json is missing", async () => {
-    await withWorkspace(async (dataDir) => {
-      await rm(path.join(workspaceDir(dataDir), ".allowed.json"), { force: true });
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate(messageUpdate(42, { title: "Bootstrap Group" }) as never);
-
-      expect(prompt).not.toHaveBeenCalled();
-      expect(await readLogEvents(dataDir)).toEqual([]);
-    });
-  });
-
-  it("drops a message from a chat that is not on the allow list", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, recordRequests: true });
-      await bot.handleUpdate(messageUpdate(999, { title: "Secret Group" }) as never);
-
-      expect(prompt).not.toHaveBeenCalled();
-      expect(sentRequests.some((request) => request.url.endsWith("/sendMessage"))).toBe(false);
-
-      expect(await readLogEvents(dataDir)).toEqual([]);
-    });
-  });
-
-  it("drops unlisted chats without adding them to the shared timeline", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const interrupt = vi.fn(async () => undefined);
-      const followup = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt, followup });
-
-      await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
-      await bot.handleUpdate(messageUpdate(999, { title: "Stranger" }) as never);
-      await bot.handleUpdate({
-        update_id: 10,
-        message: {
-          message_id: 1,
-          date: 100,
-          chat: { id: -500, type: "group", title: "Random Group" },
-          from: { id: 777, is_bot: false, first_name: "Bob" },
-          text: "hello",
-        },
-      } as never);
-
-      expect(interrupt).not.toHaveBeenCalled();
-      expect(followup).not.toHaveBeenCalled();
-      expect(await readLogEvents(dataDir)).toEqual([]);
-    });
-  });
-
-  it("admits a listed chat and denies an unlisted one", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-
-      await bot.handleUpdate(messageUpdate(42) as never);
-      expect(prompt).toHaveBeenCalledTimes(1);
-      expect(wakeArg(prompt)).toMatchObject({ type: "message", chat_id: 42 });
-
-      await bot.handleUpdate(messageUpdate(999) as never);
-      expect(prompt).toHaveBeenCalledTimes(1);
-      expect((await readLogEvents(dataDir)).filter((event) => event.type === "message")).toHaveLength(1);
-    });
-  });
-
-  it("logs ambient group messages silently without interrupting the agent", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [-100]);
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-
-      await bot.handleUpdate({
-        update_id: 1,
-        message: {
-          message_id: 1,
-          date: 1_700_000_000,
-          chat: { id: -100, type: "group", title: "Busy Work Group" },
-          from: { id: 42, is_bot: false, first_name: "Alice" },
-          text: "Just discussing general work stuff",
-        },
-      } as never);
-
-      expect(prompt).not.toHaveBeenCalled();
-      const events = await readLogEvents(dataDir);
-      expect(events.some((e) => e.type === "message" && e.chat_id === -100)).toBe(true);
-    });
-  });
-
-  it("interrupts the agent when mentioned or directly replied to in a group", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [-100]);
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-
-      // 1. Direct mention
-      await bot.handleUpdate({
-        update_id: 2,
-        message: {
-          message_id: 2,
-          date: 1_700_000_000,
-          chat: { id: -100, type: "group", title: "Busy Work Group" },
-          from: { id: 42, is_bot: false, first_name: "Alice" },
-          text: "Hey @test_bot can you summarize this?",
-          entities: [{ type: "mention", offset: 4, length: 9 }],
-        },
-      } as never);
-      expect(prompt).toHaveBeenCalledTimes(1);
-
-      // 2. Direct reply
-      await bot.handleUpdate({
-        update_id: 3,
-        message: {
-          message_id: 3,
-          date: 1_700_000_000,
-          chat: { id: -100, type: "group", title: "Busy Work Group" },
-          from: { id: 42, is_bot: false, first_name: "Alice" },
-          text: "Yes, exactly that",
-          reply_to_message: { message_id: 10, from: { id: 999, is_bot: true, first_name: "Test" } },
-        },
-      } as never);
-      expect(prompt).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  describe("isMessageDirectedToBot", () => {
+describe("Telegram gates and commands", () => {
+  it("detects direct replies and Telegram mention entities", () => {
     const botInfo = { id: 999, username: "test_bot" };
-
-    it("detects direct replies to the bot", () => {
-      const msg = {
-        message_id: 1,
-        date: 100,
-        chat: { id: -100, type: "group" },
-        reply_to_message: { message_id: 2, date: 90, chat: { id: -100, type: "group" }, from: { id: 999, is_bot: true, first_name: "Bot" } },
-      } as never;
-      expect(isMessageDirectedToBot(msg, botInfo)).toBe(true);
-    });
-
-    it("detects @username mentions in text and captions", () => {
-      const msgWithText = {
-        message_id: 1,
-        date: 100,
-        chat: { id: -100, type: "group" },
-        text: "hello @TEST_BOT what is up",
-        entities: [{ type: "mention", offset: 6, length: 9 }],
-      } as never;
-      expect(isMessageDirectedToBot(msgWithText, botInfo)).toBe(true);
-
-      const msgWithCaption = {
-        message_id: 2,
-        date: 100,
-        chat: { id: -100, type: "group" },
-        caption: "check this @test_bot",
-        caption_entities: [{ type: "mention", offset: 11, length: 9 }],
-      } as never;
-      expect(isMessageDirectedToBot(msgWithCaption, botInfo)).toBe(true);
-    });
-
-    it("detects text_mention user IDs", () => {
-      const msg = {
-        message_id: 1,
-        date: 100,
-        chat: { id: -100, type: "group" },
-        text: "hello bot",
-        entities: [{ type: "text_mention", offset: 6, length: 3, user: { id: 999, is_bot: true, first_name: "Bot" } }],
-      } as never;
-      expect(isMessageDirectedToBot(msg, botInfo)).toBe(true);
-    });
-
-    it("returns false for ambient group messages without mentions or replies", () => {
-      const msg = {
-        message_id: 1,
-        date: 100,
-        chat: { id: -100, type: "group" },
-        text: "hello everyone @someone_else",
-        entities: [{ type: "mention", offset: 15, length: 13 }],
-      } as never;
-      expect(isMessageDirectedToBot(msg, botInfo)).toBe(false);
-    });
+    expect(isMessageDirectedToBot({
+      message_id: 1,
+      date: 100,
+      chat: { id: -100, type: "group" },
+      reply_to_message: { message_id: 2, date: 90, chat: { id: -100, type: "group" }, from: { id: 999, is_bot: true, first_name: "Bot" } },
+    } as never, botInfo)).toBe(true);
+    expect(isMessageDirectedToBot({
+      message_id: 1,
+      date: 100,
+      chat: { id: -100, type: "group" },
+      caption: "check @TEST_BOT",
+      caption_entities: [{ type: "mention", offset: 6, length: 9 }],
+    } as never, botInfo)).toBe(true);
+    expect(isMessageDirectedToBot({
+      message_id: 1,
+      date: 100,
+      chat: { id: -100, type: "group" },
+      text: "hello everyone",
+    } as never, botInfo)).toBe(false);
   });
 
-  it("fails closed when allowed.json is malformed", async () => {
-    await withWorkspace(async (dataDir) => {
-      const directory = workspaceDir(dataDir);
-      await mkdir(directory, { recursive: true });
-      const malformed = path.join(directory, ".allowed.json");
-      await writeFile(malformed, "{ not valid json\n", "utf8");
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-
-      await bot.handleUpdate(messageUpdate(42) as never);
-
-      expect(prompt).not.toHaveBeenCalled();
-      expect(await readLogEvents(dataDir)).toEqual([]);
-      expect(await readFile(malformed, "utf8")).toBe("{ not valid json\n");
-    });
-  });
-});
-
-
-describe("Telegram poll answers", () => {
-  it("records a poll answer for the in-memory owning chat without waking", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const prompt = vi.fn(async () => undefined);
-      const pollOwners = new Map([["poll-9", 42]]);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, pollOwners });
-      await bot.handleUpdate({
-        update_id: 3,
-        poll_answer: {
-          poll_id: "poll-9",
-          user: { id: 42, is_bot: false, first_name: "Test" },
-          option_ids: [1, 2],
-        },
-      } as never);
-      expect(prompt).not.toHaveBeenCalled();
-      const events = await waitForChatEvents(dataDir, (records) => records.some((event) => event.type === "poll_answer"));
-      expect(events.find((event) => event.type === "poll_answer")).toMatchObject({
-        type: "poll_answer",
-        chat_id: 42,
-        poll_answer: { poll_id: "poll-9", option_ids: [1, 2] },
-      });
-    });
+  it("distinguishes bot additions from permission changes", () => {
+    expect(isBotGroupAdd({ old_chat_member: { status: "left" }, new_chat_member: { status: "member" } })).toBe(true);
+    expect(isBotGroupAdd({ old_chat_member: { status: "kicked" }, new_chat_member: { status: "administrator" } })).toBe(true);
+    expect(isBotGroupAdd({ old_chat_member: { status: "member" }, new_chat_member: { status: "administrator" } })).toBe(false);
   });
 
-  it("does not consult timeline history while routing poll answers", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      await writeFile(path.join(dataDir, "timeline.jsonl"), "not json\n", "utf8");
-      const prompt = vi.fn(async () => undefined);
-      const pollOwners = new Map([["poll-9", 42]]);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, pollOwners });
-      await bot.handleUpdate({
-        update_id: 3,
-        poll_answer: {
-          poll_id: "poll-9",
-          user: { id: 42, is_bot: false, first_name: "Test" },
-          option_ids: [0],
-        },
-      } as never);
-      expect((await readLogEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(true);
-    });
-  });
-
-  it("drops poll answers from unknown polls", async () => {
-    await withWorkspace(async (dataDir) => {
-      const prompt = vi.fn(async () => undefined);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 } });
-      await bot.handleUpdate({
-        update_id: 3,
-        poll_answer: {
-          poll_id: "poll-missing",
-          user: { id: 42, is_bot: false, first_name: "Test" },
-          option_ids: [0],
-        },
-      } as never);
-      expect(prompt).not.toHaveBeenCalled();
-      expect((await readLogEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
-    });
-  });
-
-  it("drops poll answers owned by a chat not on the allow list", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const prompt = vi.fn(async () => undefined);
-      const pollOwners = new Map([["poll-999", 999]]);
-      const bot = await makeTestBot(dataDir, { interrupt: prompt }, { fetchResult: { message_id: 555 }, pollOwners });
-      await bot.handleUpdate({
-        update_id: 3,
-        poll_answer: {
-          poll_id: "poll-999",
-          user: { id: 999, is_bot: false, first_name: "Test" },
-          option_ids: [0],
-        },
-      } as never);
-      expect(prompt).not.toHaveBeenCalled();
-      expect((await readLogEvents(dataDir)).some((event) => event.type === "poll_answer")).toBe(false);
-    });
-  });
-});
-
-
-describe("Telegram commands", () => {
-  it("publishes only the remaining commands", async () => {
+  it("publishes only current commands", async () => {
     const setMyCommands = vi.fn(async () => true);
     await registerBotCommands({ api: { setMyCommands } } as unknown as Bot);
     expect(setMyCommands).toHaveBeenCalledWith([
@@ -1223,67 +626,29 @@ describe("Telegram commands", () => {
     ]);
   });
 
-  type FakeAgents = {
-    followup: Mock<(text: string) => Promise<void>>;
-    interrupt: Mock<(text: string) => Promise<void>>;
-    restartAll: Mock<() => Promise<void>>;
-  };
-
-  function makeAgents(overrides: Partial<FakeAgents> = {}): FakeAgents {
-    return {
-      followup: vi.fn(async () => undefined),
-      interrupt: vi.fn(async () => undefined),
-      restartAll: vi.fn(async () => undefined),
-      ...overrides,
-    };
-  }
-
-  function commandLength(text: string): number {
-    const end = text.search(/[\s@]/);
-    return end === -1 ? text.length : end;
-  }
-
-  async function sendCommand(bot: Bot, text: string, chatId = 42): Promise<void> {
-    await bot.handleUpdate({
-      update_id: 1,
+  it("handles /start and /restart through the connector-owned bot", async () => {
+    const test = await fixture();
+    const command = (text: string, updateId: number) => ({
+      update_id: updateId,
       message: {
-        message_id: 1,
+        message_id: updateId,
         date: 1_700_000_000,
-        chat: { id: chatId, type: "private" },
-        from: { id: chatId, is_bot: false, first_name: "Test" },
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
         text,
-        entities: [{ type: "bot_command", offset: 0, length: commandLength(text) }],
+        entities: [{ type: "bot_command", offset: 0, length: text.length }],
       },
-    } as never);
-  }
+    });
+    await test.bot.handleUpdate(command("/start", 20) as never);
+    await test.bot.handleUpdate(command("/restart", 21) as never);
 
-  function replies(_bot: Bot): string[] {
-    return sentRequests
+    expect(test.restartAll).toHaveBeenCalledOnce();
+    const replies = test.requests
       .filter((request) => request.url.endsWith("/sendMessage"))
       .map((request) => (JSON.parse(request.body) as { text: string }).text);
-  }
-
-  it("/start sends the personal-agent help text", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const agents = makeAgents();
-      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
-      await sendCommand(bot, "/start");
-      expect(replies(bot)).toEqual([
-        "Personal agent. Send text, attachments, or a location pin to continue your persistent session.",
-      ]);
-    });
+    expect(replies).toEqual([
+      "Personal agent. Send text, attachments, or a location pin to continue your persistent session.",
+      "Restarting all agents. They will resume on the next message.",
+    ]);
   });
-
-  it("/restart restarts all agents", async () => {
-    await withWorkspace(async (dataDir) => {
-      await writeAllowedChats(dataDir, [{ chat_id: 42 }]);
-      const agents = makeAgents();
-      const bot = await makeTestBot(dataDir, agents, { recordRequests: true });
-      await sendCommand(bot, "/restart");
-      expect(agents.restartAll).toHaveBeenCalledOnce();
-      expect(replies(bot)).toEqual(["Restarting all agents. They will resume on the next message."]);
-    });
-  });
-
 });

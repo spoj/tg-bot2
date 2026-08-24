@@ -222,7 +222,6 @@ export class PiWorker {
         hostSocketDir: this.options.hostSocketDir,
         hostTimeline: this.options.hostTimeline,
         hostAttachments: this.options.hostAttachments,
-        taskRun: this.options.taskRun,
       }),
     });
 
@@ -454,9 +453,8 @@ export class PiWorker {
     this.clearIdleTimer();
     let child = this.process;
     if (!child) {
-      // Stop arriving while the run is still starting: wait for the spawn, then
-      // terminate it here (otherwise the running prompt would take the task
-      // to completion instead of settling it aborted).
+      // stop() can arrive while the process is still starting; wait for spawn,
+      // then terminate it so no untracked process survives.
       await this.startPromise?.catch(() => {});
       child = this.process;
     }

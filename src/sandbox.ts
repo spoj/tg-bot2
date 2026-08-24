@@ -151,8 +151,6 @@ export type PiRunSandboxPaths = {
   agentToken?: string;
   /** Host-owned runtime directory bind-mounted read-only at /run. */
   hostSocketDir?: string;
-  /** Task runs dial the capability-restricted task bridge socket instead of the full one. */
-  taskRun?: boolean;
   /** Host-owned global timeline exposed read-only at /run/timeline.jsonl. */
   hostTimeline?: string;
   /** Host-managed attachments exposed read-only at /run/attachments. */
@@ -275,9 +273,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
       ? []
       : ["--ro-bind", paths.hostTimeline, "/run/timeline.jsonl"]),
     ...(paths.hostSocketDir === undefined ? [] : ["--remount-ro", "/run"]),
-    ...(paths.hostSocketDir === undefined
-      ? []
-      : ["--setenv", "PI_HOST_SOCKET", paths.taskRun ? "/run/host-task.sock" : "/run/host.sock"]),
+    ...(paths.hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/run/host.sock"]),
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",

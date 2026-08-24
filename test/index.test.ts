@@ -1,424 +1,356 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deferred } from "./helpers.js";
 import { conversationAgent, type ConversationAgentRef } from "../src/agent-ref.js";
+import type { AppConfig } from "../src/config.js";
+import { workspacePaths } from "../src/util.js";
+
 const temporaryDirectories: string[] = [];
 
 const state = vi.hoisted(() => {
-  const order: string[] = [];
-  const startupOrder: string[] = [];
-  const agents = {
-    start: vi.fn(async () => { startupOrder.push("agents.start"); }),
-    beginShutdown: vi.fn(() => {
-      order.push("agents.beginShutdown");
-      return Promise.resolve();
-    }),
-    disposeAll: vi.fn(async () => { order.push("agents.disposeAll"); }),
-    interrupt: vi.fn(async () => undefined),
+  const lifecycle: string[] = [];
+  const connectorRunResolvers: Array<() => void> = [];
+  const signalHandlers: Partial<Record<"SIGINT" | "SIGTERM", () => void>> = {};
+
+  const agentsStart = vi.fn(async () => { lifecycle.push("agents.start"); });
+  const agentsBeginShutdown = vi.fn(async () => { lifecycle.push("agents.beginShutdown"); });
+  const agentsDisposeAll = vi.fn(async () => { lifecycle.push("agents.disposeAll"); });
+  const agentsRestartAll = vi.fn(async () => {});
+  const agentsInterrupt = vi.fn(async () => {});
+  const agentManager = vi.fn(class AgentManagerMock {
+    constructor(_paths: unknown, _options: unknown) {}
+    start = agentsStart;
+    beginShutdown = agentsBeginShutdown;
+    disposeAll = agentsDisposeAll;
+    restartAll = agentsRestartAll;
+    interrupt = agentsInterrupt;
+  });
+  const routerOnEvent = vi.fn();
+  const agentEventRouter = vi.fn(class AgentEventRouterMock {
+    constructor(_agents: unknown, _options: unknown) {}
+    onEvent = routerOnEvent;
+  });
+
+  const schedulerAdd = vi.fn(async () => ({ id: "schedule-1" }));
+  const schedulerReplace = vi.fn(async () => ({ id: "schedule-1" }));
+  const schedulerRemove = vi.fn(async () => "schedule-1");
+  const schedulerTake = vi.fn(async () => ({ id: "schedule-1" }));
+  const scheduler = vi.fn(class WorkspaceSchedulerMock {
+    constructor(_options: unknown) {}
+    start = vi.fn(async () => { lifecycle.push("scheduler.start"); });
+    stop = vi.fn(async () => { lifecycle.push("scheduler.stop"); });
+    add = schedulerAdd;
+    replace = schedulerReplace;
+    remove = schedulerRemove;
+    take = schedulerTake;
+  });
+
+  const bridge = vi.fn(class HostBridgeMock {
+    constructor(_options: unknown) {}
+    start = vi.fn(async () => { lifecycle.push("bridge.start"); });
+    stop = vi.fn(async () => { lifecycle.push("bridge.stop"); });
+  });
+  const agentCredentials = vi.fn(class AgentCredentialsMock {});
+
+  const timelineSubscribe = vi.fn();
+  const timelineAnnotate = vi.fn(async () => 1);
+  const timeline = vi.fn(class WorkspaceTimelineMock {
+    constructor(_filePath: string) {}
+    subscribe = timelineSubscribe;
+    start = vi.fn(async () => { lifecycle.push("timeline.start"); });
+    annotateAttachment = timelineAnnotate;
+  });
+
+  const resourcesStart = vi.fn(async () => { lifecycle.push("resources.start"); });
+  const resources = vi.fn(class WorkspaceResourcesMock {
+    constructor(_filePath: string) {}
+    start = resourcesStart;
+  });
+
+  const registryRegister = vi.fn(() => { lifecycle.push("registry.register"); });
+  const registryPrompt = vi.fn((connectorId: string) => `prompt:${connectorId}`);
+  const parsedConversation = {
+    kind: "conversation" as const,
+    connectorId: "telegram:123",
+    conversationKey: "99:3",
+    address: { chat_id: 99, message_thread_id: 3 },
   };
-  const bot = {
-    start: vi.fn(),
-    stop: vi.fn(async () => { order.push("bot.stop"); }),
-  };
-  const taskSpawn = vi.fn(async () => ({ runId: "scheduled-run", status: "launched" }));
-  const taskContinue = vi.fn(async () => ({ runId: "scheduled-run", status: "launched" }));
-  const taskCancel = vi.fn(async () => "stopped");
-  const taskSteer = vi.fn(async () => "delivered");
-  const scheduleAdd = vi.fn(async () => ({ id: "schedule-1" }));
-  const scheduleReplace = vi.fn(async () => ({ id: "schedule-1" }));
-  const scheduleRemove = vi.fn(async () => "schedule-1");
-  const scheduleTake = vi.fn(async () => ({ id: "schedule-1" }));
+  const registryParseConversation = vi.fn(() => parsedConversation);
+  const registryAuthorizeConversation = vi.fn(async () => {});
+  const registry = vi.fn(class ConnectorRegistryMock {
+    constructor() {}
+    register = registryRegister;
+    prompt = registryPrompt;
+    parseConversation = registryParseConversation;
+    authorizeConversation = registryAuthorizeConversation;
+  });
+
+  const connectorSetAgent = vi.fn(() => { lifecycle.push("connector.setAgent"); });
+  const connectorRun = vi.fn(async () => {
+    lifecycle.push("connector.run");
+    await new Promise<void>((resolve) => connectorRunResolvers.push(resolve));
+  });
+  const connectorStop = vi.fn(async () => {
+    lifecycle.push("connector.stop");
+    for (const resolve of connectorRunResolvers.splice(0)) resolve();
+  });
+  const telegramConnector = vi.fn(class TelegramConnectorMock {
+    readonly id: string;
+    constructor(config: { id: string }, _timeline: unknown, _resources: unknown) {
+      this.id = config.id;
+    }
+    setAgent = connectorSetAgent;
+    run = connectorRun;
+    stop = connectorStop;
+  });
+
+  const outboxSend = vi.fn(async () => ({ ok: true }));
+  const outbox = vi.fn(class WorkspaceOutboxMock {
+    constructor(_options: unknown) {}
+    send = outboxSend;
+  });
+
+  const sandbox = { dataDir: "/validated", bwrapPath: "/validated/bwrap" };
+  const checkSandboxEnvironment = vi.fn(async () => sandbox);
+  const terminateActiveSandboxes = vi.fn(() => { lifecycle.push("sandbox.terminate"); });
+
   return {
-    order,
-    startupOrder,
-    agents,
-    bot,
-    config: {
-      dataDir: "/requested",
-      bots: [
-        {
-          token: "123:token",
-          botId: 123,
-          dataDir: "/requested",
-          botDir: "/requested/bots/123",
-          workspace: "/requested/bots/123/workspace",
-        },
-      ],
-    },
-    sandbox: { dataDir: "/canonical-data", bwrapPath: "/validated/bwrap" },
-    signalHandlers: {} as Record<string, () => void>,
-    checkSandboxEnvironment: vi.fn(),
-    agentManager: vi.fn(class AgentManagerMock {
-      start = agents.start;
-      beginShutdown = agents.beginShutdown;
-      disposeAll = agents.disposeAll;
-      interrupt = agents.interrupt;
-    }),
-    agentEventRouter: vi.fn(class AgentEventRouterMock {
-      onEvent = vi.fn();
-    }),
-    scheduler: vi.fn(class WorkspaceSchedulerMock {
-      options: unknown;
-      constructor(options: unknown) {
-        this.options = options;
-      }
-      start = vi.fn(async () => { startupOrder.push("scheduler.start"); });
-      add = scheduleAdd;
-      replace = scheduleReplace;
-      remove = scheduleRemove;
-      take = scheduleTake;
-      stop = vi.fn(async () => { order.push("scheduler.stop"); });
-    }),
-    outbox: vi.fn(class WorkspaceOutboxMock {
-      dispatch: unknown;
-      constructor(options: { dispatch: unknown }) {
-        this.dispatch = options.dispatch;
-      }
-    }),
-    agentCredentials: vi.fn(class AgentCredentialsMock {}),
-    bridge: vi.fn(class HostBridgeMock {
-      socketPath: string;
-      constructor(options: { socketPath: string }) {
-        this.socketPath = options.socketPath;
-      }
-      start = vi.fn(async () => { startupOrder.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.start" : "bridge.start"); });
-      stop = vi.fn(async () => { order.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.stop" : "bridge.stop"); });
-    }),
-    taskSpawn,
-    taskContinue,
-    taskCancel,
-    taskSteer,
-    scheduleAdd,
-    scheduleReplace,
-    scheduleRemove,
-    scheduleTake,
-    tasks: vi.fn(class WorkspaceTasksMock {
-      constructor(_options: unknown) {}
-      spawn = taskSpawn;
-      continueTask = taskContinue;
-      cancel = taskCancel;
-      steer = taskSteer;
-      start = vi.fn(async () => { startupOrder.push("tasks.start"); });
-      stop = vi.fn(async () => { order.push("tasks.stop"); });
-    }),
-    createTelegramBot: vi.fn(() => bot),
-    dispatchOutboxRequest: vi.fn(),
-    delivery: vi.fn(class TelegramDeliveryQueueMock {
-      enqueue = vi.fn(async (_chatId: number, run: () => unknown) => run());
-      drain = vi.fn(async () => { order.push("delivery.drain"); });
-    }),
-    terminateActiveSandboxes: vi.fn(),
-    spawnProcess: vi.fn(),
-    terminateProcessGroup: vi.fn(),
+    lifecycle,
+    connectorRunResolvers,
+    signalHandlers,
+    config: undefined as unknown as AppConfig,
+    sandbox,
+    checkSandboxEnvironment,
+    terminateActiveSandboxes,
+    agentManager,
+    agentEventRouter,
+    agentsStart,
+    agentsBeginShutdown,
+    agentsDisposeAll,
+    agentsRestartAll,
+    agentsInterrupt,
+    routerOnEvent,
+    scheduler,
+    schedulerAdd,
+    schedulerReplace,
+    schedulerRemove,
+    schedulerTake,
+    bridge,
+    agentCredentials,
+    timeline,
+    timelineSubscribe,
+    timelineAnnotate,
+    resources,
+    resourcesStart,
+    registry,
+    registryRegister,
+    registryPrompt,
+    registryParseConversation,
+    registryAuthorizeConversation,
+    parsedConversation,
+    telegramConnector,
+    connectorSetAgent,
+    connectorRun,
+    connectorStop,
+    outbox,
+    outboxSend,
   };
 });
 
-vi.mock("../src/config.js", () => ({
-  loadConfig: async () => state.config,
-}));
+vi.mock("../src/config.js", () => ({ loadConfig: async () => state.config }));
 vi.mock("../src/sandbox.js", () => ({
   checkSandboxEnvironment: state.checkSandboxEnvironment,
-  spawnProcess: state.spawnProcess,
+  spawnProcess: vi.fn(),
+  terminateProcessGroup: vi.fn(),
   terminateActiveSandboxes: state.terminateActiveSandboxes,
-  terminateProcessGroup: state.terminateProcessGroup,
 }));
 vi.mock("../src/agent.js", () => ({ AgentManager: state.agentManager, AgentEventRouter: state.agentEventRouter }));
 vi.mock("../src/scheduler.js", () => ({ WorkspaceScheduler: state.scheduler }));
 vi.mock("../src/outbox.js", () => ({ WorkspaceOutbox: state.outbox }));
 vi.mock("../src/host-bridge.js", () => ({ HostBridge: state.bridge, AgentCredentials: state.agentCredentials }));
-vi.mock("../src/task.js", () => ({ WorkspaceTasks: state.tasks }));
-vi.mock("../src/telegram.js", () => ({
-  createTelegramBot: state.createTelegramBot,
-  dispatchOutboxRequest: state.dispatchOutboxRequest,
-  TelegramDeliveryQueue: state.delivery,
-}));
-async function importIndex(configure?: () => void): Promise<typeof import("../src/index.js")> {
-  state.order.length = 0;
-  state.startupOrder.length = 0;
+vi.mock("../src/events.js", () => ({ WorkspaceTimeline: state.timeline }));
+vi.mock("../src/resource-state.js", () => ({ WorkspaceResources: state.resources }));
+vi.mock("../src/connector.js", () => ({ ConnectorRegistry: state.registry }));
+vi.mock("../src/telegram-connector.js", () => ({ TelegramConnector: state.telegramConnector }));
+
+async function importIndex(): Promise<{ module: typeof import("../src/index.js"); paths: ReturnType<typeof workspacePaths> }> {
+  vi.resetModules();
+  vi.clearAllMocks();
+  state.lifecycle.length = 0;
+  state.connectorRunResolvers.length = 0;
+  delete state.signalHandlers.SIGINT;
+  delete state.signalHandlers.SIGTERM;
+
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "tg-bot2-index-"));
   temporaryDirectories.push(dataDir);
+  const paths = workspacePaths(dataDir, "primary");
   state.sandbox.dataDir = dataDir;
-  state.checkSandboxEnvironment.mockReset().mockResolvedValue(state.sandbox);
-  state.agentManager.mockClear();
-  state.taskContinue.mockClear();
-  state.taskCancel.mockClear();
-  state.taskSteer.mockClear();
-  state.scheduler.mockClear();
-  state.outbox.mockClear();
-  state.bridge.mockClear();
-  state.tasks.mockClear();
-  state.createTelegramBot.mockClear();
-  state.dispatchOutboxRequest.mockClear();
-  state.terminateActiveSandboxes.mockClear();
-  state.agents.start.mockClear();
-  state.agents.beginShutdown.mockClear();
-  state.agents.disposeAll.mockClear();
-  state.agents.interrupt.mockClear();
-  state.taskSpawn.mockClear();
-  state.scheduleAdd.mockClear();
-  state.scheduleReplace.mockClear();
-  state.scheduleRemove.mockClear();
-  state.scheduleTake.mockClear();
-  state.bot.stop.mockClear();
-  state.bot.start.mockReset();
-  configure?.();
-  state.signalHandlers = {};
+  state.sandbox.bwrapPath = "/validated/bwrap";
+  state.config = {
+    dataDir: "/requested",
+    workspaces: [{
+      id: "primary",
+      paths,
+      connectors: [{
+        type: "telegram",
+        id: "telegram:123",
+        token: "123:token",
+        botId: 123,
+        workspaceId: "primary",
+        dataDir,
+        attachmentPrefix: "/attachments",
+        workspace: paths.workspace,
+        attachments: paths.attachments,
+      }],
+    }],
+  };
+
   vi.spyOn(process, "once").mockImplementation(((event: string, listener: () => void) => {
-    state.signalHandlers[event] = listener;
+    if (event === "SIGINT" || event === "SIGTERM") state.signalHandlers[event] = listener;
     return process;
   }) as typeof process.once);
-  process.exitCode = undefined;
-  vi.resetModules();
-  return import("../src/index.js");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  return { module: await import("../src/index.js"), paths };
+}
+
+async function stopMain(running: Promise<void>): Promise<void> {
+  state.signalHandlers.SIGTERM?.();
+  await vi.waitFor(() => expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce());
+  await running;
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const resolve of state.connectorRunResolvers.splice(0)) resolve();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-const workspacePath = (): string => path.join(state.sandbox.dataDir, "bots", "123", "workspace");
+const mockInstance = <T>(mock: { mock: { instances: T[] } }, index = 0): T => mock.mock.instances[index]!;
 
 describe("application startup and shutdown wiring", () => {
-  it("passes canonical sandbox paths through every runtime component", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(state.agentManager).toHaveBeenCalledOnce());
-    expect(state.checkSandboxEnvironment).toHaveBeenCalledOnce();
+  it("constructs one workspace-native runtime and starts resources before services", async () => {
+    const { module: index, paths } = await importIndex();
+    const running = index.main();
+    await vi.waitFor(() => expect(state.connectorRun).toHaveBeenCalledOnce());
+
     expect(state.checkSandboxEnvironment).toHaveBeenCalledWith("/requested");
+    expect(state.resources).toHaveBeenCalledWith(paths.resources);
+    expect(state.resourcesStart).toHaveBeenCalledWith();
+
+    const timeline = mockInstance(state.timeline);
+    const resources = mockInstance(state.resources);
+    const connector = mockInstance(state.telegramConnector);
+    const registry = mockInstance(state.registry);
+    const agents = mockInstance(state.agentManager);
+    expect(state.telegramConnector).toHaveBeenCalledWith(state.config.workspaces[0]!.connectors[0], timeline, resources);
+    expect(state.registryRegister).toHaveBeenCalledWith(connector);
+    expect(state.connectorSetAgent).toHaveBeenCalledWith(agents);
+    expect(state.timelineSubscribe).toHaveBeenCalledWith(expect.any(Function));
+
     expect(state.agentManager).toHaveBeenCalledWith(
-      { workspace: workspacePath() },
+      { workspace: paths.workspace },
       expect.objectContaining({
-        appRoot: expect.any(String),
-        credentials: expect.any(Object),
+        appRoot: process.cwd(),
         bwrapPath: "/validated/bwrap",
-        hostSocketDir: path.join(state.sandbox.dataDir, "bots", "123", "run"),
-        hostTimeline: path.join(state.sandbox.dataDir, "bots", "123", "timeline.jsonl"),
+        hostSocketDir: paths.runDir,
+        hostTimeline: paths.timeline,
+        hostAttachments: paths.attachments,
+        notificationsPath: paths.notifications,
+        connectorPrompt: expect.any(Function),
       }),
     );
-    const schedulerOptions = (state.scheduler.mock.calls[0]?.[0] as { workspace: string; schedulePath: string; legacyStatePath: string; timeline: unknown }) ?? {};
-    expect(schedulerOptions.workspace).toBe(workspacePath());
-    expect(schedulerOptions.schedulePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "run", "schedules.json"));
-    expect(schedulerOptions.legacyStatePath).toBe(path.join(state.sandbox.dataDir, "bots", "123", "scheduler-state.json"));
-    expect(schedulerOptions.timeline).toBeDefined();
-    expect(state.outbox).toHaveBeenCalledWith(expect.objectContaining({ dispatch: expect.any(Function), timeline: expect.any(Object) }));
-    expect(state.tasks).toHaveBeenCalledWith(expect.objectContaining({
-      workspace: workspacePath(),
-      bwrapPath: "/validated/bwrap",
-      timeline: expect.any(Object),
-      credentials: expect.any(Object),
-      statePath: path.join(state.sandbox.dataDir, "bots", "123", "run", "tasks.json"),
-      hostSocketDir: expect.any(String),
-      hostTimeline: expect.any(String),
-    }));
-    expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
-      socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host.sock"),
-      credentials: expect.any(Object),
-      handlers: expect.objectContaining({
-        send: expect.any(Function),
-        annotate: expect.any(Function),
-        spawn: expect.any(Function),
-        continueTask: expect.any(Function),
-        cancel: expect.any(Function),
-        steerTask: expect.any(Function),
-        steerConversation: expect.any(Function),
-        scheduleAdd: expect.any(Function),
-        scheduleReplace: expect.any(Function),
-        scheduleRemove: expect.any(Function),
-        scheduleTake: expect.any(Function),
-      }),
-    }));
-    expect(state.bridge).toHaveBeenCalledWith(expect.objectContaining({
-      socketPath: path.join(state.sandbox.dataDir, "bots", "123", "run", "host-task.sock"),
-      credentials: expect.any(Object),
-      handlers: {
-        annotate: expect.any(Function),
-      },
-    }));
-    expect(state.bot.start).toHaveBeenCalledWith(expect.objectContaining({
-      allowed_updates: [
-        "message",
-        "edited_message",
-        "callback_query",
-        "poll_answer",
-        "message_reaction",
-        "my_chat_member",
-        "chat_join_request",
-      ],
-    }));
-  });
+    const agentOptions = state.agentManager.mock.calls[0]![1] as { connectorPrompt: (connectorId: string) => string };
+    expect(agentOptions.connectorPrompt("telegram:123")).toBe("prompt:telegram:123");
+    expect(state.registryPrompt).toHaveBeenCalledWith("telegram:123");
+    expect(state.outbox).toHaveBeenCalledWith({ connectors: registry, timeline });
+    expect(state.scheduler).toHaveBeenCalledWith({
+      schedulePath: paths.schedules,
+      timeline,
+    });
 
-  it("starts host bridges before task recovery and scheduler polling", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    expect(state.startupOrder).toEqual([
+    expect(state.bridge).toHaveBeenCalledOnce();
+    const bridgeOptions = state.bridge.mock.calls[0]![0] as { socketPath: string; handlers: Record<string, unknown> };
+    expect(bridgeOptions.socketPath).toBe(path.join(paths.runDir, "host.sock"));
+    expect(Object.keys(bridgeOptions.handlers).sort()).toEqual([
+      "annotate",
+      "scheduleAdd",
+      "scheduleRemove",
+      "scheduleReplace",
+      "scheduleTake",
+      "send",
+      "steerConversation",
+    ]);
+    expect(state.lifecycle).toEqual([
+      "timeline.start",
+      "resources.start",
+      "registry.register",
+      "connector.setAgent",
       "bridge.start",
-      "taskBridge.start",
-      "tasks.start",
       "scheduler.start",
       "agents.start",
+      "connector.run",
     ]);
+    expect(await readFile(paths.timeline, "utf8")).toBe("");
+    expect((await stat(paths.runDir)).isDirectory()).toBe(true);
+    expect((await stat(paths.attachments)).isDirectory()).toBe(true);
+
+    await stopMain(running);
   });
 
-  it("creates the host-owned timeline and run directory before starting services", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const hostLog = path.join(state.sandbox.dataDir, "bots", "123", "timeline.jsonl");
-    expect(await readFile(hostLog, "utf8")).toBe("");
-    expect((await stat(path.join(state.sandbox.dataDir, "bots", "123", "run"))).isDirectory()).toBe(true);
-  });
-
-
-  it("delegates outbox dispatch to dispatchOutboxRequest via the delivery queue", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-
-    state.dispatchOutboxRequest.mockResolvedValue({ messageId: 7 });
-    const outbox = state.outbox.mock.instances[0] as { dispatch: (chatId: number, requestId: string, req: unknown) => Promise<unknown> };
-    const request = { method: "sendMessage", text: "hi" };
-    const result = await outbox.dispatch(42, "req-1", request);
-    expect(state.dispatchOutboxRequest).toHaveBeenCalledWith(
-      state.bot,
-      expect.objectContaining({ workspace: workspacePath(), attachments: path.join(state.sandbox.dataDir, "bots", "123", "attachments") }),
-      42,
-      "req-1",
-      request,
-    );
-    expect(result).toEqual({ messageId: 7 });
-  });
-
-  it("routes cross/self conversation steering through owners", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const actor = conversationAgent(42, 7);
-
-    await mkdir(workspacePath(), { recursive: true });
-    await writeFile(path.join(workspacePath(), ".allowed.json"), JSON.stringify([42, 99]), "utf8");
-    const bridgeOptions = state.bridge.mock.calls[0]?.[0] as unknown as {
-      handlers: { steerConversation: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>> };
-    };
-    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 99, message_thread_id: 3, message: "Handle timeline message 120" }, actor))
-      .resolves.toEqual({ status: "delivered" });
-    expect(state.agents.interrupt).toHaveBeenCalledWith(
-      "Conversation 42:7 delegated work to you:\nHandle timeline message 120",
-      conversationAgent(99, 3),
-    );
-
-    await expect(bridgeOptions.handlers.steerConversation({ chat_id: 42, message_thread_id: 7, message: "Reconsider the current approach" }, actor))
-      .resolves.toEqual({ status: "delivered" });
-    expect(state.agents.interrupt).toHaveBeenLastCalledWith(
-      "Conversation 42:7 delegated work to you:\nReconsider the current approach",
-      actor,
-    );
-  });
-
-  it("routes owned task controls and launch options", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const actor = conversationAgent(42, 7);
-    const handlers = (state.bridge.mock.calls[0]?.[0] as unknown as {
+  it("routes connector-native bridge operations through the registry and conversation owner", async () => {
+    const { module: index } = await importIndex();
+    const running = index.main();
+    await vi.waitFor(() => expect(state.connectorRun).toHaveBeenCalledOnce());
+    const actor = conversationAgent("telegram:123", "42:7", { chat_id: 42, message_thread_id: 7 });
+    const handlers = (state.bridge.mock.calls[0]![0] as {
       handlers: {
-        spawn: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-        continueTask: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-        cancel: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-        steerTask: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        send: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<unknown>;
+        annotate: (params: Record<string, unknown>) => Promise<unknown>;
+        steerConversation: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<unknown>;
+        scheduleAdd: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<unknown>;
       };
     }).handlers;
-    const launch = { prompt: "work", model: "openrouter/model", thinking: "high" };
 
-    await expect(handlers.spawn(launch, actor)).resolves.toEqual({ runId: "scheduled-run", status: "launched" });
-    await expect(handlers.continueTask({ runId: "scheduled-run", ...launch }, actor)).resolves.toEqual({ runId: "scheduled-run", status: "launched" });
-    await expect(handlers.steerTask({ runId: "scheduled-run", message: "adjust" }, actor)).resolves.toEqual({ status: "delivered" });
-    await expect(handlers.cancel({ runId: "scheduled-run" }, actor)).resolves.toEqual({ status: "stopped" });
-    expect(state.taskSpawn).toHaveBeenCalledWith(launch, actor);
-    expect(state.taskContinue).toHaveBeenCalledWith({ runId: "scheduled-run", ...launch }, actor);
-    expect(state.taskSteer).toHaveBeenCalledWith("scheduled-run", "adjust", actor);
-    expect(state.taskCancel).toHaveBeenCalledWith("scheduled-run", actor);
+    const request = { method: "sendMessage", text: "hello" };
+    await expect(handlers.send({ request }, actor)).resolves.toEqual({ ok: true });
+    expect(state.outboxSend).toHaveBeenCalledWith(request, actor);
+    await expect(handlers.annotate({ attachment: "/attachments/a", description: "receipt" })).resolves.toEqual({ occurrences: 1 });
+    expect(state.timelineAnnotate).toHaveBeenCalledWith("/attachments/a", "receipt");
+    await expect(handlers.steerConversation({ conversation: { connectorId: "telegram:123" }, message: "delegate" }, actor)).resolves.toEqual({ status: "delivered" });
+    expect(state.registryAuthorizeConversation).toHaveBeenCalledWith(state.parsedConversation);
+    expect(state.agentsInterrupt).toHaveBeenCalledWith(expect.stringContaining("delegate"), state.parsedConversation);
+    await handlers.scheduleAdd({ prompt: "later" }, actor);
+    expect(state.schedulerAdd).toHaveBeenCalledWith({ prompt: "later" }, actor);
+
+    await stopMain(running);
   });
 
-  it("routes schedule mutations through the authenticated conversation", async () => {
-    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-    const actor = conversationAgent(42, 7);
-    const handlers = (state.bridge.mock.calls[0]?.[0] as unknown as {
-      handlers: {
-        scheduleAdd: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-        scheduleReplace: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-        scheduleRemove: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-        scheduleTake: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
-      };
-    }).handlers;
-    const definition = { prompt: "report", start: "2026-08-25T09:00:00.000Z", recurrence: "daily" };
-
-    await expect(handlers.scheduleAdd(definition, actor)).resolves.toEqual({ schedule: { id: "schedule-1" } });
-    await expect(handlers.scheduleReplace({ id: "schedule-1", ...definition }, actor)).resolves.toEqual({ schedule: { id: "schedule-1" } });
-    await expect(handlers.scheduleTake({ id: "schedule-1" }, actor)).resolves.toEqual({ schedule: { id: "schedule-1" } });
-    await expect(handlers.scheduleRemove({ id: "schedule-1" }, actor)).resolves.toEqual({ id: "schedule-1" });
-    expect(state.scheduleAdd).toHaveBeenCalledWith(definition, actor);
-    expect(state.scheduleReplace).toHaveBeenCalledWith({ id: "schedule-1", ...definition }, actor);
-    expect(state.scheduleTake).toHaveBeenCalledWith({ id: "schedule-1" }, actor);
-    expect(state.scheduleRemove).toHaveBeenCalledWith({ id: "schedule-1" }, actor);
-  });
-
-  it("raises the shutdown gate, disposes every service, and treats signal abort as graceful", async () => {
-    const start = deferred<void>();
-    const index = await importIndex(() => state.bot.start.mockReturnValue(start.promise));
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
-
-    state.signalHandlers.SIGTERM?.();
-    await vi.waitFor(() => expect(state.order).toEqual([
-      "bot.stop", "agents.beginShutdown", "scheduler.stop", "bridge.stop", "taskBridge.stop", "tasks.stop", "agents.disposeAll", "delivery.drain",
-    ]));
-    expect(process.exitCode).toBeUndefined();
-
-    start.reject(Object.assign(new Error("telegram polling aborted"), { name: "AbortError" }));
-    await vi.waitFor(() => expect(process.exitCode).toBeUndefined());
-  });
-
-  it("does not classify an unrelated startup failure as a signal abort", async () => {
-    const { isIntentionalSignalAbort } = await importIndex();
-    expect(isIntentionalSignalAbort(new Error("Telegram polling failed"))).toBe(false);
-    expect(isIntentionalSignalAbort(new Error("Aborted delay"))).toBe(true);
-    expect(isIntentionalSignalAbort(Object.assign(new Error("cancelled"), { name: "AbortError" }))).toBe(true);
-  });
-
-  it("starts and stops all configured bots when multiple bots exist", async () => {
-    const start1 = deferred<void>();
-    const start2 = deferred<void>();
-    state.config = {
-      dataDir: "/requested",
-      bots: [
-        { token: "100:token100", botId: 100, dataDir: "/requested", botDir: "/requested/bots/100", workspace: "/requested/bots/100/workspace" },
-        { token: "200:token200", botId: 200, dataDir: "/requested", botDir: "/requested/bots/200", workspace: "/requested/bots/200/workspace" },
-      ],
-    };
-    let callCount = 0;
-    const index = await importIndex(() => {
-      state.bot.start.mockImplementation(() => {
-        callCount++;
-        return callCount === 1 ? start1.promise : start2.promise;
-      });
-    });
-    void index.main();
-    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledTimes(2));
-    expect(state.agentManager).toHaveBeenCalledTimes(2);
-    expect(state.scheduler).toHaveBeenCalledTimes(2);
-    expect(state.bridge).toHaveBeenCalledTimes(4); // host.sock + host-task.sock per bot
-    expect(state.tasks).toHaveBeenCalledTimes(2);
+  it("stops agents before disposing the workspace and its connectors", async () => {
+    const { module: index } = await importIndex();
+    const running = index.main();
+    await vi.waitFor(() => expect(state.connectorRun).toHaveBeenCalledOnce());
 
     state.signalHandlers.SIGINT?.();
-    await vi.waitFor(() => expect(state.bot.stop).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(state.agents.beginShutdown).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(state.agents.disposeAll).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce());
+    await running;
+    expect(state.lifecycle).toEqual([
+      "timeline.start",
+      "resources.start",
+      "registry.register",
+      "connector.setAgent",
+      "bridge.start",
+      "scheduler.start",
+      "agents.start",
+      "connector.run",
+      "agents.beginShutdown",
+      "scheduler.stop",
+      "bridge.stop",
+      "agents.disposeAll",
+      "connector.stop",
+      "sandbox.terminate",
+    ]);
   });
 });
 
@@ -427,40 +359,36 @@ describe("finishDisposal", () => {
     const calls: string[] = [];
     const step = (name: string) => vi.fn(async () => {
       calls.push(name);
-      if (throws) throw new Error(`${name} failed`);
+      if (throws) throw new Error(name);
     });
     return {
       calls,
       services: {
-        agents: { disposeAll: step("disposeAll") },
         scheduler: { stop: step("scheduler.stop") },
         bridge: { stop: step("bridge.stop") },
-        taskBridge: { stop: step("taskBridge.stop") },
-        tasks: { stop: step("tasks.stop") },
-        delivery: { drain: step("delivery.drain") },
+        agents: { disposeAll: step("agents.disposeAll") },
+        connectors: [{ stop: step("connector.1.stop") }, { stop: step("connector.2.stop") }],
       },
     };
   }
 
-  it("runs every disposal step in order and forces agent disposal", async () => {
-    const { finishDisposal } = await importIndex();
+  it("disposes host services before every connector", async () => {
+    const { module: index } = await importIndex();
     const { calls, services } = makeServices();
 
-    await finishDisposal(services);
+    await index.finishDisposal(services);
 
-    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "taskBridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
-    expect(services.agents.disposeAll).toHaveBeenCalledWith();
+    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "agents.disposeAll", "connector.1.stop", "connector.2.stop"]);
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
 
-  it("runs every step even when earlier steps throw and swallows the errors", async () => {
-    const { finishDisposal } = await importIndex();
+  it("continues connector disposal after earlier failures", async () => {
+    const { module: index } = await importIndex();
     const { calls, services } = makeServices(true);
 
-    await expect(finishDisposal(services)).resolves.toBeUndefined();
+    await expect(index.finishDisposal(services)).resolves.toBeUndefined();
 
-    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "taskBridge.stop", "tasks.stop", "disposeAll", "delivery.drain"]);
-    expect(services.agents.disposeAll).toHaveBeenCalledWith();
+    expect(calls).toEqual(["scheduler.stop", "bridge.stop", "agents.disposeAll", "connector.1.stop", "connector.2.stop"]);
     expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce();
   });
 });

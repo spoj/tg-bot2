@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi, type Mock } from "vitest";
@@ -12,12 +12,12 @@ import {
   type AgentWorker,
   type AgentWorkerOptions,
 } from "../src/agent.js";
-import { conversationAgent } from "../src/agent-ref.js";
+import { conversationAgent, conversationSessionPath } from "../src/agent-ref.js";
+import { ConnectorRegistry, type WorkspaceConnector } from "../src/connector.js";
+import { TIMELINE_PROMPT, type TimelineRecord } from "../src/events.js";
 import { AgentCredentials } from "../src/host-bridge.js";
-import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
-import { TIMELINE_PROMPT } from "../src/events.js";
 import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
-import { TASKS_PROMPT } from "../src/task-protocol.js";
+import { telegramConversation } from "../src/telegram-ref.js";
 
 type FakeWorker = AgentWorker & {
   options: AgentWorkerOptions;
@@ -103,17 +103,40 @@ function fakeWorkerFactory(
   return { factory, workers };
 }
 
-const CHAT = conversationAgent(123);
+const CONNECTOR_ID = "telegram:999";
+const CONNECTOR_PROMPT = "Connector-native test instructions.\n";
+const CHAT = telegramConversation(CONNECTOR_ID, 123);
 
-function managerOptions(overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
+function managerOptions(dataDir: string, overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
   return {
     appRoot: "/tmp/tg-bot2-app",
     credentials: new AgentCredentials(),
+    notificationsPath: path.join(dataDir, "notifications.jsonl"),
+    connectorPrompt: () => CONNECTOR_PROMPT,
     spawnProcess: vi.fn(),
     terminateProcessGroup: vi.fn(),
     now: () => 1_000_000,
     ...overrides,
   };
+}
+
+function fakeTelegramConnector(): { connector: WorkspaceConnector; connectors: ConnectorRegistry } {
+  const connector: WorkspaceConnector = {
+    id: CONNECTOR_ID,
+    prompt: CONNECTOR_PROMPT,
+    send: vi.fn(async () => ({ request: {} })),
+    parseConversation: vi.fn(() => CHAT),
+    authorizeConversation: vi.fn(async () => undefined),
+    notificationText: vi.fn((_record: TimelineRecord, rawLine: string) => rawLine),
+    attention: vi.fn((record: TimelineRecord): "interrupt" | undefined => {
+      if (record.type !== "telegram.message") return undefined;
+      const meta = record.meta as { user_content?: unknown } | undefined;
+      return meta?.user_content === true ? "interrupt" : undefined;
+    }),
+  };
+  const connectors = new ConnectorRegistry();
+  connectors.register(connector);
+  return { connector, connectors };
 }
 
 async function withDataDir(run: (dataDir: string) => Promise<void>): Promise<void> {
@@ -131,20 +154,16 @@ async function settingsFile(dataDir: string, content: Record<string, unknown>): 
   await writeFile(target, JSON.stringify(content), "utf8");
 }
 
-
-it("composes a concise behavior-oriented SYSTEM_PROMPT", () => {
-  expect(SYSTEM_PROMPT).toContain(OUTBOX_PROMPT);
+it("composes a concise behavior-oriented SYSTEM_PROMPT without task protocol instructions", () => {
   expect(SYSTEM_PROMPT).toContain(TIMELINE_PROMPT);
   expect(SYSTEM_PROMPT).toContain(SCHEDULES_PROMPT);
-  expect(SYSTEM_PROMPT).toContain(TASKS_PROMPT);
-  expect(SYSTEM_PROMPT).toContain("include topic_name in a normal sendMessage");
-  expect(SYSTEM_PROMPT).toContain("Never spend a separate tool call");
-  expect(SYSTEM_PROMPT).not.toContain("around message 2-3");
-  expect(SYSTEM_PROMPT).toContain("/restart applies settings changes");
-  expect(SYSTEM_PROMPT).toContain("complete raw Telegram event");
+  expect(SYSTEM_PROMPT).toContain("connector-native payload");
+  expect(SYSTEM_PROMPT).toContain("/restart applies model and notification setting changes");
   expect(SYSTEM_PROMPT).toContain("stable notification ID");
   expect(SYSTEM_PROMPT).toContain("mktemp -d /tmp/chrome-profile.XXXXXX");
   expect(SYSTEM_PROMPT).toContain("--remote-debugging-port=0");
+  expect(SYSTEM_PROMPT).not.toContain("continue_task");
+  expect(SYSTEM_PROMPT).not.toContain("steer_task");
 });
 
 it("loadUserSettings tolerates missing, empty, and malformed files", async () => {
@@ -162,12 +181,12 @@ it("loadUserSettings tolerates missing, empty, and malformed files", async () =>
 it("followup starts a fresh worker and sends prompt with followUp streaming behavior", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled work", CHAT);
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
-      appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,annotate,spawn,continue_task,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
+      appendSystemPrompt: expect.stringContaining(CONNECTOR_PROMPT),
+      hostTools: "send,annotate,steer_conversation,schedule_add,schedule_replace,schedule_remove,schedule_take",
     });
     expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("\nscheduled work"), "followUp", undefined);
   });
@@ -176,7 +195,7 @@ it("followup starts a fresh worker and sends prompt with followUp streaming beha
 it("interrupt sends prompt with steer streaming behavior to the active worker", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("scheduled", CHAT);
     expect(workers).toHaveLength(1);
     await manager.interrupt("stop and do this", CHAT, 120_000);
@@ -188,7 +207,7 @@ it("interrupt sends prompt with steer streaming behavior to the active worker", 
 it("interrupt while idle starts a worker immediately", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.interrupt("user instruction", CHAT);
     expect(workers).toHaveLength(1);
     expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("\nuser instruction"), "steer", undefined);
@@ -204,7 +223,7 @@ it("waits for prompt acceptance before delivering the next notification", async 
       promptCount += 1;
       if (promptCount === 1) await firstAccepted;
     });
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
 
     const first = manager.interrupt("first", CHAT, undefined, { id: "event-1", sequence: 1 });
     await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledOnce());
@@ -222,12 +241,12 @@ it("replays a notification that was persisted but not accepted", async () => {
   await withDataDir(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
     const failed = fakeWorkerFactory(async () => { throw new Error("RPC rejected prompt"); });
-    const firstManager = new AgentManager({ workspace }, managerOptions({ workerFactory: failed.factory }));
+    const firstManager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: failed.factory }));
     await expect(firstManager.interrupt("complete user instruction", CHAT, undefined, { id: "event-replay", sequence: 4 }))
       .rejects.toThrow("RPC rejected prompt");
 
     const replayed = fakeWorkerFactory();
-    const secondManager = new AgentManager({ workspace }, managerOptions({ workerFactory: replayed.factory }));
+    const secondManager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: replayed.factory }));
     await secondManager.start();
 
     expect(replayed.workers[0]?.prompt).toHaveBeenCalledWith(
@@ -238,40 +257,11 @@ it("replays a notification that was persisted but not accepted", async () => {
   });
 });
 
-it("migrates the notification journal out of the shared workspace", async () => {
-  await withDataDir(async (dataDir) => {
-    const workspace = path.join(dataDir, "workspace");
-    const legacyPath = path.join(workspace, ".pi", "notifications.jsonl");
-    await mkdir(path.dirname(legacyPath), { recursive: true });
-    await writeFile(legacyPath, `${JSON.stringify({
-      type: "queued",
-      notification: {
-        id: "legacy-event",
-        sequence: 6,
-        target: CHAT,
-        text: "legacy instruction",
-        behavior: "steer",
-      },
-    })}\n`, "utf8");
-    const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace }, managerOptions({ workerFactory: factory }));
-
-    await manager.start();
-
-    expect(workers[0]?.prompt).toHaveBeenCalledWith(
-      "[notification id=legacy-event seq=6]\nlegacy instruction",
-      "steer",
-      undefined,
-    );
-    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("legacy-event");
-    await expect(readFile(legacyPath, "utf8")).rejects.toThrow();
-  });
-});
 
 it("does not redeliver an acknowledged notification ID", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
     const identity = { id: "event-once", sequence: 5 };
 
     await manager.interrupt("instruction", CHAT, undefined, identity);
@@ -284,7 +274,7 @@ it("does not redeliver an acknowledged notification ID", async () => {
 it("reaped idle worker triggers fresh worker creation on next message", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("first", CHAT);
     expect(workers).toHaveLength(1);
 
@@ -303,7 +293,7 @@ it("restartAll closes active workers and respawns them on the next message", asy
     const tenHours = 10 * 60 * 60 * 1000;
     let now = tenHours;
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => now }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => now }));
     await manager.followup("one", CHAT);
     expect(workers).toHaveLength(1);
 
@@ -329,7 +319,7 @@ it("passes settings defaults as model and thinking CLI args", async () => {
       defaultThinkingLevel: "high",
     });
     const { factory } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup(".", CHAT);
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
@@ -344,7 +334,7 @@ it("passes settings defaults as model and thinking CLI args", async () => {
 it("beginShutdown stops active workers and rejects later work", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
     await manager.followup("one", CHAT);
     expect(workers).toHaveLength(1);
     await manager.beginShutdown();
@@ -353,25 +343,27 @@ it("beginShutdown stops active workers and rejects later work", async () => {
   });
 });
 
-it("manages independent workers and session directories per conversation key", async () => {
+it("manages independent workers and session directories for generic conversation identities", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
+    const matthew = conversationAgent("matrix:primary", "room:matthew", { room_id: "!matthew:example" });
+    const daisy = conversationAgent("matrix:primary", "room:daisy", { room_id: "!daisy:example" });
+    const mirroredKey = conversationAgent("slack:primary", "room:matthew", { channel_id: "C123" });
 
-    await manager.followup("Matthew general", conversationAgent(829096380));
+    await manager.followup("Matthew general", matthew);
     expect(workers).toHaveLength(1);
-    expect(workers[0]?.options.sessionDir).toBe("/workspace/.pi/sessions/829096380/0");
+    expect(workers[0]?.options.sessionDir).toBe(`/workspace/.pi/sessions/${conversationSessionPath(matthew)}`);
 
-    await manager.followup("Daisy general", conversationAgent(875253145));
+    await manager.followup("Daisy general", daisy);
     expect(workers).toHaveLength(2);
-    expect(workers[1]?.options.sessionDir).toBe("/workspace/.pi/sessions/875253145/0");
+    expect(workers[1]?.options.sessionDir).toBe(`/workspace/.pi/sessions/${conversationSessionPath(daisy)}`);
 
-    await manager.followup("Group topic 42", conversationAgent(-100123456, 42));
+    await manager.followup("Same key, other connector", mirroredKey);
     expect(workers).toHaveLength(3);
-    expect(workers[2]?.options.sessionDir).toBe("/workspace/.pi/sessions/-100123456/42");
+    expect(workers[2]?.options.sessionDir).toBe(`/workspace/.pi/sessions/${conversationSessionPath(mirroredKey)}`);
 
-    // Sending another message to Matthew reuses his active worker
-    await manager.followup("Matthew follow up", conversationAgent(829096380));
+    await manager.followup("Matthew follow up", matthew);
     expect(workers).toHaveLength(3);
     expect(workers[0]?.prompt).toHaveBeenCalledTimes(2);
   });
@@ -380,17 +372,19 @@ it("manages independent workers and session directories per conversation key", a
 it("restartAll closes every active conversation worker and respawns them", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
 
-    await manager.followup("Chat 100", conversationAgent(100));
-    await manager.followup("Chat 200 topic 1", conversationAgent(200, 1));
+    const chat100 = telegramConversation(CONNECTOR_ID, 100);
+    const topic200 = telegramConversation(CONNECTOR_ID, 200, 1);
+    await manager.followup("Chat 100", chat100);
+    await manager.followup("Chat 200 topic 1", topic200);
     expect(workers).toHaveLength(2);
 
     await manager.restartAll();
     expect(workers[0]?.close).toHaveBeenCalled();
     expect(workers[1]?.close).toHaveBeenCalled();
 
-    await manager.followup("Chat 100 next", conversationAgent(100));
+    await manager.followup("Chat 100 next", chat100);
     expect(workers).toHaveLength(3);
   });
 });
@@ -398,7 +392,7 @@ it("restartAll closes every active conversation worker and respawns them", async
 it("restartAll waits for a busy worker's turn to settle before closing it", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
     await manager.followup("do work", CHAT);
     expect(workers).toHaveLength(1);
     workers[0]?.settleHold(true);
@@ -418,7 +412,7 @@ it("restartAll closes a never-settling busy worker after the settle cap", async 
   try {
     await withDataDir(async (dataDir) => {
       const { factory, workers } = fakeWorkerFactory();
-      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
       await manager.followup("never settles", CHAT);
       workers[0]?.settleHold(true);
 
@@ -437,7 +431,7 @@ it("restartAll keeps the entry when close rejects so exit detection can clean up
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { factory, workers } = fakeWorkerFactory();
-      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions({ workerFactory: factory }));
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
       await manager.followup("one", CHAT);
       expect(workers).toHaveLength(1);
       workers[0]?.close.mockRejectedValue(new Error("close boom"));
@@ -456,90 +450,103 @@ it("restartAll keeps the entry when close rejects so exit detection can clean up
   });
 });
 
-it("bounds user message steering waits", async () => {
+it("bounds connector message steering waits", async () => {
   const interrupt = vi.fn(async () => undefined);
-  const router = new AgentEventRouter({ interrupt, followup: vi.fn(async () => undefined) });
-  const rawLine = JSON.stringify({ type: "message" });
-
-  await router.onEvent({
+  const notifier: AgentNotifier = { interrupt, followup: vi.fn(async () => undefined) };
+  const { connector, connectors } = fakeTelegramConnector();
+  const router = new AgentEventRouter(notifier, { workspace: "/nonexistent/tg-bot2-router", connectors });
+  const target = telegramConversation(CONNECTOR_ID, 829096380);
+  const record: TimelineRecord = {
+    v: 2,
     id: "event-1",
     seq: 7,
-    type: "message",
-    chat_id: 829096380,
-    message: { message_id: 1, date: 1_700_000_000, text: "hello", chat: { id: 829096380, type: "private" } },
+    t: "2026-08-24T00:00:00.000Z",
+    type: "telegram.message",
+    connectorId: CONNECTOR_ID,
+    conversation: target,
+    payload: { message_id: 1, date: 1_700_000_000, text: "hello", chat: { id: 829096380, type: "private" } },
     attachments: [],
-  }, rawLine);
+    meta: { user_content: true },
+  };
+  const rawLine = JSON.stringify(record);
 
+  await router.onEvent(record, rawLine);
+
+  expect(connector.notificationText).toHaveBeenCalledWith(record, rawLine);
   expect(interrupt).toHaveBeenCalledWith(
     rawLine,
-    conversationAgent(829096380),
+    target,
     USER_INTERRUPT_MAX_WAIT_MS,
     { id: "event-1", sequence: 7 },
   );
 });
 
-it("ignores a topic service event and delivers the complete first post", async () => {
+it("ignores a topic service event and delivers the complete connector-native first post", async () => {
   const interrupt = vi.fn(async () => undefined);
-  const router = new AgentEventRouter({ interrupt, followup: vi.fn(async () => undefined) });
-  const target = conversationAgent(829096380, 9751);
-  await router.onEvent({
+  const { connectors } = fakeTelegramConnector();
+  const router = new AgentEventRouter({ interrupt, followup: vi.fn(async () => undefined) }, {
+    workspace: "/nonexistent/tg-bot2-router",
+    connectors,
+  });
+  const target = telegramConversation(CONNECTOR_ID, 829096380, 9751);
+  const serviceRecord: TimelineRecord = {
+    v: 2,
     id: "topic-created",
     seq: 10,
-    type: "message",
-    chat_id: 829096380,
-    message: { message_id: 9652, message_thread_id: 9751, forum_topic_created: { name: "My conception of..." } },
+    t: "2026-08-24T00:00:00.000Z",
+    type: "telegram.message",
+    connectorId: CONNECTOR_ID,
+    conversation: target,
+    payload: { message_id: 9652, message_thread_id: 9751, forum_topic_created: { name: "My conception of..." } },
     attachments: [],
-  }, "service-event");
+    meta: { user_content: false },
+  };
+  await router.onEvent(serviceRecord, JSON.stringify(serviceRecord));
 
   const text = "My conception of harness is ".repeat(50);
-  const rawLine = JSON.stringify({ id: "first-post", seq: 11, type: "message", message: { text } });
-  await router.onEvent({
+  const firstPost: TimelineRecord = {
+    v: 2,
     id: "first-post",
     seq: 11,
-    type: "message",
-    chat_id: 829096380,
-    message: { message_id: 9653, message_thread_id: 9751, text },
+    t: "2026-08-24T00:00:01.000Z",
+    type: "telegram.message",
+    connectorId: CONNECTOR_ID,
+    conversation: target,
+    payload: { message_id: 9653, message_thread_id: 9751, text },
     attachments: [],
-  }, rawLine);
+    meta: { user_content: true },
+  };
+  const rawLine = JSON.stringify(firstPost);
+  await router.onEvent(firstPost, rawLine);
 
   expect(interrupt).toHaveBeenCalledOnce();
   expect(interrupt).toHaveBeenCalledWith(rawLine, target, USER_INTERRUPT_MAX_WAIT_MS, { id: "first-post", sequence: 11 });
   expect(rawLine).toContain(text);
 });
 
-it("routes task finishes and schedules directly to their owners", async () => {
+it("routes schedules directly to generic conversation owners", async () => {
   const followup = vi.fn(async () => undefined);
-  const interrupt = vi.fn(async () => undefined);
-  const router = new AgentEventRouter({ followup, interrupt });
-  const target = conversationAgent(829096380, 9534);
-
-  await router.onEvent({
-    id: "task-event",
-    seq: 8,
-    type: "task_finished",
-    runId: "run-123",
-    owner: target,
-    prompt: "check menu",
-    status: "done",
-    exitCode: 0,
-  }, "");
-  expect(followup).toHaveBeenCalledWith(
-    "Task run-123 finished. Output: /workspace/.pi/tasks/run-123/output.md. Continue it with continue_task.",
-    target,
-    { id: "task-event", sequence: 8 },
-  );
-
-  followup.mockClear();
-  await router.onEvent({
-    scheduleId: "schedule-1",
+  const { connectors } = fakeTelegramConnector();
+  const router = new AgentEventRouter({ followup, interrupt: vi.fn(async () => undefined) }, {
+    workspace: "/nonexistent/tg-bot2-router",
+    connectors,
+  });
+  const target = conversationAgent("matrix:primary", "room:planning", { room_id: "!planning:example" });
+  const record: TimelineRecord = {
+    v: 2,
     id: "schedule-event",
     seq: 9,
+    t: "2026-08-24T00:00:00.000Z",
     type: "schedule_fired",
+    scheduleId: "schedule-1",
     occurrenceId: "occurrence-1",
-    owner: target,
+    conversation: target,
     prompt: "create today's topic",
     dueAt: "2026-08-24T00:00:00.000Z",
-  }, "");
+  };
+
+  await router.onEvent(record, JSON.stringify(record));
+
   expect(followup).toHaveBeenCalledWith(
     "Scheduled instruction due 2026-08-24T00:00:00.000Z:\ncreate today's topic",
     target,
@@ -547,29 +554,57 @@ it("routes task finishes and schedules directly to their owners", async () => {
   );
 });
 
-
-it("edited_message is logged silently without waking the agent", async () => {
+it("connector edited events remain silent without waking the agent", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);
-  const notifier: AgentNotifier = { followup, interrupt };
-  const router = new AgentEventRouter(notifier);
-
-  const rawLine = JSON.stringify({
-    v: 1,
+  const { connector, connectors } = fakeTelegramConnector();
+  const router = new AgentEventRouter({ followup, interrupt }, { workspace: "/nonexistent/tg-bot2-router", connectors });
+  const record: TimelineRecord = {
+    v: 2,
+    id: "edited-event",
+    seq: 12,
     t: "2026-08-22T00:00:00.000Z",
-    type: "edited_message",
-    chat_id: 829096380,
-    message: { message_id: 10, text: "edited text", message_thread_id: 50 },
+    type: "telegram.edited_message",
+    connectorId: CONNECTOR_ID,
+    conversation: telegramConversation(CONNECTOR_ID, 829096380, 50),
+    payload: { message_id: 10, text: "edited text", message_thread_id: 50 },
     attachments: [],
-  });
+  };
 
-  await router.onEvent({
-    type: "edited_message",
-    chat_id: 829096380,
-    message: { message_id: 10, text: "edited text", message_thread_id: 50 },
-    attachments: [],
-  }, rawLine);
+  await router.onEvent(record, JSON.stringify(record));
 
+  expect(connector.attention).toHaveBeenCalledWith(record, {});
+  expect(connector.notificationText).not.toHaveBeenCalled();
   expect(interrupt).not.toHaveBeenCalled();
   expect(followup).not.toHaveBeenCalled();
+});
+
+it("loads attention overrides from the owning conversation session", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const target = telegramConversation(CONNECTOR_ID, 42, 7);
+    const settingsPath = path.join(workspace, ".pi", "sessions", conversationSessionPath(target), "notifications.json");
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    await writeFile(settingsPath, JSON.stringify({ wake: ["telegram.edited_message"] }), "utf8");
+    const interrupt = vi.fn(async () => undefined);
+    const { connector, connectors } = fakeTelegramConnector();
+    vi.mocked(connector.attention!).mockImplementation((_record, settings) =>
+      Array.isArray(settings.wake) && settings.wake.includes("telegram.edited_message") ? "interrupt" : undefined);
+    const router = new AgentEventRouter({ interrupt, followup: vi.fn(async () => undefined) }, { workspace, connectors });
+    const record: TimelineRecord = {
+      v: 2,
+      id: "edited-wake",
+      seq: 13,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.edited_message",
+      connectorId: CONNECTOR_ID,
+      conversation: target,
+      payload: { message_id: 10, text: "changed" },
+    };
+
+    await router.onEvent(record, JSON.stringify(record));
+
+    expect(connector.attention).toHaveBeenCalledWith(record, { wake: ["telegram.edited_message"] });
+    expect(interrupt).toHaveBeenCalledWith(expect.any(String), target, USER_INTERRUPT_MAX_WAIT_MS, { id: "edited-wake", sequence: 13 });
+  });
 });

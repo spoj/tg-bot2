@@ -60,21 +60,37 @@ export async function requireRealDirectory(candidate: string, label: string, exp
 }
 
 
-/** Derives canonical directories for one bot: its workspace and host-owned state. */
-export function botPaths(dataDir: string, botId: number): { botDir: string; workspace: string; attachments: string; timeline: string; schedules: string; tasks: string; schedulerState: string; runDir: string } {
-  if (!Number.isSafeInteger(botId)) throw new Error("Telegram bot ID must be a safe integer");
-  const botDir = path.join(dataDir, "bots", String(botId));
-  const runDir = path.join(botDir, "run");
+export type WorkspacePaths = {
+  root: string;
+  workspace: string;
+  attachments: string;
+  timeline: string;
+  notifications: string;
+  schedules: string;
+  resources: string;
+  runDir: string;
+  connectorsDir: string;
+};
+
+export function workspacePaths(dataDir: string, workspaceId: string): WorkspacePaths {
+  if (!/^[A-Za-z0-9._-]+$/u.test(workspaceId)) throw new Error("Workspace ID contains unsupported characters");
+  const root = path.join(dataDir, "workspaces", workspaceId);
+  const runDir = path.join(root, "run");
   return {
-    botDir,
-    workspace: path.join(botDir, "workspace"),
-    attachments: path.join(botDir, "attachments"),
-    timeline: path.join(botDir, "timeline.jsonl"),
+    root,
+    workspace: path.join(root, "workspace"),
+    attachments: path.join(root, "attachments"),
+    timeline: path.join(root, "timeline.jsonl"),
+    notifications: path.join(root, "notifications.jsonl"),
     schedules: path.join(runDir, "schedules.json"),
-    tasks: path.join(runDir, "tasks.json"),
-    schedulerState: path.join(botDir, "scheduler-state.json"),
+    resources: path.join(runDir, "resources.json"),
     runDir,
+    connectorsDir: path.join(root, "connectors"),
   };
+}
+
+export function connectorPathSegment(connectorId: string): string {
+  return Buffer.from(connectorId).toString("base64url");
 }
 
 export type PinnedDirectory = {

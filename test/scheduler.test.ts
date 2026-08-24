@@ -82,6 +82,60 @@ describe("WorkspaceScheduler", () => {
     expect(await timeline(dataDir)).toHaveLength(1);
   });
 
+  it("restores a due one-shot when timeline publication fails", async () => {
+    const dataDir = await fixture();
+    const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    const publish = vi.spyOn(workspaceTimeline, "publish");
+    publish.mockRejectedValueOnce(new Error("timeline unavailable"));
+    const { scheduler, errors } = makeScheduler(dataDir, { timeline: workspaceTimeline });
+    const created = await scheduler.add(input, OWNER);
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    expect(await timeline(dataDir)).toEqual([]);
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: input.start });
+
+    await scheduler.poll(NOW);
+    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, dueAt: input.start }]);
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: null });
+  });
+
+  it("restores a due recurring schedule when timeline publication fails", async () => {
+    const dataDir = await fixture();
+    const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    const publish = vi.spyOn(workspaceTimeline, "publish");
+    publish.mockRejectedValueOnce(new Error("timeline unavailable"));
+    const { scheduler, errors } = makeScheduler(dataDir, { timeline: workspaceTimeline });
+    const created = await scheduler.add({ ...input, start: "2026-01-08T12:00:00.000Z", recurrence: "daily" }, OWNER);
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    expect(await timeline(dataDir)).toEqual([]);
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: created.start });
+
+    await scheduler.poll(NOW);
+    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, dueAt: created.start }]);
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: "2026-01-11T12:00:00.000Z" });
+  });
+
+  it("reactivates a completed one-shot when replaced with recurrence at the same start", async () => {
+    const dataDir = await fixture();
+    const scheduler = makeScheduler(dataDir).scheduler;
+    const created = await scheduler.add(input, OWNER);
+
+    await scheduler.poll(NOW);
+    const recurring = await scheduler.replace({ ...created, recurrence: "daily" }, OWNER);
+
+    expect(recurring.next_due_at).toBe("2026-01-11T11:00:00.000Z");
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, recurrence: "daily", next_due_at: "2026-01-11T11:00:00.000Z" });
+
+    await scheduler.poll(Date.parse("2026-01-11T11:00:00.000Z"));
+    expect(await timeline(dataDir)).toHaveLength(2);
+  });
+
+
   it("advances recurring schedules to the next future occurrence", async () => {
     const dataDir = await fixture();
     const scheduler = makeScheduler(dataDir).scheduler;

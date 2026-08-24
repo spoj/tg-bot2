@@ -167,11 +167,17 @@ export class WorkspaceScheduler {
       const id = validateId(params.id);
       const input = validateInput(params, "schedule_replace");
       const current = this.ownedSchedule(id, actor);
-      const replacement: Schedule = { id, ...input, owner: current.owner, next_due_at: input.start === current.start ? current.next_due_at : input.start };
+      const nextDueAt = input.start !== current.start
+        ? input.start
+        : current.next_due_at === null && input.recurrence !== null
+          ? advanceRecurring(input.start, input.recurrence, this.now())
+          : current.next_due_at;
+      const replacement: Schedule = { id, ...input, owner: current.owner, next_due_at: nextDueAt };
       await this.commit(() => this.schedules.set(id, replacement));
       return cloneSchedule(replacement);
     });
   }
+
 
   async remove(params: Record<string, unknown>, actor: ConversationAgentRef): Promise<string> {
     return this.writes.run(async () => {
@@ -257,15 +263,25 @@ export class WorkspaceScheduler {
         }
       }
       due.sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt) || left.schedule.prompt.localeCompare(right.schedule.prompt));
-      for (const occurrence of due) {
-        await this.timeline.publish({
-          type: "schedule_fired",
-          conversation: occurrence.schedule.owner,
-          scheduleId: occurrence.schedule.id,
-          occurrenceId: occurrence.occurrenceId,
-          prompt: occurrence.schedule.prompt,
-          dueAt: occurrence.dueAt,
-        });
+      try {
+        for (const occurrence of due) {
+          await this.timeline.publish({
+            type: "schedule_fired",
+            conversation: occurrence.schedule.owner,
+            scheduleId: occurrence.schedule.id,
+            occurrenceId: occurrence.occurrenceId,
+            prompt: occurrence.schedule.prompt,
+            dueAt: occurrence.dueAt,
+          });
+        }
+      } catch (error) {
+        this.restore(previous);
+        try {
+          await this.saveState();
+        } catch (restoreError) {
+          this.report(restoreError);
+        }
+        throw error;
       }
     } catch (error) {
       if (!isMissing(error)) this.report(error);

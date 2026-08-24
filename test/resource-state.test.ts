@@ -51,4 +51,65 @@ describe("WorkspaceResources", () => {
     expect(reloaded.owner(matrixOwner.connectorId, "message", "$event")).toBeUndefined();
     expect(reloaded.owner(customOwner.connectorId, "message", "$event")).toEqual(customOwner);
   });
+
+  it("rolls back set when the serialized state exceeds its size limit", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "run", "resources.json");
+    const original = conversationAgent("custom:original", "channel-1", { channel: "channel-1" });
+    const resources = new WorkspaceResources(filePath);
+
+    await resources.start([{ connectorId: original.connectorId, kind: "message", key: "message-1", owner: original }]);
+    const before = await readFile(filePath, "utf8");
+    const oversized = conversationAgent("custom:oversized", "channel-oversized", { value: "x".repeat(4 * 1024 * 1024) });
+
+    await expect(resources.set({ connectorId: oversized.connectorId, kind: "message", key: "message-oversized", owner: oversized })).rejects.toThrow("Resource state exceeds");
+    expect(resources.owner(original.connectorId, "message", "message-1")).toBe(original);
+    expect(resources.owner(oversized.connectorId, "message", "message-oversized")).toBeUndefined();
+    expect(await readFile(filePath, "utf8")).toBe(before);
+  });
+
+  it("rolls back setMany when the serialized state exceeds its size limit", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "run", "resources.json");
+    const original = conversationAgent("custom:original", "channel-1", { channel: "channel-1" });
+    const replacement = conversationAgent("custom:replacement", "channel-2", { channel: "channel-2" });
+    const resources = new WorkspaceResources(filePath);
+
+    await resources.start([{ connectorId: original.connectorId, kind: "message", key: "message-1", owner: original }]);
+    const before = await readFile(filePath, "utf8");
+    const oversized = conversationAgent("custom:oversized", "channel-oversized", { value: "x".repeat(4 * 1024 * 1024) });
+
+    await expect(resources.setMany([
+      { connectorId: original.connectorId, kind: "message", key: "message-1", owner: replacement },
+      { connectorId: oversized.connectorId, kind: "message", key: "message-oversized", owner: oversized },
+    ])).rejects.toThrow("Resource state exceeds");
+    expect(resources.owner(original.connectorId, "message", "message-1")).toBe(original);
+    expect(resources.owner(oversized.connectorId, "message", "message-oversized")).toBeUndefined();
+    expect(await readFile(filePath, "utf8")).toBe(before);
+  });
+
+  it("rolls back delete when serialization fails", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "run", "resources.json");
+    const retainedAddress: Record<string, unknown> = { channel: "retained" };
+    const retained = conversationAgent("custom:retained", "channel-retained", retainedAddress);
+    const deleted = conversationAgent("custom:deleted", "channel-deleted", { channel: "deleted" });
+    const resources = new WorkspaceResources(filePath);
+
+    await resources.start([
+      { connectorId: retained.connectorId, kind: "message", key: "message-retained", owner: retained },
+      { connectorId: deleted.connectorId, kind: "message", key: "message-deleted", owner: deleted },
+    ]);
+    const before = await readFile(filePath, "utf8");
+    Object.defineProperty(retainedAddress, "channel", {
+      configurable: true,
+      enumerable: true,
+      get: () => { throw new Error("resource serialization failed"); },
+    });
+
+    await expect(resources.delete(deleted.connectorId, "message", "message-deleted")).rejects.toThrow("resource serialization failed");
+    expect(resources.owner(retained.connectorId, "message", "message-retained")).toBe(retained);
+    expect(resources.owner(deleted.connectorId, "message", "message-deleted")).toBe(deleted);
+    expect(await readFile(filePath, "utf8")).toBe(before);
+  });
 });

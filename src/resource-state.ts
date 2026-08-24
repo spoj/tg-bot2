@@ -95,24 +95,45 @@ export class WorkspaceResources {
 
   async set(resource: ResourceOwnership): Promise<void> {
     await this.writes.run(async () => {
-      this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
-      await this.save();
+      await this.commit(() => {
+        this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
+      });
     });
   }
 
   async setMany(resources: readonly ResourceOwnership[]): Promise<void> {
     if (resources.length === 0) return;
     await this.writes.run(async () => {
-      for (const resource of resources) this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
-      await this.save();
+      await this.commit(() => {
+        for (const resource of resources) this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
+      });
     });
   }
 
   async delete(connectorId: string, kind: ResourceKind, key: string): Promise<void> {
     await this.writes.run(async () => {
-      if (!this.resources.delete(mapKey(connectorId, kind, key))) return;
-      await this.save();
+      const resourceKey = mapKey(connectorId, kind, key);
+      if (!this.resources.has(resourceKey)) return;
+      await this.commit(() => {
+        this.resources.delete(resourceKey);
+      });
     });
+  }
+
+  private async commit(change: () => void): Promise<void> {
+    const previous = new Map(this.resources);
+    try {
+      change();
+      await this.save();
+    } catch (error) {
+      this.restore(previous);
+      throw error;
+    }
+  }
+
+  private restore(previous: Map<string, ResourceOwnership>): void {
+    this.resources.clear();
+    for (const [key, resource] of previous) this.resources.set(key, resource);
   }
 
   private async save(): Promise<void> {

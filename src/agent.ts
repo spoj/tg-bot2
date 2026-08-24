@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { PiWorker } from "./pi-worker.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
@@ -17,7 +17,7 @@ export const SYSTEM_PROMPT = [
 `You are a persistent personal Telegram agent serving several chats.
 Assistant text is not delivered; communicate with users through send. The host always targets this session's owning chat and topic.
 The writable workspace is /workspace. Sessions and agent state live under /workspace/.pi. Host-managed attachments are read-only under /run/attachments; copy one into /workspace before editing it.
-For browser automation, launch /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --user-data-dir=/workspace/.browser/profile, then connect with puppeteer-core at http://127.0.0.1:9222. The browser survives turns and stops with the session.
+For browser automation, create a private profile with mktemp -d /tmp/chrome-profile.XXXXXX, launch /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 --user-data-dir=<profile>, read the selected port from the first line of <profile>/DevToolsActivePort, then connect with puppeteer-core. Never reuse another agent's profile or a fixed debugging port. The browser survives turns and stops with the session.
 Install project extensions with pi install <pkg> -l --approve. Project settings live at /workspace/.pi/settings.json.
 `,
   OUTBOX_PROMPT,
@@ -280,7 +280,8 @@ type NotificationLogRecord =
   | { type: "queued"; notification: PendingNotification }
   | { type: "delivered"; id: string };
 
-const NOTIFICATIONS_FILE = path.join(".pi", "notifications.jsonl");
+const NOTIFICATIONS_FILE = "notifications.jsonl";
+const LEGACY_NOTIFICATIONS_FILE = path.join(".pi", NOTIFICATIONS_FILE);
 
 function notificationPrompt(notification: PendingNotification): string {
   const sequence = notification.sequence === undefined ? "" : ` seq=${notification.sequence}`;
@@ -336,7 +337,7 @@ export class AgentManager {
     this.hostSocketDir = options.hostSocketDir;
     this.hostTimeline = options.hostTimeline;
     this.hostAttachments = options.hostAttachments;
-    this.notificationsPath = path.join(this.workspace, NOTIFICATIONS_FILE);
+    this.notificationsPath = path.join(path.dirname(this.workspace), NOTIFICATIONS_FILE);
   }
 
   private getOrCreateEntry(actor: ConversationAgentRef): ConversationWorkerEntry {
@@ -408,13 +409,21 @@ export class AgentManager {
   private async loadPendingNotifications(): Promise<void> {
     this.notificationsLoaded ??= (async () => {
       await mkdir(path.dirname(this.notificationsPath), { recursive: true, mode: 0o700 });
+      const legacyPath = path.join(this.workspace, LEGACY_NOTIFICATIONS_FILE);
       let lines: string[];
       try {
         lines = await readJsonl(this.notificationsPath);
       } catch (error) {
         if (!isMissing(error)) throw error;
-        lines = [];
+        try {
+          await rename(legacyPath, this.notificationsPath);
+          lines = await readJsonl(this.notificationsPath);
+        } catch (migrationError) {
+          if (!isMissing(migrationError)) throw migrationError;
+          lines = [];
+        }
       }
+      await rm(legacyPath, { force: true });
       for (const line of lines) {
         const record = JSON.parse(line) as NotificationLogRecord;
         if (record.type === "queued") {

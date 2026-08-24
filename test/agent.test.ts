@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi, type Mock } from "vitest";
@@ -143,6 +143,8 @@ it("composes a concise behavior-oriented SYSTEM_PROMPT", () => {
   expect(SYSTEM_PROMPT).toContain("/restart applies settings changes");
   expect(SYSTEM_PROMPT).toContain("complete raw Telegram event");
   expect(SYSTEM_PROMPT).toContain("stable notification ID");
+  expect(SYSTEM_PROMPT).toContain("mktemp -d /tmp/chrome-profile.XXXXXX");
+  expect(SYSTEM_PROMPT).toContain("--remote-debugging-port=0");
 });
 
 it("loadUserSettings tolerates missing, empty, and malformed files", async () => {
@@ -233,6 +235,36 @@ it("replays a notification that was persisted but not accepted", async () => {
       "steer",
       undefined,
     );
+  });
+});
+
+it("migrates the notification journal out of the shared workspace", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const legacyPath = path.join(workspace, ".pi", "notifications.jsonl");
+    await mkdir(path.dirname(legacyPath), { recursive: true });
+    await writeFile(legacyPath, `${JSON.stringify({
+      type: "queued",
+      notification: {
+        id: "legacy-event",
+        sequence: 6,
+        target: CHAT,
+        text: "legacy instruction",
+        behavior: "steer",
+      },
+    })}\n`, "utf8");
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace }, managerOptions({ workerFactory: factory }));
+
+    await manager.start();
+
+    expect(workers[0]?.prompt).toHaveBeenCalledWith(
+      "[notification id=legacy-event seq=6]\nlegacy instruction",
+      "steer",
+      undefined,
+    );
+    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("legacy-event");
+    await expect(readFile(legacyPath, "utf8")).rejects.toThrow();
   });
 });
 

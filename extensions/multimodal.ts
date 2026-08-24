@@ -61,17 +61,7 @@ export function resolveMultimodalModel(ctx: ExtensionContext, spec: string): Mod
 }
 
 function isAnthropicAdapter(model: Model<Api>): boolean {
-  return model.provider === "anthropic" || model.api === "anthropic-messages";
-}
-
-function isOpenAIAdapter(model: Model<Api>): boolean {
-  return model.provider === "openai" ||
-    model.provider === "openai-codex" ||
-    model.provider === "azure-openai-responses" ||
-    model.api === "openai-completions" ||
-    model.api === "openai-responses" ||
-    model.api === "openai-codex-responses" ||
-    model.api === "azure-openai-responses";
+  return model.api === "anthropic-messages";
 }
 
 function isOpenAIResponsesAdapter(model: Model<Api>): boolean {
@@ -87,7 +77,6 @@ function isOpenAIResponsesAdapter(model: Model<Api>): boolean {
  * image-specific wire block, so those modalities need an explicit route.
  */
 function isGoogleAdapter(model: Model<Api>): boolean {
-  if (isAnthropicAdapter(model) || isOpenAIAdapter(model)) return false;
   return model.api === "google-generative-ai" || model.api === "google-vertex";
 }
 

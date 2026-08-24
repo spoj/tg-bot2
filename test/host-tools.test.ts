@@ -11,7 +11,7 @@ import { deferred } from "./helpers.js";
 type RegisteredTool = {
   name: string;
   parameters: { properties?: Record<string, unknown> };
-  execute(toolCallId: string, params: Record<string, unknown>): Promise<{ content: Array<{ text: string }> }>;
+  execute(toolCallId: string, params: Record<string, unknown>): Promise<{ content: Array<{ text: string }>; details?: Record<string, unknown> }>;
 };
 
 it("keeps send calls open through the outbox retry window", async () => {
@@ -55,6 +55,53 @@ it("keeps send calls open through the outbox retry window", async () => {
   } finally {
     response.resolve({ method: "sendDocument", attachments: [attachment] });
     vi.useRealTimers();
+    vi.unstubAllEnvs();
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it("surfaces album IDs and delivered-but-uncertain persistence state", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "host-tools-test-"));
+  const socketPath = path.join(root, "host.sock");
+  const send = vi.fn(async () => ({
+    method: "sendMediaGroup",
+    messageIds: [501, 502],
+    uncertain: true,
+    deliveryStatus: "delivered_persistence_failed",
+    persistenceError: "Failed to persist Telegram delivery ownership: resource state unavailable",
+  }));
+  const credentials = new AgentCredentials();
+  const token = credentials.issue(telegramConversation("telegram:1", 42), ["send"]);
+  const bridge = new HostBridge({ socketPath, credentials, handlers: { send } });
+  await bridge.start();
+  vi.stubEnv("PI_HOST_SOCKET", socketPath);
+  vi.stubEnv("PI_AGENT_TOKEN", token);
+  vi.stubEnv("PI_HOST_TOOLS", "send");
+  try {
+    let sendTool: RegisteredTool | undefined;
+    hostTools({
+      registerTool: (tool: RegisteredTool) => {
+        if (tool.name === "send") sendTool = tool;
+      },
+    } as never);
+    if (!sendTool) throw new Error("send tool was not registered");
+
+    const result = await sendTool.execute("tool-album", { method: "sendMediaGroup" });
+    const output = result.content[0]?.text ?? "";
+    expect(output).toContain("sendMediaGroup delivered");
+    expect(output).toContain("Message IDs: 501, 502");
+    expect(output).toContain("Delivery status: delivered_persistence_failed");
+    expect(output).toContain("Persistence error: Failed to persist Telegram delivery ownership: resource state unavailable");
+    expect(output).toContain("Do not blindly retry");
+    expect(output).not.toContain("succeeded");
+    expect(result.details).toMatchObject({
+      messageIds: [501, 502],
+      uncertain: true,
+      deliveryStatus: "delivered_persistence_failed",
+      persistenceError: "Failed to persist Telegram delivery ownership: resource state unavailable",
+    });
+    expect(send).toHaveBeenCalledWith({ request: { method: "sendMediaGroup" } }, telegramConversation("telegram:1", 42));
+  } finally {
     vi.unstubAllEnvs();
     await bridge.stop();
     await rm(root, { recursive: true, force: true });

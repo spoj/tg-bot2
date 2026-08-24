@@ -21,13 +21,13 @@ const SCHEDULE_FIELDS = {
   start: Type.String({ description: "First run as a UTC ISO-8601 timestamp ending in Z" }),
   recurrence: RECURRENCE_SCHEMA,
 };
-type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
+type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const SEND_TIMEOUT_MS = 5 * 60_000;
 
-function text(content: string): ToolResult {
-  return { content: [{ type: "text", text: content }], details: {} };
+function text(content: string, details: Record<string, unknown> = {}): ToolResult {
+  return { content: [{ type: "text", text: content }], details };
 }
 
 function failure(error: unknown): ToolResult {
@@ -105,10 +105,30 @@ const HOST_TOOLS = {
         const result = await callHost("send", { request }, SEND_TIMEOUT_MS);
         const operation = typeof result.method === "string" ? result.method : "Connector request";
         const resource = typeof result.messageId === "number" ? ` (message_id ${result.messageId})` : "";
+        const messageIds = Array.isArray(result.messageIds)
+          ? result.messageIds.filter((value): value is number => typeof value === "number" && Number.isSafeInteger(value))
+          : [];
+        const deliveryStatus = typeof result.deliveryStatus === "string" ? result.deliveryStatus : undefined;
+        const persistenceError = typeof result.persistenceError === "string" ? result.persistenceError : undefined;
+        const deliveredButUncertain = result.uncertain === true ||
+          deliveryStatus?.startsWith("delivered_") === true ||
+          persistenceError !== undefined;
+        const details: Record<string, unknown> = {
+          ...(messageIds.length > 0 ? { messageIds } : {}),
+          ...(typeof result.uncertain === "boolean" ? { uncertain: result.uncertain } : {}),
+          ...(deliveryStatus === undefined ? {} : { deliveryStatus }),
+          ...(persistenceError === undefined ? {} : { persistenceError }),
+        };
+        const album = messageIds.length > 0 ? `\nMessage IDs: ${messageIds.join(", ")}` : "";
         const attachments = Array.isArray(result.attachments)
           ? result.attachments.filter((value): value is string => typeof value === "string").map((value) => `\nAttachment: ${value}`).join("")
           : "";
-        return text(`${operation} succeeded${resource}.${attachments}`);
+        if (deliveredButUncertain) {
+          const status = deliveryStatus === undefined ? "" : ` Delivery status: ${deliveryStatus}.`;
+          const persistence = persistenceError === undefined ? "" : ` Persistence error: ${persistenceError}.`;
+          return text(`${operation} delivered${resource}, but persistence is uncertain.${status}${persistence} Do not blindly retry.${album}${attachments}`, details);
+        }
+        return text(`${operation} succeeded${resource}.${album}${attachments}`, details);
       } catch (error) {
         return failure(error);
       }

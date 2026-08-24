@@ -175,6 +175,9 @@ describe("multimodal extension", () => {
         { provider: "google-vertex", id: "gemini-2.5-flash", api: "google-vertex", file: "clip.mp4", kind: "video", supported: true },
         { provider: "openai", id: "gpt-4o", api: "openai-responses", file: "image.png", kind: "image", supported: true },
         { provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", file: "image.png", kind: "image", supported: true },
+        { provider: "custom-google", id: "gemini-custom", api: "google-generative-ai", file: "voice.oga", kind: "audio", supported: true },
+        { provider: "anthropic", id: "gemini-custom", api: "google-generative-ai", file: "clip.mp4", kind: "video", supported: true },
+        { provider: "anthropic", id: "gpt-4o", api: "openai-responses", file: "voice.oga", kind: "audio", supported: false },
         { provider: "openai", id: "gpt-4o", api: "openai-responses", file: "voice.oga", kind: "audio", supported: false },
         { provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", file: "clip.mp4", kind: "video", supported: false },
         { provider: "google", id: "text-only", api: "google-generative-ai", input: ["text"], file: "voice.oga", kind: "audio", supported: false },
@@ -204,6 +207,49 @@ describe("multimodal extension", () => {
           testCase.kind === "image" ? "image/png" : testCase.kind === "audio" ? "audio/ogg" : "video/mp4",
         );
       }
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the model API rather than provider labels for wire normalization", async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "multimodal-test-"));
+    try {
+      const audioPath = path.join(tmp, "voice.oga");
+      const pdfPath = path.join(tmp, "document.pdf");
+      await writeFile(audioPath, Buffer.from("fake-oga-data"));
+      await writeFile(pdfPath, Buffer.from("fake-pdf-data"));
+
+      const googleModel = fakeModel("custom-google", "gemini-custom", ["text", "image"], "google-generative-ai");
+      const { ctx: googleCtx, completeSpy: googleComplete } = fakeContext({ cwd: tmp, model: googleModel });
+      googleComplete.mockImplementation(async (_model, _context, options) => {
+        const rawPayload = { contents: [{ parts: [{ inlineData: { mimeType: "audio/ogg", data: "..." } }] }] };
+        expect(options?.onPayload?.(rawPayload, googleModel)).toEqual(rawPayload);
+        return fakeAssistantMessage();
+      });
+
+      await expect(executeMultimodal(
+        { model: "custom-google/gemini-custom", prompt: "Transcribe", files: ["voice.oga"] },
+        undefined,
+        googleCtx,
+      )).resolves.toMatchObject({ content: [{ text: "Analysis result" }] });
+
+      const openAIModel = fakeModel("anthropic", "gpt-custom", ["text", "image"], "openai-responses");
+      const { ctx: openAICtx, completeSpy: openAIComplete } = fakeContext({ cwd: tmp, model: openAIModel });
+      openAIComplete.mockImplementation(async (_model, _context, options) => {
+        const rawPayload = {
+          input: [{ content: [{ type: "input_image", image_url: "data:application/pdf;base64,..." }] }],
+        };
+        const normalized = options?.onPayload?.(rawPayload, openAIModel) as { input: Array<{ content: Array<{ type: string }> }> };
+        expect(normalized.input[0]?.content[0]?.type).toBe("input_file");
+        return fakeAssistantMessage();
+      });
+
+      await expect(executeMultimodal(
+        { model: "anthropic/gpt-custom", prompt: "Read", files: ["document.pdf"] },
+        undefined,
+        openAICtx,
+      )).resolves.toMatchObject({ content: [{ text: "Analysis result" }] });
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
@@ -293,7 +339,7 @@ describe("multimodal extension", () => {
             },
           ],
         };
-        capturedPayload = options?.onPayload?.(rawPayload, fakeModel("anthropic", "claude-3-7-sonnet")) as { messages: Array<{ content: Array<{ type: string }> }> };
+        capturedPayload = options?.onPayload?.(rawPayload, fakeModel("anthropic", "claude-3-7-sonnet", ["text", "image"], "anthropic-messages")) as { messages: Array<{ content: Array<{ type: string }> }> };
         return {
           role: "assistant",
           stopReason: "stop",

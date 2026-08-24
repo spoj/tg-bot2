@@ -100,6 +100,18 @@ describe("configuration", () => {
         expect.objectContaining({ id: "telegram:300", botId: 300, workspaceId: "zeta" }),
       ]);
     });
+    it("rejects a Telegram bot configured in multiple workspaces", async () => {
+      const dataDir = await temporaryDirectory();
+      await connectorFile(dataDir, "alpha", "primary", "100:token-alpha");
+      await connectorFile(dataDir, "beta", "primary", "100:token-beta");
+      const alphaPath = path.join(dataDir, "workspaces", "alpha", "connectors", "primary.json");
+      const betaPath = path.join(dataDir, "workspaces", "beta", "connectors", "primary.json");
+
+      await expect(loadConfig({ dataDir })).rejects.toThrow(
+        new RegExp(`Duplicate Telegram bot telegram:100.*(?:${alphaPath}|${betaPath}).*(?:${alphaPath}|${betaPath})`, "u"),
+      );
+    });
+
 
 
     it("rejects symlinked workspace directories", async () => {

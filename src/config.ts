@@ -77,34 +77,47 @@ async function assertRealDirectory(directory: string, label: string): Promise<vo
 }
 
 
-async function loadTelegramConnectors(dataDir: string, workspaceId: string, paths: WorkspacePaths): Promise<TelegramConnectorConfig[]> {
-  const connectors: TelegramConnectorConfig[] = [];
+type LoadedTelegramConnector = {
+  config: TelegramConnectorConfig;
+  filePath: string;
+};
+
+async function loadTelegramConnectors(dataDir: string, workspaceId: string, paths: WorkspacePaths): Promise<LoadedTelegramConnector[]> {
+  const connectors: LoadedTelegramConnector[] = [];
   for (const entry of await entries(paths.connectorsDir)) {
     if (!entry.name.endsWith(".json")) continue;
     const filePath = path.join(paths.connectorsDir, entry.name);
     if (!entry.isFile() || entry.isSymbolicLink()) throw new Error(`Connector configuration must be a regular file: ${filePath}`);
     const token = await parseAuthToken(filePath);
     const botId = parseBotId(token);
+    const id = telegramConnectorId(botId);
     connectors.push({
-      type: "telegram",
-      id: telegramConnectorId(botId),
-      token,
-      botId,
-      workspaceId,
-      dataDir,
-      workspace: paths.workspace,
-      attachments: path.join(paths.attachments, Buffer.from(telegramConnectorId(botId)).toString("base64url")),
-      attachmentPrefix: Buffer.from(telegramConnectorId(botId)).toString("base64url"),
+      config: {
+        type: "telegram",
+        id,
+        token,
+        botId,
+        workspaceId,
+        dataDir,
+        workspace: paths.workspace,
+        attachments: path.join(paths.attachments, Buffer.from(id).toString("base64url")),
+        attachmentPrefix: Buffer.from(id).toString("base64url"),
+      },
+      filePath,
     });
   }
-  connectors.sort((left, right) => left.id.localeCompare(right.id));
-  const ids = new Set<string>();
+  connectors.sort((left, right) => left.config.id.localeCompare(right.config.id));
+  const ids = new Map<string, string>();
   for (const connector of connectors) {
-    if (ids.has(connector.id)) throw new Error(`Duplicate connector ${connector.id} in workspace ${workspaceId}`);
-    ids.add(connector.id);
+    const previousPath = ids.get(connector.config.id);
+    if (previousPath !== undefined) {
+      throw new Error(`Duplicate connector ${connector.config.id} in workspace ${workspaceId}: ${previousPath} and ${connector.filePath}`);
+    }
+    ids.set(connector.config.id, connector.filePath);
   }
   return connectors;
 }
+
 
 export async function loadConfig(options: { dataDir?: string; env?: NodeJS.ProcessEnv } = {}): Promise<AppConfig> {
   const env = options.env ?? process.env;
@@ -112,13 +125,26 @@ export async function loadConfig(options: { dataDir?: string; env?: NodeJS.Proce
   const dataDir = path.resolve(requestedDataDir?.trim() || defaultDataDir());
 
   const workspaces: WorkspaceConfig[] = [];
+  const seenBots = new Map<string, { workspaceId: string; filePath: string; token: string }>();
+  const seenTokens = new Map<string, { workspaceId: string; filePath: string; token: string }>();
   const workspacesDir = path.join(dataDir, "workspaces");
   for (const entry of await entries(workspacesDir)) {
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
     const paths = workspacePaths(dataDir, entry.name);
     await assertRealDirectory(paths.root, "Workspace directory");
-    const connectors = await loadTelegramConnectors(dataDir, entry.name, paths);
-    if (connectors.length > 0) workspaces.push({ id: entry.name, paths, connectors });
+    const loadedConnectors = await loadTelegramConnectors(dataDir, entry.name, paths);
+    for (const { config: connector, filePath } of loadedConnectors) {
+      const previous = seenBots.get(connector.id) ?? seenTokens.get(connector.token);
+      if (previous !== undefined && previous.workspaceId !== entry.name) {
+        throw new Error(
+          `Duplicate Telegram bot ${connector.id} configured in workspace ${previous.workspaceId} at ${previous.filePath} and workspace ${entry.name} at ${filePath}; configure each bot in only one workspace`,
+        );
+      }
+      const source = { workspaceId: entry.name, filePath, token: connector.token };
+      seenBots.set(connector.id, source);
+      seenTokens.set(connector.token, source);
+    }
+    if (loadedConnectors.length > 0) workspaces.push({ id: entry.name, paths, connectors: loadedConnectors.map(({ config }) => config) });
   }
   workspaces.sort((left, right) => left.id.localeCompare(right.id));
 

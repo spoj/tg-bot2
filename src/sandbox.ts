@@ -259,10 +259,10 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--ro-bind", nodeModules, "/app/node_modules",
     // Root-level agent scripts resolve harness dependencies (e.g. puppeteer-core)
     // through the same read-only tree; subdirectory projects keep their own installs.
+    "--bind", workspace, "/workspace",
     "--ro-bind", nodeModules, "/workspace/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
     ...mountArgs,
-    "--bind", workspace, "/workspace",
     ...(paths.hostSocketDir === undefined
       ? []
       : ["--bind", await requireRealDirectory(paths.hostSocketDir, "Host runtime directory"), "/run"]),

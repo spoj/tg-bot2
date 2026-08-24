@@ -171,6 +171,23 @@ it("binds the node binary's parent directory when node is outside the standard m
     await rm(f.root, { recursive: true, force: true });
   }
 });
+it("binds the writable workspace before its read-only node_modules submount", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    const nodeModules = await realpath(path.join(appRoot, "node_modules"));
+    const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
+    const workspaceBind = args.findIndex((value, index) => value === "--bind" && args[index + 1] === f.workspace && args[index + 2] === "/workspace");
+    const dependencySubmount = args.findIndex((value, index) => value === "--ro-bind" && args[index + 1] === nodeModules && args[index + 2] === "/workspace/node_modules");
+    expect(workspaceBind).toBeGreaterThanOrEqual(0);
+    expect(dependencySubmount).toBeGreaterThan(workspaceBind);
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
 it.skipIf(process.execPath !== "/usr/bin/node")("does not add a duplicate node bind when node is under /usr", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");
@@ -409,6 +426,31 @@ integration("Bubblewrap integration", () => {
       expect(timeout.timedOut).toBe(true);
     } finally { delete process.env.SUPER_SECRET_CANARY; await rm(f.root, { recursive: true, force: true }); }
   }, 15_000);
+  it("exposes the read-only dependency tree over the writable workspace", async () => {
+    const f = await fixture();
+    const appRoot = path.join(f.root, "app");
+    const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+    let child: ChildProcess | undefined;
+    try {
+      await mkdir(path.dirname(cli), { recursive: true });
+      await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+      await writeFile(path.join(appRoot, "node_modules", "dependency-marker.txt"), "dependency\n");
+      const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
+      const separator = args.indexOf("--");
+      const command = [...args.slice(0, separator), "--", "/bin/cat", "/workspace/node_modules/dependency-marker.txt"];
+      child = spawnProcess("bwrap", command, { stdio: ["ignore", "pipe", "pipe"], detached: true, env: {} });
+      const output = await new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        child!.stdout?.on("data", (chunk: Buffer) => chunks.push(chunk));
+        child!.once("error", reject);
+        child!.once("close", (code) => code === 0 ? resolve(Buffer.concat(chunks).toString("utf8")) : reject(new Error(`bwrap exited with ${code ?? "signal"}`)));
+      });
+      expect(output).toBe("dependency\n");
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) terminateProcessGroup(child, "SIGKILL");
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
 
   it("cannot see host-only files outside the bound workspace", async () => {
     const f = await fixture();

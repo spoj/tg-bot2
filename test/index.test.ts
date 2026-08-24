@@ -12,8 +12,17 @@ const state = vi.hoisted(() => {
   const lifecycle: string[] = [];
   const connectorRunResolvers: Array<() => void> = [];
   const signalHandlers: Partial<Record<"SIGINT" | "SIGTERM", () => void>> = {};
-
-  const agentsStart = vi.fn(async () => { lifecycle.push("agents.start"); });
+  const failures = {
+    agentsStart: false,
+    schedulerStart: false,
+    bridgeStart: false,
+    bridgeConstructor: false,
+    connectorRun: false,
+  };
+  const agentsStart = vi.fn(async () => {
+    lifecycle.push("agents.start");
+    if (failures.agentsStart) throw new Error("agents.start failed");
+  });
   const agentsBeginShutdown = vi.fn(async () => { lifecycle.push("agents.beginShutdown"); });
   const agentsDisposeAll = vi.fn(async () => { lifecycle.push("agents.disposeAll"); });
   const agentsRestartAll = vi.fn(async () => {});
@@ -38,7 +47,10 @@ const state = vi.hoisted(() => {
   const schedulerTake = vi.fn(async () => ({ id: "schedule-1" }));
   const scheduler = vi.fn(class WorkspaceSchedulerMock {
     constructor(_options: unknown) {}
-    start = vi.fn(async () => { lifecycle.push("scheduler.start"); });
+    start = vi.fn(async () => {
+      lifecycle.push("scheduler.start");
+      if (failures.schedulerStart) throw new Error("scheduler.start failed");
+    });
     stop = vi.fn(async () => { lifecycle.push("scheduler.stop"); });
     add = schedulerAdd;
     replace = schedulerReplace;
@@ -47,8 +59,13 @@ const state = vi.hoisted(() => {
   });
 
   const bridge = vi.fn(class HostBridgeMock {
-    constructor(_options: unknown) {}
-    start = vi.fn(async () => { lifecycle.push("bridge.start"); });
+    constructor(_options: unknown) {
+      if (failures.bridgeConstructor) throw new Error("bridge construction failed");
+    }
+    start = vi.fn(async () => {
+      lifecycle.push("bridge.start");
+      if (failures.bridgeStart) throw new Error("bridge.start failed");
+    });
     stop = vi.fn(async () => { lifecycle.push("bridge.stop"); });
   });
   const agentCredentials = vi.fn(class AgentCredentialsMock {});
@@ -87,13 +104,14 @@ const state = vi.hoisted(() => {
   });
 
   const connectorSetAgent = vi.fn(() => { lifecycle.push("connector.setAgent"); });
-  const connectorRun = vi.fn(async () => {
-    lifecycle.push("connector.run");
-    await new Promise<void>((resolve) => connectorRunResolvers.push(resolve));
-  });
   const connectorStop = vi.fn(async () => {
     lifecycle.push("connector.stop");
     for (const resolve of connectorRunResolvers.splice(0)) resolve();
+  });
+  const connectorRun = vi.fn(async () => {
+    lifecycle.push("connector.run");
+    if (failures.connectorRun) throw new Error("connector.run failed");
+    await new Promise<void>((resolve) => connectorRunResolvers.push(resolve));
   });
   const telegramConnector = vi.fn(class TelegramConnectorMock {
     readonly id: string;
@@ -119,6 +137,7 @@ const state = vi.hoisted(() => {
     lifecycle,
     connectorRunResolvers,
     signalHandlers,
+    failures,
     config: undefined as unknown as AppConfig,
     sandbox,
     checkSandboxEnvironment,
@@ -179,6 +198,13 @@ async function importIndex(): Promise<{ module: typeof import("../src/index.js")
   vi.clearAllMocks();
   state.lifecycle.length = 0;
   state.connectorRunResolvers.length = 0;
+  Object.assign(state.failures, {
+    agentsStart: false,
+    schedulerStart: false,
+    bridgeStart: false,
+    bridgeConstructor: false,
+    connectorRun: false,
+  });
   delete state.signalHandlers.SIGINT;
   delete state.signalHandlers.SIGTERM;
 
@@ -244,7 +270,13 @@ describe("application startup and shutdown wiring", () => {
     const connector = mockInstance(state.telegramConnector);
     const registry = mockInstance(state.registry);
     const agents = mockInstance(state.agentManager);
-    expect(state.telegramConnector).toHaveBeenCalledWith(state.config.workspaces[0]!.connectors[0], timeline, resources);
+    expect(state.telegramConnector).toHaveBeenCalledWith(expect.objectContaining({
+      id: "telegram:123",
+      dataDir: state.sandbox.dataDir,
+      workspace: paths.workspace,
+      attachments: path.join(paths.attachments, Buffer.from("telegram:123").toString("base64url")),
+      attachmentPrefix: Buffer.from("telegram:123").toString("base64url"),
+    }), timeline, resources);
     expect(state.registryRegister).toHaveBeenCalledWith(connector);
     expect(state.connectorSetAgent).toHaveBeenCalledWith(agents);
     expect(state.timelineSubscribe).toHaveBeenCalledWith(expect.any(Function));
@@ -335,6 +367,66 @@ describe("application startup and shutdown wiring", () => {
     state.signalHandlers.SIGINT?.();
     await vi.waitFor(() => expect(state.terminateActiveSandboxes).toHaveBeenCalledOnce());
     await running;
+    expect(state.lifecycle).toEqual([
+      "timeline.start",
+      "resources.start",
+      "registry.register",
+      "connector.setAgent",
+      "bridge.start",
+      "scheduler.start",
+      "agents.start",
+      "connector.run",
+      "agents.beginShutdown",
+      "scheduler.stop",
+      "bridge.stop",
+      "agents.disposeAll",
+      "connector.stop",
+      "sandbox.terminate",
+    ]);
+  });
+
+  it("disposes initialized services when startup fails", async () => {
+    const { module: index } = await importIndex();
+    state.failures.bridgeStart = true;
+
+    await expect(index.main()).rejects.toThrow("bridge.start failed");
+    expect(state.connectorRun).not.toHaveBeenCalled();
+    expect(state.lifecycle).toEqual([
+      "timeline.start",
+      "resources.start",
+      "registry.register",
+      "connector.setAgent",
+      "bridge.start",
+      "agents.beginShutdown",
+      "scheduler.stop",
+      "bridge.stop",
+      "agents.disposeAll",
+      "connector.stop",
+      "sandbox.terminate",
+    ]);
+  });
+
+  it("disposes services created before a partial workspace startup failure", async () => {
+    const { module: index } = await importIndex();
+    state.failures.bridgeConstructor = true;
+
+    await expect(index.main()).rejects.toThrow("bridge construction failed");
+    expect(state.lifecycle).toEqual([
+      "timeline.start",
+      "resources.start",
+      "registry.register",
+      "connector.setAgent",
+      "scheduler.stop",
+      "agents.disposeAll",
+      "connector.stop",
+    ]);
+  });
+
+  it("disposes every workspace when a connector run fails", async () => {
+    const { module: index } = await importIndex();
+    state.failures.connectorRun = true;
+
+    await expect(index.main()).rejects.toThrow("connector.run failed");
     expect(state.lifecycle).toEqual([
       "timeline.start",
       "resources.start",

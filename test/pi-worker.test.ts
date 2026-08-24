@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, type Mock } from "vitest";
@@ -94,6 +94,23 @@ describe("PiWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+  it("rejects a runtime path whose intermediate directory is a symlink", async () => {
+    const f = await fixture();
+    const outside = path.join(f.root, "outside");
+    try {
+      await mkdir(outside);
+      await symlink(outside, path.join(f.workspace, ".pi"), "dir");
+      const { spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+
+      await expect(worker.start()).rejects.toThrow("Pi run runtime path must be a real directory");
+      expect(spawn).not.toHaveBeenCalled();
+      expect((await lstat(path.join(f.workspace, ".pi"))).isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
 
   it("prompt sends a prompt command with streamingBehavior and touches activity", async () => {
     const f = await fixture();
@@ -303,6 +320,23 @@ describe("PiWorker", () => {
       child.stdout.emit("data", `${JSON.stringify({ type: "agent_settled" })}\n`);
 
       await expect(settled).resolves.toMatchObject({ stdout: expect.stringContaining("result 🙂") });
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+  it("terminates and rejects when an unterminated RPC line exceeds its cap", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+
+      child.stdout.emit("data", "x".repeat(2 * 1024 * 1024 + 1));
+
+      await expect(worker.prompt("must be rejected")).rejects.toThrow("Pi RPC stdout line exceeded");
+      await expect(worker.waitForSettled()).rejects.toThrow("Pi RPC stdout line exceeded");
+      expect(terminate).toHaveBeenCalledWith(child, "SIGKILL");
+      child.emit("close", null, "SIGKILL");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

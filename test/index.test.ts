@@ -23,6 +23,9 @@ const state = vi.hoisted(() => {
     stop: vi.fn(async () => { order.push("bot.stop"); }),
   };
   const taskSpawn = vi.fn(async () => ({ runId: "scheduled-run", status: "launched" }));
+  const taskContinue = vi.fn(async () => ({ runId: "scheduled-run", status: "launched" }));
+  const taskCancel = vi.fn(async () => "stopped");
+  const taskSteer = vi.fn(async () => "delivered");
   const scheduleAdd = vi.fn(async () => ({ id: "schedule-1" }));
   const scheduleReplace = vi.fn(async () => ({ id: "schedule-1" }));
   const scheduleRemove = vi.fn(async () => "schedule-1");
@@ -84,6 +87,9 @@ const state = vi.hoisted(() => {
       stop = vi.fn(async () => { order.push(this.socketPath.endsWith("host-task.sock") ? "taskBridge.stop" : "bridge.stop"); });
     }),
     taskSpawn,
+    taskContinue,
+    taskCancel,
+    taskSteer,
     scheduleAdd,
     scheduleReplace,
     scheduleRemove,
@@ -91,6 +97,9 @@ const state = vi.hoisted(() => {
     tasks: vi.fn(class WorkspaceTasksMock {
       constructor(_options: unknown) {}
       spawn = taskSpawn;
+      continueTask = taskContinue;
+      cancel = taskCancel;
+      steer = taskSteer;
       start = vi.fn(async () => { startupOrder.push("tasks.start"); });
       stop = vi.fn(async () => { order.push("tasks.stop"); });
     }),
@@ -133,6 +142,9 @@ async function importIndex(configure?: () => void): Promise<typeof import("../sr
   state.sandbox.dataDir = dataDir;
   state.checkSandboxEnvironment.mockReset().mockResolvedValue(state.sandbox);
   state.agentManager.mockClear();
+  state.taskContinue.mockClear();
+  state.taskCancel.mockClear();
+  state.taskSteer.mockClear();
   state.scheduler.mockClear();
   state.outbox.mockClear();
   state.bridge.mockClear();
@@ -197,6 +209,7 @@ describe("application startup and shutdown wiring", () => {
       bwrapPath: "/validated/bwrap",
       timeline: expect.any(Object),
       credentials: expect.any(Object),
+      statePath: path.join(state.sandbox.dataDir, "bots", "123", "run", "tasks.json"),
       hostSocketDir: expect.any(String),
       hostTimeline: expect.any(String),
     }));
@@ -207,6 +220,7 @@ describe("application startup and shutdown wiring", () => {
         send: expect.any(Function),
         annotate: expect.any(Function),
         spawn: expect.any(Function),
+        continueTask: expect.any(Function),
         cancel: expect.any(Function),
         steerTask: expect.any(Function),
         steerConversation: expect.any(Function),
@@ -302,6 +316,31 @@ describe("application startup and shutdown wiring", () => {
       "Conversation 42:7 delegated work to you:\nReconsider the current approach",
       actor,
     );
+  });
+
+  it("routes owned task controls and launch options", async () => {
+    const index = await importIndex(() => state.bot.start.mockResolvedValue(undefined));
+    void index.main();
+    await vi.waitFor(() => expect(state.bot.start).toHaveBeenCalledOnce());
+    const actor = conversationAgent(42, 7);
+    const handlers = (state.bridge.mock.calls[0]?.[0] as unknown as {
+      handlers: {
+        spawn: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        continueTask: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        cancel: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+        steerTask: (params: Record<string, unknown>, actor: ConversationAgentRef) => Promise<Record<string, unknown>>;
+      };
+    }).handlers;
+    const launch = { prompt: "work", model: "openrouter/model", thinking: "high" };
+
+    await expect(handlers.spawn(launch, actor)).resolves.toEqual({ runId: "scheduled-run", status: "launched" });
+    await expect(handlers.continueTask({ runId: "scheduled-run", ...launch }, actor)).resolves.toEqual({ runId: "scheduled-run", status: "launched" });
+    await expect(handlers.steerTask({ runId: "scheduled-run", message: "adjust" }, actor)).resolves.toEqual({ status: "delivered" });
+    await expect(handlers.cancel({ runId: "scheduled-run" }, actor)).resolves.toEqual({ status: "stopped" });
+    expect(state.taskSpawn).toHaveBeenCalledWith(launch, actor);
+    expect(state.taskContinue).toHaveBeenCalledWith({ runId: "scheduled-run", ...launch }, actor);
+    expect(state.taskSteer).toHaveBeenCalledWith("scheduled-run", "adjust", actor);
+    expect(state.taskCancel).toHaveBeenCalledWith("scheduled-run", actor);
   });
 
   it("routes schedule mutations through the authenticated conversation", async () => {

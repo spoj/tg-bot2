@@ -167,7 +167,7 @@ it("followup starts a fresh worker and sends prompt with followUp streaming beha
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory.mock.calls[0]?.[0]).toMatchObject({
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
+      hostTools: "send,annotate,spawn,continue_task,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
     });
     expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("\nscheduled work"), "followUp", undefined);
   });
@@ -524,7 +524,7 @@ it("routes task finishes and schedules directly to their owners", async () => {
     exitCode: 0,
   }, "");
   expect(followup).toHaveBeenCalledWith(
-    "Task run-123 finished. Complete instruction and results: /workspace/.pi/tasks/run-123/prompt.txt, output.md, result.json",
+    "Task run-123 finished. Output: /workspace/.pi/tasks/run-123/output.md. Continue it with continue_task.",
     target,
     { id: "task-event", sequence: 8 },
   );

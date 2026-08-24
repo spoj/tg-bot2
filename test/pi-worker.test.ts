@@ -55,7 +55,7 @@ async function fixture(): Promise<{ root: string; workspace: string; appRoot: st
 }
 
 describe("PiWorker", () => {
-  it("spawns bwrap with configured model flags and configures queue modes over RPC", async () => {
+  it("spawns bwrap with configured model and continuation flags and configures queue modes over RPC", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
@@ -66,6 +66,7 @@ describe("PiWorker", () => {
         terminateProcessGroup: terminate,
         model: "openrouter/deepseek/deepseek-chat",
         thinkingLevel: "high",
+        continueSession: true,
       });
       await worker.start();
       expect(spawn).toHaveBeenCalledOnce();
@@ -76,6 +77,7 @@ describe("PiWorker", () => {
       expect(args).toContain("rpc");
       expect(args).toContain("--session-dir");
       expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/sessions");
+      expect(args).toContain("--continue");
       expect(args).toEqual(expect.arrayContaining([
         "--model", "openrouter/deepseek/deepseek-chat",
         "--thinking", "high",

@@ -168,3 +168,42 @@ it("manages schedules through the authenticated host bridge", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it("launches and continues owned tasks with model and thinking overrides", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "host-tools-test-"));
+  const socketPath = path.join(root, "host.sock");
+  const spawn = vi.fn(async () => ({ runId: "run-1", status: "launched" }));
+  const continueTask = vi.fn(async () => ({ runId: "run-1", status: "launched" }));
+  const steerTask = vi.fn(async () => ({ status: "delivered" }));
+  const cancel = vi.fn(async () => ({ status: "stopped" }));
+  const credentials = new AgentCredentials();
+  const actor = conversationAgent(42, 7);
+  const token = credentials.issue(actor, ["spawn", "continue_task", "steer_task", "cancel"]);
+  const bridge = new HostBridge({ socketPath, credentials, handlers: { spawn, continueTask, steerTask, cancel } });
+  await bridge.start();
+  vi.stubEnv("PI_HOST_SOCKET", socketPath);
+  vi.stubEnv("PI_AGENT_TOKEN", token);
+  vi.stubEnv("PI_HOST_TOOLS", "spawn,continue_task,steer_task,cancel");
+  try {
+    const registered = new Map<string, RegisteredTool>();
+    hostTools({ registerTool: (tool: RegisteredTool) => registered.set(tool.name, tool) } as never);
+    const launch = { prompt: "Investigate", model: "openrouter/model", thinking: "high" };
+
+    await expect(registered.get("spawn")?.execute("spawn", launch)).resolves.toMatchObject({
+      content: [{ text: "Launched background task run-1. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool." }],
+    });
+    await expect(registered.get("continue_task")?.execute("continue", { runId: "run-1", ...launch })).resolves.toMatchObject({
+      content: [{ text: "Continued task run-1 in its existing session." }],
+    });
+    await registered.get("steer_task")?.execute("steer", { runId: "run-1", message: "adjust" });
+    await registered.get("cancel")?.execute("cancel", { runId: "run-1" });
+    expect(spawn).toHaveBeenCalledWith(launch, actor);
+    expect(continueTask).toHaveBeenCalledWith({ runId: "run-1", ...launch }, actor);
+    expect(steerTask).toHaveBeenCalledWith({ runId: "run-1", message: "adjust" }, actor);
+    expect(cancel).toHaveBeenCalledWith({ runId: "run-1" }, actor);
+  } finally {
+    vi.unstubAllEnvs();
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});

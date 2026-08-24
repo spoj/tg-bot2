@@ -214,6 +214,7 @@ export class PiWorker {
         cliPath: this.options.cliPath,
         appendSystemPrompt: promptFile,
         sessionDir: this.options.sessionDir,
+        continueSession: this.options.continueSession,
         model: this.options.model,
         thinkingLevel: this.options.thinkingLevel,
         hostTools: this.options.hostTools,

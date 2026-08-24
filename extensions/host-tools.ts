@@ -26,6 +26,11 @@ const SCHEDULE_FIELDS = {
   start: Type.String({ description: "First run as a UTC ISO-8601 timestamp ending in Z" }),
   recurrence: RECURRENCE_SCHEMA,
 };
+const TASK_FIELDS = {
+  prompt: Type.String({ minLength: 1, description: "Complete instruction for the background task agent" }),
+  model: Type.Optional(Type.String({ minLength: 1, description: "Exact provider/model ID for this run" })),
+  thinking: Type.Optional(Type.String({ minLength: 1, description: "Thinking level for this run" })),
+};
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, never> };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -36,7 +41,7 @@ function text(content: string): ToolResult {
 }
 
 function failure(error: unknown): ToolResult {
-  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl and /run/schedules.json as applicable before retrying.`);
+  return text(`FAILED: ${String(error)}. The host may have completed a timed-out or disconnected call; check /run/timeline.jsonl, /run/schedules.json, and /run/tasks.json as applicable before retrying.`);
 }
 
 /** Sends one request line to the host bridge and resolves with the response result. */
@@ -138,16 +143,30 @@ const HOST_TOOLS = {
   },
   spawn: {
     label: "Spawn background task",
-    description: "Start a background task from a complete, self-contained prompt. Returns its runId and whether it started or queued; task_finished follows up when it settles.",
-    parameters: Type.Object({ prompt: Type.String({ description: "The complete prompt with all instructions and context for the background task agent" }) }),
-    execute: async (params: { prompt: string }): Promise<ToolResult> => {
+    description: "Start a background task from a complete prompt, with optional model and thinking overrides. Returns its runId and whether it started or queued; task_finished follows up when it settles.",
+    parameters: Type.Object(TASK_FIELDS),
+    execute: async (params: { prompt: string; model?: string; thinking?: string }): Promise<ToolResult> => {
       try {
-        const result = await callHost("spawn", { prompt: params.prompt });
+        const result = await callHost("spawn", params);
         const runId = typeof result.runId === "string" ? result.runId : "unknown";
         if (result.status === "queued") {
           return text(`Queued background task ${runId} (all task slots busy); it will start automatically. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
         }
         return text(`Launched background task ${runId}. The result arrives as a followup message when it settles; cancel it anytime with the cancel tool.`);
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  },
+  continue_task: {
+    label: "Continue background task",
+    description: "Resume an owned settled task in its existing session with an additional prompt and optional model and thinking overrides.",
+    parameters: Type.Object({ runId: Type.String({ minLength: 1, description: "Task run UUID" }), ...TASK_FIELDS }),
+    execute: async (params: { runId: string; prompt: string; model?: string; thinking?: string }): Promise<ToolResult> => {
+      try {
+        const result = await callHost("continue_task", params);
+        if (result.status === "queued") return text(`Queued continuation of task ${params.runId}; it will resume when a task slot is free.`);
+        return text(`Continued task ${params.runId} in its existing session.`);
       } catch (error) {
         return failure(error);
       }

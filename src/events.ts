@@ -64,6 +64,22 @@ export type TimelineEvent =
       pollId?: string | undefined;
     }
   | {
+      type: "task_started";
+      runId: string;
+      owner: ConversationAgentRef;
+      prompt: string;
+      model?: string | undefined;
+      thinking?: string | undefined;
+    }
+  | {
+      type: "task_continued";
+      runId: string;
+      owner: ConversationAgentRef;
+      prompt: string;
+      model?: string | undefined;
+      thinking?: string | undefined;
+    }
+  | {
       type: "task_finished";
       runId: string;
       owner: ConversationAgentRef;
@@ -254,6 +270,6 @@ export function timelineLine(event: object, sequence?: number): string {
 
 export const TIMELINE_PROMPT = `/run/timeline.jsonl is read-only shared context across all chats. Each JSON line has {v:1,id,seq,t,type,...}; id is stable and seq is monotonic for persisted events.
 - Inbound: message, edited_message, callback, poll_answer, message_reaction, my_chat_member, chat_join_request. Attachment objects may include a searchable description added later by annotate.
-- Completed actions: sent {actor,target,request,...}, task_finished, schedule_fired, schedule_taken. Sent events include host-managed attachment paths when applicable.
+- Completed actions: sent {actor,target,request,...}, task_started, task_continued, task_finished, schedule_fired, schedule_taken. Sent events include host-managed attachment paths when applicable.
 Use chat_id and message_thread_id to narrow context before searching globally. Treat sent actions as already complete. Repeated notification IDs are delivery replay, not new user input.
 `;

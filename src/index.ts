@@ -146,6 +146,7 @@ export async function main(): Promise<void> {
     });
     const tasksInstance: WorkspaceTasks = new WorkspaceTasks({
       workspace,
+      statePath: paths.tasks,
       timeline,
       credentials,
       appRoot: process.cwd(),
@@ -167,12 +168,14 @@ export async function main(): Promise<void> {
       annotate: async (params: Record<string, unknown>) => ({
         occurrences: await timeline.annotateAttachment(stringField(params, "attachment"), stringField(params, "description")),
       }),
-      spawn: async (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => {
-        if (actor.kind !== "conversation") throw new Error("Only conversation agents can spawn tasks");
-        return tasksInstance.spawn(stringField(params, "prompt"), actor);
-      },
-      cancel: async (params: Record<string, unknown>) => ({ status: await tasksInstance.cancel(stringField(params, "runId")) }),
-      steerTask: async (params: Record<string, unknown>) => ({ status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message")) }),
+      spawn: async (params: Record<string, unknown>, actor: AgentRef) => tasksInstance.spawn(params, conversationActor(actor)),
+      continueTask: async (params: Record<string, unknown>, actor: AgentRef) => tasksInstance.continueTask(params, conversationActor(actor)),
+      cancel: async (params: Record<string, unknown>, actor: AgentRef) => ({
+        status: await tasksInstance.cancel(stringField(params, "runId"), conversationActor(actor)),
+      }),
+      steerTask: async (params: Record<string, unknown>, actor: AgentRef) => ({
+        status: await tasksInstance.steer(stringField(params, "runId"), stringField(params, "message"), conversationActor(actor)),
+      }),
       steerConversation: async (params: Record<string, unknown>, actor: Parameters<typeof outboxInstance.send>[1]) => {
         if (actor.kind !== "conversation") throw new Error("Only conversation agents can steer conversations");
         const chatId = integerField(params, "chat_id");

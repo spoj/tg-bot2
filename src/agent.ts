@@ -117,12 +117,12 @@ function formatDuration(milliseconds: number): string {
 }
 
 function formatTaskFinishedMessage(event: Extract<BotEvent, { type: "task_finished" }>): string {
-  const outcome = event.status === "done"
-    ? "finished"
-    : event.status === "failed"
-      ? `failed (exit ${event.exitCode ?? "unknown"})`
-      : "aborted";
-  return `Task ${event.runId} ${outcome}. Complete instruction and results: /workspace/.pi/tasks/${event.runId}/prompt.txt, output.md, result.json`;
+  if (event.status === "done") {
+    return `Task ${event.runId} finished. Output: /workspace/.pi/tasks/${event.runId}/output.md. Continue it with continue_task.`;
+  }
+  const outcome = event.status === "failed" ? `failed (exit ${event.exitCode ?? "unknown"})` : "aborted";
+  const error = event.stderr ? ` Error: ${preview(event.stderr, 500)}` : "";
+  return `Task ${event.runId} ${outcome}.${error} No output was produced. Continue it with continue_task.`;
 }
 
 function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progress" }>["tasks"]): string {
@@ -130,7 +130,7 @@ function formatTaskProgressMessage(tasks: Extract<BotEvent, { type: "task_progre
     const running = formatDuration(task.runningMs);
     const idle = task.idleMs !== null ? formatDuration(task.idleMs) : "unknown";
     const activity = task.lastOutput ? `; activity preview: "${preview(task.lastOutput, 120)}"` : "";
-    return `- ${task.runId} running ${running}, last activity ${idle} ago${activity}; complete instruction: /workspace/.pi/tasks/${task.runId}/prompt.txt`;
+    return `- ${task.runId} running ${running}, last activity ${idle} ago${activity}`;
   });
   return `Task heartbeat: ${tasks.length} task(s) running. Activity text is a preview only.\n${lines.join("\n")}`;
 }
@@ -513,7 +513,7 @@ export class AgentManager {
     this.release(entry, entry.worker);
 
     const actor = entry.actor;
-    const token = this.credentials.issue(actor, ["send", "annotate", "spawn", "steer_conversation", "steer_task", "cancel", "schedule"]);
+    const token = this.credentials.issue(actor, ["send", "annotate", "spawn", "continue_task", "steer_conversation", "steer_task", "cancel", "schedule"]);
     entry.token = token;
     const settings = await loadUserSettings(this.workspace);
     const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
@@ -542,7 +542,7 @@ export class AgentManager {
         clearInterval: this.clearIntervalFn,
       }),
       appendSystemPrompt: SYSTEM_PROMPT,
-      hostTools: "send,annotate,spawn,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
+      hostTools: "send,annotate,spawn,continue_task,steer_conversation,steer_task,cancel,schedule_add,schedule_replace,schedule_remove,schedule_take",
       taskRun: false,
       spawnProcess: this.spawnProcess,
       terminateProcessGroup: this.terminateProcessGroup,

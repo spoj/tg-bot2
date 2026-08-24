@@ -29,6 +29,7 @@ describe("configuration", () => {
       attachments: "/data/bots/123/attachments",
       timeline: "/data/bots/123/timeline.jsonl",
       schedules: "/data/bots/123/run/schedules.json",
+      tasks: "/data/bots/123/run/tasks.json",
       schedulerState: "/data/bots/123/scheduler-state.json",
       runDir: "/data/bots/123/run",
     });

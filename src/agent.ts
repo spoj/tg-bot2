@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { conversationId, conversationSessionPath, type ConversationAgentRef } from "./agent-ref.js";
 import type { AgentCredentials } from "./host-bridge.js";
@@ -7,8 +7,8 @@ import { PiWorker } from "./pi-worker.js";
 import { SerialQueue } from "./queue.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
 import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
-import { TIMELINE_PROMPT } from "./events.js";
-import { appendJsonl, defined, isMissing, readJsonl } from "./util.js";
+import { TIMELINE_PROMPT, type TimelineRecord } from "./events.js";
+import { appendJsonl, defined, isMissing, readJsonl, readRegularFileBounded, replaceFileAtomic } from "./util.js";
 
 const BASE_PROMPT = `You are a persistent personal agent serving one conversation in a shared long-term workspace.
 Assistant text is not delivered; communicate through send. The host derives this session's connector-native destination from its authenticated conversation identity.
@@ -20,8 +20,7 @@ Install project extensions with pi install <pkg> -l --approve. Project settings 
 const BEHAVIOR_PROMPT = `Behavior:
 - Every host notification starts with a stable notification ID and, for persisted timeline events, a sequence number. Treat repeated IDs as replay of the same notification.
 - Inbound notifications contain the complete persisted connector event. Read its connector-native payload directly.
-- Keep user-facing replies concise unless the user asks for detail.
-- After interpreting an attachment, call annotate with its exact /run/attachments path and a short factual description. The host inserts it into the attachment's original timeline event for later search.
+- After interpreting an attachment, call annotate with its exact /run/attachments path and a short factual description. The host appends an attachment.annotated event with the path and description for later search; earlier attachment records remain unchanged.
 - Use steer_conversation to wake another conversation owner when work belongs to it. Copy the target conversation object from /run/timeline.jsonl and give a concrete instruction; do not send into its conversation yourself.
 - Read only the context needed: this conversation in /run/timeline.jsonl, then its connector, then the wider workspace. Older sessions are under /workspace/.pi/sessions.
 - Connector access policy is described by the connector prompt. Notification overrides live in this agent's notifications.json beside its session file; use {"wake":["event.type"],"mute":["event.type"]}. /restart applies model and notification setting changes.
@@ -93,18 +92,25 @@ export type AgentManagerOptions = {
 
 export type NotificationIdentity = { id: string; sequence?: number | undefined };
 
+export type TimelineRecoveryHandler = (record: TimelineRecord, rawLine: string) => Promise<void>;
+
 export type AgentNotifier = {
   interrupt(text: string, target: ConversationAgentRef, maxWaitMs?: number, identity?: NotificationIdentity): Promise<void>;
   followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void>;
+  markTimelineProcessed?(sequence: number): Promise<void>;
+  registerTimelineRecovery?(handler: TimelineRecoveryHandler): void;
 };
 
 const RESTART_SETTLE_CAP_MS = 30_000;
 export const USER_INTERRUPT_MAX_WAIT_MS = 2 * 60 * 1_000;
 const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
+const SETTINGS_MAX_BYTES = 1 * 1024 * 1024;
+const MAX_RETAINED_DELIVERED = 1_024;
+const NOTIFICATION_COMPACTION_THRESHOLD = 128;
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
   try {
-    const raw = await readFile(path.join(workspace, USER_SETTINGS_RELATIVE_PATH), "utf8");
+    const raw = (await readRegularFileBounded(path.join(workspace, USER_SETTINGS_RELATIVE_PATH), SETTINGS_MAX_BYTES)).toString("utf8");
     const parsed: unknown = JSON.parse(raw);
     return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch {
@@ -130,7 +136,8 @@ type PendingNotification = {
 
 type NotificationLogRecord =
   | { type: "queued"; notification: PendingNotification }
-  | { type: "delivered"; id: string };
+  | { type: "delivered"; id: string; sequence?: number | undefined }
+  | { type: "checkpoint"; sequence: number };
 
 function notificationPrompt(notification: PendingNotification): string {
   const sequence = notification.sequence === undefined ? "" : ` seq=${notification.sequence}`;
@@ -175,8 +182,13 @@ export class AgentManager {
   private readonly workers = new Map<string, ConversationWorkerEntry>();
   private readonly notificationWrites = new SerialQueue();
   private readonly pendingNotifications = new Map<string, PendingNotification>();
-  private readonly deliveredNotifications = new Set<string>();
+  private readonly deliveredNotifications = new Map<string, number | undefined>();
   private notificationsLoaded: Promise<void> | undefined;
+  private notificationRecordCount = 0;
+  private timelineCursor = 0;
+  private timelineRecoveryHandler: TimelineRecoveryHandler | undefined;
+  private timelineRecoveryDone = false;
+  private timelineRecoveryActive = false;
   private shuttingDown = false;
 
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
@@ -211,6 +223,25 @@ export class AgentManager {
     return entry;
   }
 
+  registerTimelineRecovery(handler: TimelineRecoveryHandler): void {
+    this.timelineRecoveryHandler = handler;
+  }
+
+  async markTimelineProcessed(sequence: number): Promise<void> {
+    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error("Invalid timeline sequence");
+    await this.loadPendingNotifications();
+    await this.notificationWrites.run(async () => {
+      if (sequence <= this.timelineCursor) return;
+      if (!this.timelineRecoveryActive && this.hostTimeline !== undefined && sequence > this.timelineCursor + 1) {
+        throw new Error("Timeline notification sequence gap");
+      }
+      await this.appendNotificationRecord({ type: "checkpoint", sequence });
+      this.timelineCursor = sequence;
+      const pruned = this.pruneDeliveredThrough(sequence);
+      await this.maybeCompactNotifications(pruned);
+    });
+  }
+
   async start(): Promise<void> {
     await this.loadPendingNotifications();
     const targets = new Map<string, ConversationAgentRef>();
@@ -219,6 +250,7 @@ export class AgentManager {
       const entry = this.getOrCreateEntry(target);
       await entry.serial.run(() => this.deliverPending(entry)).catch((error) => console.error("Pending notification replay failed", error));
     }));
+    await this.recoverPersistedTimeline();
   }
 
   async followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void> {
@@ -266,41 +298,183 @@ export class AgentManager {
     this.notificationsLoaded ??= (async () => {
       await mkdir(path.dirname(this.notificationsPath), { recursive: true, mode: 0o700 });
       let lines: string[];
+      let exists = true;
       try {
         lines = await readJsonl(this.notificationsPath);
       } catch (error) {
         if (!isMissing(error)) throw error;
         lines = [];
+        exists = false;
       }
+      this.notificationRecordCount = lines.length;
+      let hasCheckpoint = false;
       for (const line of lines) {
-        const record = JSON.parse(line) as NotificationLogRecord;
+        const parsed: unknown = JSON.parse(line);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed notification log record");
+        const record = parsed as NotificationLogRecord;
         if (record.type === "queued") {
+          if (record.notification === null || typeof record.notification !== "object" || Array.isArray(record.notification)) {
+            throw new Error("Malformed queued notification");
+          }
           const notification = { ...record.notification, target: validateNotificationTarget(record.notification.target) };
+          if (typeof notification.id !== "string" || notification.id.length === 0) throw new Error("Malformed queued notification ID");
           if (!this.deliveredNotifications.has(notification.id)) this.pendingNotifications.set(notification.id, notification);
         } else if (record.type === "delivered") {
+          if (typeof record.id !== "string" || record.id.length === 0) throw new Error("Malformed delivered notification ID");
           this.pendingNotifications.delete(record.id);
-          this.deliveredNotifications.add(record.id);
+          const sequence = record.sequence === undefined ? undefined : record.sequence;
+          if (sequence !== undefined && (!Number.isSafeInteger(sequence) || sequence < 1)) throw new Error("Malformed delivered notification sequence");
+          this.rememberDelivered(record.id, sequence);
+        } else if (record.type === "checkpoint") {
+          if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) throw new Error("Malformed notification checkpoint");
+          hasCheckpoint = true;
+          this.timelineCursor = Math.max(this.timelineCursor, record.sequence);
+        } else {
+          throw new Error("Unknown notification log record");
         }
       }
+      this.pruneDeliveredThrough(this.timelineCursor);
+      if (exists && !hasCheckpoint) await this.establishLegacyTimelineBaseline();
+      if (exists) await this.compactNotifications();
     })();
     await this.notificationsLoaded;
+  }
+
+  /** Establishes the first cursor at the current timeline tail for pre-checkpoint journals. */
+  private async establishLegacyTimelineBaseline(): Promise<void> {
+    const timelinePath = this.hostTimeline;
+    if (timelinePath === undefined) return;
+    let lines: string[];
+    try {
+      lines = await readJsonl(timelinePath);
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
+    }
+    let sequence = 0;
+    for (const line of lines) {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed timeline record");
+      const record = parsed as TimelineRecord;
+      if (record.v !== 2) throw new Error("Timeline migration did not complete");
+      if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Malformed timeline sequence");
+      sequence = Math.max(sequence, record.seq);
+    }
+    this.timelineCursor = Math.max(this.timelineCursor, sequence);
+    this.pruneDeliveredThrough(this.timelineCursor);
   }
 
   private async enqueueNotification(notification: PendingNotification): Promise<void> {
     await this.loadPendingNotifications();
     await this.notificationWrites.run(async () => {
       if (this.pendingNotifications.has(notification.id) || this.deliveredNotifications.has(notification.id)) return;
-      await appendJsonl(this.notificationsPath, JSON.stringify({ type: "queued", notification } satisfies NotificationLogRecord));
+      if (notification.sequence !== undefined && notification.sequence <= this.timelineCursor) return;
+      await this.appendNotificationRecord({ type: "queued", notification });
       this.pendingNotifications.set(notification.id, notification);
+      await this.maybeCompactNotifications();
     });
   }
 
   private async acknowledgeNotification(id: string): Promise<void> {
     await this.notificationWrites.run(async () => {
-      await appendJsonl(this.notificationsPath, JSON.stringify({ type: "delivered", id } satisfies NotificationLogRecord));
+      const notification = this.pendingNotifications.get(id);
+      if (!notification) return;
+      await this.appendNotificationRecord({
+        type: "delivered",
+        id,
+        ...(notification.sequence === undefined ? {} : { sequence: notification.sequence }),
+      });
       this.pendingNotifications.delete(id);
-      this.deliveredNotifications.add(id);
+      this.rememberDelivered(id, notification.sequence);
+      await this.maybeCompactNotifications();
     });
+  }
+
+  private rememberDelivered(id: string, sequence: number | undefined): void {
+    this.deliveredNotifications.delete(id);
+    this.deliveredNotifications.set(id, sequence);
+    while (this.deliveredNotifications.size > MAX_RETAINED_DELIVERED) {
+      let oldest: string | undefined;
+      for (const [candidate, candidateSequence] of this.deliveredNotifications) {
+        if (candidateSequence === undefined) {
+          oldest = candidate;
+          break;
+        }
+        oldest ??= candidate;
+      }
+      if (oldest === undefined) break;
+      this.deliveredNotifications.delete(oldest);
+    }
+  }
+  private pruneDeliveredThrough(sequence: number): boolean {
+    let pruned = false;
+    for (const [id, deliveredSequence] of this.deliveredNotifications) {
+      if (deliveredSequence !== undefined && deliveredSequence <= sequence) {
+        this.deliveredNotifications.delete(id);
+        pruned = true;
+      }
+    }
+    return pruned;
+  }
+
+  private async appendNotificationRecord(record: NotificationLogRecord): Promise<void> {
+    await appendJsonl(this.notificationsPath, JSON.stringify(record));
+    this.notificationRecordCount += 1;
+  }
+
+  private async maybeCompactNotifications(force = false): Promise<void> {
+    if (!force && this.notificationRecordCount < NOTIFICATION_COMPACTION_THRESHOLD) return;
+    await this.compactNotifications();
+  }
+
+  private async compactNotifications(): Promise<void> {
+    const records: string[] = [];
+    for (const notification of this.pendingNotifications.values()) {
+      records.push(JSON.stringify({ type: "queued", notification } satisfies NotificationLogRecord));
+    }
+    for (const [id, sequence] of this.deliveredNotifications) {
+      records.push(JSON.stringify({ type: "delivered", id, ...(sequence === undefined ? {} : { sequence }) } satisfies NotificationLogRecord));
+    }
+    records.push(JSON.stringify({ type: "checkpoint", sequence: this.timelineCursor } satisfies NotificationLogRecord));
+    await replaceFileAtomic(this.notificationsPath, `${records.join("\n")}\n`);
+    this.notificationRecordCount = records.length;
+  }
+
+  private async recoverPersistedTimeline(): Promise<void> {
+    const recovery = this.timelineRecoveryHandler;
+    const timelinePath = this.hostTimeline;
+    if (this.timelineRecoveryDone || !timelinePath || !recovery) return;
+    let lines: string[];
+    try {
+      lines = await readJsonl(timelinePath);
+    } catch (error) {
+      if (isMissing(error)) {
+        this.timelineRecoveryDone = true;
+        return;
+      }
+      throw error;
+    }
+
+    this.timelineRecoveryActive = true;
+    try {
+      for (const line of lines) {
+        const parsed: unknown = JSON.parse(line);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed timeline record");
+        const record = parsed as TimelineRecord;
+        if (record.v !== 2) throw new Error("Timeline migration did not complete");
+        if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Malformed timeline sequence");
+        if (record.seq <= this.timelineCursor) continue;
+        try {
+          await recovery(record, line);
+        } catch (error) {
+          console.error("Timeline notification recovery failed", error);
+          break;
+        }
+      }
+      this.timelineRecoveryDone = true;
+    } finally {
+      this.timelineRecoveryActive = false;
+    }
   }
 
   async restartAll(): Promise<void> {

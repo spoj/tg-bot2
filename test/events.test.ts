@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -87,9 +87,10 @@ describe("WorkspaceTimeline", () => {
     expect(JSON.parse(line)).toMatchObject({ v: 2, seq: 9, type: "schedule_fired" });
   });
 
-  it("retroactively annotates connector attachment records in place", async () => {
+  it("appends attachment annotations without replacing the timeline inode", async () => {
     const dataDir = await temporaryDirectory();
-    const timeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    const timeline = new WorkspaceTimeline(filePath);
     const conversation = conversationAgent("files:primary", "channel-7", { channel: "channel-7" });
     const received = "/run/attachments/files-primary/received/photo.jpg";
     const sent = "/run/attachments/files-primary/sent/chart.png";
@@ -109,15 +110,29 @@ describe("WorkspaceTimeline", () => {
       attachments: [{ path: sent }],
     });
 
-    await expect(timeline.annotateAttachment(received, "Whiteboard sketch of the queue design")).resolves.toBe(1);
-    await expect(timeline.annotateAttachment(sent, "Latency chart comparing two queue designs")).resolves.toBe(1);
-    await expect(timeline.annotateAttachment(received, "Updated whiteboard description")).resolves.toBe(1);
+    const mounted = await open(filePath, "r");
+    try {
+      const inode = (await mounted.stat()).ino;
+      await expect(timeline.annotateAttachment(received, "Whiteboard sketch of the queue design")).resolves.toBe(1);
+      await expect(timeline.annotateAttachment(sent, "Latency chart comparing two queue designs")).resolves.toBe(1);
+      await expect(timeline.annotateAttachment(received, "Updated whiteboard description")).resolves.toBe(1);
+      expect((await mounted.stat()).ino).toBe(inode);
+      await expect(mounted.readFile("utf8")).resolves.toContain("Updated whiteboard description");
+    } finally {
+      await mounted.close();
+    }
 
-    const raw = await readFile(timeline.filePath, "utf8");
+    const raw = await readFile(filePath, "utf8");
     const records = raw.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(records).toHaveLength(2);
-    expect(records[0]).toMatchObject({ attachments: [{ path: received, description: "Updated whiteboard description" }] });
-    expect(records[1]).toMatchObject({ attachments: [{ path: sent, description: "Latency chart comparing two queue designs" }] });
+    expect(records).toHaveLength(5);
+    expect(records[0]).toMatchObject({ attachments: [{ path: received }] });
+    expect(records[0]).not.toMatchObject({ attachments: [{ description: "Updated whiteboard description" }] });
+    expect(records[1]).toMatchObject({ attachments: [{ path: sent }] });
+    expect(records.slice(2)).toMatchObject([
+      { type: "attachment.annotated", payload: { path: received, description: "Whiteboard sketch of the queue design", occurrences: 1 } },
+      { type: "attachment.annotated", payload: { path: sent, description: "Latency chart comparing two queue designs", occurrences: 1 } },
+      { type: "attachment.annotated", payload: { path: received, description: "Updated whiteboard description", occurrences: 1 } },
+    ]);
   });
 
   it("does not broadcast an event that could not be persisted", async () => {
@@ -135,5 +150,55 @@ describe("WorkspaceTimeline", () => {
       payload: { text: "hello" },
     })).rejects.toThrow("Failed to persist timeline event");
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("starts past an unterminated tail and keeps subsequent appends valid", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    const existing = JSON.stringify({ v: 2, id: "existing", seq: 4, t: "2026-08-24T00:00:00.000Z", type: "custom.event" });
+    await writeFile(filePath, `${existing}\n{"v":2,"id":"torn"`, "utf8");
+    const timeline = new WorkspaceTimeline(filePath);
+
+    await timeline.start();
+    const line = await timeline.publish({ type: "custom.next" });
+
+    await expect(readFile(filePath, "utf8")).resolves.toBe(`${existing}\n${line}\n`);
+  });
+
+  it("still rejects a malformed newline-terminated record", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    await writeFile(filePath, "{\"v\":2,\n", "utf8");
+
+    await expect(new WorkspaceTimeline(filePath).start()).rejects.toThrow(SyntaxError);
+  });
+
+  it("releases persistence for later events while a listener is waiting", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "timeline.jsonl");
+    const timeline = new WorkspaceTimeline(filePath);
+    let release!: () => void;
+    let entered!: () => void;
+    const listenerEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const listenerRelease = new Promise<void>((resolve) => { release = resolve; });
+    const seen: number[] = [];
+    timeline.subscribe(async (record) => {
+      seen.push(record.seq);
+      if (record.seq === 1) {
+        entered();
+        await listenerRelease;
+      }
+    });
+
+    const first = timeline.publish({ type: "custom.first" });
+    await listenerEntered;
+    const second = timeline.publish({ type: "custom.second" });
+    await vi.waitFor(async () => {
+      const raw = await readFile(filePath, "utf8");
+      expect(raw.split("\n").filter(Boolean)).toHaveLength(2);
+    });
+    release();
+    await Promise.all([first, second]);
+    expect(seen).toEqual([1, 2]);
   });
 });

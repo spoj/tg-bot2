@@ -1,4 +1,4 @@
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -79,5 +79,45 @@ describe("readJsonl", () => {
     await handle.close();
 
     await expect(readJsonl(filePath)).rejects.toThrow("exceeds 268435456 byte cap");
+  });
+
+  it("drops only an unterminated final fragment", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "store.jsonl");
+    const complete = JSON.stringify({ complete: true });
+    await writeFile(filePath, `${complete}\n{"partial":`, "utf8");
+
+    await expect(readJsonl(filePath)).resolves.toEqual([complete]);
+  });
+  it("retains a syntactically complete final record without a newline", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "store.jsonl");
+    const complete = JSON.stringify({ complete: true });
+    const final = JSON.stringify({ final: true });
+    await writeFile(filePath, `${complete}\n${final}`, "utf8");
+
+    await expect(readJsonl(filePath)).resolves.toEqual([complete, final]);
+  });
+  it("inserts a newline before appending after a valid no-newline record", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "store.jsonl");
+    const complete = JSON.stringify({ complete: true });
+    await writeFile(filePath, complete, "utf8");
+
+    await appendJsonl(filePath, JSON.stringify({ next: true }));
+
+    await expect(readFile(filePath, "utf8")).resolves.toBe(`${complete}\n{"next":true}\n`);
+  });
+
+
+  it("repairs a torn final fragment before appending", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "store.jsonl");
+    const complete = JSON.stringify({ complete: true });
+    await writeFile(filePath, `${complete}\n{"partial":`, "utf8");
+
+    await appendJsonl(filePath, JSON.stringify({ next: true }));
+
+    await expect(readFile(filePath, "utf8")).resolves.toBe(`${complete}\n{"next":true}\n`);
   });
 });

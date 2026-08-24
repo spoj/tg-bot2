@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, open, realpath, rename, rm, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 /** Strips keys whose value is undefined at runtime AND at the type level; preserves the presence/absence contract under exactOptionalPropertyTypes. */
@@ -124,6 +125,8 @@ const DIRECTORY = fsConstants.O_DIRECTORY;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;
 const READ_CHUNK_BYTES = 64 * 1024;
+const DIRECTORY_OPEN_FLAGS = fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW | NON_BLOCKING;
+const FILE_OPEN_FLAGS = fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING;
 
 /**
  * Reads a file handle to EOF in fixed-size chunks, never allocating more than
@@ -145,6 +148,62 @@ export async function readFileBounded(handle: FileHandle, capBytes: number): Pro
 }
 
 /**
+ * Reads a regular file without following symlinks in any path component,
+ * blocking on a special file, or retaining more than capBytes of input.
+ */
+export async function readRegularFileBounded(filePath: string, capBytes: number): Promise<Buffer> {
+  const resolved = path.resolve(filePath);
+  const parsed = path.parse(resolved);
+  const components = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  const finalComponent = components.pop();
+  if (finalComponent === undefined) throw new Error("File is not a regular file");
+
+  const directories: FileHandle[] = [];
+  try {
+    let directory = await open(parsed.root, DIRECTORY_OPEN_FLAGS);
+    directories.push(directory);
+    for (const component of components) {
+      const child = await open(path.join(`/proc/self/fd/${directory.fd}`, component), DIRECTORY_OPEN_FLAGS);
+      try {
+        const stat = await child.stat();
+        if (!stat.isDirectory()) throw new Error(`Path component is not a directory: ${component}`);
+      } catch (error) {
+        await child.close().catch(() => {});
+        throw error;
+      }
+      directories.push(child);
+      directory = child;
+    }
+
+    const handle = await open(path.join(`/proc/self/fd/${directory.fd}`, finalComponent), FILE_OPEN_FLAGS);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("File is not a regular file");
+      if (stat.size > capBytes) throw new Error(`File exceeds ${capBytes} byte cap`);
+      return await readFileBounded(handle, capBytes);
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  } finally {
+    for (let index = directories.length - 1; index >= 0; index--) {
+      await directories[index]!.close().catch(() => {});
+    }
+  }
+}
+
+/** Replaces a file by writing a same-directory temporary file and renaming it. */
+export async function replaceFileAtomic(filePath: string, contents: string): Promise<void> {
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await rename(temporary, filePath);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+
+/**
  * Appends serialized records to a JSONL store (filePath), creating and validating the store even when the array is empty. A symlink planted
  * at the path is unlinked and the open retried (ELOOP defense). Writes loop until the
  * whole payload is on disk; zero write progress throws instead of reporting success
@@ -160,6 +219,18 @@ export async function appendJsonl(
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
+    const completeTail = await discardUnterminatedTail(handle, stat.size);
+    if (completeTail && payload.length > 0) {
+      const separator = Buffer.from("\n", "utf8");
+      let separatorWritten = 0;
+      while (separatorWritten < separator.length) {
+        const result = await handle.write(separator, separatorWritten, separator.length - separatorWritten, null);
+        if (result.bytesWritten === 0) {
+          throw new Error(`JSONL store accepted only ${separatorWritten} of ${separator.length} bytes`);
+        }
+        separatorWritten += result.bytesWritten;
+      }
+    }
     let written = 0;
     while (written < payload.length) {
       const result = await handle.write(payload, written, payload.length - written, null);
@@ -176,13 +247,14 @@ export async function appendJsonl(
 const JSONL_READ_CAP_BYTES = 256 * 1024 * 1024;
 
 /**
- * Reads every line of a JSONL store (filePath), dropping a possible partial first
- * line, without following symlinks.
+ * Reads every complete line of a JSONL store (filePath), retaining a final
+ * syntactically complete record even when it has no trailing newline. Only a
+ * malformed unterminated final fragment is dropped, without following symlinks.
  */
 export async function readJsonl(
   filePath: string,
 ): Promise<string[]> {
-  const handle = await open(filePath, fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+  const handle = await open(filePath, FILE_OPEN_FLAGS);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("JSONL store is not a regular file");
@@ -207,8 +279,53 @@ async function openJsonlAppend(filePath: string): Promise<FileHandle> {
   }
 }
 
-/** Reads every line of a store in bounded chunks, dropping a possible partial final line. */
+/** Returns true for a valid final record, or truncates a malformed tail. */
+async function discardUnterminatedTail(handle: FileHandle, size: number): Promise<boolean> {
+  if (size > JSONL_READ_CAP_BYTES) throw new Error(`File exceeds ${JSONL_READ_CAP_BYTES} byte cap`);
+  if (size === 0) return false;
+  let end = size;
+  let tailStart = 0;
+  while (end > 0) {
+    const start = Math.max(0, end - READ_CHUNK_BYTES);
+    const chunk = Buffer.allocUnsafe(end - start);
+    const result = await handle.read(chunk, 0, chunk.length, start);
+    if (result.bytesRead !== chunk.length) throw new Error("JSONL store changed while checking its final line");
+    const newline = chunk.lastIndexOf(0x0a);
+    if (newline >= 0) {
+      tailStart = start + newline + 1;
+      break;
+    }
+    end = start;
+  }
+  if (tailStart === size) return false;
+
+  const tail = Buffer.allocUnsafe(size - tailStart);
+  const result = await handle.read(tail, 0, tail.length, tailStart);
+  if (result.bytesRead !== tail.length) throw new Error("JSONL store changed while checking its final line");
+  if (isSyntacticallyCompleteJson(tail)) return true;
+  await handle.truncate(tailStart);
+  return false;
+}
+
+/** Reads every complete line of a store in bounded chunks, dropping a malformed unterminated final fragment. */
 async function readJsonlLines(handle: FileHandle): Promise<string[]> {
   const contents = await readFileBounded(handle, JSONL_READ_CAP_BYTES);
-  return contents.toString("utf8").split("\n").filter(Boolean);
+  const finalNewline = contents.lastIndexOf(0x0a);
+  if (finalNewline < 0) {
+    const finalRecord = contents.toString("utf8");
+    return isSyntacticallyCompleteJson(contents) ? [finalRecord] : [];
+  }
+  const lines = contents.subarray(0, finalNewline).toString("utf8").split("\n").filter(Boolean);
+  const finalFragment = contents.subarray(finalNewline + 1);
+  if (finalFragment.length > 0 && isSyntacticallyCompleteJson(finalFragment)) lines.push(finalFragment.toString("utf8"));
+  return lines;
+}
+
+function isSyntacticallyCompleteJson(value: Buffer): boolean {
+  try {
+    JSON.parse(value.toString("utf8"));
+    return true;
+  } catch {
+    return false;
+  }
 }

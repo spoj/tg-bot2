@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi, type Mock } from "vitest";
@@ -176,7 +176,32 @@ it("loadUserSettings tolerates missing, empty, and malformed files", async () =>
     await settingsFile(dataDir, { defaultModel: "claude", custom: true });
     await expect(loadUserSettings(workspace)).resolves.toEqual({ defaultModel: "claude", custom: true });
   });
+
 });
+
+it("falls back when user settings are a symlink to a special file", async () => {
+  await withDataDir(async (dataDir) => {
+    const settingsPath = path.join(dataDir, "workspace", ".pi", "agent", "settings.json");
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    await rm(settingsPath, { force: true });
+    await symlink("/dev/zero", settingsPath);
+
+    await expect(loadUserSettings(path.join(dataDir, "workspace"))).resolves.toEqual({});
+  });
+});
+it("falls back when an intermediate user settings directory is a symlink", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const outside = path.join(dataDir, "outside");
+    await mkdir(workspace, { recursive: true });
+    await mkdir(path.join(outside, ".pi", "agent"), { recursive: true });
+    await writeFile(path.join(outside, ".pi", "agent", "settings.json"), JSON.stringify({ defaultModel: "escaped" }), "utf8");
+    await symlink(path.join(outside, ".pi"), path.join(workspace, ".pi"));
+
+    await expect(loadUserSettings(workspace)).resolves.toEqual({});
+  });
+});
+
 
 it("followup starts a fresh worker and sends prompt with followUp streaming behavior", async () => {
   await withDataDir(async (dataDir) => {
@@ -254,6 +279,148 @@ it("replays a notification that was persisted but not accepted", async () => {
       "steer",
       undefined,
     );
+  });
+});
+
+it("compacts notification history while retaining a bounded delivered set", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
+    for (let index = 0; index < 80; index++) {
+      await manager.followup(`instruction ${index}`, CHAT, { id: `notification-${index}` });
+    }
+
+    const lines = (await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).trim().split("\n");
+    expect(lines.length).toBeLessThan(128);
+  });
+});
+
+it("recovers a persisted timeline event that never reached the notification journal", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const target = telegramConversation(CONNECTOR_ID, 321);
+    const record: TimelineRecord = {
+      v: 2,
+      id: "unhanded-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: target,
+      payload: { message_id: 7, text: "recover me" },
+      meta: { user_content: true, private: true },
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: factory, hostTimeline: timelinePath }));
+    const { connectors } = fakeTelegramConnector();
+    new AgentEventRouter(manager, { workspace, connectors });
+
+    await manager.start();
+
+    expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover me"), "steer", USER_INTERRUPT_MAX_WAIT_MS);
+  });
+});
+it("baselines a legacy notification journal without replaying historical timeline events", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const notificationsPath = path.join(dataDir, "notifications.jsonl");
+    const target = telegramConversation(CONNECTOR_ID, 321);
+    const historical: TimelineRecord = {
+      v: 2,
+      id: "historical-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: target,
+      payload: { message_id: 6, text: "do not replay" },
+      meta: { user_content: true, private: true },
+    };
+    const tail: TimelineRecord = {
+      v: 2,
+      id: "timeline-tail",
+      seq: 2,
+      t: "2026-08-24T00:00:01.000Z",
+      type: "system.event",
+    };
+    await writeFile(timelinePath, `${JSON.stringify(historical)}\n${JSON.stringify(tail)}\n`, "utf8");
+    const queued = {
+      type: "queued",
+      notification: {
+        id: "queued-legacy",
+        sequence: 1,
+        target,
+        text: "deliver queued legacy notification",
+        behavior: "steer",
+      },
+    };
+    const delivered = Array.from({ length: 1_025 }, (_, index) => ({
+      type: "delivered",
+      id: index === 0 ? historical.id : `historical-${index}`,
+      sequence: index + 1,
+    }));
+    await writeFile(notificationsPath, `${[queued, ...delivered].map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: factory, hostTimeline: timelinePath }));
+    const { connectors } = fakeTelegramConnector();
+    new AgentEventRouter(manager, { workspace, connectors });
+
+    await manager.start();
+
+    expect(workers).toHaveLength(1);
+    expect(workers[0]?.prompt).toHaveBeenCalledOnce();
+    expect(workers[0]?.prompt).toHaveBeenCalledWith(
+      "[notification id=queued-legacy seq=1]\ndeliver queued legacy notification",
+      "steer",
+      undefined,
+    );
+  });
+});
+
+it("recovers a missed timeline event when a checkpoint establishes the cursor", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const notificationsPath = path.join(dataDir, "notifications.jsonl");
+    const target = telegramConversation(CONNECTOR_ID, 654);
+    const record: TimelineRecord = {
+      v: 2,
+      id: "checkpoint-missed-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: target,
+      payload: { message_id: 8, text: "recover after checkpoint" },
+      meta: { user_content: true, private: true },
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    await writeFile(notificationsPath, `${JSON.stringify({ type: "checkpoint", sequence: 0 })}\n`, "utf8");
+
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: factory, hostTimeline: timelinePath }));
+    const { connectors } = fakeTelegramConnector();
+    new AgentEventRouter(manager, { workspace, connectors });
+
+    await manager.start();
+
+    expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover after checkpoint"), "steer", USER_INTERRUPT_MAX_WAIT_MS);
+  });
+});
+
+
+it("still rejects a malformed newline-terminated notification record", async () => {
+  await withDataDir(async (dataDir) => {
+    const notificationsPath = path.join(dataDir, "notifications.jsonl");
+    await writeFile(notificationsPath, "{\"type\":\"queued\"\n", "utf8");
+    const { factory } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
+
+    await expect(manager.start()).rejects.toThrow(SyntaxError);
   });
 });
 
@@ -606,5 +773,59 @@ it("loads attention overrides from the owning conversation session", async () =>
 
     expect(connector.attention).toHaveBeenCalledWith(record, { wake: ["telegram.edited_message"] });
     expect(interrupt).toHaveBeenCalledWith(expect.any(String), target, USER_INTERRUPT_MAX_WAIT_MS, { id: "edited-wake", sequence: 13 });
+  });
+});
+
+it("falls back when notification settings are a symlink to a special file", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const target = telegramConversation(CONNECTOR_ID, 42, 7);
+    const settingsPath = path.join(workspace, ".pi", "sessions", conversationSessionPath(target), "notifications.json");
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    await symlink("/dev/zero", settingsPath);
+    const { connector, connectors } = fakeTelegramConnector();
+    const router = new AgentEventRouter({ interrupt: vi.fn(async () => undefined), followup: vi.fn(async () => undefined) }, { workspace, connectors });
+    const record: TimelineRecord = {
+      v: 2,
+      id: "unsafe-settings",
+      seq: 14,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.edited_message",
+      connectorId: CONNECTOR_ID,
+      conversation: target,
+      payload: { message_id: 10, text: "changed" },
+    };
+
+    await router.onEvent(record, JSON.stringify(record));
+
+    expect(connector.attention).toHaveBeenCalledWith(record, {});
+  });
+});
+it("falls back when an intermediate notification settings directory is a symlink", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const target = telegramConversation(CONNECTOR_ID, 42, 7);
+    const outside = path.join(dataDir, "outside", "sessions", conversationSessionPath(target));
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "notifications.json"), JSON.stringify({ wake: ["telegram.edited_message"] }), "utf8");
+    await mkdir(path.join(workspace, ".pi"), { recursive: true });
+    await symlink(path.join(dataDir, "outside", "sessions"), path.join(workspace, ".pi", "sessions"));
+
+    const { connector, connectors } = fakeTelegramConnector();
+    const router = new AgentEventRouter({ interrupt: vi.fn(async () => undefined), followup: vi.fn(async () => undefined) }, { workspace, connectors });
+    const record: TimelineRecord = {
+      v: 2,
+      id: "unsafe-intermediate-settings",
+      seq: 15,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.edited_message",
+      connectorId: CONNECTOR_ID,
+      conversation: target,
+      payload: { message_id: 10, text: "changed" },
+    };
+
+    await router.onEvent(record, JSON.stringify(record));
+
+    expect(connector.attention).toHaveBeenCalledWith(record, {});
   });
 });

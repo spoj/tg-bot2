@@ -235,6 +235,7 @@ export async function main(): Promise<void> {
       if (shuttingDown) {
         await instance.agents.beginShutdown().catch((error) => console.error("Agent abort failed", error));
         await finishDisposal(instance);
+        await shutdownPromise;
         return;
       }
       instances.push(instance);
@@ -242,14 +243,15 @@ export async function main(): Promise<void> {
     for (const instance of instances) {
       await instance.bridge.start();
       if (shuttingDown) return void await shutdown("startup interrupted");
-      await instance.scheduler.start();
-      if (shuttingDown) return void await shutdown("startup interrupted");
       await instance.agents.start();
+      if (shuttingDown) return void await shutdown("startup interrupted");
+      await instance.scheduler.start();
       if (shuttingDown) return void await shutdown("startup interrupted");
     }
     const connectors = instances.flatMap((instance) => instance.connectors);
     console.log(`Starting ${connectors.length} connector(s) across ${instances.length} workspace(s)`);
     await Promise.all(connectors.map((connector) => connector.run()));
+    if (shuttingDown) await shutdown("startup interrupted");
   } catch (error) {
     if (shuttingDown) {
       await shutdownPromise;

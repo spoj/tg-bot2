@@ -73,6 +73,9 @@ export class TelegramConnector implements WorkspaceConnector {
   readonly delivery = new TelegramDeliveryQueue();
   private agent: { restartAll(): Promise<void> } | undefined;
   private running = false;
+  private runPromise: Promise<void> | undefined;
+  private stopped = false;
+  private stopPromise: Promise<void> | undefined;
 
   constructor(
     readonly config: Config,
@@ -91,23 +94,61 @@ export class TelegramConnector implements WorkspaceConnector {
   setAgent(agent: { restartAll(): Promise<void> }): void {
     this.agent = agent;
   }
-
   async run(): Promise<void> {
+    if (this.stopped) return;
+    if (this.runPromise) return this.runPromise;
+    const running = this.runInternal();
+    this.runPromise = running;
+    try {
+      await running;
+    } finally {
+      if (this.runPromise === running) this.runPromise = undefined;
+    }
+  }
+
+  private async runInternal(): Promise<void> {
     await registerBotCommands(this.bot);
+    if (this.stopped) return;
     this.running = true;
     try {
+      if (this.stopped) return;
       await this.bot.start({
         allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "poll_answer", "message_reaction", "my_chat_member", "chat_join_request"],
         onStart: (info) => console.log(`Telegram connector ${this.id} @${info.username} started`),
       });
+    } catch (error) {
+      if (!this.stopped) throw error;
     } finally {
       this.running = false;
     }
   }
 
   async stop(): Promise<void> {
-    if (this.running) await this.bot.stop();
+    if (this.stopPromise) return this.stopPromise;
+    const stopping = this.stopInternal();
+    this.stopPromise = stopping;
+    return stopping;
+  }
+
+  private async stopInternal(): Promise<void> {
+    this.stopped = true;
+    let failure: unknown;
+    if (this.running) {
+      try {
+        await this.bot.stop();
+      } catch (error) {
+        failure = error;
+      }
+    }
+    try {
+      await this.runPromise?.catch((error) => {
+        failure ??= error;
+      });
+    } catch {
+      // The rejection is captured above so delivery draining still runs.
+    }
     await this.delivery.drain();
+    if (failure !== undefined) throw failure;
   }
 
   parseConversation(value: unknown): ConversationAgentRef {
@@ -143,10 +184,9 @@ export class TelegramConnector implements WorkspaceConnector {
     if (record.type === "telegram.callback") return "interrupt";
     if (record.type === "telegram.my_chat_member" && (record.meta as { group_add?: unknown } | undefined)?.group_add === true) return "interrupt";
     if (record.type !== "telegram.message") return undefined;
-    const meta = record.meta as { private?: unknown; directed?: unknown; user_content?: unknown } | undefined;
-    return meta?.user_content === true && (meta.private === true || meta.directed === true) ? "interrupt" : undefined;
+    const meta = record.meta as { private?: unknown; directed?: unknown; channel?: unknown; user_content?: unknown } | undefined;
+    return meta?.user_content === true && (meta.private === true || meta.directed === true || meta.channel === true) ? "interrupt" : undefined;
   }
-
 
   async send(request: unknown, actor: ConversationAgentRef): Promise<ConnectorSendResult> {
     if (actor.connectorId !== this.id) throw new Error(`Conversation belongs to ${actor.connectorId}, not ${this.id}`);

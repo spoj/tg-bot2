@@ -759,7 +759,12 @@ export function createTelegramBot(
       conversation,
       payload: incoming,
       attachments,
-      meta: { private: chatId > 0, directed: isMessageDirectedToBot(incoming, bot.botInfo), user_content: hasUserContent(message) },
+      meta: {
+        private: chatId > 0,
+        directed: isMessageDirectedToBot(incoming, bot.botInfo),
+        user_content: hasUserContent(message),
+        ...(chat.type === "channel" ? { channel: true } : {}),
+      }
     });
   };
   bot.on(["message", "channel_post"], persistMessage);

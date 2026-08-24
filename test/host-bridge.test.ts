@@ -1,5 +1,5 @@
 import net from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -55,6 +55,15 @@ function call(socketPath: string, token: string, type: string, params: Record<st
 }
 
 describe("HostBridge", () => {
+  it("does not recreate its socket when stopped during startup", async () => {
+    const { socketPath } = await fixture();
+    const { bridge } = makeBridge(socketPath);
+    const starting = bridge.start();
+    const stopping = bridge.stop();
+
+    await expect(Promise.all([starting, stopping])).resolves.toEqual([undefined, undefined]);
+    await expect(stat(socketPath)).rejects.toThrow();
+  });
   it("resolves authenticated actors before invoking handlers", async () => {
     const { socketPath } = await fixture();
     const send = vi.fn(async () => ({}));

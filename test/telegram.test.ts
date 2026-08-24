@@ -750,6 +750,26 @@ describe("Telegram ingress and native event preservation", () => {
     });
     expect(await readFile(path.join(test.config.attachments, "42", "2023-11-14", "7", "report.txt"), "utf8")).toBe("hello telegram");
   });
+  it("wakes the owning agent for an ordinary allowed channel post", async () => {
+    const test = await fixture({ allowed: [-100123] });
+    await test.bot.handleUpdate({
+      update_id: 13,
+      channel_post: {
+        message_id: 77,
+        date: 1_700_000_000,
+        chat: { id: -100123, type: "channel", title: "Announcements" },
+        text: "release notes",
+      },
+    } as never);
+
+    await waitForInterrupt(test.interrupt, 1);
+    expect(await timelineEvents(test.paths)).toMatchObject([{
+      type: "telegram.message",
+      conversation: telegramConversation(CONNECTOR_ID, -100123),
+      meta: { private: false, directed: false, channel: true, user_content: true },
+      payload: { text: "release notes" },
+    }]);
+  });
 });
 
 describe("Telegram gates and commands", () => {
@@ -817,6 +837,19 @@ describe("Telegram gates and commands", () => {
       { command: "restart", description: "Restart all agents after settings changes" },
       { command: "start", description: "Introduction" },
     ]);
+  });
+  it("does not start polling when stopped during command registration", async () => {
+    const test = await fixture();
+    let releaseRegistration!: (value: true) => void;
+    const registration = new Promise<true>((resolve) => { releaseRegistration = resolve; });
+    vi.spyOn(test.bot.api, "setMyCommands").mockReturnValue(registration as never);
+    const start = vi.spyOn(test.bot, "start").mockResolvedValue(undefined);
+    const running = test.connector.run();
+    await vi.waitFor(() => expect(test.bot.api.setMyCommands).toHaveBeenCalledOnce());
+    const stopping = test.connector.stop();
+    releaseRegistration(true);
+    await Promise.all([running, stopping]);
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("handles /start and /restart through the connector-owned bot", async () => {

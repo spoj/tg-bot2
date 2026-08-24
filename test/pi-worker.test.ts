@@ -543,10 +543,10 @@ describe("PiWorker", () => {
     }
   });
 
-  it("stop() before start() terminates the spawned process and settles with a signal", async () => {
+  it("stop() before start() prevents a process from being spawned", async () => {
     const f = await fixture();
     try {
-      const { child, spawn, terminate } = fakeChildFixture();
+      const { spawn, terminate } = fakeChildFixture();
       const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
@@ -554,14 +554,30 @@ describe("PiWorker", () => {
         terminateProcessGroup: terminate,
       });
       await worker.stop();
+      await expect(worker.start()).rejects.toThrow("worker is stopped");
+      expect(spawn).not.toHaveBeenCalled();
+      expect(terminate).not.toHaveBeenCalled();
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("close() cancels a startup that has not spawned yet", async () => {
+    const f = await fixture();
+    try {
+      const { spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
       const starting = worker.start();
-      await vi.waitFor(() => expect(terminate).toHaveBeenCalledWith(child, "SIGTERM"));
-      expect(spawn).toHaveBeenCalledOnce();
-      child.emit("close", null, "SIGTERM");
-      await starting;
-      const result = await worker.waitForSettled();
-      expect(result.signal).toBe("SIGTERM");
-      expect(result.code).toBeNull();
+      const closing = worker.close();
+      await expect(starting).rejects.toThrow("worker is closing");
+      await closing;
+      expect(spawn).not.toHaveBeenCalled();
+      expect(terminate).not.toHaveBeenCalled();
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

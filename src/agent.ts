@@ -99,6 +99,7 @@ export type AgentNotifier = {
   followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void>;
   markTimelineProcessed?(sequence: number): Promise<void>;
   registerTimelineRecovery?(handler: TimelineRecoveryHandler): void;
+  processTimelineEvent?(record: TimelineRecord, rawLine: string, handoff: TimelineRecoveryHandler): Promise<void>;
 };
 
 const RESTART_SETTLE_CAP_MS = 30_000;
@@ -107,6 +108,13 @@ const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
 const SETTINGS_MAX_BYTES = 1 * 1024 * 1024;
 const MAX_RETAINED_DELIVERED = 1_024;
 const NOTIFICATION_COMPACTION_THRESHOLD = 128;
+const MAX_PENDING_NOTIFICATIONS = 1_024;
+function managerShutdownError(): Error {
+  const error = new Error("Agent manager is shutting down");
+  error.name = "AbortError";
+  (error as NodeJS.ErrnoException).code = "ABORT_ERR";
+  return error;
+}
 
 export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
   try {
@@ -138,6 +146,7 @@ type NotificationLogRecord =
   | { type: "queued"; notification: PendingNotification }
   | { type: "delivered"; id: string; sequence?: number | undefined }
   | { type: "checkpoint"; sequence: number };
+type TimelineRecoveryRecord = { record: TimelineRecord; rawLine: string };
 
 function notificationPrompt(notification: PendingNotification): string {
   const sequence = notification.sequence === undefined ? "" : ` seq=${notification.sequence}`;
@@ -158,6 +167,18 @@ function validateNotificationTarget(value: unknown): ConversationAgentRef {
     address: target.address as Record<string, unknown>,
   };
 }
+function parseQueuedNotification(value: unknown): PendingNotification {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Malformed queued notification");
+  }
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.id !== "string" || raw.id.length === 0) throw new Error("Malformed queued notification ID");
+  if (raw.sequence !== undefined && (!Number.isSafeInteger(raw.sequence) || (raw.sequence as number) < 1)) {
+    throw new Error("Malformed queued notification sequence");
+  }
+  return { ...raw, target: validateNotificationTarget(raw.target) } as PendingNotification;
+}
+
 
 export class AgentManager {
   private readonly workspace: string;
@@ -181,16 +202,17 @@ export class AgentManager {
   private readonly hostAttachments: string | undefined;
   private readonly workers = new Map<string, ConversationWorkerEntry>();
   private readonly notificationWrites = new SerialQueue();
+  private readonly timelineHandoffs = new SerialQueue();
   private readonly pendingNotifications = new Map<string, PendingNotification>();
   private readonly deliveredNotifications = new Map<string, number | undefined>();
+  private readonly workerStarts = new Set<Promise<AgentWorker>>();
   private notificationsLoaded: Promise<void> | undefined;
-  private notificationRecordCount = 0;
+  private notificationRecordsSinceCompaction = 0;
   private timelineCursor = 0;
   private timelineRecoveryHandler: TimelineRecoveryHandler | undefined;
   private timelineRecoveryDone = false;
-  private timelineRecoveryActive = false;
+  private timelineHandoffActive = false;
   private shuttingDown = false;
-
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
     this.workspace = config.workspace;
     this.appRoot = options.appRoot;
@@ -214,6 +236,7 @@ export class AgentManager {
   }
 
   private getOrCreateEntry(actor: ConversationAgentRef): ConversationWorkerEntry {
+    if (this.shuttingDown) throw managerShutdownError();
     const key = conversationId(actor);
     let entry = this.workers.get(key);
     if (!entry) {
@@ -227,30 +250,57 @@ export class AgentManager {
     this.timelineRecoveryHandler = handler;
   }
 
+  async processTimelineEvent(record: TimelineRecord, rawLine: string, handoff: TimelineRecoveryHandler): Promise<void> {
+    if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Invalid timeline sequence");
+    await this.timelineHandoffs.run(async () => {
+      await this.loadPendingNotifications();
+      if (this.shuttingDown) throw managerShutdownError();
+      if (!this.timelineRecoveryDone) await this.recoverPersistedTimeline();
+      if (record.seq > this.timelineCursor + 1) await this.recoverTimelineThrough(record.seq - 1, handoff);
+      if (record.seq <= this.timelineCursor) return;
+      await this.withTimelineHandoff(() => handoff(record, rawLine));
+    });
+  }
+
+  private async withTimelineHandoff<T>(task: () => Promise<T>): Promise<T> {
+    const previous = this.timelineHandoffActive;
+    this.timelineHandoffActive = true;
+    try {
+      return await task();
+    } finally {
+      this.timelineHandoffActive = previous;
+    }
+  }
   async markTimelineProcessed(sequence: number): Promise<void> {
     if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error("Invalid timeline sequence");
+    if (this.shuttingDown) throw managerShutdownError();
     await this.loadPendingNotifications();
     await this.notificationWrites.run(async () => {
+      if (this.shuttingDown) throw managerShutdownError();
       if (sequence <= this.timelineCursor) return;
-      if (!this.timelineRecoveryActive && this.hostTimeline !== undefined && sequence > this.timelineCursor + 1) {
+      if (this.hostTimeline !== undefined && sequence > this.timelineCursor + 1) {
         throw new Error("Timeline notification sequence gap");
       }
       await this.appendNotificationRecord({ type: "checkpoint", sequence });
       this.timelineCursor = sequence;
-      const pruned = this.pruneDeliveredThrough(sequence);
-      await this.maybeCompactNotifications(pruned);
+      this.pruneDeliveredThrough(sequence);
+      await this.maybeCompactNotifications();
     });
   }
-
   async start(): Promise<void> {
     await this.loadPendingNotifications();
+    if (this.shuttingDown) throw managerShutdownError();
     const targets = new Map<string, ConversationAgentRef>();
     for (const notification of this.pendingNotifications.values()) targets.set(conversationId(notification.target), notification.target);
-    await Promise.all([...targets.values()].map(async (target) => {
+    for (const target of targets.values()) {
       const entry = this.getOrCreateEntry(target);
-      await entry.serial.run(() => this.deliverPending(entry)).catch((error) => console.error("Pending notification replay failed", error));
-    }));
-    await this.recoverPersistedTimeline();
+      this.schedulePendingDelivery(entry);
+    }
+    await this.timelineHandoffs.run(() => this.recoverPersistedTimeline());
+  }
+
+  private schedulePendingDelivery(entry: ConversationWorkerEntry): void {
+    void entry.serial.run(() => this.deliverPending(entry)).catch((error) => console.error("Pending notification replay failed", error));
   }
 
   async followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void> {
@@ -275,11 +325,16 @@ export class AgentManager {
   }
 
   private async enqueueAndDeliver(notification: PendingNotification): Promise<void> {
-    if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+    if (this.shuttingDown) throw managerShutdownError();
     await this.enqueueNotification(notification);
+    if (this.shuttingDown) throw managerShutdownError();
     const entry = this.getOrCreateEntry(notification.target);
+    if (this.timelineHandoffActive && notification.sequence !== undefined) {
+      this.schedulePendingDelivery(entry);
+      return;
+    }
     return entry.serial.run(async () => {
-      if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+      if (this.shuttingDown) throw managerShutdownError();
       await this.deliverPending(entry);
     });
   }
@@ -293,7 +348,6 @@ export class AgentManager {
       await this.acknowledgeNotification(notification.id);
     }
   }
-
   private async loadPendingNotifications(): Promise<void> {
     this.notificationsLoaded ??= (async () => {
       await mkdir(path.dirname(this.notificationsPath), { recursive: true, mode: 0o700 });
@@ -306,15 +360,21 @@ export class AgentManager {
         lines = [];
         exists = false;
       }
-      this.notificationRecordCount = lines.length;
+      this.notificationRecordsSinceCompaction = 0;
       let hasCheckpoint = false;
+      let legacyQueuedSequence = 0;
       for (const line of lines) {
         const record = this.parseNotificationLogRecord(line);
+        if (record.type === "queued" && record.notification.sequence !== undefined) {
+          legacyQueuedSequence = Math.max(legacyQueuedSequence, record.notification.sequence);
+        }
         if (this.applyNotificationLogRecord(record)) hasCheckpoint = true;
       }
       this.pruneDeliveredThrough(this.timelineCursor);
-      if (exists && !hasCheckpoint) await this.establishLegacyTimelineBaseline();
-      if (exists) await this.compactNotifications();
+      if (exists && !hasCheckpoint) {
+        this.establishLegacyTimelineBaseline(legacyQueuedSequence);
+        await this.compactNotifications();
+      }
     })();
     await this.notificationsLoaded;
   }
@@ -323,14 +383,7 @@ export class AgentManager {
     const parsed: unknown = JSON.parse(line);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed notification log record");
     const record = parsed as NotificationLogRecord;
-    if (record.type === "queued") {
-      if (record.notification === null || typeof record.notification !== "object" || Array.isArray(record.notification)) {
-        throw new Error("Malformed queued notification");
-      }
-      const notification = { ...record.notification, target: validateNotificationTarget(record.notification.target) };
-      if (typeof notification.id !== "string" || notification.id.length === 0) throw new Error("Malformed queued notification ID");
-      return { type: "queued", notification };
-    }
+    if (record.type === "queued") return { type: "queued", notification: parseQueuedNotification(record.notification) };
     if (record.type === "delivered") {
       if (typeof record.id !== "string" || record.id.length === 0) throw new Error("Malformed delivered notification ID");
       if (record.sequence !== undefined && (!Number.isSafeInteger(record.sequence) || record.sequence < 1)) {
@@ -359,35 +412,22 @@ export class AgentManager {
     return true;
   }
 
-  /** Establishes the first cursor at the current timeline tail for pre-checkpoint journals. */
-  private async establishLegacyTimelineBaseline(): Promise<void> {
-    const timelinePath = this.hostTimeline;
-    if (timelinePath === undefined) return;
-    let lines: string[];
-    try {
-      lines = await readJsonl(timelinePath);
-    } catch (error) {
-      if (isMissing(error)) return;
-      throw error;
-    }
-    let sequence = 0;
-    for (const line of lines) {
-      const parsed: unknown = JSON.parse(line);
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed timeline record");
-      const record = parsed as TimelineRecord;
-      if (record.v !== 2) throw new Error("Timeline migration did not complete");
-      if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Malformed timeline sequence");
-      sequence = Math.max(sequence, record.seq);
-    }
+  /** Establishes a legacy cursor from durable queued notification identities. */
+  private establishLegacyTimelineBaseline(sequence: number): void {
     this.timelineCursor = Math.max(this.timelineCursor, sequence);
     this.pruneDeliveredThrough(this.timelineCursor);
   }
 
   private async enqueueNotification(notification: PendingNotification): Promise<void> {
+    if (this.shuttingDown) throw managerShutdownError();
     await this.loadPendingNotifications();
     await this.notificationWrites.run(async () => {
+      if (this.shuttingDown) throw managerShutdownError();
       if (this.pendingNotifications.has(notification.id) || this.deliveredNotifications.has(notification.id)) return;
       if (notification.sequence !== undefined && notification.sequence <= this.timelineCursor) return;
+      if (this.pendingNotifications.size >= MAX_PENDING_NOTIFICATIONS) {
+        throw new Error("Pending notification backlog is full");
+      }
       await this.appendNotificationRecord({ type: "queued", notification });
       this.pendingNotifications.set(notification.id, notification);
       await this.maybeCompactNotifications();
@@ -438,11 +478,11 @@ export class AgentManager {
 
   private async appendNotificationRecord(record: NotificationLogRecord): Promise<void> {
     await appendJsonl(this.notificationsPath, JSON.stringify(record));
-    this.notificationRecordCount += 1;
+    this.notificationRecordsSinceCompaction += 1;
   }
 
-  private async maybeCompactNotifications(force = false): Promise<void> {
-    if (!force && this.notificationRecordCount < NOTIFICATION_COMPACTION_THRESHOLD) return;
+  private async maybeCompactNotifications(): Promise<void> {
+    if (this.notificationRecordsSinceCompaction < NOTIFICATION_COMPACTION_THRESHOLD) return;
     await this.compactNotifications();
   }
 
@@ -456,48 +496,74 @@ export class AgentManager {
     }
     records.push(JSON.stringify({ type: "checkpoint", sequence: this.timelineCursor } satisfies NotificationLogRecord));
     await replaceFileAtomic(this.notificationsPath, `${records.join("\n")}\n`);
-    this.notificationRecordCount = records.length;
+    this.notificationRecordsSinceCompaction = 0;
   }
 
-  private async recoverPersistedTimeline(): Promise<void> {
-    const recovery = this.timelineRecoveryHandler;
+  private async readTimelineRecords(): Promise<TimelineRecoveryRecord[] | undefined> {
     const timelinePath = this.hostTimeline;
-    if (this.timelineRecoveryDone || !timelinePath || !recovery) return;
+    if (timelinePath === undefined) return undefined;
     let lines: string[];
     try {
       lines = await readJsonl(timelinePath);
     } catch (error) {
-      if (isMissing(error)) {
-        this.timelineRecoveryDone = true;
-        return;
-      }
+      if (isMissing(error)) return undefined;
       throw error;
     }
+    const records: TimelineRecoveryRecord[] = [];
+    for (const line of lines) {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed timeline record");
+      const record = parsed as TimelineRecord;
+      if (record.v !== 2) throw new Error("Timeline migration did not complete");
+      if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Malformed timeline sequence");
+      records.push({ record, rawLine: line });
+    }
+    return records;
+  }
 
-    this.timelineRecoveryActive = true;
-    try {
-      for (const line of lines) {
-        const parsed: unknown = JSON.parse(line);
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Malformed timeline record");
-        const record = parsed as TimelineRecord;
-        if (record.v !== 2) throw new Error("Timeline migration did not complete");
-        if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Malformed timeline sequence");
-        if (record.seq <= this.timelineCursor) continue;
-        try {
-          await recovery(record, line);
-        } catch (error) {
-          console.error("Timeline notification recovery failed", error);
-          break;
-        }
-      }
-      this.timelineRecoveryDone = true;
-    } finally {
-      this.timelineRecoveryActive = false;
+  private initializeTimelineBaseline(records: readonly TimelineRecoveryRecord[]): void {
+    const firstSequence = records[0]?.record.seq;
+    if (firstSequence === undefined || firstSequence <= 1 || this.timelineCursor >= firstSequence - 1) return;
+    this.timelineCursor = firstSequence - 1;
+    this.pruneDeliveredThrough(this.timelineCursor);
+  }
+
+  private async recoverTimelineThrough(targetSequence: number, recovery: TimelineRecoveryHandler): Promise<void> {
+    const records = await this.readTimelineRecords();
+    if (records === undefined) return;
+    this.initializeTimelineBaseline(records);
+    for (const { record, rawLine } of records) {
+      if (record.seq > targetSequence) break;
+      if (this.shuttingDown) throw managerShutdownError();
+      if (record.seq <= this.timelineCursor) continue;
+      await this.withTimelineHandoff(() => recovery(record, rawLine));
     }
   }
 
+  private async recoverPersistedTimeline(): Promise<void> {
+    const recovery = this.timelineRecoveryHandler;
+    if (this.timelineRecoveryDone || !this.hostTimeline || !recovery) return;
+    const records = await this.readTimelineRecords();
+    if (records === undefined) {
+      this.timelineRecoveryDone = true;
+      return;
+    }
+    this.initializeTimelineBaseline(records);
+    for (const { record, rawLine } of records) {
+      if (this.shuttingDown) throw managerShutdownError();
+      if (record.seq <= this.timelineCursor) continue;
+      try {
+        await this.withTimelineHandoff(() => recovery(record, rawLine));
+      } catch (error) {
+        console.error("Timeline notification recovery failed", error);
+        throw error;
+      }
+    }
+    this.timelineRecoveryDone = true;
+  }
+
   async restartAll(): Promise<void> {
-    if (this.shuttingDown) throw new Error("Agent manager is shutting down");
+    if (this.shuttingDown) throw managerShutdownError();
     await Promise.all([...this.workers.values()].map(async (entry) => {
       await entry.serial.run(async () => {
         const worker = entry.worker;
@@ -527,15 +593,33 @@ export class AgentManager {
     this.shuttingDown = true;
     const entries = [...this.workers.values()];
     this.workers.clear();
-    await Promise.all(entries.map((entry) => {
+    const closing = entries.map((entry) => {
       const worker = entry.worker;
       this.release(entry, worker);
-      return worker ? worker.close().catch((error) => console.error("Agent shutdown stop failed", error)) : Promise.resolve();
-    }));
+      return worker ? this.closeWorkerForShutdown(worker) : Promise.resolve();
+    });
+    const starts = [...this.workerStarts];
+    await Promise.all([
+      ...closing,
+      ...starts.map((start) => start.catch(() => {})),
+    ]);
   }
 
   async disposeAll(): Promise<void> {
     await this.beginShutdown();
+  }
+
+  private async closeWorkerForShutdown(worker: AgentWorker): Promise<void> {
+    try {
+      await worker.close();
+    } catch (error) {
+      console.error("Agent shutdown close failed", error);
+      try {
+        await worker.stop();
+      } catch (stopError) {
+        console.error("Agent shutdown stop failed", stopError);
+      }
+    }
   }
 
   private release(entry: ConversationWorkerEntry, worker?: AgentWorker): void {
@@ -546,48 +630,69 @@ export class AgentManager {
   }
 
   private async ensureWorker(entry: ConversationWorkerEntry): Promise<AgentWorker> {
+    if (this.shuttingDown) throw managerShutdownError();
     if (entry.worker?.isAlive()) return entry.worker;
     this.release(entry, entry.worker);
+    if (this.shuttingDown) throw managerShutdownError();
     const actor = entry.actor;
     const token = this.credentials.issue(actor, ["send", "annotate", "steer_conversation", "schedule"]);
     entry.token = token;
-    const settings = await loadUserSettings(this.workspace);
-    const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
-    const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
-    const model = settingsProvider && settingsModel ? `${settingsProvider}/${settingsModel}` : undefined;
-    const thinkingLevel = typeof settings.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined;
-    const sessionDir = path.posix.join("/workspace/.pi/sessions", conversationSessionPath(actor));
-    const workerOptions: AgentWorkerOptions = {
-      workspace: this.workspace,
-      sessionDir,
-      appRoot: this.appRoot,
-      agentToken: token,
-      now: this.now,
-      ...defined({
-        bwrapPath: this.bwrapPath,
-        model,
-        thinkingLevel,
-        stopGraceMs: this.stopGraceMs,
-        idleTimeoutMs: this.idleTimeoutMs,
-        hostSocketDir: this.hostSocketDir,
-        hostTimeline: this.hostTimeline,
-        hostAttachments: this.hostAttachments,
-        setTimeout: this.setTimeoutFn,
-        clearTimeout: this.clearTimeoutFn,
-        setInterval: this.setIntervalFn,
-        clearInterval: this.clearIntervalFn,
-      }),
-      appendSystemPrompt: systemPrompt(this.connectorPrompt(actor.connectorId), path.posix.join(sessionDir, "notifications.json")),
-      hostTools: "send,annotate,steer_conversation,schedule_add,schedule_replace,schedule_remove,schedule_take",
-      spawnProcess: this.spawnProcess,
-      terminateProcessGroup: this.terminateProcessGroup,
-    };
-    let worker: AgentWorker;
     try {
-      worker = await this.workerFactory(workerOptions);
+      const settings = await loadUserSettings(this.workspace);
+      if (this.shuttingDown) throw managerShutdownError();
+      const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
+      const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
+      const model = settingsProvider && settingsModel ? `${settingsProvider}/${settingsModel}` : undefined;
+      const thinkingLevel = typeof settings.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined;
+      const sessionDir = path.posix.join("/workspace/.pi/sessions", conversationSessionPath(actor));
+      const workerOptions: AgentWorkerOptions = {
+        workspace: this.workspace,
+        sessionDir,
+        appRoot: this.appRoot,
+        agentToken: token,
+        now: this.now,
+        ...defined({
+          bwrapPath: this.bwrapPath,
+          model,
+          thinkingLevel,
+          stopGraceMs: this.stopGraceMs,
+          idleTimeoutMs: this.idleTimeoutMs,
+          hostSocketDir: this.hostSocketDir,
+          hostTimeline: this.hostTimeline,
+          hostAttachments: this.hostAttachments,
+          setTimeout: this.setTimeoutFn,
+          clearTimeout: this.clearTimeoutFn,
+          setInterval: this.setIntervalFn,
+          clearInterval: this.clearIntervalFn,
+        }),
+        appendSystemPrompt: systemPrompt(this.connectorPrompt(actor.connectorId), path.posix.join(sessionDir, "notifications.json")),
+        hostTools: "send,annotate,steer_conversation,schedule_add,schedule_replace,schedule_remove,schedule_take",
+        spawnProcess: this.spawnProcess,
+        terminateProcessGroup: this.terminateProcessGroup,
+      };
+      const starting = this.createWorker(entry, token, workerOptions);
+      this.workerStarts.add(starting);
+      try {
+        return await starting;
+      } finally {
+        this.workerStarts.delete(starting);
+      }
     } catch (error) {
       this.release(entry);
       throw error;
+    }
+  }
+
+  private async createWorker(entry: ConversationWorkerEntry, token: string, options: AgentWorkerOptions): Promise<AgentWorker> {
+    if (this.shuttingDown) throw managerShutdownError();
+    const worker = await this.workerFactory(options);
+    if (this.shuttingDown) {
+      await this.closeWorkerForShutdown(worker);
+      throw managerShutdownError();
+    }
+    if (entry.token !== token) {
+      await this.closeWorkerForShutdown(worker);
+      throw managerShutdownError();
     }
     entry.worker = worker;
     worker.onReaped(() => this.release(entry, worker));

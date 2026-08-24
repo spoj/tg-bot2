@@ -199,7 +199,11 @@ export class PiWorker {
   private steerWaitTimer: NodeJS.Timeout | undefined;
   private steerWaitExpiresAt: number | undefined;
   private startPromise: Promise<void> | undefined;
+  private closePromise: Promise<void> | undefined;
+  private stopPromise: Promise<void> | undefined;
   private exitPromise: Promise<PiRunResult> | undefined;
+  private terminatingChild: PiWorkerChildProcess | undefined;
+  private terminatingPromise: Promise<void> | undefined;
   private readonly settledResolvers = new Set<{
     resolve: (result: PiRunResult) => void;
     reject: (error: Error) => void;
@@ -257,31 +261,43 @@ export class PiWorker {
       this.lastActivity = trimmed.length <= MAX_ACTIVITY_TEXT ? trimmed : `${trimmed.slice(0, MAX_ACTIVITY_TEXT - 1)}…`;
     }
   }
-
   async start(): Promise<void> {
     if (this.protocolLineError) throw this.protocolLineError;
+    this.ensureStartAllowed();
     if (this.isAlive()) return;
     if (this.startPromise) return this.startPromise;
-    this.startPromise = this.startInternal();
+    const starting = this.startInternal();
+    this.startPromise = starting;
     try {
-      await this.startPromise;
+      await starting;
     } finally {
-      this.startPromise = undefined;
+      if (this.startPromise === starting) this.startPromise = undefined;
     }
   }
 
+  private ensureStartAllowed(): void {
+    if (this.stopped) throw new Error("Pi RPC worker is stopped");
+    if (this.closing) throw new Error("Pi RPC worker is closing");
+  }
+
+  private startupCancelled(): Error {
+    return new Error(this.stopped ? "Pi RPC worker is stopped" : "Pi RPC worker is closing");
+  }
+
   private async startInternal(): Promise<void> {
+    this.ensureStartAllowed();
     this.stdout = "";
     this.stderr = "";
     this.lastActivityAt = 0;
     this.lastActivity = "";
     this.isBusyState = false;
-    this.closing = false;
 
     await prepareWorkspace(this.options.workspace);
+    this.ensureStartAllowed();
     const promptFile = this.options.appendSystemPrompt !== undefined
       ? await ensurePromptFile(this.options.appRoot, this.options.appendSystemPrompt)
       : undefined;
+    this.ensureStartAllowed();
     const built = await buildPiRunBwrapArgs({
       workspace: this.options.workspace,
       appRoot: this.options.appRoot,
@@ -299,6 +315,7 @@ export class PiWorker {
         hostAttachments: this.options.hostAttachments,
       }),
     });
+    this.ensureStartAllowed();
 
     let child: PiWorkerChildProcess;
     try {
@@ -373,15 +390,16 @@ export class PiWorker {
         resolve(result);
       });
     });
-
-    if (this.stopped) {
-      // stop() arrived before the spawn finished; never let this run go on.
-      await this.terminateProcess(child);
-      return;
+    if (this.stopped || this.closing) {
+      await this.terminateOnce(child);
+      throw this.startupCancelled();
     }
 
     await this.request({ id: "init-steer", type: "set_steering_mode", mode: "all" });
+    this.ensureStartAllowed();
     await this.request({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
+    this.ensureStartAllowed();
+
 
     this.armIdleTimer();
   }
@@ -470,12 +488,10 @@ export class PiWorker {
   }
 
 
-
-
   async prompt(message: string, streamingBehavior?: "steer" | "followUp", maxWaitMs?: number): Promise<void> {
     if (this.protocolLineError) throw this.protocolLineError;
+    if (this.stopped || this.closing) throw this.startupCancelled();
     if (!this.isAlive()) {
-      if (this.stopped) throw new Error("Pi RPC worker is stopped");
       await this.start();
     }
     const wasBusy = this.isBusyState;
@@ -540,18 +556,32 @@ export class PiWorker {
   }
 
   async close(): Promise<void> {
-    if (this.closing) return this.exitPromise ? this.exitPromise.then(() => {}) : Promise.resolve();
+    if (this.closePromise) return this.closePromise;
+    const closing = this.closeInternal();
+    this.closePromise = closing;
+    return closing;
+  }
+
+  private async closeInternal(): Promise<void> {
     this.closing = true;
     this.clearSteerWaitTimer();
     this.clearIdleTimer();
+    const starting = this.startPromise;
+    const startingChild = this.process;
+    if (starting && startingChild && this.isAlive()) await this.terminateOnce(startingChild);
+    if (starting) await starting.catch(() => {});
     const child = this.process;
-    if (!child || !this.isAlive()) return Promise.resolve();
+    if (!child || !this.isAlive()) return;
+    await this.closeProcess(child);
+  }
 
+  private async closeProcess(child: PiWorkerChildProcess): Promise<void> {
     const done = this.exitPromise ?? Promise.resolve({ code: null, signal: null, stderr: "", stdout: "" });
     try {
       child.stdin?.end();
     } catch {
-      this.options.terminateProcessGroup(child, "SIGTERM");
+      await this.terminateOnce(child);
+      return;
     }
 
     const timer = this.setTimeoutFn(() => {
@@ -565,18 +595,37 @@ export class PiWorker {
   }
 
   async stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    const stopping = this.stopInternal();
+    this.stopPromise = stopping;
+    return stopping;
+  }
+
+  private async stopInternal(): Promise<void> {
     this.stopped = true;
+    this.closing = true;
     this.clearSteerWaitTimer();
     this.clearIdleTimer();
-    let child = this.process;
-    if (!child) {
-      // stop() can arrive while the process is still starting; wait for spawn,
-      // then terminate it so no untracked process survives.
-      await this.startPromise?.catch(() => {});
-      child = this.process;
-    }
-    if (!child || !this.isAlive()) return Promise.resolve();
-    await this.terminateProcess(child);
+    const starting = this.startPromise;
+    const startingChild = this.process;
+    if (starting && startingChild && this.isAlive()) await this.terminateOnce(startingChild);
+    if (starting) await starting.catch(() => {});
+    const child = this.process;
+    if (!child || !this.isAlive()) return;
+    await this.terminateOnce(child);
+  }
+
+  private terminateOnce(child: PiWorkerChildProcess): Promise<void> {
+    if (this.terminatingChild === child && this.terminatingPromise) return this.terminatingPromise;
+    const terminating = this.terminateProcess(child).finally(() => {
+      if (this.terminatingChild === child) {
+        this.terminatingChild = undefined;
+        this.terminatingPromise = undefined;
+      }
+    });
+    this.terminatingChild = child;
+    this.terminatingPromise = terminating;
+    return terminating;
   }
 
   /** SIGTERM the process group, escalate to SIGKILL after stopGraceMs, and wait for exit. */

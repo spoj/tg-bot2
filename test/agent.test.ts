@@ -274,11 +274,11 @@ it("replays a notification that was persisted but not accepted", async () => {
     const secondManager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: replayed.factory }));
     await secondManager.start();
 
-    expect(replayed.workers[0]?.prompt).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(replayed.workers[0]?.prompt).toHaveBeenCalledWith(
       "[notification id=event-replay seq=4]\ncomplete user instruction",
       "steer",
       undefined,
-    );
+    ));
   });
 });
 
@@ -319,7 +319,7 @@ it("recovers a persisted timeline event that never reached the notification jour
 
     await manager.start();
 
-    expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover me"), "steer", USER_INTERRUPT_MAX_WAIT_MS);
+    await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover me"), "steer", USER_INTERRUPT_MAX_WAIT_MS));
   });
 });
 it("baselines a legacy notification journal without replaying historical timeline events", async () => {
@@ -371,8 +371,8 @@ it("baselines a legacy notification journal without replaying historical timelin
 
     await manager.start();
 
-    expect(workers).toHaveLength(1);
-    expect(workers[0]?.prompt).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(workers).toHaveLength(1));
+    await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledOnce());
     expect(workers[0]?.prompt).toHaveBeenCalledWith(
       "[notification id=queued-legacy seq=1]\ndeliver queued legacy notification",
       "steer",
@@ -408,7 +408,204 @@ it("recovers a missed timeline event when a checkpoint establishes the cursor", 
 
     await manager.start();
 
-    expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover after checkpoint"), "steer", USER_INTERRUPT_MAX_WAIT_MS);
+    await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover after checkpoint"), "steer", USER_INTERRUPT_MAX_WAIT_MS));
+  });
+});
+it("retries a transient timeline recovery failure on the next start", async () => {
+  await withDataDir(async (dataDir) => {
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const record: TimelineRecord = {
+      v: 2,
+      id: "retry-recovery",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "system.event",
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { hostTimeline: timelinePath }));
+    let attempts = 0;
+    let fail = true;
+    manager.registerTimelineRecovery(async (nextRecord) => {
+      attempts += 1;
+      if (fail) throw new Error("temporary recovery failure");
+      await manager.markTimelineProcessed(nextRecord.seq);
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(manager.start()).rejects.toThrow("temporary recovery failure");
+      fail = false;
+      await manager.start();
+      expect(attempts).toBe(2);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+it("initializes a safe baseline for a compacted timeline starting above one", async () => {
+  await withDataDir(async (dataDir) => {
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const record: TimelineRecord = {
+      v: 2,
+      id: "compacted-first-event",
+      seq: 7,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "system.event",
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { hostTimeline: timelinePath }));
+    const recovered: number[] = [];
+    manager.registerTimelineRecovery(async (nextRecord) => {
+      recovered.push(nextRecord.seq);
+      await manager.markTimelineProcessed(nextRecord.seq);
+    });
+
+    await manager.start();
+
+    expect(recovered).toEqual([7]);
+  });
+});
+
+it("recovers a torn legacy queue append without baselining to the timeline tail", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const notificationsPath = path.join(dataDir, "notifications.jsonl");
+    const record: TimelineRecord = {
+      v: 2,
+      id: "torn-queue-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: CHAT,
+      payload: { text: "recover torn append" },
+      meta: { private: true, user_content: true },
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    await writeFile(notificationsPath, '{"type":"queued","notification":', "utf8");
+    const { factory, workers } = fakeWorkerFactory();
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: factory, hostTimeline: timelinePath }));
+    const { connectors } = fakeTelegramConnector();
+    new AgentEventRouter(manager, { workspace, connectors });
+
+    await manager.start();
+
+    await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover torn append"), "steer", USER_INTERRUPT_MAX_WAIT_MS));
+  });
+});
+
+it("recovers a live cursor gap before advancing a later event", async () => {
+  await withDataDir(async (dataDir) => {
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const first: TimelineRecord = { v: 2, id: "live-gap-1", seq: 1, t: "2026-08-24T00:00:00.000Z", type: "system.event" };
+    const second: TimelineRecord = { v: 2, id: "live-gap-2", seq: 2, t: "2026-08-24T00:00:01.000Z", type: "system.event" };
+    await writeFile(timelinePath, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`, "utf8");
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { hostTimeline: timelinePath }));
+    let firstAttempt = true;
+    const handoff = async (record: TimelineRecord): Promise<void> => {
+      if (record.seq === 1 && firstAttempt) {
+        firstAttempt = false;
+        throw new Error("temporary handoff failure");
+      }
+      await manager.markTimelineProcessed(record.seq);
+    };
+
+    await expect(manager.processTimelineEvent(first, JSON.stringify(first), handoff)).rejects.toThrow("temporary handoff failure");
+    await expect(manager.processTimelineEvent(second, JSON.stringify(second), handoff)).resolves.toBeUndefined();
+  });
+});
+
+it("marks events from removed connectors as intentionally unroutable history", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const record: TimelineRecord = {
+      v: 2,
+      id: "removed-connector-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.message",
+      connectorId: "telegram:removed",
+      conversation: telegramConversation("telegram:removed", 123),
+      payload: { text: "old" },
+      meta: { private: true, user_content: true },
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { hostTimeline: timelinePath }));
+    const { connectors } = fakeTelegramConnector();
+    new AgentEventRouter(manager, { workspace, connectors });
+
+    await manager.start();
+
+    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain('"sequence":1');
+  });
+});
+
+it("keeps timeline recovery independent of a wedged worker", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const first: TimelineRecord = {
+      v: 2,
+      id: "wedged-worker-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: CHAT,
+      payload: { text: "wedged" },
+      meta: { private: true, user_content: true },
+    };
+    const secondTarget = telegramConversation(CONNECTOR_ID, 456);
+    const second: TimelineRecord = {
+      v: 2,
+      id: "independent-worker-event",
+      seq: 2,
+      t: "2026-08-24T00:00:01.000Z",
+      type: "telegram.message",
+      connectorId: CONNECTOR_ID,
+      conversation: secondTarget,
+      payload: { text: "independent" },
+      meta: { private: true, user_content: true },
+    };
+    await writeFile(timelinePath, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`, "utf8");
+    let promptCount = 0;
+    const { factory, workers } = fakeWorkerFactory(async () => {
+      promptCount += 1;
+      if (promptCount === 1) await new Promise<void>(() => {});
+    });
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: factory, hostTimeline: timelinePath }));
+    const { connectors } = fakeTelegramConnector();
+    new AgentEventRouter(manager, { workspace, connectors });
+
+    await manager.start();
+
+    await vi.waitFor(() => expect(workers).toHaveLength(2));
+    await vi.waitFor(() => expect(workers[1]?.prompt).toHaveBeenCalledWith(expect.stringContaining("independent"), "steer", USER_INTERRUPT_MAX_WAIT_MS));
+  });
+});
+
+it("rejects new notifications when the pending backlog is full", async () => {
+  await withDataDir(async (dataDir) => {
+    const workspace = path.join(dataDir, "workspace");
+    const notificationsPath = path.join(dataDir, "notifications.jsonl");
+    const queued = Array.from({ length: 1_024 }, (_, index) => ({
+      type: "queued",
+      notification: {
+        id: `pending-${index}`,
+        sequence: index + 1,
+        target: CHAT,
+        text: `pending ${index}`,
+        behavior: "steer",
+      },
+    }));
+    await writeFile(notificationsPath, `${queued.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+    const { factory } = fakeWorkerFactory(async () => new Promise<void>(() => {}));
+    const manager = new AgentManager({ workspace }, managerOptions(dataDir, { workerFactory: factory }));
+
+    await manager.start();
+
+    await expect(manager.interrupt("overflow", CHAT, undefined, { id: "pending-overflow", sequence: 1_025 })).rejects.toThrow("Pending notification backlog is full");
   });
 });
 

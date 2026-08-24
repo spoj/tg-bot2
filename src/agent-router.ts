@@ -22,10 +22,19 @@ export class AgentEventRouter {
     private readonly agents: AgentNotifier,
     private readonly options: { workspace: string; connectors: ConnectorRegistry },
   ) {
-    this.agents.registerTimelineRecovery?.((record, rawLine) => this.onEvent(record, rawLine));
+    this.agents.registerTimelineRecovery?.((record, rawLine) => this.routeEvent(record, rawLine));
   }
 
   async onEvent(record: TimelineRecord, rawLine: string): Promise<void> {
+    const process = this.agents.processTimelineEvent;
+    if (process) {
+      await process.call(this.agents, record, rawLine, (nextRecord, nextRawLine) => this.routeEvent(nextRecord, nextRawLine));
+      return;
+    }
+    await this.routeEvent(record, rawLine);
+  }
+
+  private async routeEvent(record: TimelineRecord, rawLine: string): Promise<void> {
     const identity = { id: record.id, sequence: record.seq };
     if (record.type === "schedule_fired") {
       if (!record.conversation) throw new Error("schedule_fired has no conversation owner");
@@ -38,7 +47,16 @@ export class AgentEventRouter {
       await this.markProcessed(record);
       return;
     }
-    const connector = this.options.connectors.get(record.connectorId);
+    let connector: ReturnType<ConnectorRegistry["get"]>;
+    try {
+      connector = this.options.connectors.get(record.connectorId);
+    } catch (error) {
+      if (error instanceof Error && error.message === `Unknown connector ${record.connectorId}`) {
+        await this.markProcessed(record);
+        return;
+      }
+      throw error;
+    }
     const settings = await loadNotificationSettings(this.options.workspace, target);
     const attention = connector.attention?.(record, settings);
     if (!attention) {

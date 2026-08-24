@@ -70,6 +70,12 @@ export type HostBridgeOptions = {
 };
 
 const DEFAULT_MAX_LINE_BYTES = 2 * 1024 * 1024;
+function bridgeStartupAbort(): Error {
+  const error = new Error("Host bridge startup aborted");
+  error.name = "AbortError";
+  (error as NodeJS.ErrnoException).code = "ABORT_ERR";
+  return error;
+}
 
 /**
  * Agent-to-host RPC bridge over a UNIX socket: agent tools (running inside the
@@ -84,6 +90,10 @@ export class HostBridge {
   private readonly logger: (error: unknown) => void;
   private server: net.Server | undefined;
   private readonly connections = new Set<net.Socket>();
+  private startPromise: Promise<void> | undefined;
+  private listenReject: ((error: Error) => void) | undefined;
+  private stopped = false;
+  private stopPromise: Promise<void> | undefined;
 
   constructor(options: HostBridgeOptions) {
     this.socketPath = options.socketPath;
@@ -94,37 +104,100 @@ export class HostBridge {
   }
 
   async start(): Promise<void> {
-    if (this.server) return;
+    if (this.stopped) return;
+    if (this.server?.listening) return;
+    if (this.startPromise) return this.startPromise;
+    const starting = this.startInternal();
+    this.startPromise = starting;
+    try {
+      await starting;
+    } finally {
+      if (this.startPromise === starting) this.startPromise = undefined;
+    }
+  }
+
+  private async startInternal(): Promise<void> {
+    if (this.stopped) return;
     await mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
+    if (this.stopped) return;
     try {
       await unlink(this.socketPath);
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
+    if (this.stopped) return;
     const server = net.createServer((socket) => this.handleConnection(socket));
     this.server = server;
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(this.socketPath, () => {
-        server.removeListener("error", reject);
-        server.on("error", (error) => this.logger(error));
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const onError = (error: Error): void => {
+          if (settled) return;
+          settled = true;
+          this.listenReject = undefined;
+          reject(error);
+        };
+        this.listenReject = onError;
+        server.once("error", onError);
+        server.listen(this.socketPath, () => {
+          if (this.stopped) {
+            onError(bridgeStartupAbort());
+            void this.closeServer(server);
+            return;
+          }
+          if (settled) return;
+          settled = true;
+          this.listenReject = undefined;
+          server.removeListener("error", onError);
+          server.on("error", (error) => this.logger(error));
+          resolve();
+        });
       });
+    } catch (error) {
+      if (this.listenReject) this.listenReject = undefined;
+      if (this.server === server) this.server = undefined;
+      await this.closeServer(server);
+      throw error;
+    }
+  }
+
+  private closeServer(server: net.Server): Promise<void> {
+    return new Promise<void>((resolve) => {
+      try {
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
     });
   }
 
   async stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopped = true;
+    const stopping = this.stopInternal();
+    this.stopPromise = stopping;
+    return stopping;
+  }
+
+  private async stopInternal(): Promise<void> {
+    this.listenReject?.(bridgeStartupAbort());
     const server = this.server;
-    this.server = undefined;
     for (const socket of this.connections) socket.destroy();
     this.connections.clear();
-    if (server) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+    const close = server ? this.closeServer(server) : Promise.resolve();
+    await Promise.all([
+      close,
+      this.startPromise?.catch(() => {}) ?? Promise.resolve(),
+    ]);
+    if (this.server === server) this.server = undefined;
     await unlink(this.socketPath).catch(() => {});
   }
 
   private handleConnection(socket: net.Socket): void {
+    if (this.stopped) {
+      socket.destroy();
+      return;
+    }
     this.connections.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -149,6 +222,7 @@ export class HostBridge {
   }
 
   private async handleLine(socket: net.Socket, line: string): Promise<void> {
+    if (this.stopped) return;
     let request: BridgeRequest;
     try {
       const parsed: unknown = JSON.parse(line);
@@ -165,8 +239,9 @@ export class HostBridge {
       this.logger(error);
       return;
     }
+    if (this.stopped) return;
     const response = await this.invoke(request);
-    if (!socket.destroyed && socket.writable) {
+    if (!this.stopped && !socket.destroyed && socket.writable) {
       socket.write(`${JSON.stringify(response)}\n`);
     }
   }

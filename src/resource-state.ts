@@ -20,6 +20,7 @@ type ResourceStateFile = {
 };
 
 const MAX_RESOURCE_STATE_BYTES = 4 * 1024 * 1024;
+const MAX_RESOURCE_ENTRIES = 8_192;
 const READ_FILE = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
 
 function mapKey(connectorId: string, kind: ResourceKind, key: string): string {
@@ -78,11 +79,14 @@ export class WorkspaceResources {
           if (!stat.isFile() || stat.size > MAX_RESOURCE_STATE_BYTES) throw new Error("Invalid resource state file");
           const parsed = validateState(JSON.parse((await readFileBounded(handle, MAX_RESOURCE_STATE_BYTES)).toString("utf8")) as unknown);
           for (const resource of parsed.resources) this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
+          this.prune();
+          if (this.resources.size !== parsed.resources.length) await this.save();
         } finally {
           await closeQuietly(handle);
         }
       } else {
         for (const resource of seed) this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
+        this.prune();
         await this.save();
       }
       this.loaded = true;
@@ -96,7 +100,7 @@ export class WorkspaceResources {
   async set(resource: ResourceOwnership): Promise<void> {
     await this.writes.run(async () => {
       await this.commit(() => {
-        this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
+        this.put(resource);
       });
     });
   }
@@ -105,7 +109,7 @@ export class WorkspaceResources {
     if (resources.length === 0) return;
     await this.writes.run(async () => {
       await this.commit(() => {
-        for (const resource of resources) this.resources.set(mapKey(resource.connectorId, resource.kind, resource.key), resource);
+        for (const resource of resources) this.put(resource);
       });
     });
   }
@@ -124,6 +128,7 @@ export class WorkspaceResources {
     const previous = new Map(this.resources);
     try {
       change();
+      this.prune();
       await this.save();
     } catch (error) {
       this.restore(previous);
@@ -134,6 +139,20 @@ export class WorkspaceResources {
   private restore(previous: Map<string, ResourceOwnership>): void {
     this.resources.clear();
     for (const [key, resource] of previous) this.resources.set(key, resource);
+  }
+
+  private put(resource: ResourceOwnership): void {
+    const key = mapKey(resource.connectorId, resource.kind, resource.key);
+    this.resources.delete(key);
+    this.resources.set(key, resource);
+  }
+
+  private prune(): void {
+    while (this.resources.size > MAX_RESOURCE_ENTRIES) {
+      const oldest = this.resources.keys().next().value;
+      if (typeof oldest !== "string") return;
+      this.resources.delete(oldest);
+    }
   }
 
   private async save(): Promise<void> {

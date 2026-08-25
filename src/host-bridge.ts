@@ -90,6 +90,7 @@ export class HostBridge {
   private readonly logger: (error: unknown) => void;
   private server: net.Server | undefined;
   private readonly connections = new Set<net.Socket>();
+  private readonly invocations = new Set<Promise<BridgeResponse>>();
   private startPromise: Promise<void> | undefined;
   private listenReject: ((error: Error) => void) | undefined;
   private stopped = false;
@@ -188,6 +189,7 @@ export class HostBridge {
     await Promise.all([
       close,
       this.startPromise?.catch(() => {}) ?? Promise.resolve(),
+      ...this.invocations,
     ]);
     if (this.server === server) this.server = undefined;
     await unlink(this.socketPath).catch(() => {});
@@ -240,9 +242,15 @@ export class HostBridge {
       return;
     }
     if (this.stopped) return;
-    const response = await this.invoke(request);
-    if (!this.stopped && !socket.destroyed && socket.writable) {
-      socket.write(`${JSON.stringify(response)}\n`);
+    const invocation = this.invoke(request);
+    this.invocations.add(invocation);
+    try {
+      const response = await invocation;
+      if (!this.stopped && !socket.destroyed && socket.writable) {
+        socket.write(`${JSON.stringify(response)}\n`);
+      }
+    } finally {
+      this.invocations.delete(invocation);
     }
   }
 

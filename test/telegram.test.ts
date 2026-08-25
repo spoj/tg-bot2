@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as realSetTimeout } from "node:timers";
@@ -267,6 +267,47 @@ describe("raw Telegram Bot API dispatch", () => {
     expect(result.attachmentPaths).toEqual([managed]);
   });
 
+  it("removes staged workspace uploads when Telegram rejects delivery", async () => {
+    const test = await fixture();
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+    const sendDocument = vi.fn(async () => { throw new Error("Telegram rejected the document"); });
+    const bot = { api: { raw: { sendDocument } } } as unknown as Bot;
+
+    await expect(dispatchOutboxRequest(bot, test.config, 42, "req-failed", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+    })).rejects.toThrow("Telegram rejected the document");
+
+    const chatAttachments = path.join(test.config.attachments, "42");
+    const files = await readdir(chatAttachments, { recursive: true });
+    expect(files.some((file) => file.endsWith("report.txt"))).toBe(false);
+  });
+
+  it("limits attachment storage per chat by removing the oldest files", async () => {
+    const test = await fixture();
+    const oldFiles: string[] = [];
+    for (let index = 0; index < 4; index++) {
+      const filePath = path.join(test.config.attachments, "42", "2020-01-01", String(index), "old.bin");
+      await mkdir(path.dirname(filePath), { recursive: true });
+      await writeFile(filePath, "", "utf8");
+      await truncate(filePath, 2 * 1024 * 1024 * 1024);
+      const old = new Date(Date.UTC(2020, 0, index + 1));
+      await utimes(filePath, old, old);
+      oldFiles.push(filePath);
+    }
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+
+    await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-quota", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+    });
+
+    await expect(stat(oldFiles[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(oldFiles[3]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
+  });
+
   it("rejects symlinked intermediate workspace paths", async () => {
     const test = await fixture();
     const outside = await mkdtemp(path.join(os.tmpdir(), "telegram-outside-"));
@@ -335,6 +376,29 @@ describe("TelegramConnector send", () => {
     expect(test.requests.filter((request) => request.url.endsWith("/editMessageText"))).toHaveLength(1);
   });
 
+  it("omits forum thread targets from methods that do not accept them", async () => {
+    const test = await fixture();
+    const owner = telegramConversation(CONNECTOR_ID, 42, 7);
+    const mutations = [
+      "editMessageText", "editMessageCaption", "editMessageReplyMarkup", "deleteMessage", "setMessageReaction", "stopPoll",
+    ] as const;
+    for (const [index, method] of mutations.entries()) {
+      await test.resources.set({ connectorId: CONNECTOR_ID, kind: "message", key: `42:${100 + index}`, owner });
+      await test.connector.send({
+        method,
+        message_id: 100 + index,
+        ...(method === "editMessageText" ? { text: "updated" } : {}),
+        ...(method === "editMessageCaption" ? { caption: "updated" } : {}),
+        ...(method === "setMessageReaction" ? { reaction: [] } : {}),
+      }, owner);
+    }
+    await test.connector.send({ method: "createForumTopic", name: "new topic", message_thread_id: 7 }, owner);
+
+    for (const request of test.requests.filter((request) => mutations.some((method) => request.url.endsWith(`/${method}`)) || request.url.endsWith("/createForumTopic"))) {
+      expect(JSON.parse(request.body)).not.toHaveProperty("message_thread_id");
+    }
+  });
+
   it("returns and owns every message from a media group", async () => {
     const test = await fixture({
       responses: [{ ok: true, result: [{ message_id: 9101 }, { message_id: 9102 }, { message_id: 9103 }] }],
@@ -393,6 +457,45 @@ describe("TelegramConnector send", () => {
 
     await expect(pending).resolves.toMatchObject({ summary: { messageId: 9001 } });
     expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(3);
+  });
+
+  it("rechecks the allowlist when a send leaves the per-chat queue", async () => {
+    const test = await fixture();
+    let release!: () => void;
+    let started = false;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const first = test.connector.delivery.enqueue(42, async () => {
+      started = true;
+      await blocked;
+    });
+    const pending = test.connector.send({ method: "sendMessage", text: "queued" }, telegramConversation(CONNECTOR_ID, 42));
+
+    await vi.waitFor(() => expect(started).toBe(true));
+    await vi.waitFor(() => expect(test.requests).toHaveLength(0));
+    await writeAllowedChats(test.config, []);
+    release();
+
+    await first;
+    await expect(pending).rejects.toThrow("Chat 42 is not on the allow list");
+    expect(test.requests).toHaveLength(0);
+  });
+
+  it("rechecks the allowlist before a rate-limit retry", async () => {
+    const test = await fixture({
+      responses: [
+        { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 5 } },
+        { ok: true, result: { message_id: 9002 } },
+      ],
+    });
+    vi.useFakeTimers();
+
+    const pending = test.connector.send({ method: "sendMessage", text: "retry" }, telegramConversation(CONNECTOR_ID, 42));
+    await waitForRetryTimer();
+    await writeAllowedChats(test.config, []);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expect(pending).rejects.toThrow("Chat 42 is not on the allow list");
+    expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(1);
   });
   it("keeps later same-chat sends behind retry backoff and drains sleeping retries", async () => {
     const test = await fixture({

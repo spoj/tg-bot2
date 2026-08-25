@@ -14,6 +14,11 @@ import { errorMessage } from "./util.js";
 
 const MAX_OUTBOX_ATTEMPTS = 3;
 const MAX_RETRY_AFTER_SECONDS = 60;
+const THREAD_TARGET_METHODS = new Set([
+  "sendMessage", "sendPhoto", "sendAudio", "sendVideo", "sendAnimation", "sendVoice", "sendVideoNote", "sendDocument",
+  "sendMediaGroup", "sendLocation", "sendVenue", "sendContact", "sendDice", "sendPoll",
+  "editForumTopic", "closeForumTopic", "reopenForumTopic", "deleteForumTopic",
+]);
 const MESSAGE_MUTATIONS = new Set(["editMessageText", "editMessageCaption", "editMessageReplyMarkup", "deleteMessage", "setMessageReaction", "stopPoll"]);
 
 function retryDelaySeconds(error: unknown): number | undefined {
@@ -32,12 +37,16 @@ function sleep(milliseconds: number): Promise<void> {
 function applyOwnerTarget(request: Record<string, unknown>, actor: ConversationAgentRef): Record<string, unknown> {
   const address = telegramAddress(actor);
   if (request.chat_id !== undefined && request.chat_id !== address.chat_id) throw new Error("send cannot target another conversation's chat");
-  if (request.message_thread_id !== undefined && request.message_thread_id !== address.message_thread_id) throw new Error("send cannot target another conversation's thread");
-  return {
-    ...request,
-    chat_id: address.chat_id,
-    ...((address.message_thread_id ?? 0) > 0 ? { message_thread_id: address.message_thread_id } : {}),
-  };
+  const { message_thread_id: requestedThreadId, ...withoutThread } = request;
+  if (requestedThreadId !== undefined && requestedThreadId !== address.message_thread_id) throw new Error("send cannot target another conversation's thread");
+  if (THREAD_TARGET_METHODS.has(String(request.method))) {
+    return {
+      ...withoutThread,
+      chat_id: address.chat_id,
+      ...((address.message_thread_id ?? 0) > 0 ? { message_thread_id: address.message_thread_id } : {}),
+    };
+  }
+  return { ...withoutThread, chat_id: address.chat_id };
 }
 
 function connectorSendResult(result: TelegramDispatchResult, recorded: WorkspaceOutboxRequest, persistenceError?: string): ConnectorSendResult {
@@ -250,6 +259,8 @@ export class TelegramConnector implements WorkspaceConnector {
     return this.delivery.enqueue(chatId, async () => {
       for (let attempt = 1; ; attempt++) {
         try {
+          const allowed = await readAllowedFile(this.config.workspace);
+          if (allowed.status !== "ready" || !allowed.chats.includes(chatId)) throw new Error(`Chat ${chatId} is not on the allow list`);
           return await dispatchOutboxRequest(this.bot, this.config, chatId, requestId, request);
         } catch (error) {
           const retryAfter = retryDelaySeconds(error);

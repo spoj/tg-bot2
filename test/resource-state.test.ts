@@ -52,6 +52,23 @@ describe("WorkspaceResources", () => {
     expect(reloaded.owner(customOwner.connectorId, "message", "$event")).toEqual(customOwner);
   });
 
+  it("retains only the newest ownership rows", async () => {
+    const dataDir = await temporaryDirectory();
+    const filePath = path.join(dataDir, "run", "resources.json");
+    const resources = new WorkspaceResources(filePath);
+    const seed = Array.from({ length: 10_000 }, (_, index) => {
+      const owner = conversationAgent("custom:owner", `channel-${index}`, { channel: `channel-${index}` });
+      return { connectorId: owner.connectorId, kind: "message" as const, key: `message-${index}`, owner };
+    });
+
+    await resources.start(seed);
+
+    expect(resources.owner("custom:owner", "message", "message-0")).toBeUndefined();
+    expect(resources.owner("custom:owner", "message", "message-9999")).toEqual(seed.at(-1)!.owner);
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as { resources: unknown[] };
+    expect(persisted.resources).toHaveLength(8_192);
+  });
+
   it("rolls back set when the serialized state exceeds its size limit", async () => {
     const dataDir = await temporaryDirectory();
     const filePath = path.join(dataDir, "run", "resources.json");

@@ -109,6 +109,8 @@ const SETTINGS_MAX_BYTES = 1 * 1024 * 1024;
 const MAX_RETAINED_DELIVERED = 1_024;
 const NOTIFICATION_COMPACTION_THRESHOLD = 128;
 const MAX_PENDING_NOTIFICATIONS = 1_024;
+const TIMELINE_RETRY_BASE_MS = 1_000;
+const TIMELINE_RETRY_MAX_MS = 30_000;
 function managerShutdownError(): Error {
   const error = new Error("Agent manager is shutting down");
   error.name = "AbortError";
@@ -147,6 +149,8 @@ type NotificationLogRecord =
   | { type: "delivered"; id: string; sequence?: number | undefined }
   | { type: "checkpoint"; sequence: number };
 type TimelineRecoveryRecord = { record: TimelineRecord; rawLine: string };
+type TimelineRetry = TimelineRecoveryRecord & { handoff: TimelineRecoveryHandler; attempt: number; timer: ReturnType<typeof setTimeout> | undefined };
+type PendingDeliveryRetry = { attempt: number; timer: ReturnType<typeof setTimeout> | undefined };
 
 function notificationPrompt(notification: PendingNotification): string {
   const sequence = notification.sequence === undefined ? "" : ` seq=${notification.sequence}`;
@@ -206,6 +210,8 @@ export class AgentManager {
   private readonly pendingNotifications = new Map<string, PendingNotification>();
   private readonly deliveredNotifications = new Map<string, number | undefined>();
   private readonly workerStarts = new Set<Promise<AgentWorker>>();
+  private readonly timelineRetries = new Map<number, TimelineRetry>();
+  private readonly pendingDeliveryRetries = new Map<ConversationWorkerEntry, PendingDeliveryRetry>();
   private notificationsLoaded: Promise<void> | undefined;
   private notificationRecordsSinceCompaction = 0;
   private timelineCursor = 0;
@@ -252,14 +258,48 @@ export class AgentManager {
 
   async processTimelineEvent(record: TimelineRecord, rawLine: string, handoff: TimelineRecoveryHandler): Promise<void> {
     if (!Number.isSafeInteger(record.seq) || record.seq < 1) throw new Error("Invalid timeline sequence");
-    await this.timelineHandoffs.run(async () => {
-      await this.loadPendingNotifications();
-      if (this.shuttingDown) throw managerShutdownError();
-      if (!this.timelineRecoveryDone) await this.recoverPersistedTimeline();
-      if (record.seq > this.timelineCursor + 1) await this.recoverTimelineThrough(record.seq - 1, handoff);
-      if (record.seq <= this.timelineCursor) return;
-      await this.withTimelineHandoff(() => handoff(record, rawLine));
-    });
+    try {
+      await this.timelineHandoffs.run(async () => {
+        await this.loadPendingNotifications();
+        if (this.shuttingDown) throw managerShutdownError();
+        if (!this.timelineRecoveryDone) await this.recoverPersistedTimeline();
+        if (record.seq > this.timelineCursor + 1) await this.recoverTimelineThrough(record.seq - 1, handoff);
+        if (record.seq <= this.timelineCursor) return;
+        await this.withTimelineHandoff(() => handoff(record, rawLine));
+      });
+    } catch (error) {
+      this.scheduleTimelineRetry(record, rawLine, handoff);
+      throw error;
+    }
+    this.cancelTimelineRetry(record.seq);
+  }
+
+  private scheduleTimelineRetry(record: TimelineRecord, rawLine: string, handoff: TimelineRecoveryHandler): void {
+    if (this.shuttingDown) return;
+    const previous = this.timelineRetries.get(record.seq);
+    if (previous?.timer !== undefined) return;
+    const retry: TimelineRetry = {
+      record,
+      rawLine,
+      handoff,
+      attempt: (previous?.attempt ?? 0) + 1,
+      timer: undefined,
+    };
+    const delay = Math.min(TIMELINE_RETRY_MAX_MS, TIMELINE_RETRY_BASE_MS * 2 ** (retry.attempt - 1));
+    retry.timer = this.setTimeoutFn(() => {
+      if (this.timelineRetries.get(record.seq) !== retry) return;
+      retry.timer = undefined;
+      void this.processTimelineEvent(record, rawLine, handoff).catch(() => {});
+    }, delay);
+    retry.timer.unref?.();
+    this.timelineRetries.set(record.seq, retry);
+  }
+
+  private cancelTimelineRetry(sequence: number): void {
+    const retry = this.timelineRetries.get(sequence);
+    if (!retry) return;
+    if (retry.timer !== undefined) this.clearTimeoutFn(retry.timer);
+    this.timelineRetries.delete(sequence);
   }
 
   private async withTimelineHandoff<T>(task: () => Promise<T>): Promise<T> {
@@ -300,7 +340,35 @@ export class AgentManager {
   }
 
   private schedulePendingDelivery(entry: ConversationWorkerEntry): void {
-    void entry.serial.run(() => this.deliverPending(entry)).catch((error) => console.error("Pending notification replay failed", error));
+    void entry.serial.run(() => this.deliverPending(entry)).then(
+      () => this.cancelPendingDeliveryRetry(entry),
+      (error) => {
+        console.error("Pending notification replay failed", error);
+        this.schedulePendingDeliveryRetry(entry);
+      },
+    );
+  }
+
+  private schedulePendingDeliveryRetry(entry: ConversationWorkerEntry): void {
+    if (this.shuttingDown) return;
+    const previous = this.pendingDeliveryRetries.get(entry);
+    if (previous?.timer !== undefined) return;
+    const retry: PendingDeliveryRetry = { attempt: (previous?.attempt ?? 0) + 1, timer: undefined };
+    const delay = Math.min(TIMELINE_RETRY_MAX_MS, TIMELINE_RETRY_BASE_MS * 2 ** (retry.attempt - 1));
+    retry.timer = this.setTimeoutFn(() => {
+      if (this.pendingDeliveryRetries.get(entry) !== retry) return;
+      retry.timer = undefined;
+      this.schedulePendingDelivery(entry);
+    }, delay);
+    retry.timer.unref?.();
+    this.pendingDeliveryRetries.set(entry, retry);
+  }
+
+  private cancelPendingDeliveryRetry(entry: ConversationWorkerEntry): void {
+    const retry = this.pendingDeliveryRetries.get(entry);
+    if (!retry) return;
+    if (retry.timer !== undefined) this.clearTimeoutFn(retry.timer);
+    this.pendingDeliveryRetries.delete(entry);
   }
 
   async followup(text: string, target: ConversationAgentRef, identity?: NotificationIdentity): Promise<void> {
@@ -362,17 +430,20 @@ export class AgentManager {
       }
       this.notificationRecordsSinceCompaction = 0;
       let hasCheckpoint = false;
-      let legacyQueuedSequence = 0;
+      let legacyTimelineSequence = 0;
       for (const line of lines) {
         const record = this.parseNotificationLogRecord(line);
         if (record.type === "queued" && record.notification.sequence !== undefined) {
-          legacyQueuedSequence = Math.max(legacyQueuedSequence, record.notification.sequence);
+          legacyTimelineSequence = Math.max(legacyTimelineSequence, record.notification.sequence);
+        }
+        if (record.type === "delivered" && record.sequence !== undefined) {
+          legacyTimelineSequence = Math.max(legacyTimelineSequence, record.sequence);
         }
         if (this.applyNotificationLogRecord(record)) hasCheckpoint = true;
       }
       this.pruneDeliveredThrough(this.timelineCursor);
       if (exists && !hasCheckpoint) {
-        this.establishLegacyTimelineBaseline(legacyQueuedSequence);
+        this.establishLegacyTimelineBaseline(legacyTimelineSequence);
         await this.compactNotifications();
       }
     })();
@@ -412,7 +483,7 @@ export class AgentManager {
     return true;
   }
 
-  /** Establishes a legacy cursor from durable queued notification identities. */
+  /** Establishes a legacy cursor from durable notification identities. */
   private establishLegacyTimelineBaseline(sequence: number): void {
     this.timelineCursor = Math.max(this.timelineCursor, sequence);
     this.pruneDeliveredThrough(this.timelineCursor);
@@ -591,8 +662,17 @@ export class AgentManager {
 
   async beginShutdown(): Promise<void> {
     this.shuttingDown = true;
+    for (const retry of this.timelineRetries.values()) {
+      if (retry.timer !== undefined) this.clearTimeoutFn(retry.timer);
+    }
+    this.timelineRetries.clear();
+    for (const retry of this.pendingDeliveryRetries.values()) {
+      if (retry.timer !== undefined) this.clearTimeoutFn(retry.timer);
+    }
+    this.pendingDeliveryRetries.clear();
     const entries = [...this.workers.values()];
     this.workers.clear();
+    await Promise.all(entries.map((entry) => entry.serial.idle()));
     const closing = entries.map((entry) => {
       const worker = entry.worker;
       this.release(entry, worker);

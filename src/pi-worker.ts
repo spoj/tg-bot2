@@ -370,6 +370,20 @@ export class PiWorker {
       child.stderr?.on("data", (chunk: Buffer | string) => {
         consumeStderr(typeof chunk === "string" ? chunk : stderrDecoder.write(chunk));
       });
+      child.stdin?.on("error", (error) => {
+        if (this.closing || this.stopped || this.process !== child) return;
+        const stdinError = asError(error);
+        consumeStderr(stdinError.message);
+        this.stopped = true;
+        this.closing = true;
+        this.clearIdleTimer();
+        this.clearSteerWaitTimer();
+        this.isBusyState = false;
+        for (const pending of this.pendingResponses.values()) pending.reject(stdinError);
+        this.pendingResponses.clear();
+        this.rejectSettled(stdinError);
+        void this.terminateOnce(child).catch(() => {});
+      });
       child.once("error", (error) => consumeStderr(asError(error).message));
       child.once("close", (code, signal) => {
         consumeStdout(stdoutDecoder.end());
@@ -510,7 +524,7 @@ export class PiWorker {
     } catch (error) {
       if (!wasBusy) {
         this.isBusyState = false;
-        this.armIdleTimer();
+        if (!this.closing) this.armIdleTimer();
       }
       throw error;
     }

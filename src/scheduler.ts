@@ -296,11 +296,13 @@ export class WorkspaceScheduler {
         }
       }
 
-      const due = [...this.pending.values()].map((pending) => {
-        const schedule = this.schedules.get(pending.scheduleId);
-        if (!schedule) throw new Error(`Pending occurrence references missing schedule ${pending.scheduleId}`);
-        return { pending, schedule };
-      });
+      const due = [...this.pending.values()]
+        .filter((pending) => Date.parse(pending.dueAt) <= now)
+        .map((pending) => {
+          const schedule = this.schedules.get(pending.scheduleId);
+          if (!schedule) throw new Error(`Pending occurrence references missing schedule ${pending.scheduleId}`);
+          return { pending, schedule };
+        });
       due.sort((left, right) => Date.parse(left.pending.dueAt) - Date.parse(right.pending.dueAt)
         || left.schedule.prompt.localeCompare(right.schedule.prompt)
         || left.pending.occurrenceId.localeCompare(right.pending.occurrenceId));

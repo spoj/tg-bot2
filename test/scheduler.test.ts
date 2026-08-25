@@ -100,6 +100,29 @@ describe("WorkspaceScheduler", () => {
     expect((await schedules(dataDir)).pending).toEqual([]);
   });
 
+  it("defers a persisted pending occurrence until it is due", async () => {
+    const dataDir = await fixture();
+    const future = "2026-01-10T13:00:00.000Z";
+    const occurrenceId = "future-occurrence";
+    await writeFile(path.join(dataDir, "run", "schedules.json"), JSON.stringify({
+      version: 1,
+      schedules: [{ id: "future-schedule", prompt: "future", start: future, recurrence: null, owner: OWNER, next_due_at: future }],
+      pending: [{ occurrenceId, scheduleId: "future-schedule", dueAt: future }],
+    }), "utf8");
+    const scheduler = makeScheduler(dataDir).scheduler;
+
+    await scheduler.poll(NOW);
+
+    expect(await timeline(dataDir)).toEqual([]);
+    expect((await schedules(dataDir)).pending).toEqual([{ occurrenceId, scheduleId: "future-schedule", dueAt: future }]);
+
+    await scheduler.poll(Date.parse(future));
+
+    expect(await timeline(dataDir)).toMatchObject([{ id: occurrenceId, type: "schedule_fired", scheduleId: "future-schedule", dueAt: future }]);
+    expect((await schedules(dataDir)).pending).toEqual([]);
+    expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: "future-schedule", next_due_at: null });
+  });
+
   it("restores a due one-shot when timeline publication fails", async () => {
     const dataDir = await fixture();
     const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));

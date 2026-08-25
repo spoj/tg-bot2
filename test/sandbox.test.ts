@@ -311,14 +311,19 @@ it("mounts host-exposed files under /run outside the writable workspace", async 
   const appRoot = path.join(f.root, "app");
   const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
   const runDir = path.join(f.root, "run");
-  const timeline = path.join(f.root, "timeline.jsonl");
+  const timelineDirectory = path.join(f.root, "timeline-source");
+  const timelineAlias = path.join(f.root, "timeline-alias");
+  const timeline = path.join(timelineAlias, "timeline.jsonl");
+  const canonicalTimeline = path.join(timelineDirectory, "timeline.jsonl");
   const attachments = path.join(f.root, "attachments");
   try {
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
     await mkdir(runDir);
+    await mkdir(timelineDirectory);
+    await symlink(timelineDirectory, timelineAlias, "dir");
     await mkdir(attachments);
-    await writeFile(timeline, "", "utf8");
+    await writeFile(canonicalTimeline, "", "utf8");
     const workerArgs = await buildPiRunBwrapArgs({
       workspace: f.workspace,
       appRoot,
@@ -330,11 +335,33 @@ it("mounts host-exposed files under /run outside the writable workspace", async 
     expect(workerArgs.args).toEqual(expect.arrayContaining([
       "--bind", await realpath(runDir), "/run",
       "--ro-bind", await realpath(attachments), "/run/attachments",
-      "--ro-bind", timeline, "/run/timeline.jsonl",
+      "--ro-bind", canonicalTimeline, "/run/timeline.jsonl",
       "--remount-ro", "/run",
       "--setenv", "PI_HOST_SOCKET", "/run/host.sock",
       "--setenv", "PI_AGENT_TOKEN", "secret-token",
     ]));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+it("rejects symlinked and non-regular timeline sources", async () => {
+  const f = await fixture();
+  const appRoot = path.join(f.root, "app");
+  const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const target = path.join(f.root, "timeline-target.jsonl");
+  const linked = path.join(f.root, "timeline-link.jsonl");
+  const directory = path.join(f.root, "timeline-directory");
+  try {
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
+    await writeFile(target, "", "utf8");
+    await symlink(target, linked, "file");
+    await mkdir(directory);
+    await expect(buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, hostTimeline: linked }))
+      .rejects.toThrow("Host timeline must be a real file");
+    await expect(buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, hostTimeline: directory }))
+      .rejects.toThrow("Host timeline must be a real file");
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

@@ -1,7 +1,7 @@
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type Dirent } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
@@ -13,6 +13,8 @@ import { WorkspaceResources } from "./resource-state.js";
 import { telegramAddress, telegramConversation } from "./telegram-ref.js";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
+const MAX_ATTACHMENT_STORAGE_BYTES = 50 * 1024 * 1024 * 1024;
+const MAX_CHAT_ATTACHMENT_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
 
 const MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
@@ -164,24 +166,33 @@ async function readLocalFile(root: string, exposedPath: string, mountPoint: stri
   }
 }
 
+type StagedOutboundFile = {
+  path: string;
+  input: InputFile;
+  protectedPath: string;
+  cleanupPath?: string;
+};
+
 async function stageOutboundFile(
   paths: { workspace: string; attachments: string; attachmentPrefix: string }, chatId: number, requestId: string, exposedPath: string, index?: number,
-): Promise<{ path: string; input: InputFile }> {
+): Promise<StagedOutboundFile> {
   const alreadyManaged = exposedPath.startsWith("/run/attachments/");
   const source = await readLocalFile(
     alreadyManaged ? paths.attachments : paths.workspace,
     exposedPath,
     alreadyManaged ? `/run/attachments/${paths.attachmentPrefix}` : "/workspace",
   );
-  if (alreadyManaged) return { path: exposedPath, input: new InputFile(source.bytes, path.basename(source.resolved)) };
+  if (alreadyManaged) return { path: exposedPath, input: new InputFile(source.bytes, path.basename(source.resolved)), protectedPath: source.resolved };
 
   const date = new Date().toISOString().slice(0, 10);
   const directory = await ensureAttachmentDirectory(paths.attachments, chatId, date, requestId);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let cleanupPath: string | undefined;
   try {
     const base = safeFilename(path.basename(source.resolved), "file.bin");
     const filename = index === undefined ? base : `${index + 1}-${base}`;
     const destination = path.join(directory.path, filename);
+    cleanupPath = path.resolve(paths.attachments, String(chatId), date, String(requestId), filename);
     try {
       handle = await open(destination, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, 0o600);
     } catch (error) {
@@ -204,7 +215,12 @@ async function stageOutboundFile(
     return {
       path: `/run/attachments/${paths.attachmentPrefix}/${chatId}/${date}/${requestId}/${filename}`,
       input: new InputFile(source.bytes, filename),
+      protectedPath: cleanupPath,
+      cleanupPath,
     };
+  } catch (error) {
+    if (cleanupPath !== undefined) await rm(cleanupPath, { force: true });
+    throw error;
   } finally {
     await handle?.close().catch(() => {});
     await directory.handle.close();
@@ -212,34 +228,58 @@ async function stageOutboundFile(
 }
 
 
+async function removeStagedFiles(paths: readonly string[]): Promise<void> {
+  const files = [...new Set(paths)];
+  await Promise.all(files.map(async (filePath) => {
+    await rm(filePath, { force: true });
+  }));
+  await Promise.all([...new Set(files.map((filePath) => path.dirname(filePath)))].map(async (directory) => {
+    await rm(directory, { force: true }).catch(() => {});
+  }));
+}
+
 async function prepareTelegramPayload(
   paths: { workspace: string; attachments: string; attachmentPrefix: string }, chatId: number, requestId: string, request: WorkspaceOutboxRequest,
-): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest; attachmentPaths: string[] }> {
+): Promise<{ payload: Record<string, unknown>; recorded: WorkspaceOutboxRequest; attachmentPaths: string[]; cleanupPaths: string[] }> {
   const payload = telegramPayload(request);
   const recorded = structuredClone(request);
   const attachmentPaths: string[] = [];
-  const field = MEDIA_FIELDS[request.method];
-  if (field !== undefined && typeof payload[field] === "string" && (payload[field] as string).startsWith("/")) {
-    const staged = await stageOutboundFile(paths, chatId, requestId, payload[field] as string);
-    payload[field] = staged.input;
-    recorded[field] = staged.path;
-    attachmentPaths.push(staged.path);
-  }
-  if (request.method === "sendMediaGroup" && Array.isArray(payload.media)) {
-    const recordedMedia = recorded.media as Array<Record<string, unknown>>;
-    payload.media = await Promise.all(payload.media.map(async (item, index) => {
-      if (item === null || typeof item !== "object" || Array.isArray(item)) return item;
-      const copy = { ...(item as Record<string, unknown>) };
-      if (typeof copy.media === "string" && copy.media.startsWith("/")) {
-        const staged = await stageOutboundFile(paths, chatId, requestId, copy.media, index);
-        copy.media = staged.input;
-        recordedMedia[index] = { ...(recordedMedia[index] ?? {}), media: staged.path };
-        attachmentPaths.push(staged.path);
+  const protectedPaths: string[] = [];
+  const cleanupPaths: string[] = [];
+  try {
+    const field = MEDIA_FIELDS[request.method];
+    if (field !== undefined && typeof payload[field] === "string" && (payload[field] as string).startsWith("/")) {
+      const staged = await stageOutboundFile(paths, chatId, requestId, payload[field] as string);
+      payload[field] = staged.input;
+      recorded[field] = staged.path;
+      attachmentPaths.push(staged.path);
+      protectedPaths.push(staged.protectedPath);
+      if (staged.cleanupPath !== undefined) cleanupPaths.push(staged.cleanupPath);
+    }
+    if (request.method === "sendMediaGroup" && Array.isArray(payload.media)) {
+      const recordedMedia = recorded.media as Array<Record<string, unknown>>;
+      const media = payload.media;
+      for (let index = 0; index < media.length; index++) {
+        const item = media[index];
+        if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+        const copy = { ...(item as Record<string, unknown>) };
+        if (typeof copy.media === "string" && copy.media.startsWith("/")) {
+          const staged = await stageOutboundFile(paths, chatId, requestId, copy.media, index);
+          copy.media = staged.input;
+          recordedMedia[index] = { ...(recordedMedia[index] ?? {}), media: staged.path };
+          attachmentPaths.push(staged.path);
+          protectedPaths.push(staged.protectedPath);
+          if (staged.cleanupPath !== undefined) cleanupPaths.push(staged.cleanupPath);
+        }
+        media[index] = copy;
       }
-      return copy;
-    }));
+    }
+    if (protectedPaths.length > 0) await enforceAttachmentQuota(paths.attachments, protectedPaths);
+    return { payload, recorded, attachmentPaths, cleanupPaths };
+  } catch (error) {
+    await removeStagedFiles(cleanupPaths);
+    throw error;
   }
-  return { payload, recorded, attachmentPaths };
 }
 
 export type TelegramDispatchResult = WorkspaceOutboxDispatchResult & { messageIds?: number[] };
@@ -272,25 +312,95 @@ export async function dispatchOutboxRequest(
   requestId: string,
   request: WorkspaceOutboxRequest,
 ): Promise<TelegramDispatchResult> {
-  const { payload, recorded, attachmentPaths } = await prepareTelegramPayload(paths, chatId, requestId, request);
   const raw = bot.api.raw as unknown as Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
   const call = raw[request.method];
   if (!call) throw new Error(`Telegram Bot API method is unavailable: ${request.method}`);
-  const data = await call(payload);
-  if (request.topic_name !== undefined && request.message_thread_id !== undefined) {
-    try {
-      await raw.editForumTopic?.({ chat_id: chatId, message_thread_id: request.message_thread_id, name: request.topic_name });
-    } catch (error) {
-      console.error("Incidental topic rename failed", error);
+  const prepared = await prepareTelegramPayload(paths, chatId, requestId, request);
+  try {
+    const data = await call(prepared.payload);
+    if (request.topic_name !== undefined && request.message_thread_id !== undefined) {
+      try {
+        await raw.editForumTopic?.({ chat_id: chatId, message_thread_id: request.message_thread_id, name: request.topic_name });
+      } catch (error) {
+        console.error("Incidental topic rename failed", error);
+      }
     }
+    return dispatchResult(data, prepared.recorded, prepared.attachmentPaths);
+  } catch (error) {
+    await removeStagedFiles(prepared.cleanupPaths);
+    throw error;
   }
-  return dispatchResult(data, recorded, attachmentPaths);
 }
 type AttachmentDirectory = {
   path: string;
   expectedPath: string;
   handle: Awaited<ReturnType<typeof open>>;
 };
+
+type StoredAttachment = {
+  path: string;
+  chatId: number;
+  size: number;
+  mtimeMs: number;
+};
+
+async function readAttachmentEntries(directory: string): Promise<Dirent[]> {
+  try {
+    return await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function attachmentFiles(rootPath: string): Promise<StoredAttachment[]> {
+  const files: StoredAttachment[] = [];
+  for (const chat of await readAttachmentEntries(rootPath)) {
+    if (!chat.isDirectory() || chat.isSymbolicLink()) continue;
+    const chatId = Number(chat.name);
+    if (!Number.isSafeInteger(chatId)) continue;
+    const chatPath = path.join(rootPath, chat.name);
+    for (const date of await readAttachmentEntries(chatPath)) {
+      if (!date.isDirectory() || date.isSymbolicLink()) continue;
+      const datePath = path.join(chatPath, date.name);
+      for (const entry of await readAttachmentEntries(datePath)) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const entryPath = path.join(datePath, entry.name);
+        for (const file of await readAttachmentEntries(entryPath)) {
+          if (file.isDirectory() || file.isSymbolicLink() || file.name.endsWith(".part")) continue;
+          const filePath = path.join(entryPath, file.name);
+          const stat = await lstat(filePath).catch(() => undefined);
+          if (!stat?.isFile()) continue;
+          files.push({ path: filePath, chatId, size: stat.size, mtimeMs: stat.mtimeMs });
+        }
+      }
+    }
+  }
+  return files;
+}
+
+async function enforceAttachmentQuota(rootPath: string, protectedPaths: readonly string[] = []): Promise<void> {
+  const root = path.resolve(rootPath);
+  const files = await attachmentFiles(root);
+  let total = files.reduce((sum, file) => sum + file.size, 0);
+  const byChat = new Map<number, number>();
+  for (const file of files) byChat.set(file.chatId, (byChat.get(file.chatId) ?? 0) + file.size);
+  const protectedSet = new Set(protectedPaths.map((filePath) => path.resolve(filePath)));
+  files.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
+  for (const file of files) {
+    const chatTotal = byChat.get(file.chatId) ?? 0;
+    if (total <= MAX_ATTACHMENT_STORAGE_BYTES && chatTotal <= MAX_CHAT_ATTACHMENT_STORAGE_BYTES) {
+      if (![...byChat.values()].some((size) => size > MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) break;
+    }
+    if (protectedSet.has(file.path) || (total <= MAX_ATTACHMENT_STORAGE_BYTES && chatTotal <= MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) continue;
+    await rm(file.path, { force: true });
+    total -= file.size;
+    byChat.set(file.chatId, chatTotal - file.size);
+  }
+  if (total > MAX_ATTACHMENT_STORAGE_BYTES || [...byChat.values()].some((size) => size > MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) {
+    throw new Error("Attachment storage quota exceeded");
+  }
+}
 
 async function ensureAttachmentDirectory(rootPath: string, chatId: number, date: string, entryId: number | string): Promise<AttachmentDirectory> {
   const expectedRoot = path.resolve(rootPath);
@@ -523,8 +633,16 @@ async function downloadAttachment(
       await attachmentTimeout(readAttachmentBody(response, temporaryHandle, controller.signal), controller);
       await temporaryHandle.close();
       temporaryHandle = undefined;
-      await rename(temporary, path.join(directory, filename));
+      const finalPath = path.join(directory, filename);
+      const protectedPath = path.join(attachmentDirectory.expectedPath, filename);
+      await rename(temporary, finalPath);
       await verifyAttachmentDirectory(attachmentDirectory);
+      try {
+        await enforceAttachmentQuota(config.attachments, [protectedPath]);
+      } catch (error) {
+        await rm(protectedPath, { force: true });
+        throw error;
+      }
       return {
         ...common,
         path: `/run/attachments/${config.attachmentPrefix}/${chatId}/${date}/${message.message_id}/${filename}`,

@@ -381,6 +381,38 @@ it("baselines a legacy notification journal without replaying historical timelin
   });
 });
 
+it("uses delivered legacy sequences as the timeline baseline", async () => {
+  await withDataDir(async (dataDir) => {
+    const timelinePath = path.join(dataDir, "timeline.jsonl");
+    const notificationsPath = path.join(dataDir, "notifications.jsonl");
+    const record: TimelineRecord = {
+      v: 2,
+      id: "delivered-legacy-event",
+      seq: 1,
+      t: "2026-08-24T00:00:00.000Z",
+      type: "system.event",
+    };
+    await writeFile(timelinePath, `${JSON.stringify(record)}\n`, "utf8");
+    const delivered = Array.from({ length: 1_025 }, (_, index) => ({
+      type: "delivered",
+      id: index === 0 ? record.id : `delivered-${index}`,
+      sequence: index + 1,
+    }));
+    await writeFile(notificationsPath, `${delivered.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { hostTimeline: timelinePath }));
+    const recovered: number[] = [];
+    manager.registerTimelineRecovery(async (nextRecord) => {
+      recovered.push(nextRecord.seq);
+      await manager.markTimelineProcessed(nextRecord.seq);
+    });
+
+    await manager.start();
+
+    expect(recovered).toEqual([]);
+  });
+});
+
 it("recovers a missed timeline event when a checkpoint establishes the cursor", async () => {
   await withDataDir(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
@@ -513,6 +545,74 @@ it("recovers a live cursor gap before advancing a later event", async () => {
     await expect(manager.processTimelineEvent(first, JSON.stringify(first), handoff)).rejects.toThrow("temporary handoff failure");
     await expect(manager.processTimelineEvent(second, JSON.stringify(second), handoff)).resolves.toBeUndefined();
   });
+});
+
+it("retries a failed live timeline handoff without another event", async () => {
+  vi.useFakeTimers();
+  try {
+    await withDataDir(async (dataDir) => {
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir));
+      const record: TimelineRecord = {
+        v: 2,
+        id: "live-handoff-retry",
+        seq: 1,
+        t: "2026-08-24T00:00:00.000Z",
+        type: "system.event",
+      };
+      let attempts = 0;
+      const handoff = async (nextRecord: TimelineRecord): Promise<void> => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("temporary live handoff failure");
+        await manager.markTimelineProcessed(nextRecord.seq);
+      };
+
+      await expect(manager.processTimelineEvent(record, JSON.stringify(record), handoff)).rejects.toThrow("temporary live handoff failure");
+      expect(attempts).toBe(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(attempts).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(attempts).toBe(2);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("retries a failed live notification delivery without another event", async () => {
+  vi.useFakeTimers();
+  try {
+    await withDataDir(async (dataDir) => {
+      const { factory, workers } = fakeWorkerFactory();
+      factory.mockImplementationOnce(async () => { throw new Error("temporary worker startup failure"); });
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
+      const { connectors } = fakeTelegramConnector();
+      const router = new AgentEventRouter(manager, { workspace: path.join(dataDir, "workspace"), connectors });
+      const record: TimelineRecord = {
+        v: 2,
+        id: "live-delivery-retry",
+        seq: 1,
+        t: "2026-08-24T00:00:00.000Z",
+        type: "telegram.message",
+        connectorId: CONNECTOR_ID,
+        conversation: CHAT,
+        payload: { text: "retry delivery" },
+        meta: { private: true, user_content: true },
+      };
+
+      await router.onEvent(record, JSON.stringify(record));
+      await vi.waitFor(() => expect(factory).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(vi.getTimerCount()).toBe(1));
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledWith(
+        expect.stringContaining("[notification id=live-delivery-retry seq=1]"),
+        "steer",
+        USER_INTERRUPT_MAX_WAIT_MS,
+      ));
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("marks events from removed connectors as intentionally unroutable history", async () => {
@@ -704,6 +804,41 @@ it("beginShutdown stops active workers and rejects later work", async () => {
     await manager.beginShutdown();
     expect(workers[0]?.close).toHaveBeenCalledOnce();
     await expect(manager.followup("two", CHAT)).rejects.toThrow("Agent manager is shutting down");
+  });
+});
+
+it("beginShutdown waits for conversation delivery queues before closing workers", async () => {
+  await withDataDir(async (dataDir) => {
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstPromptStarted = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const firstPromptRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let promptCount = 0;
+    const { factory, workers } = fakeWorkerFactory(async () => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        firstStarted();
+        await firstPromptRelease;
+      }
+    });
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory }));
+    const first = manager.followup("first", CHAT, { id: "shutdown-first" });
+    await firstPromptStarted;
+    const second = manager.followup("second", CHAT, { id: "shutdown-second" });
+    await vi.waitFor(async () => expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("shutdown-second"));
+
+    const shutdown = manager.beginShutdown();
+    await Promise.resolve();
+    expect(workers[0]?.close).not.toHaveBeenCalled();
+
+    releaseFirst();
+    await expect(first).rejects.toThrow("Agent manager is shutting down");
+    await expect(second).rejects.toThrow("Agent manager is shutting down");
+    await shutdown;
+
+    expect(workers[0]?.prompt).toHaveBeenCalledOnce();
+    expect(workers[0]?.close).toHaveBeenCalledOnce();
+    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain('{"type":"delivered","id":"shutdown-first"}');
   });
 });
 

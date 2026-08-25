@@ -166,6 +166,19 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
   return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
 }
 
+async function requireRealFile(candidate: string, label: string): Promise<string> {
+  const initial = await lstat(candidate);
+  if (!initial.isFile() || initial.isSymbolicLink()) {
+    throw new Error(`${label} must be a real file: ${candidate}`);
+  }
+  const canonical = await realpath(candidate);
+  const canonicalStat = await lstat(canonical);
+  if (!canonicalStat.isFile() || canonicalStat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real file: ${candidate}`);
+  }
+  return canonical;
+}
+
 type ExtensionConfig = {
   hostToolsExtension: string | undefined;
   hostTools: string | undefined;
@@ -232,6 +245,15 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   });
   const nodePath = await requireExecutable("node");
   const runtimePaths = [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
+  const hostSocketDir = paths.hostSocketDir === undefined
+    ? undefined
+    : await requireRealDirectory(paths.hostSocketDir, "Host runtime directory");
+  const hostAttachments = paths.hostAttachments === undefined
+    ? undefined
+    : await requireRealDirectory(paths.hostAttachments, "Host attachments directory");
+  const hostTimeline = paths.hostTimeline === undefined
+    ? undefined
+    : await requireRealFile(paths.hostTimeline, "Host timeline");
   const args: string[] = [
     "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
     "--unshare-ipc", "--unshare-uts", "--share-net", "--cap-drop", "ALL",
@@ -263,17 +285,11 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--ro-bind", nodeModules, "/workspace/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
     ...mountArgs,
-    ...(paths.hostSocketDir === undefined
-      ? []
-      : ["--bind", await requireRealDirectory(paths.hostSocketDir, "Host runtime directory"), "/run"]),
-    ...(paths.hostAttachments === undefined
-      ? []
-      : ["--ro-bind", await requireRealDirectory(paths.hostAttachments, "Host attachments directory"), "/run/attachments"]),
-    ...(paths.hostTimeline === undefined
-      ? []
-      : ["--ro-bind", paths.hostTimeline, "/run/timeline.jsonl"]),
-    ...(paths.hostSocketDir === undefined ? [] : ["--remount-ro", "/run"]),
-    ...(paths.hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/run/host.sock"]),
+    ...(hostSocketDir === undefined ? [] : ["--bind", hostSocketDir, "/run"]),
+    ...(hostAttachments === undefined ? [] : ["--ro-bind", hostAttachments, "/run/attachments"]),
+    ...(hostTimeline === undefined ? [] : ["--ro-bind", hostTimeline, "/run/timeline.jsonl"]),
+    ...(hostSocketDir === undefined ? [] : ["--remount-ro", "/run"]),
+    ...(hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/run/host.sock"]),
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",

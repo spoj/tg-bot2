@@ -64,6 +64,48 @@ describe("HostBridge", () => {
     await expect(Promise.all([starting, stopping])).resolves.toEqual([undefined, undefined]);
     await expect(stat(socketPath)).rejects.toThrow();
   });
+  it("waits for in-flight handlers before completing stop", async () => {
+    const { socketPath } = await fixture();
+    let release!: () => void;
+    const work = new Promise<void>((resolve) => { release = resolve; });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let completed = false;
+    const send = vi.fn(async () => {
+      markStarted();
+      await work;
+      completed = true;
+      return {};
+    });
+    const { bridge, token } = makeBridge(socketPath, ["send"], { send });
+    await bridge.start();
+    const socket = net.connect(socketPath);
+    socket.on("error", () => {});
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once("connect", () => {
+          socket.write(`${JSON.stringify({ id: "req-1", token, type: "send", params: {} })}\n`);
+          resolve();
+        });
+        socket.once("error", reject);
+      });
+      await started;
+
+      let stopped = false;
+      const stopping = bridge.stop().then(() => { stopped = true; });
+      await Promise.resolve();
+      expect(stopped).toBe(false);
+
+      release();
+      await stopping;
+      expect(completed).toBe(true);
+    } finally {
+      release();
+      socket.destroy();
+      await bridge.stop();
+    }
+  });
+
   it("resolves authenticated actors before invoking handlers", async () => {
     const { socketPath } = await fixture();
     const send = vi.fn(async () => ({}));

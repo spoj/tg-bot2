@@ -179,6 +179,30 @@ describe("PiWorker", () => {
     }
   });
 
+  it("rejects active requests and reaps the worker when stdin emits an error", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+      child.stdin.write.mockImplementation(() => true);
+
+      const prompt = worker.prompt("complete instruction");
+      await Promise.resolve();
+      const settled = worker.waitForSettled();
+      const stdinError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+      queueMicrotask(() => child.stdin.emit("error", stdinError));
+
+      await expect(prompt).rejects.toBe(stdinError);
+      await expect(settled).rejects.toBe(stdinError);
+      expect(worker.isBusy()).toBe(false);
+      expect(terminate).toHaveBeenCalledWith(child, "SIGTERM");
+      child.emit("close", null, "SIGTERM");
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("aborts a queued steer that exceeds its maximum wait without replacing its instruction", async () => {
     vi.useFakeTimers();
     const f = await fixture();
@@ -423,6 +447,27 @@ describe("PiWorker", () => {
       }
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("suppresses asynchronous stdin errors during orderly shutdown", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+      child.stdin.end.mockImplementation(() => {
+        queueMicrotask(() => child.stdin.emit("error", new Error("write EPIPE")));
+      });
+
+      const closing = worker.close();
+      await Promise.resolve();
+      child.emit("close", 0, null);
+      await closing;
+
+      expect(terminate).not.toHaveBeenCalled();
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
     }
   });
 

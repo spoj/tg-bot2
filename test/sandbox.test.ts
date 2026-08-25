@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildBwrapArgs, buildPiRunBwrapArgs, checkSandboxEnvironment, runSandbox, spawnProcess, terminateProcessGroup } from "../src/sandbox.js";
+import { buildBwrapArgs, buildPiRunBwrapArgs, checkSandboxEnvironment, HOST_TIMELINE_FD, runSandbox, spawnProcess, terminateProcessGroup } from "../src/sandbox.js";
 import { openPinnedDirectory } from "../src/util.js";
 
 async function fixture() {
@@ -335,11 +335,13 @@ it("mounts host-exposed files under /run outside the writable workspace", async 
     expect(workerArgs.args).toEqual(expect.arrayContaining([
       "--bind", await realpath(runDir), "/run",
       "--ro-bind", await realpath(attachments), "/run/attachments",
-      "--ro-bind", canonicalTimeline, "/run/timeline.jsonl",
+      "--ro-bind", `/proc/self/fd/${HOST_TIMELINE_FD}`, "/run/timeline.jsonl",
       "--remount-ro", "/run",
       "--setenv", "PI_HOST_SOCKET", "/run/host.sock",
       "--setenv", "PI_AGENT_TOKEN", "secret-token",
     ]));
+    expect(workerArgs.hostTimelineHandle).toBeDefined();
+    await workerArgs.hostTimelineHandle?.close();
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

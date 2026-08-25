@@ -1,10 +1,11 @@
 import { EventEmitter } from "node:events";
 import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { fstatSync, readFileSync, renameSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, type Mock } from "vitest";
 import { PiWorker } from "../src/pi-worker.js";
-import type { PiWorkerChildProcess } from "../src/sandbox.js";
+import { HOST_TIMELINE_FD, type PiWorkerChildProcess } from "../src/sandbox.js";
 
 type FakeStdin = EventEmitter & {
   end: Mock<(chunk?: string, encoding?: string) => void>;
@@ -94,6 +95,43 @@ describe("PiWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+  it("pins the validated timeline inode before spawn", async () => {
+    const f = await fixture();
+    const timeline = path.join(f.root, "timeline.jsonl");
+    const movedTimeline = path.join(f.root, "timeline.validated.jsonl");
+    const replacement = path.join(f.root, "timeline.replacement.jsonl");
+    try {
+      await writeFile(timeline, "validated timeline\\n");
+      await writeFile(replacement, "replacement timeline\\n");
+      const { child, spawn, terminate } = fakeChildFixture();
+      spawn.mockImplementation((_executable, args, options) => {
+        const stdio = (options as { stdio: unknown[] }).stdio;
+        const timelineFd = stdio[HOST_TIMELINE_FD] as number;
+        const validatedInode = statSync(timeline).ino;
+        renameSync(timeline, movedTimeline);
+        renameSync(replacement, timeline);
+        expect(args).toEqual(expect.arrayContaining(["--ro-bind", `/proc/self/fd/${HOST_TIMELINE_FD}`, "/run/timeline.jsonl"]));
+        expect(fstatSync(timelineFd).ino).toBe(validatedInode);
+        expect(readFileSync(`/proc/self/fd/${timelineFd}`, "utf8")).toBe("validated timeline\\n");
+        return child as unknown as PiWorkerChildProcess;
+      });
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        hostTimeline: timeline,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+
+      await worker.start();
+
+      expect(readFileSync(timeline, "utf8")).toBe("replacement timeline\\n");
+      expect(spawn).toHaveBeenCalledOnce();
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a runtime path whose intermediate directory is a symlink", async () => {
     const f = await fixture();
     const outside = path.join(f.root, "outside");

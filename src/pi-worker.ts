@@ -5,6 +5,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   buildPiRunBwrapArgs,
+  HOST_TIMELINE_FD,
   type PiRunSandboxPaths,
   type PiWorkerChildProcess,
   type PiWorkerSpawn,
@@ -315,17 +316,26 @@ export class PiWorker {
         hostAttachments: this.options.hostAttachments,
       }),
     });
-    this.ensureStartAllowed();
+    try {
+      this.ensureStartAllowed();
+    } catch (error) {
+      await built.hostTimelineHandle?.close().catch(() => {});
+      throw error;
+    }
 
+    const stdio: Array<"pipe" | number> = ["pipe", "pipe", "pipe"];
+    if (built.hostTimelineHandle !== undefined) stdio[HOST_TIMELINE_FD] = built.hostTimelineHandle.fd;
     let child: PiWorkerChildProcess;
     try {
       child = this.options.spawnProcess(this.bwrapPath, built.args, {
         detached: true,
         env: {},
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio,
       });
     } catch (error) {
       throw new Error(`Pi run spawn failed: ${asError(error).message}`);
+    } finally {
+      await built.hostTimelineHandle?.close().catch(() => {});
     }
     this.process = child;
 

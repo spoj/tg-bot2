@@ -1,5 +1,5 @@
 import { constants as fsConstants, existsSync } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, type FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from "node:child_process";
@@ -156,7 +156,9 @@ export type PiRunSandboxPaths = {
   /** Host-managed attachments exposed read-only at /run/attachments. */
   hostAttachments?: string;
 };
-export type PiRunBwrapResult = { args: string[] };
+export type PiRunBwrapResult = { args: string[]; hostTimelineHandle?: FileHandle };
+/** Child fd slot used to pass the validated timeline inode to Bubblewrap. */
+export const HOST_TIMELINE_FD = 3;
 
 function relativeMountPath(root: string, candidate: string, mountPoint: string, label: string): string {
   const relative = path.relative(root, candidate);
@@ -166,17 +168,18 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
   return relative.length === 0 ? mountPoint : path.posix.join(mountPoint, relative.split(path.sep).join("/"));
 }
 
-async function requireRealFile(candidate: string, label: string): Promise<string> {
-  const initial = await lstat(candidate);
-  if (!initial.isFile() || initial.isSymbolicLink()) {
+async function requireRealFile(candidate: string, label: string): Promise<FileHandle> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(candidate, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`${label} must be a real file: ${candidate}`);
+    return handle;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error instanceof Error && error.message === `${label} must be a real file: ${candidate}`) throw error;
     throw new Error(`${label} must be a real file: ${candidate}`);
   }
-  const canonical = await realpath(candidate);
-  const canonicalStat = await lstat(canonical);
-  if (!canonicalStat.isFile() || canonicalStat.isSymbolicLink()) {
-    throw new Error(`${label} must be a real file: ${candidate}`);
-  }
-  return canonical;
 }
 
 type ExtensionConfig = {
@@ -251,7 +254,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   const hostAttachments = paths.hostAttachments === undefined
     ? undefined
     : await requireRealDirectory(paths.hostAttachments, "Host attachments directory");
-  const hostTimeline = paths.hostTimeline === undefined
+  const hostTimelineHandle = paths.hostTimeline === undefined
     ? undefined
     : await requireRealFile(paths.hostTimeline, "Host timeline");
   const args: string[] = [
@@ -287,7 +290,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     ...mountArgs,
     ...(hostSocketDir === undefined ? [] : ["--bind", hostSocketDir, "/run"]),
     ...(hostAttachments === undefined ? [] : ["--ro-bind", hostAttachments, "/run/attachments"]),
-    ...(hostTimeline === undefined ? [] : ["--ro-bind", hostTimeline, "/run/timeline.jsonl"]),
+    ...(hostTimelineHandle === undefined ? [] : ["--ro-bind", `/proc/self/fd/${HOST_TIMELINE_FD}`, "/run/timeline.jsonl"]),
     ...(hostSocketDir === undefined ? [] : ["--remount-ro", "/run"]),
     ...(hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/run/host.sock"]),
     "--setenv", "HOME", "/workspace",
@@ -313,7 +316,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     ...(paths.thinkingLevel === undefined ? [] : ["--thinking", paths.thinkingLevel]),
   ];
   args.push("--chdir", "/workspace", "--", nodePath, cliMountPath, ...piArgs);
-  return { args };
+  return hostTimelineHandle === undefined ? { args } : { args, hostTimelineHandle };
 }
 
 async function requireHostToolsExtension(appRoot: string): Promise<string> {

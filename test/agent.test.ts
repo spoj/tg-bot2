@@ -443,7 +443,7 @@ it("recovers a missed timeline event when a checkpoint establishes the cursor", 
     await vi.waitFor(() => expect(workers[0]?.prompt).toHaveBeenCalledWith(expect.stringContaining("recover after checkpoint"), "steer", USER_INTERRUPT_MAX_WAIT_MS));
   });
 });
-it("retries a transient timeline recovery failure on the next start", async () => {
+it("retries a transient timeline recovery failure after startup without another start", async () => {
   await withDataDir(async (dataDir) => {
     const timelinePath = path.join(dataDir, "timeline.jsonl");
     const record: TimelineRecord = {
@@ -464,10 +464,11 @@ it("retries a transient timeline recovery failure on the next start", async () =
     });
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await expect(manager.start()).rejects.toThrow("temporary recovery failure");
-      fail = false;
       await manager.start();
-      expect(attempts).toBe(2);
+      expect(attempts).toBe(1);
+      fail = false;
+      await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 2_000 });
+      await manager.beginShutdown();
     } finally {
       errorSpy.mockRestore();
     }
@@ -807,7 +808,7 @@ it("beginShutdown stops active workers and rejects later work", async () => {
   });
 });
 
-it("beginShutdown waits for conversation delivery queues before closing workers", async () => {
+it("beginShutdown closes workers while draining queues and preserves unacknowledged notifications", async () => {
   await withDataDir(async (dataDir) => {
     let releaseFirst!: () => void;
     let firstStarted!: () => void;
@@ -827,19 +828,52 @@ it("beginShutdown waits for conversation delivery queues before closing workers"
     const second = manager.followup("second", CHAT, { id: "shutdown-second" });
     await vi.waitFor(async () => expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("shutdown-second"));
 
+    const firstResult = first.catch((error: unknown) => error);
+    const secondResult = second.catch((error: unknown) => error);
     const shutdown = manager.beginShutdown();
-    await Promise.resolve();
-    expect(workers[0]?.close).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(workers[0]?.close).toHaveBeenCalledOnce());
 
+    await expect(firstResult).resolves.toMatchObject({ message: "Agent manager is shutting down" });
+    await expect(secondResult).resolves.toMatchObject({ message: "Agent manager is shutting down" });
     releaseFirst();
-    await expect(first).rejects.toThrow("Agent manager is shutting down");
-    await expect(second).rejects.toThrow("Agent manager is shutting down");
     await shutdown;
 
     expect(workers[0]?.prompt).toHaveBeenCalledOnce();
-    expect(workers[0]?.close).toHaveBeenCalledOnce();
-    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain('{"type":"delivered","id":"shutdown-first"}');
+    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).not.toContain('{"type":"delivered","id":"shutdown-first"}');
+    expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("shutdown-first");
   });
+});
+
+it("bounds shutdown close and stop attempts when a worker remains wedged", async () => {
+  vi.useFakeTimers();
+  try {
+    await withDataDir(async (dataDir) => {
+      let promptStarted!: () => void;
+      const started = new Promise<void>((resolve) => { promptStarted = resolve; });
+      const { factory, workers } = fakeWorkerFactory(async () => {
+        promptStarted();
+        await new Promise<void>(() => {});
+      });
+      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, {
+        workerFactory: factory,
+        stopGraceMs: 10,
+      }));
+      const delivery = manager.followup("wedged", CHAT).catch((error: unknown) => error);
+      await started;
+      workers[0]!.close.mockImplementation(() => new Promise<void>(() => {}));
+
+      const shutdown = manager.beginShutdown();
+      await vi.advanceTimersByTimeAsync(10);
+      await shutdown;
+
+      await expect(delivery).resolves.toMatchObject({ message: "Agent manager is shutting down" });
+      expect(workers[0]?.close).toHaveBeenCalledOnce();
+      expect(workers[0]?.stop).toHaveBeenCalledOnce();
+      expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("wedged");
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("manages independent workers and session directories for generic conversation identities", async () => {

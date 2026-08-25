@@ -111,6 +111,7 @@ const NOTIFICATION_COMPACTION_THRESHOLD = 128;
 const MAX_PENDING_NOTIFICATIONS = 1_024;
 const TIMELINE_RETRY_BASE_MS = 1_000;
 const TIMELINE_RETRY_MAX_MS = 30_000;
+const WORKER_SHUTDOWN_ACTION_CAP_MS = 1_000;
 function managerShutdownError(): Error {
   const error = new Error("Agent manager is shutting down");
   error.name = "AbortError";
@@ -211,7 +212,11 @@ export class AgentManager {
   private readonly deliveredNotifications = new Map<string, number | undefined>();
   private readonly workerStarts = new Set<Promise<AgentWorker>>();
   private readonly timelineRetries = new Map<number, TimelineRetry>();
+  private readonly timelineRetryRuns = new Set<Promise<void>>();
   private readonly pendingDeliveryRetries = new Map<ConversationWorkerEntry, PendingDeliveryRetry>();
+  private readonly shutdownSignal: Promise<void>;
+  private resolveShutdownSignal!: () => void;
+  private shutdownPromise: Promise<void> | undefined;
   private notificationsLoaded: Promise<void> | undefined;
   private notificationRecordsSinceCompaction = 0;
   private timelineCursor = 0;
@@ -236,6 +241,7 @@ export class AgentManager {
     this.setIntervalFn = options.setInterval;
     this.clearIntervalFn = options.clearInterval;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
+    this.shutdownSignal = new Promise<void>((resolve) => { this.resolveShutdownSignal = resolve; });
     this.hostSocketDir = options.hostSocketDir;
     this.hostTimeline = options.hostTimeline;
     this.hostAttachments = options.hostAttachments;
@@ -289,7 +295,9 @@ export class AgentManager {
     retry.timer = this.setTimeoutFn(() => {
       if (this.timelineRetries.get(record.seq) !== retry) return;
       retry.timer = undefined;
-      void this.processTimelineEvent(record, rawLine, handoff).catch(() => {});
+      const run = this.processTimelineEvent(record, rawLine, handoff);
+      this.timelineRetryRuns.add(run);
+      void run.finally(() => this.timelineRetryRuns.delete(run)).catch(() => {});
     }, delay);
     retry.timer.unref?.();
     this.timelineRetries.set(record.seq, retry);
@@ -336,7 +344,12 @@ export class AgentManager {
       const entry = this.getOrCreateEntry(target);
       this.schedulePendingDelivery(entry);
     }
-    await this.timelineHandoffs.run(() => this.recoverPersistedTimeline());
+    try {
+      await this.timelineHandoffs.run(() => this.recoverPersistedTimeline());
+    } catch (error) {
+      if (this.shuttingDown || this.timelineRetries.size === 0) throw error;
+      console.error("Timeline startup recovery failed; retry scheduled", error);
+    }
   }
 
   private schedulePendingDelivery(entry: ConversationWorkerEntry): void {
@@ -412,7 +425,11 @@ export class AgentManager {
       const notification = [...this.pendingNotifications.values()].find((candidate) => sameTarget(candidate.target, entry.actor));
       if (!notification) return;
       const worker = await this.ensureWorker(entry);
-      await worker.prompt(notificationPrompt(notification), notification.behavior, notification.maxWaitMs);
+      const promptAccepted = await Promise.race([
+        worker.prompt(notificationPrompt(notification), notification.behavior, notification.maxWaitMs).then(() => true),
+        this.shutdownSignal.then(() => false),
+      ]);
+      if (!promptAccepted) throw managerShutdownError();
       await this.acknowledgeNotification(notification.id);
     }
   }
@@ -627,6 +644,7 @@ export class AgentManager {
         await this.withTimelineHandoff(() => recovery(record, rawLine));
       } catch (error) {
         console.error("Timeline notification recovery failed", error);
+        this.scheduleTimelineRetry(record, rawLine, recovery);
         throw error;
       }
     }
@@ -661,7 +679,14 @@ export class AgentManager {
   }
 
   async beginShutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
     this.shuttingDown = true;
+    this.resolveShutdownSignal();
+    this.shutdownPromise = this.finishShutdown();
+    return this.shutdownPromise;
+  }
+
+  private async finishShutdown(): Promise<void> {
     for (const retry of this.timelineRetries.values()) {
       if (retry.timer !== undefined) this.clearTimeoutFn(retry.timer);
     }
@@ -672,7 +697,6 @@ export class AgentManager {
     this.pendingDeliveryRetries.clear();
     const entries = [...this.workers.values()];
     this.workers.clear();
-    await Promise.all(entries.map((entry) => entry.serial.idle()));
     const closing = entries.map((entry) => {
       const worker = entry.worker;
       this.release(entry, worker);
@@ -680,9 +704,13 @@ export class AgentManager {
     });
     const starts = [...this.workerStarts];
     await Promise.all([
+      this.timelineHandoffs.idle(),
+      ...this.timelineRetryRuns,
       ...closing,
       ...starts.map((start) => start.catch(() => {})),
     ]);
+    await Promise.all(entries.map((entry) => entry.serial.idle()));
+    await this.notificationWrites.idle();
   }
 
   async disposeAll(): Promise<void> {
@@ -690,15 +718,31 @@ export class AgentManager {
   }
 
   private async closeWorkerForShutdown(worker: AgentWorker): Promise<void> {
+    const capMs = this.stopGraceMs ?? WORKER_SHUTDOWN_ACTION_CAP_MS;
+    const closeCompleted = await this.runBoundedWorkerAction(() => worker.close(), capMs);
+    if (closeCompleted) return;
+    console.error("Agent shutdown close timed out");
+    const stopCompleted = await this.runBoundedWorkerAction(() => worker.stop(), capMs);
+    if (!stopCompleted) console.error("Agent shutdown stop timed out");
+  }
+
+  private async runBoundedWorkerAction(action: () => Promise<void>, capMs: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const operation = Promise.resolve().then(action).then(
+      () => true,
+      (error) => {
+        console.error("Agent shutdown worker action failed", error);
+        return false;
+      },
+    );
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = this.setTimeoutFn(() => resolve(false), capMs);
+      timer.unref?.();
+    });
     try {
-      await worker.close();
-    } catch (error) {
-      console.error("Agent shutdown close failed", error);
-      try {
-        await worker.stop();
-      } catch (stopError) {
-        console.error("Agent shutdown stop failed", stopError);
-      }
+      return await Promise.race([operation, timeout]);
+    } finally {
+      if (timer !== undefined) this.clearTimeoutFn(timer);
     }
   }
 

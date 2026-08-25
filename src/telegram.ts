@@ -1,7 +1,7 @@
 import { constants as fsConstants, type Dirent } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
@@ -15,6 +15,7 @@ const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 const MAX_ATTACHMENT_STORAGE_BYTES = 50 * 1024 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
+const STALE_ATTACHMENT_PART_TTL_MS = 10 * 60 * 1_000;
 
 const MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024;
 const OUTBOUND_READ_CHUNK_BYTES = 64 * 1024;
@@ -274,7 +275,10 @@ async function prepareTelegramPayload(
         media[index] = copy;
       }
     }
-    if (protectedPaths.length > 0) await enforceAttachmentQuota(paths.attachments, protectedPaths);
+    if (protectedPaths.length > 0) {
+      const attachmentRoot = attachmentWorkspaceRoot(paths.attachments);
+      await enforceAttachmentQuota(attachmentRoot, attachmentTimelinePath(paths.attachments), protectedPaths);
+    }
     return { payload, recorded, attachmentPaths, cleanupPaths };
   } catch (error) {
     await removeStagedFiles(cleanupPaths);
@@ -339,9 +343,16 @@ type AttachmentDirectory = {
 
 type StoredAttachment = {
   path: string;
+  exposedPath: string;
   chatId: number;
   size: number;
   mtimeMs: number;
+};
+
+type AttachmentScan = {
+  files: StoredAttachment[];
+  staleParts: string[];
+  directories: string[];
 };
 
 async function readAttachmentEntries(directory: string): Promise<Dirent[]> {
@@ -353,50 +364,112 @@ async function readAttachmentEntries(directory: string): Promise<Dirent[]> {
   }
 }
 
-async function attachmentFiles(rootPath: string): Promise<StoredAttachment[]> {
+function attachmentWorkspaceRoot(connectorRoot: string): string {
+  return path.resolve(connectorRoot, "..");
+}
+
+function attachmentTimelinePath(connectorRoot: string): string {
+  return path.resolve(attachmentWorkspaceRoot(connectorRoot), "..", "timeline.jsonl");
+}
+
+function exposedAttachmentPath(root: string, filePath: string): string {
+  return `/run/attachments/${path.relative(root, filePath).split(path.sep).join("/")}`;
+}
+
+async function attachmentFiles(rootPath: string): Promise<AttachmentScan> {
   const files: StoredAttachment[] = [];
-  for (const chat of await readAttachmentEntries(rootPath)) {
-    if (!chat.isDirectory() || chat.isSymbolicLink()) continue;
-    const chatId = Number(chat.name);
-    if (!Number.isSafeInteger(chatId)) continue;
-    const chatPath = path.join(rootPath, chat.name);
-    for (const date of await readAttachmentEntries(chatPath)) {
-      if (!date.isDirectory() || date.isSymbolicLink()) continue;
-      const datePath = path.join(chatPath, date.name);
-      for (const entry of await readAttachmentEntries(datePath)) {
-        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-        const entryPath = path.join(datePath, entry.name);
-        for (const file of await readAttachmentEntries(entryPath)) {
-          if (file.isDirectory() || file.isSymbolicLink() || file.name.endsWith(".part")) continue;
-          const filePath = path.join(entryPath, file.name);
-          const stat = await lstat(filePath).catch(() => undefined);
-          if (!stat?.isFile()) continue;
-          files.push({ path: filePath, chatId, size: stat.size, mtimeMs: stat.mtimeMs });
+  const staleParts: string[] = [];
+  const directories: string[] = [];
+  const staleBefore = Date.now() - STALE_ATTACHMENT_PART_TTL_MS;
+  for (const connector of await readAttachmentEntries(rootPath)) {
+    if (!connector.isDirectory() || connector.isSymbolicLink()) continue;
+    const connectorPath = path.join(rootPath, connector.name);
+    directories.push(connectorPath);
+    for (const chat of await readAttachmentEntries(connectorPath)) {
+      if (!chat.isDirectory() || chat.isSymbolicLink()) continue;
+      const chatId = Number(chat.name);
+      if (!Number.isSafeInteger(chatId)) continue;
+      const chatPath = path.join(connectorPath, chat.name);
+      directories.push(chatPath);
+      for (const date of await readAttachmentEntries(chatPath)) {
+        if (!date.isDirectory() || date.isSymbolicLink()) continue;
+        const datePath = path.join(chatPath, date.name);
+        directories.push(datePath);
+        for (const entry of await readAttachmentEntries(datePath)) {
+          if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+          const entryPath = path.join(datePath, entry.name);
+          directories.push(entryPath);
+          for (const file of await readAttachmentEntries(entryPath)) {
+            if (file.isDirectory() || file.isSymbolicLink()) continue;
+            const filePath = path.join(entryPath, file.name);
+            const stat = await lstat(filePath).catch(() => undefined);
+            if (!stat?.isFile()) continue;
+            if (file.name.endsWith(".part")) {
+              if (stat.mtimeMs < staleBefore) staleParts.push(filePath);
+              continue;
+            }
+            files.push({ path: filePath, exposedPath: exposedAttachmentPath(rootPath, filePath), chatId, size: stat.size, mtimeMs: stat.mtimeMs });
+          }
         }
       }
     }
   }
-  return files;
+  return { files, staleParts, directories };
 }
 
-async function enforceAttachmentQuota(rootPath: string, protectedPaths: readonly string[] = []): Promise<void> {
+async function referencedAttachmentPaths(timelinePath: string): Promise<Set<string>> {
+  let raw: string;
+  try {
+    raw = await readFile(timelinePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    throw error;
+  }
+  const referenced = new Set<string>();
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    const parsed: unknown = JSON.parse(line);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const attachments = (parsed as Record<string, unknown>).attachments;
+    if (!Array.isArray(attachments)) continue;
+    for (const attachment of attachments) {
+      if (attachment === null || typeof attachment !== "object" || Array.isArray(attachment)) continue;
+      const attachmentPath = (attachment as Record<string, unknown>).path;
+      if (typeof attachmentPath === "string") referenced.add(attachmentPath);
+    }
+  }
+  return referenced;
+}
+
+async function removeEmptyAttachmentDirectories(directories: readonly string[]): Promise<void> {
+  const ordered = [...directories].sort((left, right) => right.length - left.length);
+  for (const directory of ordered) await rm(directory, { force: true }).catch(() => {});
+}
+
+async function enforceAttachmentQuota(rootPath: string, timelinePath: string, protectedPaths: readonly string[] = []): Promise<void> {
   const root = path.resolve(rootPath);
-  const files = await attachmentFiles(root);
+  const scan = await attachmentFiles(root);
+  await Promise.all(scan.staleParts.map((filePath) => rm(filePath, { force: true })));
+  const referenced = await referencedAttachmentPaths(timelinePath);
+  const files = scan.files;
   let total = files.reduce((sum, file) => sum + file.size, 0);
   const byChat = new Map<number, number>();
   for (const file of files) byChat.set(file.chatId, (byChat.get(file.chatId) ?? 0) + file.size);
   const protectedSet = new Set(protectedPaths.map((filePath) => path.resolve(filePath)));
   files.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
-  for (const file of files) {
-    const chatTotal = byChat.get(file.chatId) ?? 0;
-    if (total <= MAX_ATTACHMENT_STORAGE_BYTES && chatTotal <= MAX_CHAT_ATTACHMENT_STORAGE_BYTES) {
-      if (![...byChat.values()].some((size) => size > MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) break;
-    }
-    if (protectedSet.has(file.path) || (total <= MAX_ATTACHMENT_STORAGE_BYTES && chatTotal <= MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) continue;
-    await rm(file.path, { force: true });
-    total -= file.size;
-    byChat.set(file.chatId, chatTotal - file.size);
+  while (total > MAX_ATTACHMENT_STORAGE_BYTES || [...byChat.values()].some((size) => size > MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) {
+    const candidate = files.find((file) => {
+      if (protectedSet.has(file.path) || referenced.has(file.exposedPath)) return false;
+      const chatTotal = byChat.get(file.chatId) ?? 0;
+      return total > MAX_ATTACHMENT_STORAGE_BYTES || chatTotal > MAX_CHAT_ATTACHMENT_STORAGE_BYTES;
+    });
+    if (!candidate) break;
+    await rm(candidate.path, { force: true });
+    total -= candidate.size;
+    byChat.set(candidate.chatId, (byChat.get(candidate.chatId) ?? 0) - candidate.size);
+    files.splice(files.indexOf(candidate), 1);
   }
+  await removeEmptyAttachmentDirectories(scan.directories);
   if (total > MAX_ATTACHMENT_STORAGE_BYTES || [...byChat.values()].some((size) => size > MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) {
     throw new Error("Attachment storage quota exceeded");
   }
@@ -638,7 +711,7 @@ async function downloadAttachment(
       await rename(temporary, finalPath);
       await verifyAttachmentDirectory(attachmentDirectory);
       try {
-        await enforceAttachmentQuota(config.attachments, [protectedPath]);
+        await enforceAttachmentQuota(attachmentWorkspaceRoot(config.attachments), attachmentTimelinePath(config.attachments), [protectedPath]);
       } catch (error) {
         await rm(protectedPath, { force: true });
         throw error;
@@ -789,7 +862,10 @@ export function createTelegramBot(
 ): Bot {
   const bot = new Bot(config.token);
   const workspace = config.workspace;
-  const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, () => ctx.reply(text));
+  const queuedReply = (ctx: Context, text: string) => deliveryQueue.enqueue(ctx.chat!.id, async () => {
+    if (!(await isChatAllowed(workspace, ctx.chat!.id))) return;
+    await ctx.reply(text);
+  });
   const rejectedIngress = new Map<string, { state: string; expiresAt: number }>();
 
   bot.use(async (ctx, next) => {

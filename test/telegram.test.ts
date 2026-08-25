@@ -308,6 +308,68 @@ describe("raw Telegram Bot API dispatch", () => {
     await expect(stat(oldFiles[3]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
   });
 
+  it("enforces the workspace quota across connector attachment roots", async () => {
+    const test = await fixture();
+    const otherId = "telegram:1000";
+    const otherPrefix = connectorPathSegment(otherId);
+    const otherRoot = path.join(test.paths.attachments, otherPrefix);
+    const oldFiles: string[] = [];
+    for (let index = 0; index < 26; index++) {
+      const root = index % 2 === 0 ? test.config.attachments : otherRoot;
+      const chatId = 100 + index;
+      const filePath = path.join(root, String(chatId), "2020-01-01", "old", "old.bin");
+      await mkdir(path.dirname(filePath), { recursive: true });
+      await writeFile(filePath, "", "utf8");
+      await truncate(filePath, 2 * 1024 * 1024 * 1024);
+      await utimes(filePath, new Date(Date.UTC(2020, 0, index + 1)), new Date(Date.UTC(2020, 0, index + 1)));
+      oldFiles.push(filePath);
+    }
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+    const otherConfig: TelegramConnectorConfig = {
+      ...test.config,
+      id: otherId,
+      token: "1000:test-token",
+      botId: 1000,
+      attachmentPrefix: otherPrefix,
+      attachments: otherRoot,
+    };
+
+    await dispatchOutboxRequest(fakeBot(), otherConfig, 42, "req-global-quota", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+    });
+
+    await expect(stat(oldFiles[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(oldFiles[25]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
+  });
+
+  it("preserves attachment files referenced by durable timeline records", async () => {
+    const test = await fixture();
+    const oldFiles: string[] = [];
+    for (let index = 0; index < 26; index++) {
+      const chatId = 100 + index;
+      const filePath = path.join(test.config.attachments, String(chatId), "2020-01-01", "old", "old.bin");
+      await mkdir(path.dirname(filePath), { recursive: true });
+      await writeFile(filePath, "", "utf8");
+      await truncate(filePath, 2 * 1024 * 1024 * 1024);
+      await utimes(filePath, new Date(Date.UTC(2020, 0, index + 1)), new Date(Date.UTC(2020, 0, index + 1)));
+      oldFiles.push(filePath);
+    }
+    const referenced = "/run/attachments/" + ATTACHMENT_PREFIX + "/100/2020-01-01/old/old.bin";
+    await writeFile(test.paths.timeline, JSON.stringify({ v: 2, id: "durable", seq: 1, t: new Date().toISOString(), type: "connector.sent", attachments: [{ path: referenced }] }) + "\n", "utf8");
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+
+    await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-referenced-quota", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+    });
+
+    await expect(stat(oldFiles[0]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
+    await expect(stat(oldFiles[1]!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects symlinked intermediate workspace paths", async () => {
     const test = await fixture();
     const outside = await mkdtemp(path.join(os.tmpdir(), "telegram-outside-"));
@@ -979,5 +1041,32 @@ describe("Telegram gates and commands", () => {
       "Personal agent. Send text, attachments, or a location pin to continue your persistent session.",
       "Restarting all agents. They will resume on the next message.",
     ]);
+  });
+
+  it("does not send queued start or restart replies after allowlist revocation", async () => {
+    const test = await fixture();
+    const command = (text: string, updateId: number) => ({
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        text,
+        entities: [{ type: "bot_command", offset: 0, length: text.length }],
+      },
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const first = test.connector.delivery.enqueue(42, () => blocked);
+    const start = test.bot.handleUpdate(command("/start", 22) as never);
+    const restart = test.bot.handleUpdate(command("/restart", 23) as never);
+    await vi.waitFor(() => expect(test.requests).toHaveLength(0));
+    await writeAllowedChats(test.config, []);
+    release();
+
+    await Promise.all([first, start, restart]);
+    expect(test.restartAll).toHaveBeenCalledOnce();
+    expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(0);
   });
 });

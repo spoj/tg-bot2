@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 
 const integration = process.argv.includes("--integration");
 const steps = [
+  { name: "Build", args: ["build"] },
   { name: "Lint", args: ["lint"] },
   { name: "Typecheck", args: ["typecheck"] },
   { name: "Tests", args: ["test"] },

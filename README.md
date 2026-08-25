@@ -21,6 +21,8 @@ pnpm start
 
 A single host loads every workspace under `$DATA_DIR/workspaces/` (defaults to `~/.local/share/tg-bot2`). Connector instances configured in one workspace share its writable `workspace/`, timeline, schedules, and agent runtime. Provider credentials go under `DATA_DIR/workspaces/<workspaceId>/workspace/.pi/agent/` before the first prompt. A systemd unit example lives at `deploy/tg-bot2.service.example`. Only the workspace-first layout is supported.
 
+Attachment files live under `DATA_DIR/workspaces/<workspaceId>/attachments/`, in connector-specific subdirectories. The whole attachment tree, including partial downloads, has a 50 GiB hard cap. New attachments are rejected when they would exceed it, while completed files are never evicted automatically; remove old files manually when space is needed. Failed staging and failed Telegram deliveries clean up only the new staged files.
+
 ## Chat access
 
 Telegram connectors in a workspace share its allow list at `DATA_DIR/workspaces/<workspaceId>/workspace/.allowed.json` (a JSON array of allowed chat IDs); the host enforces it for ingress, sends, and cross-conversation steering. An update from an unlisted chat is discarded without retaining content or its native payload. The timeline records at most one `telegram.access_request` per rejection reason, chat, update type, and process lifetime: private chats include bounded requester identity; bot group-adds include bounded group and inviter identity; other group activity includes only bounded group identity. Rejected updates are never queued or replayed after approval.

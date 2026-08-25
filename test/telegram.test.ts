@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as realSetTimeout } from "node:timers";
@@ -9,8 +9,6 @@ import { ConnectorRegistry } from "../src/connector.js";
 import type { TelegramConnectorConfig } from "../src/config.js";
 import { WorkspaceTimeline } from "../src/events.js";
 import { WorkspaceResources } from "../src/resource-state.js";
-import { WorkspaceOutbox } from "../src/outbox.js";
-import type { WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
 import { TelegramConnector } from "../src/telegram-connector.js";
 import { telegramConversation } from "../src/telegram-ref.js";
 import {
@@ -286,193 +284,22 @@ describe("raw Telegram Bot API dispatch", () => {
     expect(files.some((file) => file.endsWith("report.txt"))).toBe(false);
   });
 
-  it("limits attachment storage per chat by removing the oldest files", async () => {
+  it("rejects a new attachment when the workspace hard cap is exceeded", async () => {
     const test = await fixture();
-    const oldFiles: string[] = [];
-    for (let index = 0; index < 4; index++) {
-      const filePath = path.join(test.config.attachments, "42", "2020-01-01", String(index), "old.bin");
-      await mkdir(path.dirname(filePath), { recursive: true });
-      await writeFile(filePath, "", "utf8");
-      await truncate(filePath, 2 * 1024 * 1024 * 1024);
-      const old = new Date(Date.UTC(2020, 0, index + 1));
-      await utimes(filePath, old, old);
-      oldFiles.push(filePath);
-    }
+    const existing = path.join(test.paths.attachments, connectorPathSegment("telegram:1000"), "42", "2020-01-01", "old", "old.bin");
+    await mkdir(path.dirname(existing), { recursive: true });
+    await writeFile(existing, "", "utf8");
+    await truncate(existing, 50 * 1024 * 1024 * 1024);
     await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
 
-    await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-quota", {
+    await expect(dispatchOutboxRequest(fakeBot(), test.config, 42, "req-quota", {
       method: "sendDocument",
       chat_id: 42,
       document: "/workspace/report.txt",
-    });
-
-    await expect(stat(oldFiles[0]!)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(oldFiles[3]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
-  });
-
-  it("enforces the workspace quota across connector attachment roots", async () => {
-    const test = await fixture();
-    const otherId = "telegram:1000";
-    const otherPrefix = connectorPathSegment(otherId);
-    const otherRoot = path.join(test.paths.attachments, otherPrefix);
-    const oldFiles: string[] = [];
-    for (let index = 0; index < 26; index++) {
-      const root = index % 2 === 0 ? test.config.attachments : otherRoot;
-      const chatId = 100 + index;
-      const filePath = path.join(root, String(chatId), "2020-01-01", "old", "old.bin");
-      await mkdir(path.dirname(filePath), { recursive: true });
-      await writeFile(filePath, "", "utf8");
-      await truncate(filePath, 2 * 1024 * 1024 * 1024);
-      await utimes(filePath, new Date(Date.UTC(2020, 0, index + 1)), new Date(Date.UTC(2020, 0, index + 1)));
-      oldFiles.push(filePath);
-    }
-    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
-    const otherConfig: TelegramConnectorConfig = {
-      ...test.config,
-      id: otherId,
-      token: "1000:test-token",
-      botId: 1000,
-      attachmentPrefix: otherPrefix,
-      attachments: otherRoot,
-    };
-
-    await dispatchOutboxRequest(fakeBot(), otherConfig, 42, "req-global-quota", {
-      method: "sendDocument",
-      chat_id: 42,
-      document: "/workspace/report.txt",
-    });
-
-    await expect(stat(oldFiles[0]!)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(oldFiles[25]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
-  });
-
-  it("does not evict another chat's staged attachment while its send is paused", async () => {
-    const test = await fixture();
-    const quota = 50 * 1024 * 1024 * 1024;
-    const baseline = quota - 1_500 * 1024;
-    const baselinePerChat = Math.floor(baseline / 11);
-    const baselinePaths: string[] = [];
-    for (let index = 0; index < 11; index++) {
-      const chatId = 100 + index;
-      const baselinePath = path.join(test.config.attachments, String(chatId), "2020-01-01", "old", "old.bin");
-      await mkdir(path.dirname(baselinePath), { recursive: true });
-      await writeFile(baselinePath, "", "utf8");
-      await truncate(baselinePath, baselinePerChat);
-      baselinePaths.push(`/run/attachments/${ATTACHMENT_PREFIX}/${chatId}/2020-01-01/old/old.bin`);
-    }
-    await writeFile(test.paths.timeline, JSON.stringify({
-      v: 2, id: "baseline", seq: 1, t: new Date().toISOString(), type: "connector.sent",
-      attachments: baselinePaths.map((path) => ({ path })),
-    }) + "\n", "utf8");
-    await writeFile(path.join(test.config.workspace, "first.txt"), "x".repeat(1024 * 1024), "utf8");
-    await writeFile(path.join(test.config.workspace, "second.txt"), "y".repeat(1024 * 1024), "utf8");
-
-    let releaseFirst!: () => void;
-    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const firstBot = fakeBot();
-    firstBot.api.raw.sendDocument = vi.fn(async () => {
-      await firstBlocked;
-      return { message_id: 1 };
-    }) as never;
-    const first = dispatchOutboxRequest(firstBot, test.config, 42, "first", {
-      method: "sendDocument", chat_id: 42, document: "/workspace/first.txt",
-    });
-    await vi.waitFor(() => expect(firstBot.api.raw.sendDocument).toHaveBeenCalledTimes(1));
-    const firstPath = path.join(test.config.attachments, "42", new Date().toISOString().slice(0, 10), "first", "first.txt");
-    await expect(stat(firstPath)).resolves.toMatchObject({ size: 1024 * 1024 });
-
-    await expect(dispatchOutboxRequest(fakeBot(), test.config, 43, "second", {
-      method: "sendDocument", chat_id: 43, document: "/workspace/second.txt",
     })).rejects.toThrow("Attachment storage quota exceeded");
-    await expect(stat(firstPath)).resolves.toMatchObject({ size: 1024 * 1024 });
 
-    releaseFirst();
-    await first;
-  });
-
-  it("scans complete timeline records before ignoring a malformed unterminated tail", async () => {
-    const test = await fixture();
-    const files: string[] = [];
-    for (let index = 0; index < 3; index++) {
-      const filePath = path.join(test.config.attachments, "42", "2020-01-01", String(index), "old.bin");
-      await mkdir(path.dirname(filePath), { recursive: true });
-      await writeFile(filePath, "", "utf8");
-      await truncate(filePath, 2 * 1024 * 1024 * 1024);
-      await utimes(filePath, new Date(Date.UTC(2020, 0, index + 1)), new Date(Date.UTC(2020, 0, index + 1)));
-      files.push(filePath);
-    }
-    const referenced = `/run/attachments/${ATTACHMENT_PREFIX}/42/2020-01-01/0/old.bin`;
-    await writeFile(test.paths.timeline, JSON.stringify({
-      v: 2, id: "durable", seq: 1, t: new Date().toISOString(), type: "connector.sent", attachments: [{ path: referenced }],
-    }) + "\n{\"truncated\":", "utf8");
-    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
-
-    await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-torn-tail", {
-      method: "sendDocument",
-      chat_id: 42,
-      document: "/workspace/report.txt",
-    });
-
-    await expect(stat(files[0]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
-    await expect(stat(files[1]!)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(files[2]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
-  });
-
-  it("still fails quota enforcement for a malformed newline-terminated timeline record", async () => {
-    const test = await fixture();
-    await writeFile(test.paths.timeline, "{\"truncated\":\n", "utf8");
-    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
-
-    await expect(dispatchOutboxRequest(fakeBot(), test.config, 42, "req-malformed-record", {
-      method: "sendDocument",
-      chat_id: 42,
-      document: "/workspace/report.txt",
-    })).rejects.toThrow();
-  });
-
-  it("cleans staged attachments when terminal timeline publication fails", async () => {
-    const test = await fixture();
-    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
-    const connectors = new ConnectorRegistry();
-    connectors.register(test.connector);
-    const outbox = new WorkspaceOutbox({ connectors, timeline: test.timeline });
-    Object.defineProperty(test.connector, "dispatchWithRetry", {
-      value: vi.fn((chatId: number, requestId: string, request: WorkspaceOutboxRequest) => dispatchOutboxRequest(fakeBot(), test.config, chatId, requestId, request)),
-    });
-    vi.spyOn(test.timeline, "publish").mockRejectedValue(new Error("timeline disk full"));
-
-    const result = await outbox.send({ method: "sendDocument", document: "/workspace/report.txt" }, telegramConversation(CONNECTOR_ID, 42));
-
-    expect(result).toMatchObject({ uncertain: true, deliveryStatus: "delivered_timeline_persistence_failed" });
-    const chatAttachments = path.join(test.config.attachments, "42");
-    const files = await readdir(chatAttachments, { recursive: true });
-    expect(files.some((file) => file.endsWith("report.txt"))).toBe(false);
-  });
-
-  it("preserves attachment files referenced by durable timeline records", async () => {
-    const test = await fixture();
-    const oldFiles: string[] = [];
-    for (let index = 0; index < 26; index++) {
-      const chatId = 100 + index;
-      const filePath = path.join(test.config.attachments, String(chatId), "2020-01-01", "old", "old.bin");
-      await mkdir(path.dirname(filePath), { recursive: true });
-      await writeFile(filePath, "", "utf8");
-      await truncate(filePath, 2 * 1024 * 1024 * 1024);
-      await utimes(filePath, new Date(Date.UTC(2020, 0, index + 1)), new Date(Date.UTC(2020, 0, index + 1)));
-      oldFiles.push(filePath);
-    }
-    const referenced = "/run/attachments/" + ATTACHMENT_PREFIX + "/100/2020-01-01/old/old.bin";
-    await writeFile(test.paths.timeline, JSON.stringify({ v: 2, id: "durable", seq: 1, t: new Date().toISOString(), type: "connector.sent", attachments: [{ path: referenced }] }) + "\n", "utf8");
-    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
-
-    await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-referenced-quota", {
-      method: "sendDocument",
-      chat_id: 42,
-      document: "/workspace/report.txt",
-    });
-
-    await expect(stat(oldFiles[0]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
-    await expect(stat(oldFiles[1]!)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(existing)).resolves.toMatchObject({ size: 50 * 1024 * 1024 * 1024 });
+    await expect(stat(path.join(test.config.attachments, "42", new Date().toISOString().slice(0, 10), "req-quota", "report.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects symlinked intermediate workspace paths", async () => {

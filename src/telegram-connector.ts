@@ -100,7 +100,6 @@ function connectorSendResult(result: TelegramDispatchResult, recorded: Workspace
     request: recorded,
     response,
     attachments: attachmentPaths.map((path) => ({ path })),
-    ...(result.cleanup === undefined ? {} : { cleanup: result.cleanup }),
     summary: {
       method: recorded.method,
       ...(typeof result.messageId === "number" ? { messageId: result.messageId } : {}),

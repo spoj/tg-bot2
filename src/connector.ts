@@ -6,7 +6,6 @@ export type ConnectorSendResult = {
   response?: unknown;
   attachments?: TimelineAttachment[] | undefined;
   summary?: Record<string, unknown> | undefined;
-  cleanup?: (() => Promise<void>) | undefined;
 };
 
 export interface WorkspaceConnector {

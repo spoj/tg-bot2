@@ -50,14 +50,8 @@ export class WorkspaceOutbox {
         }),
       });
     } catch (error) {
-      let cleanupError: string | undefined;
-      try {
-        await result.cleanup?.();
-      } catch (cleanupFailure) {
-        cleanupError = `Failed to clean connector attachments: ${errorMessage(cleanupFailure)}`;
-      }
       const timelinePersistenceError = `Failed to persist connector timeline event: ${errorMessage(error)}`;
-      const persistenceErrors = [connectorPersistenceError, timelinePersistenceError, cleanupError].filter((value): value is string => value !== undefined);
+      const persistenceErrors = [connectorPersistenceError, timelinePersistenceError].filter((value): value is string => value !== undefined);
       return {
         requestId,
         ...summary,

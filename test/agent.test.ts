@@ -10,6 +10,7 @@ import {
   SYSTEM_PROMPT,
   type AgentNotifier,
   type AgentWorker,
+  type AgentWorkerFactory,
   type AgentWorkerOptions,
 } from "../src/agent.js";
 import { conversationAgent, conversationSessionPath } from "../src/agent-ref.js";
@@ -841,6 +842,31 @@ it("beginShutdown closes workers while draining queues and preserves unacknowled
     expect(workers[0]?.prompt).toHaveBeenCalledOnce();
     expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).not.toContain('{"type":"delivered","id":"shutdown-first"}');
     expect(await readFile(path.join(dataDir, "notifications.jsonl"), "utf8")).toContain("shutdown-first");
+  });
+});
+
+it("does not prompt after shutdown begins at the ensureWorker await boundary", async () => {
+  await withDataDir(async (dataDir) => {
+    const { factory, workers } = fakeWorkerFactory();
+    const boundaryFactory = vi.fn((options: AgentWorkerOptions) => ({
+      then(resolve: (worker: AgentWorker) => void, reject: (error: unknown) => void) {
+        void factory(options).then((worker) => {
+          resolve(worker);
+          queueMicrotask(() => { void manager.beginShutdown(); });
+        }, reject);
+      },
+    })) as unknown as AgentWorkerFactory;
+    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: boundaryFactory }));
+
+    const delivery = manager.followup("boundary", CHAT, { id: "shutdown-boundary" }).catch((error: unknown) => error);
+    await expect(delivery).resolves.toMatchObject({ message: "Agent manager is shutting down" });
+    await manager.beginShutdown();
+
+    expect(workers[0]?.prompt).not.toHaveBeenCalled();
+    expect(workers[0]?.close).toHaveBeenCalledOnce();
+    const log = await readFile(path.join(dataDir, "notifications.jsonl"), "utf8");
+    expect(log).not.toContain('{"type":"delivered","id":"shutdown-boundary"}');
+    expect(log).toContain('"id":"shutdown-boundary"');
   });
 });
 

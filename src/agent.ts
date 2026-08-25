@@ -425,6 +425,7 @@ export class AgentManager {
       const notification = [...this.pendingNotifications.values()].find((candidate) => sameTarget(candidate.target, entry.actor));
       if (!notification) return;
       const worker = await this.ensureWorker(entry);
+      if (this.shuttingDown) throw managerShutdownError();
       const promptAccepted = await Promise.race([
         worker.prompt(notificationPrompt(notification), notification.behavior, notification.maxWaitMs).then(() => true),
         this.shutdownSignal.then(() => false),

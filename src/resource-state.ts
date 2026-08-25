@@ -20,7 +20,6 @@ type ResourceStateFile = {
 };
 
 const MAX_RESOURCE_STATE_BYTES = 4 * 1024 * 1024;
-const MAX_RESOURCE_STATE_MIGRATION_BYTES = 8 * 1024 * 1024;
 const MAX_RESOURCE_ENTRIES = 8_192;
 const READ_FILE = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
 
@@ -79,12 +78,11 @@ export class WorkspaceResources {
         if (handle) {
           try {
             const stat = await handle.stat();
-            if (!stat.isFile() || stat.size > MAX_RESOURCE_STATE_MIGRATION_BYTES) throw new Error("Invalid resource state file");
-            const migrating = stat.size > MAX_RESOURCE_STATE_BYTES;
-            const parsed = validateState(JSON.parse((await readFileBounded(handle, migrating ? MAX_RESOURCE_STATE_MIGRATION_BYTES : MAX_RESOURCE_STATE_BYTES)).toString("utf8")) as unknown);
+            if (!stat.isFile() || stat.size > MAX_RESOURCE_STATE_BYTES) throw new Error("Invalid resource state file");
+            const parsed = validateState(JSON.parse((await readFileBounded(handle, MAX_RESOURCE_STATE_BYTES)).toString("utf8")) as unknown);
             for (const resource of parsed.resources) this.put(resource);
             this.prune();
-            if (migrating || this.resources.size !== parsed.resources.length) await this.save();
+            if (this.resources.size !== parsed.resources.length) await this.save();
           } finally {
             await closeQuietly(handle);
           }

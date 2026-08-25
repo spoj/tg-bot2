@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -91,67 +91,6 @@ describe("WorkspaceResources", () => {
     expect(resources.owner("custom:duplicate", "message", "duplicate")).toEqual(newestOwner);
     expect(resources.owner("custom:owner", "message", "message-0")).toBeUndefined();
     expect(JSON.parse(await readFile(filePath, "utf8")).resources).toHaveLength(8_192);
-  });
-
-  it("migrates an oversized legacy file by pruning before rewriting it", async () => {
-    const dataDir = await temporaryDirectory();
-    const filePath = path.join(dataDir, "run", "resources.json");
-    await mkdir(path.dirname(filePath), { recursive: true });
-    const oldRows = Array.from({ length: 64 }, (_, index) => {
-      const owner = conversationAgent("custom:legacy", `legacy-${index}`, { padding: "x".repeat(55_000) });
-      return { connectorId: owner.connectorId, kind: "message" as const, key: `legacy-${index}`, owner };
-    });
-    const retainedRows = Array.from({ length: 8_192 }, (_, index) => {
-      const owner = conversationAgent("custom:retained", `channel-${index}`, { channel: `channel-${index}` });
-      return { connectorId: owner.connectorId, kind: "message" as const, key: `message-${index}`, owner };
-    });
-    await writeFile(filePath, `${JSON.stringify({ version: 1, resources: [...oldRows, ...retainedRows] }, null, 2)}\n`);
-    const before = await readFile(filePath);
-    expect(before.byteLength).toBeGreaterThan(4 * 1024 * 1024);
-
-    const resources = new WorkspaceResources(filePath);
-    await resources.start();
-
-    expect(resources.owner("custom:legacy", "message", "legacy-0")).toBeUndefined();
-    expect(resources.owner("custom:retained", "message", "message-8191")).toEqual(retainedRows.at(-1)!.owner);
-    const after = await readFile(filePath);
-    expect(after.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024);
-    expect(after.equals(before)).toBe(false);
-    expect(JSON.parse(after.toString("utf8")).resources).toHaveLength(8_192);
-  });
-
-  it("rejects a migrated state that still exceeds the normal output limit", async () => {
-    const dataDir = await temporaryDirectory();
-    const filePath = path.join(dataDir, "run", "resources.json");
-    await mkdir(path.dirname(filePath), { recursive: true });
-    const rows = [
-      ...Array.from({ length: 8_192 }, (_, index) => {
-        const owner = conversationAgent("custom:legacy", `legacy-${index}`, { channel: `channel-${index}` });
-        return { connectorId: owner.connectorId, kind: "message" as const, key: `legacy-${index}`, owner };
-      }),
-      (() => {
-        const owner = conversationAgent("custom:legacy", "oversized", { padding: "x".repeat(3 * 1024 * 1024) });
-        return { connectorId: owner.connectorId, kind: "message" as const, key: "oversized", owner };
-      })(),
-    ];
-    await writeFile(filePath, `${JSON.stringify({ version: 1, resources: rows }, null, 2)}\n`);
-    const before = await readFile(filePath);
-    expect(before.byteLength).toBeGreaterThan(4 * 1024 * 1024);
-    const resources = new WorkspaceResources(filePath);
-
-    await expect(resources.start()).rejects.toThrow("Resource state exceeds");
-    expect(resources.owner("custom:legacy", "message", "oversized")).toBeUndefined();
-    expect((await readFile(filePath)).equals(before)).toBe(true);
-  });
-
-  it("rejects a legacy file above the bounded migration input limit", async () => {
-    const dataDir = await temporaryDirectory();
-    const filePath = path.join(dataDir, "run", "resources.json");
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, "{}");
-    await truncate(filePath, 9 * 1024 * 1024);
-    await expect(new WorkspaceResources(filePath).start()).rejects.toThrow("Invalid resource state file");
-    expect((await stat(filePath)).size).toBe(9 * 1024 * 1024);
   });
 
   it("rolls back set when the serialized state exceeds its size limit", async () => {

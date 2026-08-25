@@ -20,6 +20,10 @@ const THREAD_TARGET_METHODS = new Set([
   "editForumTopic", "closeForumTopic", "reopenForumTopic", "deleteForumTopic",
 ]);
 const MESSAGE_MUTATIONS = new Set(["editMessageText", "editMessageCaption", "editMessageReplyMarkup", "deleteMessage", "setMessageReaction", "stopPoll"]);
+const REPLY_TARGET_METHODS = new Set([
+  "sendMessage", "sendPhoto", "sendAudio", "sendVideo", "sendAnimation", "sendVoice", "sendVideoNote", "sendDocument",
+  "sendMediaGroup", "sendLocation", "sendVenue", "sendContact", "sendPoll", "sendDice",
+]);
 
 function retryDelaySeconds(error: unknown): number | undefined {
   if (error === null || typeof error !== "object") return undefined;
@@ -47,6 +51,42 @@ function applyOwnerTarget(request: Record<string, unknown>, actor: ConversationA
     };
   }
   return { ...withoutThread, chat_id: address.chat_id };
+}
+
+function assertOwnedReplyMessage(
+  messageId: unknown,
+  chatId: number,
+  actor: ConversationAgentRef,
+  resources: WorkspaceResources,
+): void {
+  if (typeof messageId !== "number" || !Number.isSafeInteger(messageId)) throw new Error("Reply target message_id must be a safe integer");
+  const owner = resources.owner(actor.connectorId, "message", `${chatId}:${messageId}`);
+  if (!owner || !sameConversation(owner, actor)) throw new Error(`Reply target message ${messageId} is not owned by this conversation`);
+}
+
+function assertReplyTargetOwner(request: WorkspaceOutboxRequest, actor: ConversationAgentRef, resources: WorkspaceResources): void {
+  if (!REPLY_TARGET_METHODS.has(request.method)) return;
+  const address = telegramAddress(actor);
+  if (request.reply_to_message_id !== undefined) assertOwnedReplyMessage(request.reply_to_message_id, address.chat_id, actor, resources);
+
+  const rawParameters = request.reply_parameters;
+  if (rawParameters === undefined) return;
+  if (rawParameters === null || typeof rawParameters !== "object" || Array.isArray(rawParameters)) {
+    throw new Error("reply_parameters must be an object");
+  }
+  const parameters = rawParameters as Record<string, unknown>;
+  const targetChatId = parameters.chat_id;
+  if (targetChatId !== undefined && (typeof targetChatId !== "number" || !Number.isSafeInteger(targetChatId))) {
+    throw new Error("reply_parameters.chat_id must be the owning conversation's chat_id");
+  }
+  if (targetChatId !== undefined && targetChatId !== address.chat_id) {
+    throw new Error("reply_parameters.chat_id cannot target another conversation's chat");
+  }
+  if (parameters.message_id !== undefined) {
+    assertOwnedReplyMessage(parameters.message_id, targetChatId ?? address.chat_id, actor, resources);
+  } else if (targetChatId !== undefined || parameters.ephemeral_message_id !== undefined) {
+    throw new Error("reply_parameters must identify an owned message");
+  }
 }
 
 function connectorSendResult(result: TelegramDispatchResult, recorded: WorkspaceOutboxRequest, persistenceError?: string): ConnectorSendResult {
@@ -202,6 +242,7 @@ export class TelegramConnector implements WorkspaceConnector {
     if (request === null || typeof request !== "object" || Array.isArray(request)) throw new Error("Telegram request must be a JSON object");
     const validated = validateRequest(applyOwnerTarget(request as Record<string, unknown>, actor));
     const address = telegramAddress(actor, this.id);
+    assertReplyTargetOwner(validated, actor, this.resources);
     const allowed = await readAllowedFile(this.config.workspace);
     if (allowed.status !== "ready" || !allowed.chats.includes(address.chat_id)) throw new Error(`Chat ${address.chat_id} is not on the allow list`);
     this.assertMutationOwner(validated, actor);

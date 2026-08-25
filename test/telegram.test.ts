@@ -344,6 +344,50 @@ describe("raw Telegram Bot API dispatch", () => {
     await expect(stat(oldFiles[25]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
   });
 
+  it("does not evict another chat's staged attachment while its send is paused", async () => {
+    const test = await fixture();
+    const quota = 50 * 1024 * 1024 * 1024;
+    const baseline = quota - 1_500 * 1024;
+    const baselinePerChat = Math.floor(baseline / 11);
+    const baselinePaths: string[] = [];
+    for (let index = 0; index < 11; index++) {
+      const chatId = 100 + index;
+      const baselinePath = path.join(test.config.attachments, String(chatId), "2020-01-01", "old", "old.bin");
+      await mkdir(path.dirname(baselinePath), { recursive: true });
+      await writeFile(baselinePath, "", "utf8");
+      await truncate(baselinePath, baselinePerChat);
+      baselinePaths.push(`/run/attachments/${ATTACHMENT_PREFIX}/${chatId}/2020-01-01/old/old.bin`);
+    }
+    await writeFile(test.paths.timeline, JSON.stringify({
+      v: 2, id: "baseline", seq: 1, t: new Date().toISOString(), type: "connector.sent",
+      attachments: baselinePaths.map((path) => ({ path })),
+    }) + "\n", "utf8");
+    await writeFile(path.join(test.config.workspace, "first.txt"), "x".repeat(1024 * 1024), "utf8");
+    await writeFile(path.join(test.config.workspace, "second.txt"), "y".repeat(1024 * 1024), "utf8");
+
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstBot = fakeBot();
+    firstBot.api.raw.sendDocument = vi.fn(async () => {
+      await firstBlocked;
+      return { message_id: 1 };
+    }) as never;
+    const first = dispatchOutboxRequest(firstBot, test.config, 42, "first", {
+      method: "sendDocument", chat_id: 42, document: "/workspace/first.txt",
+    });
+    await vi.waitFor(() => expect(firstBot.api.raw.sendDocument).toHaveBeenCalledTimes(1));
+    const firstPath = path.join(test.config.attachments, "42", new Date().toISOString().slice(0, 10), "first", "first.txt");
+    await expect(stat(firstPath)).resolves.toMatchObject({ size: 1024 * 1024 });
+
+    await expect(dispatchOutboxRequest(fakeBot(), test.config, 43, "second", {
+      method: "sendDocument", chat_id: 43, document: "/workspace/second.txt",
+    })).rejects.toThrow("Attachment storage quota exceeded");
+    await expect(stat(firstPath)).resolves.toMatchObject({ size: 1024 * 1024 });
+
+    releaseFirst();
+    await first;
+  });
+
   it("preserves attachment files referenced by durable timeline records", async () => {
     const test = await fixture();
     const oldFiles: string[] = [];
@@ -421,6 +465,29 @@ describe("TelegramConnector send", () => {
     await expect(test.connector.send({ method: "sendMessage", text: "no" }, telegramConversation(CONNECTOR_ID, 99)))
       .rejects.toThrow("Chat 99 is not on the allow list");
     expect(test.requests).toHaveLength(0);
+  });
+
+  it("enforces ownership for reply targets", async () => {
+    const test = await fixture({ fetchResult: { message_id: 56 } });
+    const owner = telegramConversation(CONNECTOR_ID, 42, 7);
+    await test.resources.set({ connectorId: CONNECTOR_ID, kind: "message", key: "42:55", owner });
+
+    await expect(test.connector.send({
+      method: "sendMessage", text: "foreign nested reply", reply_parameters: { chat_id: 99, message_id: 55 },
+    }, owner)).rejects.toThrow("reply_parameters.chat_id cannot target another conversation's chat");
+    await expect(test.connector.send({
+      method: "sendMessage", text: "foreign deprecated reply", reply_to_message_id: 99,
+    }, owner)).rejects.toThrow("Reply target message 99 is not owned by this conversation");
+    await expect(test.connector.send({
+      method: "sendMessage", text: "foreign nested message", reply_parameters: { message_id: 99 },
+    }, owner)).rejects.toThrow("Reply target message 99 is not owned by this conversation");
+
+    await expect(test.connector.send({
+      method: "sendMessage", text: "valid nested reply", reply_parameters: { chat_id: 42, message_id: 55 },
+    }, owner)).resolves.toMatchObject({ request: { reply_parameters: { chat_id: 42, message_id: 55 } } });
+    await expect(test.connector.send({
+      method: "sendMessage", text: "valid deprecated reply", reply_to_message_id: 55,
+    }, owner)).resolves.toMatchObject({ request: { reply_to_message_id: 55 } });
   });
 
   it("allows mutations only for connector resources owned by the conversation", async () => {

@@ -1,7 +1,8 @@
-import { constants as fsConstants, type Dirent } from "node:fs";
+import { constants as fsConstants, createReadStream, type Dirent } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
 import type { Config } from "./config.js";
@@ -174,6 +175,38 @@ type StagedOutboundFile = {
   cleanupPath?: string;
 };
 
+type AttachmentQuotaState = {
+  queue: SerialQueue;
+  pending: Map<string, string>;
+};
+
+const attachmentQuotaStates = new Map<string, AttachmentQuotaState>();
+
+function attachmentQuotaState(rootPath: string): AttachmentQuotaState {
+  const root = path.resolve(rootPath);
+  let state = attachmentQuotaStates.get(root);
+  if (!state) {
+    state = { queue: new SerialQueue(), pending: new Map() };
+    attachmentQuotaStates.set(root, state);
+  }
+  return state;
+}
+
+function withAttachmentQuotaLock<T>(rootPath: string, operation: () => Promise<T>): Promise<T> {
+  return attachmentQuotaState(rootPath).queue.run(operation);
+}
+
+function registerPendingAttachment(rootPath: string, filePath: string, exposedPath: string): void {
+  attachmentQuotaState(rootPath).pending.set(path.resolve(filePath), exposedPath);
+}
+
+function unregisterPendingAttachments(filePaths: readonly string[]): void {
+  const paths = new Set(filePaths.map((filePath) => path.resolve(filePath)));
+  for (const state of attachmentQuotaStates.values()) {
+    for (const filePath of paths) state.pending.delete(filePath);
+  }
+}
+
 async function stageOutboundFile(
   paths: { workspace: string; attachments: string; attachmentPrefix: string }, chatId: number, requestId: string, exposedPath: string, index?: number,
 ): Promise<StagedOutboundFile> {
@@ -231,6 +264,7 @@ async function stageOutboundFile(
 
 async function removeStagedFiles(paths: readonly string[]): Promise<void> {
   const files = [...new Set(paths)];
+  unregisterPendingAttachments(files);
   await Promise.all(files.map(async (filePath) => {
     await rm(filePath, { force: true });
   }));
@@ -247,43 +281,51 @@ async function prepareTelegramPayload(
   const attachmentPaths: string[] = [];
   const protectedPaths: string[] = [];
   const cleanupPaths: string[] = [];
-  try {
-    const field = MEDIA_FIELDS[request.method];
-    if (field !== undefined && typeof payload[field] === "string" && (payload[field] as string).startsWith("/")) {
-      const staged = await stageOutboundFile(paths, chatId, requestId, payload[field] as string);
-      payload[field] = staged.input;
-      recorded[field] = staged.path;
-      attachmentPaths.push(staged.path);
-      protectedPaths.push(staged.protectedPath);
-      if (staged.cleanupPath !== undefined) cleanupPaths.push(staged.cleanupPath);
-    }
-    if (request.method === "sendMediaGroup" && Array.isArray(payload.media)) {
-      const recordedMedia = recorded.media as Array<Record<string, unknown>>;
-      const media = payload.media;
-      for (let index = 0; index < media.length; index++) {
-        const item = media[index];
-        if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
-        const copy = { ...(item as Record<string, unknown>) };
-        if (typeof copy.media === "string" && copy.media.startsWith("/")) {
-          const staged = await stageOutboundFile(paths, chatId, requestId, copy.media, index);
-          copy.media = staged.input;
-          recordedMedia[index] = { ...(recordedMedia[index] ?? {}), media: staged.path };
-          attachmentPaths.push(staged.path);
-          protectedPaths.push(staged.protectedPath);
-          if (staged.cleanupPath !== undefined) cleanupPaths.push(staged.cleanupPath);
+  const attachmentRoot = attachmentWorkspaceRoot(paths.attachments);
+  return withAttachmentQuotaLock(attachmentRoot, async () => {
+    try {
+      const field = MEDIA_FIELDS[request.method];
+      if (field !== undefined && typeof payload[field] === "string" && (payload[field] as string).startsWith("/")) {
+        const staged = await stageOutboundFile(paths, chatId, requestId, payload[field] as string);
+        payload[field] = staged.input;
+        recorded[field] = staged.path;
+        attachmentPaths.push(staged.path);
+        protectedPaths.push(staged.protectedPath);
+        if (staged.cleanupPath !== undefined) {
+          cleanupPaths.push(staged.cleanupPath);
+          registerPendingAttachment(attachmentRoot, staged.cleanupPath, staged.path);
         }
-        media[index] = copy;
       }
+      if (request.method === "sendMediaGroup" && Array.isArray(payload.media)) {
+        const recordedMedia = recorded.media as Array<Record<string, unknown>>;
+        const media = payload.media;
+        for (let index = 0; index < media.length; index++) {
+          const item = media[index];
+          if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+          const copy = { ...(item as Record<string, unknown>) };
+          if (typeof copy.media === "string" && copy.media.startsWith("/")) {
+            const staged = await stageOutboundFile(paths, chatId, requestId, copy.media, index);
+            copy.media = staged.input;
+            recordedMedia[index] = { ...(recordedMedia[index] ?? {}), media: staged.path };
+            attachmentPaths.push(staged.path);
+            protectedPaths.push(staged.protectedPath);
+            if (staged.cleanupPath !== undefined) {
+              cleanupPaths.push(staged.cleanupPath);
+              registerPendingAttachment(attachmentRoot, staged.cleanupPath, staged.path);
+            }
+          }
+          media[index] = copy;
+        }
+      }
+      if (protectedPaths.length > 0) {
+        await enforceAttachmentQuota(attachmentRoot, attachmentTimelinePath(paths.attachments), protectedPaths);
+      }
+      return { payload, recorded, attachmentPaths, cleanupPaths };
+    } catch (error) {
+      await removeStagedFiles(cleanupPaths);
+      throw error;
     }
-    if (protectedPaths.length > 0) {
-      const attachmentRoot = attachmentWorkspaceRoot(paths.attachments);
-      await enforceAttachmentQuota(attachmentRoot, attachmentTimelinePath(paths.attachments), protectedPaths);
-    }
-    return { payload, recorded, attachmentPaths, cleanupPaths };
-  } catch (error) {
-    await removeStagedFiles(cleanupPaths);
-    throw error;
-  }
+  });
 }
 
 export type TelegramDispatchResult = WorkspaceOutboxDispatchResult & { messageIds?: number[] };
@@ -429,25 +471,28 @@ async function attachmentFiles(rootPath: string): Promise<AttachmentScan> {
 }
 
 async function referencedAttachmentPaths(timelinePath: string): Promise<Set<string>> {
-  let raw: string;
-  try {
-    raw = await readFile(timelinePath, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
-    throw error;
-  }
   const referenced = new Set<string>();
-  for (const line of raw.split("\n")) {
-    if (!line) continue;
-    const parsed: unknown = JSON.parse(line);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-    const attachments = (parsed as Record<string, unknown>).attachments;
-    if (!Array.isArray(attachments)) continue;
-    for (const attachment of attachments) {
-      if (attachment === null || typeof attachment !== "object" || Array.isArray(attachment)) continue;
-      const attachmentPath = (attachment as Record<string, unknown>).path;
-      if (typeof attachmentPath === "string") referenced.add(attachmentPath);
+  const input = createReadStream(timelinePath, { encoding: "utf8" });
+  const lines = createInterface({ input });
+  try {
+    for await (const line of lines) {
+      if (!line) continue;
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const attachments = (parsed as Record<string, unknown>).attachments;
+      if (!Array.isArray(attachments)) continue;
+      for (const attachment of attachments) {
+        if (attachment === null || typeof attachment !== "object" || Array.isArray(attachment)) continue;
+        const attachmentPath = (attachment as Record<string, unknown>).path;
+        if (typeof attachmentPath === "string") referenced.add(attachmentPath);
+      }
     }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return referenced;
+    throw error;
+  } finally {
+    lines.close();
+    input.destroy();
   }
   return referenced;
 }
@@ -461,12 +506,19 @@ async function enforceAttachmentQuota(rootPath: string, timelinePath: string, pr
   const root = path.resolve(rootPath);
   const scan = await attachmentFiles(root);
   await Promise.all(scan.staleParts.map((filePath) => rm(filePath, { force: true })));
+  const state = attachmentQuotaState(root);
   const referenced = await referencedAttachmentPaths(timelinePath);
+  for (const [filePath, exposedPath] of state.pending) {
+    if (referenced.has(exposedPath)) state.pending.delete(filePath);
+  }
   const files = scan.files;
   let total = files.reduce((sum, file) => sum + file.size, 0);
   const byChat = new Map<number, number>();
   for (const file of files) byChat.set(file.chatId, (byChat.get(file.chatId) ?? 0) + file.size);
-  const protectedSet = new Set(protectedPaths.map((filePath) => path.resolve(filePath)));
+  const protectedSet = new Set([
+    ...protectedPaths.map((filePath) => path.resolve(filePath)),
+    ...state.pending.keys(),
+  ]);
   files.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
   while (total > MAX_ATTACHMENT_STORAGE_BYTES || [...byChat.values()].some((size) => size > MAX_CHAT_ATTACHMENT_STORAGE_BYTES)) {
     const candidate = files.find((file) => {
@@ -681,6 +733,16 @@ async function downloadAttachment(
   message: Message,
   source: AttachmentSource,
 ): Promise<SavedAttachment> {
+  return withAttachmentQuotaLock(attachmentWorkspaceRoot(config.attachments), () => downloadAttachmentLocked(bot, config, chatId, message, source));
+}
+
+async function downloadAttachmentLocked(
+  bot: Bot,
+  config: Config,
+  chatId: number,
+  message: Message,
+  source: AttachmentSource,
+): Promise<SavedAttachment> {
   const common = { type: source.type, mimeType: source.mimeType, originalName: source.originalName };
   if (source.fileSize !== undefined && source.fileSize > MAX_ATTACHMENT_BYTES) {
     return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
@@ -719,17 +781,20 @@ async function downloadAttachment(
       temporaryHandle = undefined;
       const finalPath = path.join(directory, filename);
       const protectedPath = path.join(attachmentDirectory.expectedPath, filename);
+      const exposedPath = `/run/attachments/${config.attachmentPrefix}/${chatId}/${date}/${message.message_id}/${filename}`;
       await rename(temporary, finalPath);
       await verifyAttachmentDirectory(attachmentDirectory);
+      registerPendingAttachment(attachmentWorkspaceRoot(config.attachments), protectedPath, exposedPath);
       try {
         await enforceAttachmentQuota(attachmentWorkspaceRoot(config.attachments), attachmentTimelinePath(config.attachments), [protectedPath]);
       } catch (error) {
+        unregisterPendingAttachments([protectedPath]);
         await rm(protectedPath, { force: true });
         throw error;
       }
       return {
         ...common,
-        path: `/run/attachments/${config.attachmentPrefix}/${chatId}/${date}/${message.message_id}/${filename}`,
+        path: exposedPath,
       };
     } finally {
       await temporaryHandle?.close().catch(() => {});

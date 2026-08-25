@@ -70,7 +70,6 @@ export type HostBridgeOptions = {
 };
 
 const DEFAULT_MAX_LINE_BYTES = 2 * 1024 * 1024;
-const HOST_BRIDGE_SHUTDOWN_CAP_MS = 1_000;
 function bridgeStartupAbort(): Error {
   const error = new Error("Host bridge startup aborted");
   error.name = "AbortError";
@@ -256,21 +255,7 @@ export class HostBridge {
   }
 
   private async waitForInvocations(): Promise<void> {
-    const invocations = [...this.invocations];
-    if (invocations.length === 0) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => resolve(false), HOST_BRIDGE_SHUTDOWN_CAP_MS);
-      timer.unref?.();
-    });
-    try {
-      await Promise.race([
-        Promise.allSettled(invocations).then(() => true),
-        timeout,
-      ]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    await Promise.allSettled([...this.invocations]);
   }
 
   private async invoke(request: BridgeRequest): Promise<BridgeResponse> {

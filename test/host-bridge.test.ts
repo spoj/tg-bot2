@@ -106,50 +106,6 @@ describe("HostBridge", () => {
     }
   });
 
-  it("bounds stop when an in-flight handler never settles", async () => {
-    let rejectHandler!: (error: Error) => void;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => { markStarted = resolve; });
-    const send = vi.fn(() => new Promise<Record<string, unknown>>((_, reject) => {
-      markStarted();
-      rejectHandler = reject;
-    }));
-    const { socketPath } = await fixture();
-    const credentials = new AgentCredentials();
-    const token = credentials.issue(conversationAgent("connector:test", "conversation:123", { id: 123 }), ["send"]);
-    const bridge = new HostBridge({ socketPath, credentials, handlers: { send } });
-    await bridge.start();
-    const socket = net.connect(socketPath);
-    socket.on("error", () => {});
-    try {
-      await new Promise<void>((resolve, reject) => {
-        socket.once("connect", () => {
-          socket.write(`${JSON.stringify({ id: "req-1", token, type: "send", params: {} })}\n`);
-          resolve();
-        });
-        socket.once("error", reject);
-      });
-      await started;
-      vi.useFakeTimers();
-
-      let stopped = false;
-      const stopping = bridge.stop().then(() => { stopped = true; });
-      await vi.advanceTimersByTimeAsync(999);
-      expect(stopped).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      await stopping;
-      expect(stopped).toBe(true);
-
-      rejectHandler(new Error("late handler failure"));
-      await Promise.resolve();
-    } finally {
-      rejectHandler?.(new Error("test cleanup"));
-      socket.destroy();
-      await bridge.stop();
-      vi.useRealTimers();
-    }
-  });
-
   it("resolves authenticated actors before invoking handlers", async () => {
     const { socketPath } = await fixture();
     const send = vi.fn(async () => ({}));

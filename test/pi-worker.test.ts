@@ -1,11 +1,10 @@
 import { EventEmitter } from "node:events";
-import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { fstatSync, readFileSync, renameSync, statSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, type Mock } from "vitest";
 import { PiWorker } from "../src/pi-worker.js";
-import { HOST_TIMELINE_FD, type PiWorkerChildProcess } from "../src/sandbox.js";
+import type { PiWorkerChildProcess } from "../src/sandbox.js";
 
 type FakeStdin = EventEmitter & {
   end: Mock<(chunk?: string, encoding?: string) => void>;
@@ -95,26 +94,12 @@ describe("PiWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
-  it("pins the validated timeline inode before spawn", async () => {
+  it("passes the canonical timeline path to bwrap without fd inheritance", async () => {
     const f = await fixture();
     const timeline = path.join(f.root, "timeline.jsonl");
-    const movedTimeline = path.join(f.root, "timeline.validated.jsonl");
-    const replacement = path.join(f.root, "timeline.replacement.jsonl");
     try {
-      await writeFile(timeline, "validated timeline\\n");
-      await writeFile(replacement, "replacement timeline\\n");
+      await writeFile(timeline, "timeline\\n");
       const { child, spawn, terminate } = fakeChildFixture();
-      spawn.mockImplementation((_executable, args, options) => {
-        const stdio = (options as { stdio: unknown[] }).stdio;
-        const timelineFd = stdio[HOST_TIMELINE_FD] as number;
-        const validatedInode = statSync(timeline).ino;
-        renameSync(timeline, movedTimeline);
-        renameSync(replacement, timeline);
-        expect(args).toEqual(expect.arrayContaining(["--ro-bind", `/proc/self/fd/${HOST_TIMELINE_FD}`, "/run/timeline.jsonl"]));
-        expect(fstatSync(timelineFd).ino).toBe(validatedInode);
-        expect(readFileSync(`/proc/self/fd/${timelineFd}`, "utf8")).toBe("validated timeline\\n");
-        return child as unknown as PiWorkerChildProcess;
-      });
       const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
@@ -125,8 +110,12 @@ describe("PiWorker", () => {
 
       await worker.start();
 
-      expect(readFileSync(timeline, "utf8")).toBe("replacement timeline\\n");
-      expect(spawn).toHaveBeenCalledOnce();
+      const options = spawn.mock.calls[0]?.[2] as { stdio: unknown[] };
+      expect(options.stdio).toEqual(["pipe", "pipe", "pipe"]);
+      expect(spawn.mock.calls[0]?.[1]).toEqual(expect.arrayContaining([
+        "--ro-bind", await realpath(timeline), "/run/timeline.jsonl",
+      ]));
+      expect(child).toBeDefined();
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

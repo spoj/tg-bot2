@@ -98,6 +98,7 @@ function validateScheduleFile(value: unknown): ScheduleFile {
 
   const rawPending = root.pending;
   if (rawPending !== undefined && !Array.isArray(rawPending)) throw new Error("Invalid schedules state: pending must be an array");
+  const schedulesById = new Map(schedules.map((schedule) => [schedule.id, schedule]));
   const pendingIds = new Set<string>();
   const pending = (rawPending ?? []).map((value, index): PendingOccurrence => {
     if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid schedules state: pending row ${index}`);
@@ -105,6 +106,10 @@ function validateScheduleFile(value: unknown): ScheduleFile {
     if (typeof row.occurrenceId !== "string" || row.occurrenceId.length === 0) throw new Error(`Invalid schedules state: pending row ${index} has an invalid occurrenceId`);
     if (typeof row.scheduleId !== "string" || row.scheduleId.length === 0 || !ids.has(row.scheduleId)) throw new Error(`Invalid schedules state: pending row ${index} has an invalid scheduleId`);
     if (!isUtcIso(row.dueAt)) throw new Error(`Invalid schedules state: pending row ${index} has an invalid dueAt`);
+    const schedule = schedulesById.get(row.scheduleId);
+    if (schedule?.next_due_at === null || schedule === undefined || Date.parse(row.dueAt) !== Date.parse(schedule.next_due_at)) {
+      throw new Error(`Invalid schedules state: pending row ${index} has a dueAt that disagrees with its schedule next_due_at`);
+    }
     if (pendingIds.has(row.occurrenceId)) throw new Error(`Invalid schedules state: duplicate occurrenceId ${row.occurrenceId}`);
     pendingIds.add(row.occurrenceId);
     return { occurrenceId: row.occurrenceId, scheduleId: row.scheduleId, dueAt: row.dueAt };

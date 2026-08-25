@@ -123,6 +123,24 @@ describe("WorkspaceScheduler", () => {
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: "future-schedule", next_due_at: null });
   });
 
+  it("rejects a pending occurrence whose due time disagrees with its schedule", async () => {
+    const dataDir = await fixture();
+    const schedulePath = path.join(dataDir, "run", "schedules.json");
+    const persisted = JSON.stringify({
+      version: 1,
+      schedules: [{ id: "inconsistent-schedule", prompt: "inconsistent", start: input.start, recurrence: null, owner: OWNER, next_due_at: input.start }],
+      pending: [{ occurrenceId: "inconsistent-occurrence", scheduleId: "inconsistent-schedule", dueAt: "2026-01-10T10:00:00.000Z" }],
+    });
+    await writeFile(schedulePath, persisted, "utf8");
+    const { scheduler, errors } = makeScheduler(dataDir);
+
+    await scheduler.poll(NOW);
+
+    expect(errors).toHaveLength(1);
+    expect(await timeline(dataDir)).toEqual([]);
+    expect(await readFile(schedulePath, "utf8")).toBe(persisted);
+  });
+
   it("restores a due one-shot when timeline publication fails", async () => {
     const dataDir = await fixture();
     const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));

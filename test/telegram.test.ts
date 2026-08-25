@@ -9,6 +9,8 @@ import { ConnectorRegistry } from "../src/connector.js";
 import type { TelegramConnectorConfig } from "../src/config.js";
 import { WorkspaceTimeline } from "../src/events.js";
 import { WorkspaceResources } from "../src/resource-state.js";
+import { WorkspaceOutbox } from "../src/outbox.js";
+import type { WorkspaceOutboxRequest } from "../src/outbox-protocol.js";
 import { TelegramConnector } from "../src/telegram-connector.js";
 import { telegramConversation } from "../src/telegram-ref.js";
 import {
@@ -386,6 +388,65 @@ describe("raw Telegram Bot API dispatch", () => {
 
     releaseFirst();
     await first;
+  });
+
+  it("scans complete timeline records before ignoring a malformed unterminated tail", async () => {
+    const test = await fixture();
+    const files: string[] = [];
+    for (let index = 0; index < 3; index++) {
+      const filePath = path.join(test.config.attachments, "42", "2020-01-01", String(index), "old.bin");
+      await mkdir(path.dirname(filePath), { recursive: true });
+      await writeFile(filePath, "", "utf8");
+      await truncate(filePath, 2 * 1024 * 1024 * 1024);
+      await utimes(filePath, new Date(Date.UTC(2020, 0, index + 1)), new Date(Date.UTC(2020, 0, index + 1)));
+      files.push(filePath);
+    }
+    const referenced = `/run/attachments/${ATTACHMENT_PREFIX}/42/2020-01-01/0/old.bin`;
+    await writeFile(test.paths.timeline, JSON.stringify({
+      v: 2, id: "durable", seq: 1, t: new Date().toISOString(), type: "connector.sent", attachments: [{ path: referenced }],
+    }) + "\n{\"truncated\":", "utf8");
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+
+    await dispatchOutboxRequest(fakeBot(), test.config, 42, "req-torn-tail", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+    });
+
+    await expect(stat(files[0]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
+    await expect(stat(files[1]!)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(files[2]!)).resolves.toMatchObject({ size: 2 * 1024 * 1024 * 1024 });
+  });
+
+  it("still fails quota enforcement for a malformed newline-terminated timeline record", async () => {
+    const test = await fixture();
+    await writeFile(test.paths.timeline, "{\"truncated\":\n", "utf8");
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+
+    await expect(dispatchOutboxRequest(fakeBot(), test.config, 42, "req-malformed-record", {
+      method: "sendDocument",
+      chat_id: 42,
+      document: "/workspace/report.txt",
+    })).rejects.toThrow();
+  });
+
+  it("cleans staged attachments when terminal timeline publication fails", async () => {
+    const test = await fixture();
+    await writeFile(path.join(test.config.workspace, "report.txt"), "report", "utf8");
+    const connectors = new ConnectorRegistry();
+    connectors.register(test.connector);
+    const outbox = new WorkspaceOutbox({ connectors, timeline: test.timeline });
+    Object.defineProperty(test.connector, "dispatchWithRetry", {
+      value: vi.fn((chatId: number, requestId: string, request: WorkspaceOutboxRequest) => dispatchOutboxRequest(fakeBot(), test.config, chatId, requestId, request)),
+    });
+    vi.spyOn(test.timeline, "publish").mockRejectedValue(new Error("timeline disk full"));
+
+    const result = await outbox.send({ method: "sendDocument", document: "/workspace/report.txt" }, telegramConversation(CONNECTOR_ID, 42));
+
+    expect(result).toMatchObject({ uncertain: true, deliveryStatus: "delivered_timeline_persistence_failed" });
+    const chatAttachments = path.join(test.config.attachments, "42");
+    const files = await readdir(chatAttachments, { recursive: true });
+    expect(files.some((file) => file.endsWith("report.txt"))).toBe(false);
   });
 
   it("preserves attachment files referenced by durable timeline records", async () => {

@@ -50,15 +50,20 @@ export class WorkspaceOutbox {
         }),
       });
     } catch (error) {
+      let cleanupError: string | undefined;
+      try {
+        await result.cleanup?.();
+      } catch (cleanupFailure) {
+        cleanupError = `Failed to clean connector attachments: ${errorMessage(cleanupFailure)}`;
+      }
       const timelinePersistenceError = `Failed to persist connector timeline event: ${errorMessage(error)}`;
+      const persistenceErrors = [connectorPersistenceError, timelinePersistenceError, cleanupError].filter((value): value is string => value !== undefined);
       return {
         requestId,
         ...summary,
         uncertain: true,
         deliveryStatus: "delivered_timeline_persistence_failed",
-        persistenceError: connectorPersistenceError === undefined
-          ? timelinePersistenceError
-          : `${connectorPersistenceError}; ${timelinePersistenceError}`,
+        persistenceError: persistenceErrors.join("; "),
       };
     }
     return { requestId, ...summary };

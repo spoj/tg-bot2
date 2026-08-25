@@ -328,7 +328,10 @@ async function prepareTelegramPayload(
   });
 }
 
-export type TelegramDispatchResult = WorkspaceOutboxDispatchResult & { messageIds?: number[] };
+export type TelegramDispatchResult = WorkspaceOutboxDispatchResult & {
+  messageIds?: number[];
+  cleanup?: (() => Promise<void>) | undefined;
+};
 
 function dispatchResult(data: unknown, request: WorkspaceOutboxRequest, attachmentPaths: string[]): TelegramDispatchResult {
   const result = data !== null && typeof data === "object" ? data as Record<string, unknown> : {};
@@ -371,7 +374,13 @@ export async function dispatchOutboxRequest(
         console.error("Incidental topic rename failed", error);
       }
     }
-    return dispatchResult(data, prepared.recorded, prepared.attachmentPaths);
+    return {
+      ...dispatchResult(data, prepared.recorded, prepared.attachmentPaths),
+      cleanup: () => withAttachmentQuotaLock(
+        attachmentWorkspaceRoot(paths.attachments),
+        () => removeStagedFiles(prepared.cleanupPaths),
+      ),
+    };
   } catch (error) {
     await removeStagedFiles(prepared.cleanupPaths);
     throw error;
@@ -473,11 +482,25 @@ async function attachmentFiles(rootPath: string): Promise<AttachmentScan> {
 async function referencedAttachmentPaths(timelinePath: string): Promise<Set<string>> {
   const referenced = new Set<string>();
   const input = createReadStream(timelinePath, { encoding: "utf8" });
+  let endedWithNewline = false;
+  input.on("data", (chunk: string | Buffer) => {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (text.length > 0) endedWithNewline = text.endsWith("\n");
+  });
   const lines = createInterface({ input });
+  let lineNumber = 0;
+  let malformed: { error: unknown; lineNumber: number } | undefined;
   try {
     for await (const line of lines) {
+      lineNumber += 1;
       if (!line) continue;
-      const parsed: unknown = JSON.parse(line);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch (error) {
+        malformed ??= { error, lineNumber };
+        continue;
+      }
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
       const attachments = (parsed as Record<string, unknown>).attachments;
       if (!Array.isArray(attachments)) continue;
@@ -487,6 +510,7 @@ async function referencedAttachmentPaths(timelinePath: string): Promise<Set<stri
         if (typeof attachmentPath === "string") referenced.add(attachmentPath);
       }
     }
+    if (malformed && (malformed.lineNumber !== lineNumber || endedWithNewline)) throw malformed.error;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return referenced;
     throw error;

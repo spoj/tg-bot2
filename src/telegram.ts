@@ -376,6 +376,27 @@ function exposedAttachmentPath(root: string, filePath: string): string {
   return `/run/attachments/${path.relative(root, filePath).split(path.sep).join("/")}`;
 }
 
+async function scanAttachmentFiles(
+  rootPath: string,
+  entryPath: string,
+  chatId: number,
+  staleBefore: number,
+  files: StoredAttachment[],
+  staleParts: string[],
+): Promise<void> {
+  for (const file of await readAttachmentEntries(entryPath)) {
+    if (file.isDirectory() || file.isSymbolicLink()) continue;
+    const filePath = path.join(entryPath, file.name);
+    const stat = await lstat(filePath).catch(() => undefined);
+    if (!stat?.isFile()) continue;
+    if (file.name.endsWith(".part")) {
+      if (stat.mtimeMs < staleBefore) staleParts.push(filePath);
+      continue;
+    }
+    files.push({ path: filePath, exposedPath: exposedAttachmentPath(rootPath, filePath), chatId, size: stat.size, mtimeMs: stat.mtimeMs });
+  }
+}
+
 async function attachmentFiles(rootPath: string): Promise<AttachmentScan> {
   const files: StoredAttachment[] = [];
   const staleParts: string[] = [];
@@ -399,17 +420,7 @@ async function attachmentFiles(rootPath: string): Promise<AttachmentScan> {
           if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
           const entryPath = path.join(datePath, entry.name);
           directories.push(entryPath);
-          for (const file of await readAttachmentEntries(entryPath)) {
-            if (file.isDirectory() || file.isSymbolicLink()) continue;
-            const filePath = path.join(entryPath, file.name);
-            const stat = await lstat(filePath).catch(() => undefined);
-            if (!stat?.isFile()) continue;
-            if (file.name.endsWith(".part")) {
-              if (stat.mtimeMs < staleBefore) staleParts.push(filePath);
-              continue;
-            }
-            files.push({ path: filePath, exposedPath: exposedAttachmentPath(rootPath, filePath), chatId, size: stat.size, mtimeMs: stat.mtimeMs });
-          }
+          await scanAttachmentFiles(rootPath, entryPath, chatId, staleBefore, files, staleParts);
         }
       }
     }

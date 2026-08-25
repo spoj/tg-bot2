@@ -208,6 +208,15 @@ function buildExtensionMountArgs(config: ExtensionConfig): { mountArgs: string[]
   return { mountArgs, cliArgs };
 }
 
+function appendNodeDirectoryMount(args: string[], nodePath: string, runtimePaths: readonly string[]): void {
+  // requireExecutable returns the canonical realpath, so dirname() is the real parent
+  // dir even through symlink chains; skip when an already-bound prefix covers it.
+  const nodeDir = path.dirname(nodePath);
+  if (nodeDir !== "/" && !["/usr", ...runtimePaths].some((prefix) => nodeDir === prefix || nodeDir.startsWith(`${prefix}/`))) {
+    args.push("--ro-bind", nodeDir, nodeDir);
+  }
+}
+
 async function resolveNodeModulesAndCli(appRoot: string, requestedCli?: string): Promise<{ nodeModules: string; cliMountPath: string }> {
   const nodeModulesPath = path.join(appRoot, "node_modules");
   const nodeModulesStat = await lstat(nodeModulesPath);
@@ -265,12 +274,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   for (const runtimePath of runtimePaths) {
     args.push("--ro-bind", runtimePath, runtimePath);
   }
-  // requireExecutable returns the canonical realpath, so dirname() is the real parent
-  // dir even through symlink chains; skip when an already-bound prefix covers it.
-  const nodeDir = path.dirname(nodePath);
-  if (nodeDir !== "/" && !["/usr", ...runtimePaths].some((prefix) => nodeDir === prefix || nodeDir.startsWith(`${prefix}/`))) {
-    args.push("--ro-bind", nodeDir, nodeDir);
-  }
+  appendNodeDirectoryMount(args, nodePath, runtimePaths);
   // DNS/TLS/fonts that Chrome (launched by the agent inside the sandbox) and other
   // tools need; ro-bound individually so nothing host-private leaks in.
   const chromeSupportPaths = [

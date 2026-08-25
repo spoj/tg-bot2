@@ -902,51 +902,6 @@ it("bounds shutdown close and stop attempts when a worker remains wedged", async
   }
 });
 
-it("bounds shutdown when lifecycle operations never settle", async () => {
-  vi.useFakeTimers();
-  try {
-    await withDataDir(async (dataDir) => {
-      let workerStart!: () => void;
-      const workerStarted = new Promise<void>((resolve) => { workerStart = resolve; });
-      const workerFactory: AgentWorkerFactory = vi.fn(async (): Promise<AgentWorker> => {
-        workerStart();
-        return await new Promise<AgentWorker>(() => {});
-      });
-      const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, {
-        workerFactory,
-        stopGraceMs: 10,
-      }));
-      const timelineRecord: TimelineRecord = {
-        v: 2,
-        id: "never-settling-handoff",
-        seq: 1,
-        t: "2026-08-24T00:00:00.000Z",
-        type: "system.event",
-      };
-      let handoffStart!: () => void;
-      const handoffStarted = new Promise<void>((resolve) => { handoffStart = resolve; });
-      void manager.processTimelineEvent(timelineRecord, JSON.stringify(timelineRecord), async () => {
-        handoffStart();
-        await new Promise<void>(() => {});
-      });
-      await handoffStarted;
-
-      void manager.followup("never-settling worker start", CHAT).catch(() => {});
-      await workerStarted;
-
-      let finished = false;
-      const shutdown = manager.beginShutdown().then(() => { finished = true; });
-      await vi.advanceTimersByTimeAsync(9);
-      expect(finished).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      await shutdown;
-      expect(finished).toBe(true);
-    });
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
 it("manages independent workers and session directories for generic conversation identities", async () => {
   await withDataDir(async (dataDir) => {
     const { factory, workers } = fakeWorkerFactory();

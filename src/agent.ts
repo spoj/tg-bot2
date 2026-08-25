@@ -112,7 +112,6 @@ const MAX_PENDING_NOTIFICATIONS = 1_024;
 const TIMELINE_RETRY_BASE_MS = 1_000;
 const TIMELINE_RETRY_MAX_MS = 30_000;
 const WORKER_SHUTDOWN_ACTION_CAP_MS = 1_000;
-const AGENT_MANAGER_SHUTDOWN_CAP_MS = 1_000;
 function managerShutdownError(): Error {
   const error = new Error("Agent manager is shutting down");
   error.name = "AbortError";
@@ -705,7 +704,7 @@ export class AgentManager {
       return worker ? this.closeWorkerForShutdown(worker) : Promise.resolve();
     });
     const starts = [...this.workerStarts];
-    await this.waitForShutdownTasks([
+    await Promise.allSettled([
       this.timelineHandoffs.idle(),
       ...this.timelineRetryRuns,
       ...closing,
@@ -714,21 +713,6 @@ export class AgentManager {
       this.notificationWrites.idle(),
       ...(this.notificationsLoaded === undefined ? [] : [this.notificationsLoaded]),
     ]);
-  }
-
-  private async waitForShutdownTasks(tasks: readonly Promise<unknown>[]): Promise<void> {
-    if (tasks.length === 0) return;
-    const capMs = this.stopGraceMs ?? AGENT_MANAGER_SHUTDOWN_CAP_MS;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<void>((resolve) => {
-      timer = this.setTimeoutFn(resolve, capMs);
-      timer.unref?.();
-    });
-    try {
-      await Promise.race([Promise.allSettled(tasks).then(() => undefined), timeout]);
-    } finally {
-      if (timer !== undefined) this.clearTimeoutFn(timer);
-    }
   }
 
   async disposeAll(): Promise<void> {

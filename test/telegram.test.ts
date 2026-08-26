@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as realSetTimeout } from "node:timers";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
-import { InputFile, type Bot } from "grammy";
+import { GrammyError, InputFile, type Bot } from "grammy";
 import { AgentEventRouter } from "../src/agent-router.js";
 import { ConnectorRegistry } from "../src/connector.js";
 import type { TelegramConnectorConfig } from "../src/config.js";
@@ -21,6 +21,21 @@ import {
 } from "../src/telegram.js";
 import { connectorPathSegment, workspacePaths, type WorkspacePaths } from "../src/util.js";
 
+const temporaryUnlinkFailure = vi.hoisted(() => ({ enabled: false }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rm: async (target: Parameters<typeof actual.rm>[0], options: Parameters<typeof actual.rm>[1]) => {
+      if (temporaryUnlinkFailure.enabled && String(target).endsWith(".part")) {
+        temporaryUnlinkFailure.enabled = false;
+        throw new Error("temporary unlink failed");
+      }
+      return actual.rm(target, options);
+    },
+  };
+});
+
 const CONNECTOR_ID = "telegram:999";
 const WORKSPACE_ID = "primary";
 const ATTACHMENT_PREFIX = connectorPathSegment(CONNECTOR_ID);
@@ -32,6 +47,15 @@ afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
+
+function testPayload(value: unknown): unknown {
+  if (value instanceof InputFile) return { type: "InputFile" };
+  if (Array.isArray(value)) return value.map(testPayload);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, testPayload(item)]));
+  }
+  return value;
+}
 
 function connectorConfig(dataDir: string): TelegramConnectorConfig {
   const paths = workspacePaths(dataDir, WORKSPACE_ID);
@@ -93,7 +117,10 @@ async function fixture(options: { allowed?: number[]; fetchResult?: unknown; res
   timeline.subscribe((record, rawLine) => router.onEvent(record, rawLine));
   const requests: Array<{ url: string; body: string }> = [];
   connector.bot.api.config.use(async (_previous, method, payload) => {
-    requests.push({ url: `/${method}`, body: JSON.stringify(payload) });
+    requests.push({
+      url: `/${method}`,
+      body: JSON.stringify(testPayload(payload)),
+    });
     return (options.responses?.shift() ?? { ok: true, result: options.fetchResult ?? {} }) as never;
   });
   (connector.bot as unknown as { botInfo: unknown }).botInfo = {
@@ -437,6 +464,44 @@ describe("TelegramConnector send", () => {
     });
     for (const messageId of [9101, 9102, 9103]) {
       expect(test.resources.owner(CONNECTOR_ID, "message", `42:${messageId}`)).toEqual(owner);
+    }
+  });
+
+  it("restages all local media group uploads after a rate-limit retry", async () => {
+    const test = await fixture({
+      responses: [
+        { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 0 } },
+        { ok: true, result: [{ message_id: 9105 }, { message_id: 9106 }] },
+      ],
+    });
+    await writeFile(path.join(test.config.workspace, "one.jpg"), "one", "utf8");
+    await writeFile(path.join(test.config.workspace, "two.mp4"), "two", "utf8");
+
+    const media = [
+      { type: "photo", media: "/workspace/one.jpg" },
+      { type: "video", media: "/workspace/two.mp4" },
+    ];
+    const result = await test.connector.send({ method: "sendMediaGroup", media }, telegramConversation(CONNECTOR_ID, 42));
+
+    expect(media).toEqual([
+      { type: "photo", media: "/workspace/one.jpg" },
+      { type: "video", media: "/workspace/two.mp4" },
+    ]);
+    const recordedMedia = result.request?.media as Array<Record<string, unknown>>;
+    expect(recordedMedia.map((item) => item.media)).toEqual([
+      expect.stringMatching(new RegExp(`^/run/attachments/${ATTACHMENT_PREFIX}/42/\\d{4}-\\d{2}-\\d{2}/.*one\\.jpg$`)),
+      expect.stringMatching(new RegExp(`^/run/attachments/${ATTACHMENT_PREFIX}/42/\\d{4}-\\d{2}-\\d{2}/.*two\\.mp4$`)),
+    ]);
+    for (const request of test.requests.filter((item) => item.url.endsWith("/sendMediaGroup"))) {
+      const media = (JSON.parse(request.body) as { media: Array<Record<string, unknown>> }).media;
+      expect(media).toHaveLength(2);
+      expect(media.every((item) => item.media)).toBe(true);
+      expect(media.map((item) => item.media)).toEqual([{ type: "InputFile" }, { type: "InputFile" }]);
+    }
+    expect(test.requests.filter((item) => item.url.endsWith("/sendMediaGroup"))).toHaveLength(2);
+    for (const item of recordedMedia) {
+      const relative = String(item.media).slice(`/run/attachments/${ATTACHMENT_PREFIX}/`.length);
+      await expect(readFile(path.join(test.config.attachments, relative), "utf8")).resolves.toMatch(/one|two/);
     }
   });
 
@@ -870,6 +935,473 @@ describe("Telegram ingress and native event preservation", () => {
     });
     expect(await readFile(path.join(test.config.attachments, "42", "2023-11-14", "7", "report.txt"), "utf8")).toBe("hello telegram");
   });
+
+  it("removes a newly linked final when finalization fails", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/finalization.txt" })) as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("finalization bytes", { status: 200 })));
+    temporaryUnlinkFailure.enabled = true;
+
+    await test.bot.handleUpdate({
+      update_id: 29,
+      message: {
+        message_id: 29,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "finalization.txt" },
+      },
+    } as never);
+
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toEqual([{ type: "document", originalName: "finalization.txt", failure: "Telegram attachment download failed during unknown." }]);
+    const directory = path.join(test.config.attachments, "42", "2023-11-14", "29");
+    await expect(readdir(directory)).resolves.toEqual([]);
+  });
+
+  it("reuses a safe final file for duplicate ordinary attachment updates", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/duplicate.txt" })) as never;
+    const fetch = vi.fn(async () => new Response("duplicate bytes", { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    const update = {
+      update_id: 24,
+      message: {
+        message_id: 24,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "duplicate.txt" },
+      },
+    };
+
+    await test.bot.handleUpdate(update as never);
+    await test.bot.handleUpdate({ ...update, update_id: 25 } as never);
+
+    const events = await timelineEvents(test.paths);
+    const attachments = events.map((event) => (event.attachments as Array<Record<string, unknown>>)[0]!);
+    const paths = attachments.map((attachment) => String(attachment.path));
+    expect(paths).toHaveLength(2);
+    expect(paths[0]).toBe(paths[1]);
+    expect(attachments.every((attachment) => attachment.failure === undefined)).toBe(true);
+    expect(fetch).toHaveBeenCalledOnce();
+    await expect(readFile(path.join(test.config.attachments, "42", "2023-11-14", "24", "duplicate.txt"), "utf8")).resolves.toBe("duplicate bytes");
+  });
+
+  it("reuses an existing attachment near the storage cap without fetching or accounting quota", async () => {
+    const test = await fixture();
+    const existing = path.join(test.config.attachments, "42", "2023-11-14", "30", "near-cap.bin");
+    await mkdir(path.dirname(existing), { recursive: true });
+    await writeFile(existing, "", "utf8");
+    await truncate(existing, 50 * 1024 * 1024 * 1024);
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/near-cap.bin" })) as never;
+    const fetch = vi.fn(async () => { throw new Error("duplicate must not fetch"); });
+    vi.stubGlobal("fetch", fetch);
+
+    await test.bot.handleUpdate({
+      update_id: 30,
+      message: {
+        message_id: 30,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "near-cap.bin" },
+      },
+    } as never);
+
+    expect(fetch).not.toHaveBeenCalled();
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toEqual([{ type: "document", originalName: "near-cap.bin", path: `/run/attachments/${ATTACHMENT_PREFIX}/42/2023-11-14/30/near-cap.bin` }]);
+    await expect(readdir(path.dirname(existing))).resolves.toEqual(["near-cap.bin"]);
+  });
+
+  it("stores edited attachment revisions separately and reuses a replayed edit", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn(async (fileId: string) => ({ file_id: fileId, file_path: `documents/${fileId}.txt` })) as never;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(url.includes("original-file") ? "original bytes" : "edited bytes", { status: 200 })));
+    const original = {
+      update_id: 26,
+      message: {
+        message_id: 26,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "original-file", file_name: "revision.txt" },
+      },
+    };
+    const edit = {
+      update_id: 27,
+      edited_message: {
+        message_id: 26,
+        date: 1_700_000_000,
+        edit_date: 1_700_000_100,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "edited-file", file_name: "revision.txt" },
+      },
+    };
+
+    await test.bot.handleUpdate(original as never);
+    await test.bot.handleUpdate(edit as never);
+    await test.bot.handleUpdate({ ...edit, update_id: 28 } as never);
+
+    const events = await timelineEvents(test.paths);
+    const attachments = events.map((event) => (event.attachments as Array<Record<string, unknown>>)[0]!);
+    const paths = attachments.map((attachment) => String(attachment.path));
+    expect(paths[0]).not.toBe(paths[1]);
+    expect(paths[1]).toBe(paths[2]);
+    expect(attachments.every((attachment) => attachment.failure === undefined)).toBe(true);
+    const originalPath = path.join(test.config.attachments, "42", "2023-11-14", "26", "revision.txt");
+    const editedEntry = paths[1]!.slice(`/run/attachments/${ATTACHMENT_PREFIX}/`.length).split("/").slice(0, -1).join("/");
+    const editedPath = path.join(test.config.attachments, editedEntry, "revision.txt");
+    await expect(readFile(originalPath, "utf8")).resolves.toBe("original bytes");
+    await expect(readFile(editedPath, "utf8")).resolves.toBe("edited bytes");
+  });
+
+  it("retries a transient getFile failure before saving the attachment", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    const getFile = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary getFile network failure"))
+      .mockResolvedValue({ file_id: "file-id", file_path: "photos/retried.jpg" });
+    test.bot.api.getFile = getFile as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("retried photo", { status: 200 })));
+
+    const pending = test.bot.handleUpdate({
+      update_id: 13,
+      message: {
+        message_id: 8,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        photo: [{ file_id: "file-id", file_size: 12 }],
+      },
+    } as never);
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(99);
+    expect(getFile).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+
+    expect(getFile).toHaveBeenCalledTimes(2);
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toMatchObject([{ path: `/run/attachments/${ATTACHMENT_PREFIX}/42/2023-11-14/8/retried.jpg` }]);
+    await expect(readFile(path.join(test.config.attachments, "42", "2023-11-14", "8", "retried.jpg"), "utf8")).resolves.toBe("retried photo");
+  });
+
+  it("retries a transient file download failure before saving the attachment", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "photos/retried.jpg" })) as never;
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary file download network failure"))
+      .mockResolvedValue(new Response("retried photo", { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+
+    const pending = test.bot.handleUpdate({
+      update_id: 14,
+      message: {
+        message_id: 9,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        photo: [{ file_id: "file-id", file_size: 12 }],
+      },
+    } as never);
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(99);
+    expect(fetch).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toMatchObject([{ path: `/run/attachments/${ATTACHMENT_PREFIX}/42/2023-11-14/9/retried.jpg` }]);
+  });
+
+  it("preserves non-retryable file download status without creating an attachment", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "photos/missing.jpg" })) as never;
+    const fetch = vi.fn(async () => new Response("not found", { status: 404 }));
+    vi.stubGlobal("fetch", fetch);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await test.bot.handleUpdate({
+      update_id: 15,
+      message: {
+        message_id: 10,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "missing.bin" },
+      },
+    } as never);
+
+    expect(fetch).toHaveBeenCalledOnce();
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toEqual([{ type: "document", originalName: "missing.bin", failure: "Telegram attachment download failed during file download." }]);
+    expect(log).toHaveBeenCalledWith("Telegram attachment download failed", {
+      stage: "file download",
+      errorClass: "AttachmentDownloadFailure",
+      httpStatus: 404,
+    });
+  });
+
+  it("cancels a timed-out body before removing its partial file", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "photos/stalled.jpg" })) as never;
+    let releaseCancellation!: () => void;
+    let cancellationStarted = false;
+    const cancellation = new Promise<void>((resolve) => { releaseCancellation = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancellationStarted = true;
+        return cancellation;
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 200 })));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const pending = test.bot.handleUpdate({
+      update_id: 22,
+      message: {
+        message_id: 17,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "stalled.bin" },
+      },
+    } as never);
+    await waitForRetryTimer();
+    const directory = path.join(test.config.attachments, "42", "2023-11-14", "17");
+    await expect(readdir(directory)).resolves.toEqual([expect.stringMatching(/^\.stalled\.bin\..+\.part$/)]);
+
+    vi.advanceTimersByTime(30_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(cancellationStarted).toBe(true);
+    await expect(readdir(directory)).resolves.toEqual([expect.stringMatching(/^\.stalled\.bin\..+\.part$/)]);
+    releaseCancellation();
+    await pending;
+
+    expect(log).toHaveBeenCalledWith("Telegram attachment download failed", {
+      stage: "file download",
+      errorClass: "AttachmentRetryableFailure",
+    });
+    await expect(readdir(directory)).resolves.toEqual([]);
+    await expect(stat(path.join(directory, "stalled.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects malformed message dates before opening the file response", async () => {
+    const test = await fixture();
+    const getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "photos/invalid.jpg" }));
+    const fetch = vi.fn(async () => new Response("should not fetch", { status: 200 }));
+    test.bot.api.getFile = getFile as never;
+    vi.stubGlobal("fetch", fetch);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await test.bot.handleUpdate({
+      update_id: 23,
+      message: {
+        message_id: 18,
+        date: Number.NaN,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "invalid.bin" },
+      },
+    } as never);
+
+    expect(getFile).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toEqual([{ type: "document", originalName: "invalid.bin", failure: "Telegram attachment download failed during message metadata." }]);
+    expect(log).toHaveBeenCalledWith("Telegram attachment download failed", {
+      stage: "message metadata",
+      errorClass: "AttachmentDownloadFailure",
+    });
+    expect(log).not.toHaveBeenCalledWith("Telegram attachment download failed", expect.objectContaining({ stage: "unknown" }));
+  });
+
+  it("honors Telegram retry_after for getFile without retrying immediately", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    const rateLimit = new GrammyError("hidden description", { ok: false, error_code: 429, description: "hidden description", parameters: { retry_after: 2 } }, "getFile", {});
+    const getFile = vi.fn()
+      .mockRejectedValueOnce(rateLimit)
+      .mockResolvedValue({ file_id: "file-id", file_path: "photos/retried.jpg" });
+    test.bot.api.getFile = getFile as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("retried photo", { status: 200 })));
+
+    const pending = test.bot.handleUpdate({
+      update_id: 16,
+      message: {
+        message_id: 11,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        photo: [{ file_id: "file-id", file_size: 12 }],
+      },
+    } as never);
+    await waitForRetryTimer();
+    expect(getFile).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(getFile).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(getFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors numeric HTTP Retry-After for transient file responses", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "photos/retried.jpg" })) as never;
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response("busy", { status: 503, headers: { "Retry-After": "2" } }))
+      .mockResolvedValue(new Response("retried photo", { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+
+    const pending = test.bot.handleUpdate({
+      update_id: 17,
+      message: {
+        message_id: 12,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        photo: [{ file_id: "file-id", file_size: 12 }],
+      },
+    } as never);
+    await waitForRetryTimer();
+    expect(fetch).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(fetch).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("passes timeout cancellation to getFile before starting a retry", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const getFile = vi.fn((_fileId: string, signal?: AbortSignal) => {
+      signals.push(signal!);
+      if (signals.length === 1) {
+        return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted"))));
+      }
+      return Promise.resolve({ file_id: "file-id", file_path: "photos/retried.jpg" });
+    });
+    test.bot.api.getFile = getFile as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("retried photo", { status: 200 })));
+
+    const pending = test.bot.handleUpdate({
+      update_id: 18,
+      message: {
+        message_id: 13,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        photo: [{ file_id: "file-id", file_size: 12 }],
+      },
+    } as never);
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(signals).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(signals).toHaveLength(2);
+    expect(signals[1]?.aborted).toBe(false);
+  });
+
+  it("records a fixed getFile failure without exception text after retries are exhausted", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    const secret = `${test.config.token} /private/secret/path`;
+    const getFile = vi.fn().mockRejectedValue(new Error(`getFile failed: ${secret}`));
+    test.bot.api.getFile = getFile as never;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const pending = test.bot.handleUpdate({
+      update_id: 19,
+      message: {
+        message_id: 14,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "failure.bin" },
+      },
+    } as never);
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(200);
+    await pending;
+
+    const [event] = await timelineEvents(test.paths);
+    const attachment = (event?.attachments as Array<Record<string, unknown>>)[0];
+    expect(attachment).toEqual({ type: "document", originalName: "failure.bin", failure: "Telegram attachment download failed during getFile." });
+    expect(JSON.stringify(attachment)).not.toContain(secret);
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    expect(log).toHaveBeenCalledWith("Telegram attachment download failed", { stage: "getFile", errorClass: "Error" });
+  });
+
+  it("records a fixed file failure without exception text after retries are exhausted", async () => {
+    const test = await fixture();
+    vi.useFakeTimers();
+    const secret = `${test.config.token} /private/secret/path`;
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "photos/failure.jpg" })) as never;
+    const fetch = vi.fn().mockRejectedValue(new Error(`download failed: ${secret}`));
+    vi.stubGlobal("fetch", fetch);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const pending = test.bot.handleUpdate({
+      update_id: 20,
+      message: {
+        message_id: 15,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "failure.bin" },
+      },
+    } as never);
+    await waitForRetryTimer();
+    await vi.advanceTimersByTimeAsync(200);
+    await pending;
+
+    const [event] = await timelineEvents(test.paths);
+    const attachment = (event?.attachments as Array<Record<string, unknown>>)[0];
+    expect(attachment).toEqual({ type: "document", originalName: "failure.bin", failure: "Telegram attachment download failed during file download." });
+    expect(JSON.stringify(attachment)).not.toContain(secret);
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    expect(log).toHaveBeenCalledWith("Telegram attachment download failed", { stage: "file download", errorClass: "Error" });
+  });
+
+  it("does not double-count the temporary hard link against the inbound quota", async () => {
+    const test = await fixture();
+    const existing = path.join(test.paths.attachments, "telegram-other", "42", "old", "existing.bin");
+    await mkdir(path.dirname(existing), { recursive: true });
+    await writeFile(existing, "", "utf8");
+    await truncate(existing, 50 * 1024 * 1024 * 1024 - 15);
+    test.bot.api.getFile = vi.fn(async () => ({ file_id: "file-id", file_path: "documents/new.bin" })) as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("0123456789", { status: 200 })));
+
+    await test.bot.handleUpdate({
+      update_id: 21,
+      message: {
+        message_id: 16,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "file-id", file_name: "new.bin", file_size: 10 },
+      },
+    } as never);
+
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toMatchObject([{ path: `/run/attachments/${ATTACHMENT_PREFIX}/42/2023-11-14/16/new.bin` }]);
+    await expect(stat(path.join(test.config.attachments, "42", "2023-11-14", "16", "new.bin"))).resolves.toMatchObject({ size: 10 });
+  });
+
   it("wakes the owning agent for an ordinary allowed channel post", async () => {
     const test = await fixture({ allowed: [-100123] });
     await test.bot.handleUpdate({

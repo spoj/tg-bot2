@@ -12,6 +12,9 @@ import type { WorkspaceOutboxRequest, WorkspaceOutboxDispatchResult } from "./ou
 import { WorkspaceResources } from "./resource-state.js";
 import { telegramAddress, telegramConversation } from "./telegram-ref.js";
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
+const ATTACHMENT_RETRY_FALLBACK_MS = 100;
+const MAX_ATTACHMENT_RETRY_AFTER_MS = 60_000;
+const MAX_ATTACHMENT_ATTEMPTS = 3;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit for incoming attachments (20 MiB).
 const MAX_ATTACHMENT_STORAGE_BYTES = 50 * 1024 * 1024 * 1024;
 
@@ -74,6 +77,7 @@ const MEDIA_FIELDS: Partial<Record<WorkspaceOutboxRequest["method"], string>> = 
 
 function telegramPayload(request: WorkspaceOutboxRequest): Record<string, unknown> {
   const payload: Record<string, unknown> = { ...request };
+  if (Array.isArray(payload.media)) payload.media = [...payload.media];
   delete payload.method;
   delete payload.topic_name;
   return payload;
@@ -409,9 +413,9 @@ async function ensureAttachmentDirectory(rootPath: string, chatId: number, date:
   }
 }
 
-function cancelAttachmentResponse(response: Response, controller: AbortController): void {
+async function cancelAttachmentResponse(response: Response, controller: AbortController): Promise<void> {
   controller.abort();
-  if (response.body) void response.body.cancel().catch(() => {});
+  await response.body?.cancel().catch(() => {});
 }
 
 async function verifyAttachmentDirectory(directory: AttachmentDirectory): Promise<void> {
@@ -419,6 +423,30 @@ async function verifyAttachmentDirectory(directory: AttachmentDirectory): Promis
   const pinned = await directory.handle.stat();
   if (!live.isDirectory() || live.dev !== pinned.dev || live.ino !== pinned.ino) {
     throw new AttachmentDownloadFailure("Telegram attachment download failed.");
+  }
+}
+
+async function verifyExistingAttachment(directory: AttachmentDirectory, filename: string): Promise<boolean> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await verifyAttachmentDirectory(directory);
+    try {
+      handle = await open(path.join(directory.path, filename), fsConstants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    const resolved = await realpath(`/proc/self/fd/${handle.fd}`);
+    const pinned = await realpath(`/proc/self/fd/${directory.handle.fd}`);
+    if (resolved !== path.join(pinned, filename) || !(await handle.stat()).isFile()) {
+      throw new AttachmentDownloadFailure("Telegram attachment download failed.");
+    }
+    return true;
+  } catch (error) {
+    if (error instanceof AttachmentDownloadFailure) throw error;
+    throw new AttachmentDownloadFailure("Telegram attachment download failed.");
+  } finally {
+    await handle?.close().catch(() => {});
   }
 }
 
@@ -511,6 +539,15 @@ export function attachmentSource(message: Message): AttachmentSource | undefined
   return undefined;
 }
 
+function attachmentEntryId(message: Message, source: AttachmentSource, edited: boolean): number | string {
+  if (!edited) return message.message_id;
+  const editDate = "edit_date" in message && typeof message.edit_date === "number" && Number.isSafeInteger(message.edit_date) && message.edit_date >= 0
+    ? String(message.edit_date)
+    : "unknown";
+  const fileDigest = createHash("sha256").update(source.fileId).digest("hex").slice(0, 16);
+  return `${message.message_id}-edit-${editDate}-${fileDigest}`;
+}
+
 function fallbackName(source: AttachmentSource, remotePath?: string): string {
   const remoteName = remotePath ? path.posix.basename(remotePath) : undefined;
   if (remoteName && remoteName.includes(".")) return remoteName;
@@ -521,8 +558,123 @@ function fallbackName(source: AttachmentSource, remotePath?: string): string {
   return `${source.type}${extension[source.type] ?? ".bin"}`;
 }
 
-class AttachmentDownloadFailure extends Error {}
+class AttachmentDownloadFailure extends Error {
+  constructor(message = "Telegram attachment download failed", readonly status?: number) {
+    super(message);
+  }
+}
 class AttachmentQuotaFailure extends Error {}
+class AttachmentRetryableFailure extends Error {
+  constructor(readonly status?: number, readonly retryAfterMs?: number) {
+    super("Telegram attachment download failed");
+  }
+}
+class AttachmentStageFailure extends Error {
+  constructor(readonly stage: string) {
+    super(`Attachment ${stage} failed`);
+  }
+}
+
+type GrammyAbortSignal = NonNullable<Parameters<Bot["api"]["getFile"]>[1]>;
+type AttachmentAbortSignal = AbortSignal & GrammyAbortSignal;
+
+function transientAttachmentStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function attachmentErrorClass(error: unknown): string {
+  if (error instanceof GrammyError) return "GrammyError";
+  if (error instanceof HttpError) return "HttpError";
+  if (error instanceof AttachmentRetryableFailure) return "AttachmentRetryableFailure";
+  if (error instanceof AttachmentDownloadFailure) return "AttachmentDownloadFailure";
+  if (error instanceof AttachmentQuotaFailure) return "AttachmentQuotaFailure";
+  return error instanceof Error ? "Error" : "UnknownError";
+}
+
+function attachmentHttpStatus(error: unknown): number | undefined {
+  if (error instanceof AttachmentDownloadFailure || error instanceof AttachmentRetryableFailure) return error.status;
+  if (error instanceof HttpError && error.error !== null && typeof error.error === "object" && "status" in error.error && typeof error.error.status === "number") {
+    return error.error.status;
+  }
+  if (error instanceof Error || error === null || typeof error !== "object" || !("status" in error) || typeof error.status !== "number") return undefined;
+  return error.status;
+}
+
+function attachmentErrorCode(error: unknown): number | string | undefined {
+  if (error instanceof GrammyError) return error.error_code;
+  if (error === null || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = error.code;
+  return typeof code === "number" || (typeof code === "string" && /^[A-Za-z0-9_.-]{1,32}$/.test(code)) ? code : undefined;
+}
+
+function attachmentErrorMetadata(error: unknown): Record<string, number | string> {
+  const metadata: Record<string, number | string> = { errorClass: attachmentErrorClass(error) };
+  const errorCode = attachmentErrorCode(error);
+  if (errorCode !== undefined) metadata.errorCode = errorCode;
+  const httpStatus = attachmentHttpStatus(error);
+  if (httpStatus !== undefined) metadata.httpStatus = httpStatus;
+  return metadata;
+}
+
+function retryAfterMilliseconds(error: unknown): number {
+  let requested: number | undefined;
+  if (error instanceof GrammyError) {
+    const retryAfter = error.parameters?.retry_after;
+    if (typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0) requested = retryAfter * 1_000;
+  } else if (error instanceof AttachmentRetryableFailure) {
+    requested = error.retryAfterMs;
+  }
+  return Math.min(Math.max(requested ?? ATTACHMENT_RETRY_FALLBACK_MS, ATTACHMENT_RETRY_FALLBACK_MS), MAX_ATTACHMENT_RETRY_AFTER_MS);
+}
+
+function attachmentStageFailure(stage: string, error: unknown): AttachmentStageFailure {
+  console.error("Telegram attachment download failed", { stage, ...attachmentErrorMetadata(error) });
+  return new AttachmentStageFailure(stage);
+}
+
+function attachmentDate(message: Message): string {
+  const timestamp = typeof message.date === "number" && Number.isFinite(message.date) ? message.date * 1_000 : NaN;
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) throw attachmentStageFailure("message metadata", new AttachmentDownloadFailure("Invalid message date metadata."));
+  return date.toISOString().slice(0, 10);
+}
+
+function retryAfterHeaderMilliseconds(response: Response): number | undefined {
+  const value = response.headers.get("retry-after")?.trim();
+  if (!value || !/^\d+(?:\.\d+)?$/.test(value)) return undefined;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) ? seconds * 1_000 : undefined;
+}
+
+async function retryAttachment<T>(
+  stage: string,
+  operation: (signal: AttachmentAbortSignal) => Promise<T>,
+): Promise<{ value: T; controller: AbortController }> {
+  for (let attempt = 1; attempt <= MAX_ATTACHMENT_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    try {
+      const value = await attachmentTimeout(operation(controller.signal as AttachmentAbortSignal), controller);
+      return { value, controller };
+    } catch (error) {
+      if (error instanceof AttachmentQuotaFailure) throw error;
+      if (error instanceof AttachmentDownloadFailure) {
+        if (error.status === undefined) throw error;
+        throw attachmentStageFailure(stage, error);
+      }
+      const status = error instanceof GrammyError
+        ? error.error_code
+        : error instanceof AttachmentRetryableFailure
+          ? error.status
+          : error !== null && typeof error === "object" && "status" in error && typeof error.status === "number"
+            ? error.status
+            : undefined;
+      if (status !== undefined && !transientAttachmentStatus(status)) throw attachmentStageFailure(stage, error);
+      if (attempt >= MAX_ATTACHMENT_ATTEMPTS) throw attachmentStageFailure(stage, error);
+      await new Promise<void>((resolve) => setTimeout(resolve, retryAfterMilliseconds(error)));
+    }
+  }
+  throw new AttachmentStageFailure(stage);
+}
 
 async function readAttachmentBody(
   response: Response,
@@ -532,11 +684,21 @@ async function readAttachmentBody(
 ): Promise<void> {
   if (!response.body) return;
   const reader = response.body.getReader();
+  let readerCancellation: Promise<void> | undefined;
+  const cancelReader = (): void => {
+    readerCancellation ??= reader.cancel().catch(() => {});
+  };
+  signal.addEventListener("abort", cancelReader, { once: true });
+  if (signal.aborted) cancelReader();
+  let completed = false;
   let total = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) return;
+      if (done) {
+        completed = true;
+        return;
+      }
       if (!value || value.byteLength === 0) continue;
       if (value.byteLength > MAX_ATTACHMENT_BYTES - total) {
         throw new AttachmentDownloadFailure("Attachment exceeds Telegram's 20 MB bot download limit.");
@@ -551,23 +713,125 @@ async function readAttachmentBody(
         offset += result.bytesWritten;
       }
       total += value.byteLength;
-      if (signal.aborted) throw new AttachmentDownloadFailure("Telegram attachment download timed out.");
+      if (signal.aborted) throw new AttachmentRetryableFailure();
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    signal.removeEventListener("abort", cancelReader);
+    if (!completed) cancelReader();
+    await readerCancellation;
     reader.releaseLock();
   }
 }
 
 function attachmentTimeout<T>(operation: Promise<T>, controller: AbortController): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false;
+    let timedOut = false;
+    const timer = setTimeout(async () => {
+      if (settled) return;
+      timedOut = true;
       controller.abort();
-      reject(new AttachmentDownloadFailure("Telegram attachment download timed out."));
+      try {
+        await operation;
+      } catch {
+        // The timeout is the failure reported to the caller after the operation settles.
+      }
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new AttachmentRetryableFailure());
     }, ATTACHMENT_FETCH_TIMEOUT_MS);
     timer.unref?.();
-    operation.then(resolve, reject).finally(() => clearTimeout(timer));
+    operation.then(
+      (value) => {
+        if (settled || timedOut) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled || timedOut) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
+}
+
+async function downloadAttachmentBody(
+  response: Response,
+  destination: Awaited<ReturnType<typeof open>>,
+  rootPath: string,
+  controller: AbortController,
+): Promise<void> {
+  try {
+    await attachmentTimeout(readAttachmentBody(response, destination, rootPath, controller.signal), controller);
+  } catch (error) {
+    if (error instanceof AttachmentQuotaFailure || (error instanceof AttachmentDownloadFailure && error.message.startsWith("Attachment exceeds"))) throw error;
+    throw attachmentStageFailure("file download", error);
+  }
+}
+
+async function fetchAttachmentResponse(config: Config, filePath: string, signal: AttachmentAbortSignal): Promise<Response> {
+  const response = await fetch(`https://api.telegram.org/file/bot${config.token}/${filePath}`, { signal });
+  if (response.ok) return response;
+  await response.body?.cancel().catch(() => {});
+  if (transientAttachmentStatus(response.status)) {
+    throw new AttachmentRetryableFailure(response.status, retryAfterHeaderMilliseconds(response));
+  }
+  throw new AttachmentDownloadFailure(undefined, response.status);
+}
+
+async function saveAttachment(
+  response: Response,
+  controller: AbortController,
+  attachmentDirectory: AttachmentDirectory,
+  attachmentsRoot: string,
+  filename: string,
+): Promise<void> {
+  const directory = attachmentDirectory.path;
+  const finalPath = path.join(directory, filename);
+  let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
+  let temporary: string | undefined;
+  let createdFinal = false;
+  try {
+    temporary = path.join(directory, `.${filename}.${randomUUID()}.part`);
+    try {
+      temporaryHandle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    } catch (error) {
+      await cancelAttachmentResponse(response, controller);
+      throw error;
+    }
+    await downloadAttachmentBody(response, temporaryHandle, attachmentsRoot, controller);
+    await temporaryHandle.close();
+    temporaryHandle = undefined;
+    try {
+      await link(temporary, finalPath);
+      createdFinal = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!(await verifyExistingAttachment(attachmentDirectory, filename))) {
+        throw new AttachmentDownloadFailure("Telegram attachment download failed.");
+      }
+    }
+    if (createdFinal) {
+      try {
+        await rm(temporary, { force: true });
+        await verifyAttachmentDirectory(attachmentDirectory);
+        await enforceAttachmentQuota(attachmentsRoot);
+      } catch (error) {
+        await rm(finalPath, { force: true });
+        throw error;
+      }
+    } else {
+      await rm(temporary, { force: true });
+    }
+  } finally {
+    await cancelAttachmentResponse(response, controller);
+    await temporaryHandle?.close().catch(() => {});
+    if (temporary) await rm(temporary, { force: true });
+  }
 }
 
 async function downloadAttachment(
@@ -576,79 +840,65 @@ async function downloadAttachment(
   chatId: number,
   message: Message,
   source: AttachmentSource,
+  edited = false,
 ): Promise<SavedAttachment> {
   const common = { type: source.type, mimeType: source.mimeType, originalName: source.originalName };
   if (source.fileSize !== undefined && source.fileSize > MAX_ATTACHMENT_BYTES) {
     return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
   }
+  let attachmentDirectory: AttachmentDirectory | undefined;
   try {
-    const controller = new AbortController();
-    const file = await attachmentTimeout(
-      Promise.resolve().then(() => bot.api.getFile(source.fileId)),
-      controller,
+    const date = attachmentDate(message);
+    const entryId = attachmentEntryId(message, source, edited);
+    const fileAttempt = await retryAttachment(
+      "getFile",
+      (signal) => Promise.resolve().then(() => bot.api.getFile(source.fileId, signal)),
     );
-    if (!file.file_path) return { ...common, failure: "Telegram did not provide a downloadable file path." };
-    const response = await attachmentTimeout(
-      fetch(`https://api.telegram.org/file/bot${config.token}/${file.file_path}`, { signal: controller.signal }),
-      controller,
-    );
-    if (!response.ok) {
-      cancelAttachmentResponse(response, controller);
-      return { ...common, failure: `Telegram download failed with HTTP ${response.status}.` };
+    const file = fileAttempt.value;
+    if (!file.file_path) return { ...common, failure: "Telegram attachment download failed during getFile." };
+    const filename = safeFilename(source.originalName, fallbackName(source, file.file_path));
+    attachmentDirectory = await ensureAttachmentDirectory(config.attachments, chatId, date, entryId);
+    const exposedPath = `/run/attachments/${config.attachmentPrefix}/${chatId}/${date}/${entryId}/${filename}`;
+    if (await verifyExistingAttachment(attachmentDirectory, filename)) {
+      return { ...common, path: exposedPath };
     }
+
+    const responseAttempt = await retryAttachment(
+      "file download",
+      (signal) => fetchAttachmentResponse(config, file.file_path!, signal),
+    );
+    const response = responseAttempt.value;
+    const controller = responseAttempt.controller;
     const declaredLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(declaredLength) && declaredLength > MAX_ATTACHMENT_BYTES) {
-      cancelAttachmentResponse(response, controller);
+      await cancelAttachmentResponse(response, controller);
       return { ...common, failure: "Attachment exceeds Telegram's 20 MB bot download limit." };
     }
-    const date = new Date(message.date * 1_000).toISOString().slice(0, 10);
-    const attachmentDirectory = await ensureAttachmentDirectory(config.attachments, chatId, date, message.message_id);
-    let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
-    let temporary: string | undefined;
-    try {
-      const filename = safeFilename(source.originalName, fallbackName(source, file.file_path));
-      const directory = attachmentDirectory.path;
-      temporary = path.join(directory, `.${filename}.${randomUUID()}.part`);
-      temporaryHandle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-      await attachmentTimeout(readAttachmentBody(response, temporaryHandle, attachmentWorkspaceRoot(config.attachments), controller.signal), controller);
-      await temporaryHandle.close();
-      temporaryHandle = undefined;
-      const finalPath = path.join(directory, filename);
-      const exposedPath = `/run/attachments/${config.attachmentPrefix}/${chatId}/${date}/${message.message_id}/${filename}`;
-      try {
-        await link(temporary, finalPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new AttachmentDownloadFailure("Telegram attachment download failed.");
-        throw error;
-      }
-      await verifyAttachmentDirectory(attachmentDirectory);
-      try {
-        await enforceAttachmentQuota(attachmentWorkspaceRoot(config.attachments));
-      } catch (error) {
-        await rm(finalPath, { force: true });
-        throw error;
-      }
-      return {
-        ...common,
-        path: exposedPath,
-      };
-    } finally {
-      await temporaryHandle?.close().catch(() => {});
-      if (temporary) await rm(temporary, { force: true });
-      await attachmentDirectory.handle.close();
-    }
+    await saveAttachment(response, controller, attachmentDirectory, attachmentWorkspaceRoot(config.attachments), filename);
+    return {
+      ...common,
+      path: exposedPath,
+    };
   } catch (error) {
-    if (error instanceof AttachmentDownloadFailure || error instanceof AttachmentQuotaFailure) return { ...common, failure: error.message };
-    return { ...common, failure: "Telegram attachment download failed." };
+    if (error instanceof AttachmentQuotaFailure) return { ...common, failure: error.message };
+    if (error instanceof AttachmentDownloadFailure) {
+      if (error.message.startsWith("Attachment exceeds")) return { ...common, failure: error.message };
+      return { ...common, failure: "Telegram attachment download failed during file download." };
+    }
+    if (error instanceof AttachmentStageFailure) return { ...common, failure: `Telegram attachment download failed during ${error.stage}.` };
+    const failure = attachmentStageFailure("unknown", error);
+    return { ...common, failure: `Telegram attachment download failed during ${failure.stage}.` };
+  } finally {
+    await attachmentDirectory?.handle.close();
   }
 }
 
-async function prepareMessage(bot: Bot, config: Config, ctx: Context): Promise<SavedAttachment[]> {
+async function prepareMessage(bot: Bot, config: Config, ctx: Context, edited = false): Promise<SavedAttachment[]> {
   const message = ctx.msg;
   if (!message) return [];
   const source = attachmentSource(message);
   return source
-    ? [await downloadAttachment(bot, config, ctx.chat!.id, message, source)]
+    ? [await downloadAttachment(bot, config, ctx.chat!.id, message, source, edited)]
     : [];
 }
 
@@ -883,7 +1133,7 @@ export function createTelegramBot(
     const chatId = chat.id;
     const threadId = typeof message.message_thread_id === "number" ? message.message_thread_id : 0;
     const conversation = telegramConversation(config.id, chatId, threadId);
-    const attachments = await prepareMessage(bot, config, ctx);
+    const attachments = await prepareMessage(bot, config, ctx, true);
     await resources.set({ connectorId: config.id, kind: "message", key: `${chatId}:${incoming.message_id}`, owner: conversation });
     await timeline.publish({ type: "telegram.edited_message", connectorId: config.id, conversation, payload: incoming, attachments });
   };

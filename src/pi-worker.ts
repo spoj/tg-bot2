@@ -409,10 +409,16 @@ export class PiWorker {
       throw this.startupCancelled();
     }
 
-    await this.request({ id: "init-steer", type: "set_steering_mode", mode: "all" });
-    this.ensureStartAllowed();
-    await this.request({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
-    this.ensureStartAllowed();
+    try {
+      await this.request({ id: "init-steer", type: "set_steering_mode", mode: "all" });
+      this.ensureStartAllowed();
+      await this.request({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
+      this.ensureStartAllowed();
+    } catch (error) {
+      await this.terminateOnce(child).catch(() => {});
+      this.process = undefined;
+      throw error;
+    }
 
 
     this.armIdleTimer();

@@ -655,6 +655,38 @@ describe("PiWorker", () => {
     }
   });
 
+  it("terminates the spawned process and clears state if initialization requests fail", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      child.stdin.write = vi.fn((chunk: string) => {
+        const command = JSON.parse(chunk) as { id?: string; type?: string };
+        queueMicrotask(() => {
+          if (command.id === "init-steer") {
+            child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", command: command.type, success: false, error: "failed to set steering" })}\n`);
+          } else {
+            child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: {} })}\n`);
+          }
+        });
+        return true;
+      });
+      terminate.mockImplementation(() => {
+        queueMicrotask(() => child.emit("close", 0, "SIGTERM"));
+      });
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await expect(worker.start()).rejects.toThrow("failed to set steering");
+      expect(terminate).toHaveBeenCalledWith(child, "SIGTERM");
+      expect(worker.isAlive()).toBe(false);
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("does not respawn a stopped worker when prompted again", async () => {
     const f = await fixture();
     try {

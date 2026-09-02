@@ -661,13 +661,18 @@ export class AgentManager {
           this.release(entry, worker);
           return;
         }
-        await Promise.race([
-          worker.waitForSettled(),
-          new Promise<void>((resolve) => {
-            const timer = this.setTimeoutFn(resolve, RESTART_SETTLE_CAP_MS);
-            timer.unref?.();
-          }),
-        ]);
+        let settleTimer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            worker.waitForSettled(),
+            new Promise<void>((resolve) => {
+              settleTimer = this.setTimeoutFn(resolve, RESTART_SETTLE_CAP_MS);
+              settleTimer.unref?.();
+            }),
+          ]);
+        } finally {
+          if (settleTimer !== undefined) this.clearTimeoutFn(settleTimer);
+        }
         try {
           await worker.close();
         } catch (error) {

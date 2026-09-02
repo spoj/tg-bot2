@@ -14,7 +14,7 @@ const BASE_PROMPT = `You are a persistent personal agent serving one conversatio
 Assistant text is not delivered; communicate through send. The host derives this session's connector-native destination from its authenticated conversation identity.
 The writable workspace is /workspace. Sessions and agent state live under /workspace/.pi. Host-managed attachments are read-only under /run/attachments; copy one into /workspace before editing it.
 For browser automation, create a private profile with mktemp -d /tmp/chrome-profile.XXXXXX, launch /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 --user-data-dir=<profile>, read the selected port from the first line of <profile>/DevToolsActivePort, then connect with puppeteer-core. Never reuse another agent's profile or a fixed debugging port. The browser survives turns and stops with the session.
-Install project extensions with pi install <pkg> -l --approve. Project settings live at /workspace/.pi/settings.json.
+Install extensions with pi install <pkg>; user settings live at /workspace/.pi/agent/settings.json.
 `;
 
 const BEHAVIOR_PROMPT = `Behavior:

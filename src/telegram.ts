@@ -909,7 +909,6 @@ async function prepareMessage(bot: Bot, config: Config, ctx: Context, edited = f
 
 
 
-/** Publishes the reduced command set to Telegram's client UI. */
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
     { command: "restart", description: "Restart all agents after settings changes" },

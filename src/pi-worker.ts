@@ -12,7 +12,6 @@ import {
 import { defined, errorCode } from "./util.js";
 
 export type PiRunResult = {
-  /** Exit code when the process ran to completion; null when signal-killed. */
   code: number | null;
   signal: NodeJS.Signals | null;
   stderr: string;
@@ -26,7 +25,6 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   stopGraceMs?: number;
   idleTimeoutMs?: number;
   now?: () => number;
-  /** Invoked once, after the first prompt is accepted by the RPC worker. */
   onInitialPromptWritten?: () => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -648,7 +646,6 @@ export class PiWorker {
     return terminating;
   }
 
-  /** SIGTERM the process group, escalate to SIGKILL after stopGraceMs, and wait for exit. */
   private async terminateProcess(child: PiWorkerChildProcess): Promise<void> {
     const done = this.exitPromise ?? Promise.resolve({ code: null, signal: null, stderr: "", stdout: "" });
     this.options.terminateProcessGroup(child, "SIGTERM");

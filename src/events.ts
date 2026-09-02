@@ -34,9 +34,7 @@ export type TimelineEnvelope = {
 };
 
 export type TimelineRecord = TimelineEnvelope & TimelineEvent;
-export type BotEvent = TimelineEvent;
 export type EventListener = (record: TimelineRecord, rawLine: string) => void | Promise<void>;
-export const TIMELINE_FILE = "timeline.jsonl";
 
 
 export class WorkspaceTimeline {
@@ -160,7 +158,7 @@ export class WorkspaceTimeline {
   }
 }
 
-export function timelineLine(event: TimelineEvent, sequence: number): string {
+function timelineLine(event: TimelineEvent, sequence: number): string {
   const { id, ...payload } = event;
   return JSON.stringify({ v: 2, id: id ?? randomUUID(), seq: sequence, t: new Date().toISOString(), ...payload });
 }

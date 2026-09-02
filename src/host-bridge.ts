@@ -5,7 +5,6 @@ import path from "node:path";
 import type { AgentRef } from "./agent-ref.js";
 import { errorMessage, isMissing } from "./util.js";
 
-/** One request line from an agent tool: `{id, token, type, params}`. */
 type BridgeRequest = {
   id: string;
   token: string;
@@ -13,7 +12,6 @@ type BridgeRequest = {
   params: Record<string, unknown>;
 };
 
-/** One response line to the agent tool: `{id, ok, result | error}`. */
 type BridgeResponse = { id: string } & ({ ok: true; result: Record<string, unknown> } | { ok: false; error: string });
 
 export type HostCapability = "send" | "annotate" | "steer_conversation" | "schedule";
@@ -59,12 +57,9 @@ export class AgentCredentials {
 }
 
 export type HostBridgeOptions = {
-  /** Absolute path of the UNIX socket the agent tools dial. */
   socketPath: string;
   credentials: AgentCredentials;
-  /** Handlers by request type; a type without a handler is rejected as unknown. */
   handlers: Partial<HostBridgeHandlers>;
-  /** Kills a connection whose request line exceeds this many bytes. */
   maxLineBytes?: number;
   logger?: (error: unknown) => void;
 };
@@ -77,11 +72,6 @@ function bridgeStartupAbort(): Error {
   return error;
 }
 
-/**
- * Agent-to-host RPC bridge over a UNIX socket: agent tools (running inside the
- * sandbox) send JSON request lines and receive one response line per request.
- * The host validates and executes every request; the agent never touches host state.
- */
 export class HostBridge {
   private readonly socketPath: string;
   private readonly credentials: AgentCredentials;

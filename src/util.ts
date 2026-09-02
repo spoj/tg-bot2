@@ -191,7 +191,6 @@ export async function readRegularFileBounded(filePath: string, capBytes: number)
   }
 }
 
-/** Replaces a file by writing a same-directory temporary file and renaming it. */
 export async function replaceFileAtomic(filePath: string, contents: string): Promise<void> {
   const temporary = `${filePath}.${randomUUID()}.tmp`;
   try {

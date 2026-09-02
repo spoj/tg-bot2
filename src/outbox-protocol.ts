@@ -45,12 +45,6 @@ export type WorkspaceOutboxDispatchResult = {
   data?: unknown;
 };
 
-export type WorkspaceOutboxDispatcher = (
-  chatId: number,
-  requestId: string,
-  request: WorkspaceOutboxRequest,
-) => Promise<WorkspaceOutboxDispatchResult | undefined>;
-
 const METHODS = new Set<string>(TELEGRAM_METHODS);
 
 export function validateRequest(value: unknown): WorkspaceOutboxRequest {

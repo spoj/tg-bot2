@@ -18,8 +18,7 @@ export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signal
   try { child.kill(signal); } catch { /* already exited */ }
 }
 
-/** Terminate a process group by PID, then the PID itself if needed. */
-export function terminatePid(pid: number, signal: NodeJS.Signals): void {
+function terminatePid(pid: number, signal: NodeJS.Signals): void {
   if (pid > 0) {
     try {
       process.kill(-pid, signal);
@@ -156,7 +155,7 @@ export type PiRunSandboxPaths = {
   /** Host-managed attachments exposed read-only at /run/attachments. */
   hostAttachments?: string;
 };
-export type PiRunBwrapResult = { args: string[] };
+type PiRunBwrapResult = { args: string[] };
 
 function relativeMountPath(root: string, candidate: string, mountPoint: string, label: string): string {
   const relative = path.relative(root, candidate);
@@ -168,12 +167,12 @@ function relativeMountPath(root: string, candidate: string, mountPoint: string, 
 
 async function requireRealFile(candidate: string, label: string): Promise<string> {
   const initial = await lstat(candidate);
-  if (!initial.isFile() || initial.isSymbolicLink()) {
+  if (!initial.isFile()) {
     throw new Error(`${label} must be a real file: ${candidate}`);
   }
   const canonical = await realpath(candidate);
   const canonicalStat = await lstat(canonical);
-  if (!canonicalStat.isFile() || canonicalStat.isSymbolicLink()) {
+  if (!canonicalStat.isFile()) {
     throw new Error(`${label} must be a real file: ${candidate}`);
   }
   return canonical;

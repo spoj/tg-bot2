@@ -309,6 +309,7 @@ describe("raw Telegram Bot API dispatch", () => {
     const chatAttachments = path.join(test.config.attachments, "42");
     const files = await readdir(chatAttachments, { recursive: true });
     expect(files.some((file) => file.endsWith("report.txt"))).toBe(false);
+    expect(files.some((file) => file.includes("req-failed"))).toBe(false);
   });
 
   it("rejects a new attachment when the workspace hard cap is exceeded", async () => {
@@ -1555,5 +1556,54 @@ describe("Telegram gates and commands", () => {
     await Promise.all([first, start, restart]);
     expect(test.restartAll).toHaveBeenCalledOnce();
     expect(test.requests.filter((request) => request.url.endsWith("/sendMessage"))).toHaveLength(0);
+  });
+
+  it("fails attachment downloads if stream terminates prematurely against declared content-length", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn().mockResolvedValue({ file_id: "doc-1", file_path: "docs/file.bin" }) as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("short", {
+      status: 200,
+      headers: { "content-length": "1000" },
+    })));
+
+    await test.bot.handleUpdate({
+      update_id: 24,
+      message: {
+        message_id: 24,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "doc-1", file_name: "truncated.bin" },
+      },
+    } as never);
+
+    const [event] = await timelineEvents(test.paths);
+    expect(event?.attachments).toEqual([{
+      type: "document",
+      originalName: "truncated.bin",
+      failure: "Telegram attachment download failed during file download.",
+    }]);
+  });
+
+  it("sanitizes dot-only filenames to avoid path traversal", async () => {
+    const test = await fixture();
+    test.bot.api.getFile = vi.fn().mockResolvedValue({ file_id: "doc-dots", file_path: "docs/.." }) as never;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("valid-doc", { status: 200 })));
+
+    await test.bot.handleUpdate({
+      update_id: 25,
+      message: {
+        message_id: 25,
+        date: 1_700_000_000,
+        chat: { id: 42, type: "private" },
+        from: { id: 42, is_bot: false, first_name: "Alice" },
+        document: { file_id: "doc-dots", file_name: ".." },
+      },
+    } as never);
+
+    const [event] = await timelineEvents(test.paths);
+    const attachment = (event?.attachments as Array<Record<string, unknown>>)?.[0];
+    expect(attachment?.failure).toBeUndefined();
+    expect(attachment?.path).toMatch(/\/document\.bin$/);
   });
 });

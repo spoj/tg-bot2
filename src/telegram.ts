@@ -239,7 +239,7 @@ async function removeStagedFiles(paths: readonly string[]): Promise<void> {
     await rm(filePath, { force: true });
   }));
   await Promise.all([...new Set(files.map((filePath) => path.dirname(filePath)))].map(async (directory) => {
-    await rm(directory, { force: true }).catch(() => {});
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
   }));
 }
 
@@ -451,12 +451,13 @@ async function verifyExistingAttachment(directory: AttachmentDirectory, filename
 }
 
 function safeFilename(name: string | undefined, fallback: string): string {
-  const base = path.basename(name?.trim() || fallback)
+  const safeFallback = path.basename(fallback).replace(/^\.+/, "") || "file.bin";
+  const base = path.basename(name?.trim() || safeFallback)
     .normalize("NFKC")
     .replace(/[^\p{L}\p{N}._ -]/gu, "_")
     .replace(/^\.+/, "")
     .slice(0, 48);
-  return base || fallback;
+  return base || safeFallback;
 }
 
 type AttachmentSourceRow = {
@@ -550,7 +551,7 @@ function attachmentEntryId(message: Message, source: AttachmentSource, edited: b
 
 function fallbackName(source: AttachmentSource, remotePath?: string): string {
   const remoteName = remotePath ? path.posix.basename(remotePath) : undefined;
-  if (remoteName && remoteName.includes(".")) return remoteName;
+  if (remoteName && path.posix.extname(remoteName) && !/^\.+$/.test(remoteName)) return remoteName;
   const extension: Record<string, string> = {
     animation: ".mp4", audio: ".audio", document: ".bin", photo: ".jpg", sticker: ".webp",
     video: ".mp4", video_note: ".mp4", voice: ".ogg",
@@ -681,6 +682,7 @@ async function readAttachmentBody(
   destination: Awaited<ReturnType<typeof open>>,
   rootPath: string,
   signal: AbortSignal,
+  declaredLength?: number,
 ): Promise<void> {
   if (!response.body) return;
   const reader = response.body.getReader();
@@ -692,10 +694,15 @@ async function readAttachmentBody(
   if (signal.aborted) cancelReader();
   let completed = false;
   let total = 0;
+  let currentStorage = await attachmentStorageBytes(rootPath);
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
+        if (signal.aborted) throw new AttachmentRetryableFailure();
+        if (declaredLength !== undefined && total !== declaredLength) {
+          throw new AttachmentDownloadFailure("Telegram attachment download failed.");
+        }
         completed = true;
         return;
       }
@@ -703,7 +710,7 @@ async function readAttachmentBody(
       if (value.byteLength > MAX_ATTACHMENT_BYTES - total) {
         throw new AttachmentDownloadFailure("Attachment exceeds Telegram's 20 MB bot download limit.");
       }
-      if (value.byteLength > MAX_ATTACHMENT_STORAGE_BYTES - await attachmentStorageBytes(rootPath)) {
+      if (currentStorage + value.byteLength > MAX_ATTACHMENT_STORAGE_BYTES) {
         throw new AttachmentQuotaFailure("Attachment storage quota exceeded");
       }
       let offset = 0;
@@ -713,6 +720,7 @@ async function readAttachmentBody(
         offset += result.bytesWritten;
       }
       total += value.byteLength;
+      currentStorage += value.byteLength;
       if (signal.aborted) throw new AttachmentRetryableFailure();
     }
   } finally {
@@ -727,16 +735,10 @@ function attachmentTimeout<T>(operation: Promise<T>, controller: AbortController
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     let timedOut = false;
-    const timer = setTimeout(async () => {
+    const timer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
       controller.abort();
-      try {
-        await operation;
-      } catch {
-        // The timeout is the failure reported to the caller after the operation settles.
-      }
-      if (settled) return;
       settled = true;
       clearTimeout(timer);
       reject(new AttachmentRetryableFailure());
@@ -766,7 +768,10 @@ async function downloadAttachmentBody(
   controller: AbortController,
 ): Promise<void> {
   try {
-    await attachmentTimeout(readAttachmentBody(response, destination, rootPath, controller.signal), controller);
+    const header = response.headers.get("content-length");
+    const contentLength = header !== null ? Number(header) : NaN;
+    const declaredLength = Number.isSafeInteger(contentLength) && contentLength >= 0 ? contentLength : undefined;
+    await attachmentTimeout(readAttachmentBody(response, destination, rootPath, controller.signal, declaredLength), controller);
   } catch (error) {
     if (error instanceof AttachmentQuotaFailure || (error instanceof AttachmentDownloadFailure && error.message.startsWith("Attachment exceeds"))) throw error;
     throw attachmentStageFailure("file download", error);

@@ -130,19 +130,14 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
-    const workerArgs = await buildPiRunBwrapArgs({ workspace: target, appRoot, model: "anthropic/claude", thinkingLevel: "high" });
+    const workerArgs = await buildPiRunBwrapArgs({ workspace: target, appRoot });
     expect(workerArgs.args).toContain(await realpath(node));
     expect(workerArgs.args).not.toContain("/usr/bin/node");
     expect(workerArgs.args.slice(workerArgs.args.indexOf("--") + 1)).toEqual([
       await realpath(node),
       "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
       "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
-      "--extension", "/app/node_modules/pi-agent-browser",
-      "--extension", "/app/node_modules/pi-exa",
-      "--extension", "/app/node_modules/pi-tiny-fork",
-      "--extension", "/app/node_modules/pi-tiny-monitor",
-      "--extension", "/app/node_modules/pi-tiny-ask",
-      "--model", "anthropic/claude", "--thinking", "high",
+
     ]);
     const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });
     expect(result).toEqual({ dataDir: target, bwrapPath: await realpath(bwrap) });
@@ -285,22 +280,28 @@ it("rejects a missing host-tools extension before building argv", async () => {
     await rm(f.root, { recursive: true, force: true });
   }
 });
-it("loads the harness Pi packages from read-only node_modules", async () => {
+it("mounts the shared agent profile with harness settings and instructions", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");
   const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const agentDir = path.join(f.root, "agent-state");
+  const settings = path.join(appRoot, "agent", "settings.json");
+  const agents = path.join(appRoot, "agent", "AGENTS.md");
   try {
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
-    const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
+    await mkdir(agentDir);
+    await mkdir(path.dirname(settings), { recursive: true });
+    await writeFile(settings, "{}\n");
+    await writeFile(agents, "instructions\n");
+    const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, agentDir });
     expect(args).toEqual(expect.arrayContaining([
-      "--extension", "/app/node_modules/pi-agent-browser",
-      "--extension", "/app/node_modules/pi-exa",
-      "--extension", "/app/node_modules/pi-tiny-fork",
-      "--extension", "/app/node_modules/pi-tiny-monitor",
-      "--extension", "/app/node_modules/pi-tiny-ask",
+      "--bind", agentDir, "/app/agent",
+      "--ro-bind", settings, "/app/agent/settings.json",
+      "--ro-bind", agents, "/app/agent/AGENTS.md",
+      "--setenv", "PI_CODING_AGENT_DIR", "/app/agent",
     ]));
-    expect(args).not.toContain("/app/extensions/multimodal.ts");
+    expect(args).not.toContain("/app/node_modules/pi-exa");
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

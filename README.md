@@ -19,7 +19,7 @@ pnpm build
 pnpm start
 ```
 
-A single host loads every workspace under `$DATA_DIR/workspaces/` (defaults to `~/.local/share/tg-bot2`). Connector instances configured in one workspace share its writable `workspace/`, timeline, schedules, and agent runtime. Provider credentials go under `DATA_DIR/workspaces/<workspaceId>/workspace/.pi/agent/` before the first prompt. A systemd unit example lives at `deploy/tg-bot2.service.example`. Only the workspace-first layout is supported.
+A single host loads every workspace under `$DATA_DIR/workspaces/` (defaults to `~/.local/share/tg-bot2`). Connector instances configured in one workspace share its writable `workspace/`, timeline, and schedules. Pi's shared harness profile lives under `$DATA_DIR/agent/` and is mounted as `/app/agent`; workspace-level Pi settings and packages live under `/workspace/.pi/`. A systemd unit example lives at `deploy/tg-bot2.service.example`. Only the workspace-first layout is supported.
 
 Attachment files live under `DATA_DIR/workspaces/<workspaceId>/attachments/`, in connector-specific subdirectories. The whole attachment tree, including partial downloads, has a 50 GiB hard cap. New attachments are rejected when they would exceed it, while completed files are never evicted automatically; remove old files manually when space is needed. Failed staging and failed Telegram deliveries clean up only the new staged files.
 

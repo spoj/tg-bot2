@@ -19,12 +19,15 @@ integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
     await mkdir(hostSocketDir);
     await writeFile(hostTimeline, "", "utf8");
     const appRoot = await realpath(process.cwd());
+    const agentDir = path.join(root, "agent");
+    await mkdir(agentDir);
     const { bwrapPath } = await checkSandboxEnvironment(path.join(root, "data"));
 
     try {
       const worker = new PiWorker({
         workspace,
         appRoot,
+        agentDir,
         bwrapPath,
         spawnProcess,
         terminateProcessGroup,

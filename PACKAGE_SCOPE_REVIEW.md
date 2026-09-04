@@ -1,73 +1,65 @@
-# tg-bot2 Pi package scope review
+# tg-bot2 Pi package scope
 
-This plan does not change `~/.pi/agent/`.
+This migration does not change `~/.pi/agent/`.
 
-## Scope choices
+## Final package decisions
 
-Replace each `TODO` with exactly one choice:
+| Package | Scope |
+|---|---|
+| `npm:pi-agent-browser@0.1.0` | Shared harness |
+| `npm:pi-exa@0.6.1` | Shared harness |
+| `git:github.com/spoj/pi-tiny-fork@5c7c3647f4b2f87a3e39fba4b4f20edc7afaa185` | Shared harness |
+| `git:github.com/spoj/pi-tiny-monitor@ab7fa33eab6af9530f084c19acb286447076737e` | Shared harness |
+| `git:github.com/spoj/pi-tiny-ask@487144ddde9179dca6767f77558e55c1f59cd05f` | Shared harness |
+| `git:github.com/spoj/pi-tiny-tools` | Not added |
+| `git:github.com/spoj/pi-show-herdr` | Not added |
+| `npm:@gregjohnso/pi-monitor` | Removed from Save Matthew |
 
-- `HARNESS` — pin in tg-bot2 and provide read-only to every bot workspace.
-- `WORKSPACE` — do not provide from tg-bot2; Save Matthew may keep/install it in its own `.pi/agent/settings.json`.
-- `REMOVE` — do not provide it and remove it from Save Matthew's settings if present.
+Harness packages are declared in the repository's `agent/settings.json`, not in
+`package.json`. Pi installs and loads them through its native global package
+scope.
 
-## Package decisions
+## Pi runtime
 
-| Package | Current scope | What it does | Suggested | Decision |
-|---|---|---|---|---|
-| `npm:pi-agent-browser` | personal only | Browser automation tool and screenshots | `HARNESS` | `HARNESS` |
-| `npm:pi-exa` | personal + Save Matthew | Exa web search and fetch tools | `HARNESS` | `HARNESS` |
-| `git:github.com/spoj/pi-tiny-fork` | personal + Save Matthew | Asynchronous Pi session forks | `HARNESS` | `HARNESS` |
-| `git:github.com/spoj/pi-tiny-tools` | personal only | Compact TUI rendering for tools/messages | `REMOVE` (RPC bot has no interactive TUI) | `REMOVE` |
-| `git:github.com/spoj/pi-show-herdr` | personal only | Interactive Herdr review tool | `REMOVE` (Herdr is not exposed inside bot sandbox) | `REMOVE` |
-| `git:github.com/spoj/pi-tiny-monitor` | personal only | Background process monitor with bounded/rate-limited output | `HARNESS` | `HARNESS` |
-| `git:github.com/spoj/pi-tiny-ask` | personal only | Media inspection and image generation through another model | `HARNESS` if its extra capabilities are wanted; tg-bot2 already provides `multimodal.ts` | `HARNESS`; remove the existing multimodal extension |
-| `npm:@gregjohnso/pi-monitor` | Save Matthew only | Older background process monitor | `REMOVE` if `pi-tiny-monitor` is selected | `REMOVE` |
+The tg-bot2 repository pins Pi `0.85.0` independently of personal Pi:
 
-## Pi runtime version
+- `@earendil-works/pi-ai`: `0.85.0`
+- `@earendil-works/pi-coding-agent`: `0.85.0`
+- `@earendil-works/pi-server`: `0.85.0`
 
-The tg-bot2 runtime is pinned by this repository, independently of personal Pi:
+## Native Pi scope layout
 
-- Current: `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` `0.84.2`
-- Latest published when this review was created: `0.85.0`
-- Workers run this repo's `node_modules/@earendil-works/pi-coding-agent/dist/cli.js`
+The host's shared state is `$DATA_DIR/agent/`, mounted into every worker as
+`/app/agent`. The repository files `agent/settings.json` and `agent/AGENTS.md`
+are overlaid read-only at those paths. Package caches and the shared `auth.json`
+remain in `$DATA_DIR/agent/`.
 
-Replace `TODO`:
+Each bot workspace uses native project scope:
 
-update to latest as of now
+```text
+/workspace/.pi/settings.json
+/workspace/.pi/npm/
+/workspace/.pi/git/
+/workspace/.pi/sessions/
+```
 
-## Phase 1: tg-bot2 harness
+Project settings can add packages with `pi install -l <source>`. Pi combines
+`/app/agent/settings.json` with `/workspace/.pi/settings.json`; project entries
+win for duplicate package identities.
 
-After approval:
+## Prompt and settings migration
 
-1. Update the pinned Pi packages in `package.json`, `pnpm-workspace.yaml`, and `pnpm-lock.yaml` if requested.
-2. Add each `HARNESS` package as an exact/pinned tg-bot2 dependency.
-3. Pass those packages to every Pi RPC worker as harness-owned extensions.
-4. Keep the harness copies read-only inside the sandbox.
-5. Add tests proving the selected extensions are exposed and workspace settings are not required.
-6. Run typecheck, tests, and integration checks.
+Static harness instructions live in `agent/AGENTS.md`. Only dynamic connector
+instructions and the per-conversation notification path are appended at worker
+startup. Model, thinking, steering, and follow-up settings are read by Pi from
+native settings rather than by tg-bot2.
 
-## Phase 2: Save Matthew workspace cleanup
+Save Matthew's preferences are now in:
 
-Only after Phase 1 is working:
+```text
+$DATA_DIR/workspaces/8442941973/workspace/.pi/settings.json
+```
 
-1. Remove harness-provided packages from Save Matthew's `.pi/agent/settings.json`.
-2. Keep packages marked `WORKSPACE` there.
-3. Remove packages marked `REMOVE`.
-4. Preserve Save Matthew's model/auth and other non-package settings unless separately approved.
-5. Restart tg-bot2 and smoke-test the tools.
-
-## Optional non-package alignment (Phase 2)
-
-These do not need a decision for package migration. Mark `KEEP`, `CHANGE`, or add a note.
-
-| Save Matthew setting | Current value | Decision / desired value |
-|---|---|---|
-| Default model | `github-copilot/gpt-5.6-luna` | `KEEP` |
-| Default thinking | `xhigh` | `KEEP` |
-| Fork model | `github-copilot/gpt-5.6-luna` | `KEEP` |
-| Fork thinking | `xhigh` | `KEEP` |
-| `steeringMode` | `all` | `KEEP` |
-| `followUpMode` | `all` | `KEEP` |
-| Theme | `dark` | `KEEP` |
-
-this section okay
+The obsolete `$DATA_DIR/workspaces/8442941973/workspace/.pi/agent/` directory
+was removed. The existing Save Matthew `auth.json` was moved to the shared
+`$DATA_DIR/agent/auth.json` profile as agreed.

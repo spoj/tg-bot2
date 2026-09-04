@@ -6,32 +6,12 @@ import type { AgentCredentials } from "./host-bridge.js";
 import { PiWorker } from "./pi-worker.js";
 import { SerialQueue } from "./queue.js";
 import type { PiWorkerChildProcess, PiWorkerSpawn } from "./sandbox.js";
-import { SCHEDULES_PROMPT } from "./schedule-protocol.js";
-import { TIMELINE_PROMPT, type TimelineRecord } from "./events.js";
-import { appendJsonl, defined, isMissing, readJsonl, readRegularFileBounded, replaceFileAtomic } from "./util.js";
+import type { TimelineRecord } from "./events.js";
+import { appendJsonl, defined, isMissing, readJsonl, replaceFileAtomic } from "./util.js";
 
-const BASE_PROMPT = `You are a persistent personal agent serving one conversation in a shared long-term workspace.
-Assistant text is not delivered; communicate through send. The host derives this session's connector-native destination from its authenticated conversation identity.
-The writable workspace is /workspace. Sessions and agent state live under /workspace/.pi. Host-managed attachments are read-only under /run/attachments; copy one into /workspace before editing it.
-For browser automation, create a private profile with mktemp -d /tmp/chrome-profile.XXXXXX, launch /usr/bin/google-chrome-stable --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 --user-data-dir=<profile>, read the selected port from the first line of <profile>/DevToolsActivePort, then connect with puppeteer-core. Never reuse another agent's profile or a fixed debugging port. The browser survives turns and stops with the session.
-Install extensions with pi install <pkg>; user settings live at /workspace/.pi/agent/settings.json.
-`;
-
-const BEHAVIOR_PROMPT = `Behavior:
-- Every host notification starts with a stable notification ID and, for persisted timeline events, a sequence number. Treat repeated IDs as replay of the same notification.
-- Inbound notifications contain the complete persisted connector event. Read its connector-native payload directly.
-- After interpreting an attachment, call annotate with its exact /run/attachments path and a short factual description. The host appends an attachment.annotated event with the path and description for later search; earlier attachment records remain unchanged.
-- Use steer_conversation to wake another conversation owner when work belongs to it. Copy the target conversation object from /run/timeline.jsonl and give a concrete instruction; do not send into its conversation yourself.
-- Read only the context needed: this conversation in /run/timeline.jsonl, then its connector, then the wider workspace. Older sessions are under /workspace/.pi/sessions.
-- Connector access policy is described by the connector prompt. Notification overrides live in this agent's notifications.json beside its session file; use {"wake":["event.type"],"mute":["event.type"]}. /restart applies model and notification setting changes.
-- Always give bash commands that can hang an explicit timeout in seconds. Use 300 by default; increase it only when the operation requires more time.
-`;
-
-export function systemPrompt(connectorPrompt: string, notificationPath = "notifications.json"): string {
-  return [BASE_PROMPT, connectorPrompt, TIMELINE_PROMPT, SCHEDULES_PROMPT, BEHAVIOR_PROMPT, `Notification settings path: ${notificationPath}.\n`].join("");
+export function runtimePrompt(connectorPrompt: string, notificationPath: string): string {
+  return `${connectorPrompt}\nNotification settings path: ${notificationPath}.\n`;
 }
-
-export const SYSTEM_PROMPT = systemPrompt("");
 
 export type AgentWorker = {
   isAlive(): boolean;
@@ -46,13 +26,12 @@ export type AgentWorker = {
 export type AgentWorkerOptions = {
   workspace: string;
   sessionDir: string;
-  model?: string;
+  agentDir: string;
   appRoot: string;
   bwrapPath?: string;
   appendSystemPrompt?: string;
   hostTools?: string;
   agentToken: string;
-  thinkingLevel?: string;
   idleTimeoutMs?: number;
   stopGraceMs?: number;
   now?: () => number;
@@ -71,6 +50,7 @@ export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | 
 
 export type AgentManagerOptions = {
   appRoot: string;
+  agentDir: string;
   credentials: AgentCredentials;
   notificationsPath: string;
   connectorPrompt: (connectorId: string) => string;
@@ -104,8 +84,6 @@ export type AgentNotifier = {
 
 const RESTART_SETTLE_CAP_MS = 30_000;
 export const USER_INTERRUPT_MAX_WAIT_MS = 2 * 60 * 1_000;
-const USER_SETTINGS_RELATIVE_PATH = path.join(".pi", "agent", "settings.json");
-const SETTINGS_MAX_BYTES = 1 * 1024 * 1024;
 const MAX_RETAINED_DELIVERED = 1_024;
 const NOTIFICATION_COMPACTION_THRESHOLD = 128;
 const MAX_PENDING_NOTIFICATIONS = 1_024;
@@ -117,16 +95,6 @@ function managerShutdownError(): Error {
   error.name = "AbortError";
   (error as NodeJS.ErrnoException).code = "ABORT_ERR";
   return error;
-}
-
-export async function loadUserSettings(workspace: string): Promise<Record<string, unknown>> {
-  try {
-    const raw = (await readRegularFileBounded(path.join(workspace, USER_SETTINGS_RELATIVE_PATH), SETTINGS_MAX_BYTES)).toString("utf8");
-    const parsed: unknown = JSON.parse(raw);
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-  } catch {
-    return {};
-  }
 }
 
 type ConversationWorkerEntry = {
@@ -188,6 +156,7 @@ function parseQueuedNotification(value: unknown): PendingNotification {
 export class AgentManager {
   private readonly workspace: string;
   private readonly appRoot: string;
+  private readonly agentDir: string;
   private readonly credentials: AgentCredentials;
   private readonly notificationsPath: string;
   private readonly connectorPrompt: (connectorId: string) => string;
@@ -227,6 +196,7 @@ export class AgentManager {
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
     this.workspace = config.workspace;
     this.appRoot = options.appRoot;
+    this.agentDir = options.agentDir;
     this.credentials = options.credentials;
     this.notificationsPath = path.resolve(options.notificationsPath);
     this.connectorPrompt = options.connectorPrompt;
@@ -769,23 +739,16 @@ export class AgentManager {
     const token = this.credentials.issue(actor, ["send", "annotate", "steer_conversation", "schedule"]);
     entry.token = token;
     try {
-      const settings = await loadUserSettings(this.workspace);
-      if (this.shuttingDown) throw managerShutdownError();
-      const settingsProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : undefined;
-      const settingsModel = typeof settings.defaultModel === "string" ? settings.defaultModel : undefined;
-      const model = settingsProvider && settingsModel ? `${settingsProvider}/${settingsModel}` : undefined;
-      const thinkingLevel = typeof settings.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined;
       const sessionDir = path.posix.join("/workspace/.pi/sessions", conversationSessionPath(actor));
       const workerOptions: AgentWorkerOptions = {
         workspace: this.workspace,
         sessionDir,
         appRoot: this.appRoot,
+        agentDir: this.agentDir,
         agentToken: token,
         now: this.now,
         ...defined({
           bwrapPath: this.bwrapPath,
-          model,
-          thinkingLevel,
           stopGraceMs: this.stopGraceMs,
           idleTimeoutMs: this.idleTimeoutMs,
           hostSocketDir: this.hostSocketDir,
@@ -796,7 +759,7 @@ export class AgentManager {
           setInterval: this.setIntervalFn,
           clearInterval: this.clearIntervalFn,
         }),
-        appendSystemPrompt: systemPrompt(this.connectorPrompt(actor.connectorId), path.posix.join(sessionDir, "notifications.json")),
+        appendSystemPrompt: runtimePrompt(this.connectorPrompt(actor.connectorId), path.posix.join(sessionDir, "notifications.json")),
         hostTools: "send,annotate,steer_conversation,schedule_add,schedule_replace,schedule_remove,schedule_take",
         spawnProcess: this.spawnProcess,
         terminateProcessGroup: this.terminateProcessGroup,

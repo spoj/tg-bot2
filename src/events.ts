@@ -163,7 +163,3 @@ function timelineLine(event: TimelineEvent, sequence: number): string {
   return JSON.stringify({ v: 2, id: id ?? randomUUID(), seq: sequence, t: new Date().toISOString(), ...payload });
 }
 
-export const TIMELINE_PROMPT = `/run/timeline.jsonl is read-only shared memory for this workspace. Each JSON line has {v:2,id,seq,t,type,...}; id is stable and seq is monotonic.
-Connector events retain native structure: {connectorId,conversation:{connectorId,conversationKey,address},type,payload,attachments}. Telegram types are telegram.message, telegram.edited_message, telegram.callback, telegram.poll_answer, telegram.message_reaction, telegram.my_chat_member, and telegram.chat_join_request.
-Completed sends are connector.sent with connector-native request and response. Host events such as schedule_fired remain host-native. Attachment descriptions are append-only attachment.annotated events with payload {path,description,occurrences}; correlate the exact path with prior attachment records and apply the latest annotation without expecting earlier records to change. Use connectorId and conversation to narrow context. Treat connector.sent as already complete. Repeated notification IDs are delivery replay, not new activity.
-`;

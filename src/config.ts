@@ -22,6 +22,7 @@ export type Config = TelegramConnectorConfig;
 export type WorkspaceConfig = {
   id: string;
   paths: WorkspacePaths;
+  agentDir: string;
   connectors: TelegramConnectorConfig[];
 };
 
@@ -144,7 +145,14 @@ export async function loadConfig(options: { dataDir?: string; env?: NodeJS.Proce
       seenBots.set(connector.id, source);
       seenTokens.set(connector.token, source);
     }
-    if (loadedConnectors.length > 0) workspaces.push({ id: entry.name, paths, connectors: loadedConnectors.map(({ config }) => config) });
+    if (loadedConnectors.length > 0) {
+      workspaces.push({
+        id: entry.name,
+        paths,
+        agentDir: path.join(dataDir, "agent"),
+        connectors: loadedConnectors.map(({ config }) => config),
+      });
+    }
   }
   workspaces.sort((left, right) => left.id.localeCompare(right.id));
 

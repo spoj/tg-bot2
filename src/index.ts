@@ -119,7 +119,7 @@ function canonicalConfig(config: AppConfig, dataDir: string): AppConfig {
           attachmentPrefix,
         };
       });
-      return { ...workspace, paths, connectors };
+      return { ...workspace, paths, agentDir: path.join(dataDir, "agent"), connectors };
     }),
   };
 }
@@ -160,6 +160,7 @@ async function createInstance(config: WorkspaceConfig, bwrapPath: string | undef
     const hostSocketDir = path.resolve(paths.runDir);
     const agents = new AgentManager({ workspace: paths.workspace }, {
       appRoot: process.cwd(),
+      agentDir: config.agentDir,
       credentials,
       notificationsPath: paths.notifications,
       connectorPrompt: (connectorId) => registry.prompt(connectorId),

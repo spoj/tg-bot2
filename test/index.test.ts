@@ -218,6 +218,7 @@ async function importIndex(): Promise<{ module: typeof import("../src/index.js")
     workspaces: [{
       id: "primary",
       paths,
+      agentDir: path.join(dataDir, "agent"),
       connectors: [{
         type: "telegram",
         id: "telegram:123",

@@ -136,14 +136,12 @@ export type PiRunSandboxPaths = {
   appRoot: string;
   cliPath?: string;
   appendSystemPrompt?: string;
+  /** Host directory for the shared Pi global profile. */
+  agentDir?: string;
   /** In-sandbox directory for session files; defaults to /workspace/.pi/sessions. */
   sessionDir?: string;
   /** Continue the latest session in sessionDir instead of creating a new session. */
   continueSession?: boolean;
-  /** "provider/modelId" passed at launch so session restoration cannot override the configured model. */
-  model?: string;
-  /** Thinking level passed at launch with the configured model. */
-  thinkingLevel?: string;
   /** Comma-separated host tool names exposed via the mounted host-tools extension and PI_HOST_TOOLS. */
   hostTools?: string;
   /** Host-issued capability token passed as PI_AGENT_TOKEN. */
@@ -178,17 +176,9 @@ async function requireRealFile(candidate: string, label: string): Promise<string
   return canonical;
 }
 
-const HARNESS_PI_PACKAGES = [
-  "pi-agent-browser",
-  "pi-exa",
-  "pi-tiny-fork",
-  "pi-tiny-monitor",
-  "pi-tiny-ask",
-] as const;
-
 function buildExtensionArgs(hostToolsExtension: string | undefined, hostTools: string | undefined): { mountArgs: string[]; cliArgs: string[] } {
   const mountArgs: string[] = [];
-  const cliArgs = HARNESS_PI_PACKAGES.flatMap((name) => ["--extension", `/app/node_modules/${name}`]);
+  const cliArgs: string[] = [];
   if (hostToolsExtension !== undefined) {
     mountArgs.push(
       "--dir", "/app/extensions",
@@ -198,6 +188,25 @@ function buildExtensionArgs(hostToolsExtension: string | undefined, hostTools: s
     cliArgs.push("--extension", "/app/extensions/host-tools.ts");
   }
   return { mountArgs, cliArgs };
+}
+
+async function buildAgentMountArgs(appRoot: string, agentDir: string | undefined): Promise<string[]> {
+  if (agentDir === undefined) return [];
+  const [settings, agents, directory] = await Promise.all([
+    requireRealFile(path.join(appRoot, "agent", "settings.json"), "Harness Pi settings"),
+    requireRealFile(path.join(appRoot, "agent", "AGENTS.md"), "Harness Pi instructions"),
+    requireRealDirectory(agentDir, "Harness Pi agent directory", path.resolve(agentDir)),
+  ]);
+  return [
+    "--dir", "/app/agent",
+    "--bind", directory, "/app/agent",
+    "--ro-bind", settings, "/app/agent/settings.json",
+    "--ro-bind", agents, "/app/agent/AGENTS.md",
+  ];
+}
+
+function buildAgentEnvironment(agentDir: string | undefined): string[] {
+  return agentDir === undefined ? [] : ["--setenv", "PI_CODING_AGENT_DIR", "/app/agent"];
 }
 
 function appendNodeDirectoryMount(args: string[], nodePath: string, runtimePaths: readonly string[]): void {
@@ -241,6 +250,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   const hostToolsExtension = paths.hostTools === undefined
     ? undefined
     : await requireHostToolsExtension(appRoot);
+  const agentMountArgs = await buildAgentMountArgs(appRoot, paths.agentDir);
   const { mountArgs, cliArgs } = buildExtensionArgs(hostToolsExtension, paths.hostTools);
   const nodePath = await requireExecutable("node");
   const runtimePaths = [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
@@ -273,8 +283,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     "--dir", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
-    // Root-level agent scripts resolve harness dependencies (e.g. puppeteer-core)
-    // through the same read-only tree; subdirectory projects keep their own installs.
+    ...agentMountArgs,
     "--bind", workspace, "/workspace",
     "--ro-bind", nodeModules, "/workspace/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
@@ -287,7 +296,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
-    "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
+    ...buildAgentEnvironment(paths.agentDir),
     "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
     "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
     "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",
@@ -303,8 +312,6 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),
     ...cliArgs,
-    ...(paths.model === undefined ? [] : ["--model", paths.model]),
-    ...(paths.thinkingLevel === undefined ? [] : ["--thinking", paths.thinkingLevel]),
   ];
   args.push("--chdir", "/workspace", "--", nodePath, cliMountPath, ...piArgs);
   return { args };

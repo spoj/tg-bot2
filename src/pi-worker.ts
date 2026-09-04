@@ -135,15 +135,6 @@ async function createPrivateFile(directory: string, name: string, content: strin
   }
 }
 
-async function ensureWebSearchConfig(workspace: string): Promise<void> {
-  await createPrivateFile(
-    path.join(workspace, ".pi", "agent"),
-    "web-search.json",
-    '{"workflow":"none","autoOpenBrowser":false}\n',
-    0o600,
-  );
-}
-
 async function ensurePromptFile(appRoot: string, content: string): Promise<string> {
   const hash = createHash("sha256").update(content, "utf8").digest("hex");
   const promptDir = path.join(appRoot, ".prompts");
@@ -153,11 +144,12 @@ async function ensurePromptFile(appRoot: string, content: string): Promise<strin
   return promptFile;
 }
 
-async function prepareWorkspace(workspace: string): Promise<void> {
+async function prepareWorkspace(workspace: string, agentDir?: string): Promise<void> {
   await ensurePrivateDirectory(workspace);
   for (const relative of [
     ".pi",
-    ".pi/agent",
+    ".pi/npm",
+    ".pi/git",
     ".pi/sessions",
     ".cache",
     ".cache/npm",
@@ -169,7 +161,11 @@ async function prepareWorkspace(workspace: string): Promise<void> {
   ]) {
     await ensurePrivateDirectory(path.join(workspace, relative));
   }
-  await ensureWebSearchConfig(workspace);
+  if (agentDir !== undefined) {
+    for (const relative of ["", "npm", "git"]) {
+      await ensurePrivateDirectory(path.join(agentDir, relative));
+    }
+  }
 }
 
 
@@ -290,7 +286,7 @@ export class PiWorker {
     this.lastActivity = "";
     this.isBusyState = false;
 
-    await prepareWorkspace(this.options.workspace);
+    await prepareWorkspace(this.options.workspace, this.options.agentDir);
     this.ensureStartAllowed();
     const promptFile = this.options.appendSystemPrompt !== undefined
       ? await ensurePromptFile(this.options.appRoot, this.options.appendSystemPrompt)
@@ -302,10 +298,9 @@ export class PiWorker {
       ...defined({
         cliPath: this.options.cliPath,
         appendSystemPrompt: promptFile,
+        agentDir: this.options.agentDir,
         sessionDir: this.options.sessionDir,
         continueSession: this.options.continueSession,
-        model: this.options.model,
-        thinkingLevel: this.options.thinkingLevel,
         hostTools: this.options.hostTools,
         agentToken: this.options.agentToken,
         hostSocketDir: this.options.hostSocketDir,

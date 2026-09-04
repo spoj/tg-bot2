@@ -5,9 +5,7 @@ import { expect, it, vi, type Mock } from "vitest";
 import {
   AgentEventRouter,
   AgentManager,
-  loadUserSettings,
   USER_INTERRUPT_MAX_WAIT_MS,
-  SYSTEM_PROMPT,
   type AgentNotifier,
   type AgentWorker,
   type AgentWorkerFactory,
@@ -15,9 +13,8 @@ import {
 } from "../src/agent.js";
 import { conversationAgent, conversationSessionPath } from "../src/agent-ref.js";
 import { ConnectorRegistry, type WorkspaceConnector } from "../src/connector.js";
-import { TIMELINE_PROMPT, type TimelineRecord } from "../src/events.js";
+import type { TimelineRecord } from "../src/events.js";
 import { AgentCredentials } from "../src/host-bridge.js";
-import { SCHEDULES_PROMPT } from "../src/schedule-protocol.js";
 import { telegramConversation } from "../src/telegram-ref.js";
 
 type FakeWorker = AgentWorker & {
@@ -111,6 +108,7 @@ const CHAT = telegramConversation(CONNECTOR_ID, 123);
 function managerOptions(dataDir: string, overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
   return {
     appRoot: "/tmp/tg-bot2-app",
+    agentDir: path.join(dataDir, "agent"),
     credentials: new AgentCredentials(),
     notificationsPath: path.join(dataDir, "notifications.jsonl"),
     connectorPrompt: () => CONNECTOR_PROMPT,
@@ -148,61 +146,6 @@ async function withDataDir(run: (dataDir: string) => Promise<void>): Promise<voi
     await rm(dataDir, { recursive: true, force: true });
   }
 }
-
-async function settingsFile(dataDir: string, content: Record<string, unknown>): Promise<void> {
-  const target = path.join(dataDir, "workspace", ".pi", "agent", "settings.json");
-  await mkdir(path.dirname(target), { recursive: true });
-  await writeFile(target, JSON.stringify(content), "utf8");
-}
-
-it("composes a concise behavior-oriented SYSTEM_PROMPT without task protocol instructions", () => {
-  expect(SYSTEM_PROMPT).toContain(TIMELINE_PROMPT);
-  expect(SYSTEM_PROMPT).toContain(SCHEDULES_PROMPT);
-  expect(SYSTEM_PROMPT).toContain("connector-native payload");
-  expect(SYSTEM_PROMPT).toContain("/restart applies model and notification setting changes");
-  expect(SYSTEM_PROMPT).toContain("stable notification ID");
-  expect(SYSTEM_PROMPT).toContain("mktemp -d /tmp/chrome-profile.XXXXXX");
-  expect(SYSTEM_PROMPT).toContain("--remote-debugging-port=0");
-  expect(SYSTEM_PROMPT).not.toContain("continue_task");
-  expect(SYSTEM_PROMPT).not.toContain("steer_task");
-});
-
-it("loadUserSettings tolerates missing, empty, and malformed files", async () => {
-  await withDataDir(async (dataDir) => {
-    const workspace = path.join(dataDir, "workspace");
-    await mkdir(path.join(workspace, ".pi", "agent"), { recursive: true });
-    await expect(loadUserSettings(workspace)).resolves.toEqual({});
-    await writeFile(path.join(workspace, ".pi", "agent", "settings.json"), "not json", "utf8");
-    await expect(loadUserSettings(workspace)).resolves.toEqual({});
-    await settingsFile(dataDir, { defaultModel: "claude", custom: true });
-    await expect(loadUserSettings(workspace)).resolves.toEqual({ defaultModel: "claude", custom: true });
-  });
-
-});
-
-it("falls back when user settings are a symlink to a special file", async () => {
-  await withDataDir(async (dataDir) => {
-    const settingsPath = path.join(dataDir, "workspace", ".pi", "agent", "settings.json");
-    await mkdir(path.dirname(settingsPath), { recursive: true });
-    await rm(settingsPath, { force: true });
-    await symlink("/dev/zero", settingsPath);
-
-    await expect(loadUserSettings(path.join(dataDir, "workspace"))).resolves.toEqual({});
-  });
-});
-it("falls back when an intermediate user settings directory is a symlink", async () => {
-  await withDataDir(async (dataDir) => {
-    const workspace = path.join(dataDir, "workspace");
-    const outside = path.join(dataDir, "outside");
-    await mkdir(workspace, { recursive: true });
-    await mkdir(path.join(outside, ".pi", "agent"), { recursive: true });
-    await writeFile(path.join(outside, ".pi", "agent", "settings.json"), JSON.stringify({ defaultModel: "escaped" }), "utf8");
-    await symlink(path.join(outside, ".pi"), path.join(workspace, ".pi"));
-
-    await expect(loadUserSettings(workspace)).resolves.toEqual({});
-  });
-});
-
 
 it("followup starts a fresh worker and sends prompt with followUp streaming behavior", async () => {
   await withDataDir(async (dataDir) => {
@@ -776,25 +719,6 @@ it("restartAll closes active workers and respawns them on the next message", asy
     expect(workers).toHaveLength(2);
   });
 });
-
-it("passes settings defaults as model and thinking CLI args", async () => {
-  await withDataDir(async (dataDir) => {
-    await settingsFile(dataDir, {
-      defaultProvider: "openrouter",
-      defaultModel: "deepseek/deepseek-chat",
-      defaultThinkingLevel: "high",
-    });
-    const { factory } = fakeWorkerFactory();
-    const manager = new AgentManager({ workspace: path.join(dataDir, "workspace") }, managerOptions(dataDir, { workerFactory: factory, now: () => 10 * 60 * 60 * 1000 }));
-    await manager.followup(".", CHAT);
-    expect(factory).toHaveBeenCalledTimes(1);
-    expect(factory.mock.calls[0]?.[0]).toMatchObject({
-      model: "openrouter/deepseek/deepseek-chat",
-      thinkingLevel: "high",
-    });
-  });
-});
-
 
 
 it("beginShutdown stops active workers and rejects later work", async () => {

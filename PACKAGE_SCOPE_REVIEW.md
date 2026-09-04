@@ -6,11 +6,11 @@ This migration does not change `~/.pi/agent/`.
 
 | Package | Scope |
 |---|---|
-| `npm:pi-agent-browser@0.1.0` | Shared harness |
-| `npm:pi-exa@0.6.1` | Shared harness |
-| `git:github.com/spoj/pi-tiny-fork@5c7c3647f4b2f87a3e39fba4b4f20edc7afaa185` | Shared harness |
-| `git:github.com/spoj/pi-tiny-monitor@ab7fa33eab6af9530f084c19acb286447076737e` | Shared harness |
-| `git:github.com/spoj/pi-tiny-ask@487144ddde9179dca6767f77558e55c1f59cd05f` | Shared harness |
+| `npm:pi-agent-browser` | Shared harness |
+| `npm:pi-exa` | Shared harness |
+| `git:github.com/spoj/pi-tiny-fork` | Shared harness |
+| `git:github.com/spoj/pi-tiny-monitor` | Shared harness |
+| `git:github.com/spoj/pi-tiny-ask` | Shared harness |
 | `git:github.com/spoj/pi-tiny-tools` | Not added |
 | `git:github.com/spoj/pi-show-herdr` | Not added |
 | `npm:@gregjohnso/pi-monitor` | Removed from Save Matthew |

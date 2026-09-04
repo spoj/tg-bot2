@@ -1,9 +1,9 @@
 {
   "packages": [
-    "npm:pi-agent-browser@0.1.0",
-    "npm:pi-exa@0.6.1",
-    "git:github.com/spoj/pi-tiny-fork@5c7c3647f4b2f87a3e39fba4b4f20edc7afaa185",
-    "git:github.com/spoj/pi-tiny-monitor@ab7fa33eab6af9530f084c19acb286447076737e",
-    "git:github.com/spoj/pi-tiny-ask@487144ddde9179dca6767f77558e55c1f59cd05f"
+    "npm:pi-agent-browser",
+    "npm:pi-exa",
+    "git:github.com/spoj/pi-tiny-fork",
+    "git:github.com/spoj/pi-tiny-monitor",
+    "git:github.com/spoj/pi-tiny-ask"
   ]
 }

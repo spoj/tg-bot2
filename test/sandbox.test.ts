@@ -230,7 +230,7 @@ it("binds appendSystemPrompt read-only to /app/append-system-prompt.md", async (
       appendSystemPrompt: hostPrompt,
     });
     expect(workerArgs.args).toEqual(expect.arrayContaining([
-      "--dir", "/app",
+      "--tmpfs", "/app",
       "--ro-bind", hostPrompt, "/app/append-system-prompt.md",
     ]));
     expect(workerArgs.args).toEqual(expect.arrayContaining([
@@ -280,27 +280,24 @@ it("rejects a missing host-tools extension before building argv", async () => {
     await rm(f.root, { recursive: true, force: true });
   }
 });
-it("mounts the shared agent profile with harness settings and instructions", async () => {
+it("mounts the shared agent profile read-only as one complete profile", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");
   const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
   const agentDir = path.join(f.root, "agent-state");
-  const settings = path.join(appRoot, "agent", "settings.json");
-  const agents = path.join(appRoot, "agent", "AGENTS.md");
   try {
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
     await mkdir(agentDir);
-    await mkdir(path.dirname(settings), { recursive: true });
-    await writeFile(settings, "{}\n");
-    await writeFile(agents, "instructions\n");
     const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, agentDir });
     expect(args).toEqual(expect.arrayContaining([
-      "--bind", agentDir, "/app/agent",
-      "--ro-bind", settings, "/app/agent/settings.json",
-      "--ro-bind", agents, "/app/agent/AGENTS.md",
+      "--ro-bind", agentDir, "/app/agent",
       "--setenv", "PI_CODING_AGENT_DIR", "/app/agent",
     ]));
+    expect(args[args.indexOf(agentDir) - 1]).toBe("--ro-bind");
+    expect(args).toEqual(expect.arrayContaining(["--remount-ro", "/app"]));
+    expect(args).not.toContain("/app/agent/settings.json");
+    expect(args).not.toContain("/app/agent/AGENTS.md");
     expect(args).not.toContain("/app/node_modules/pi-exa");
   } finally {
     await rm(f.root, { recursive: true, force: true });

@@ -15,9 +15,9 @@ This migration does not change `~/.pi/agent/`.
 | `git:github.com/spoj/pi-show-herdr` | Not added |
 | `npm:@gregjohnso/pi-monitor` | Removed from Save Matthew |
 
-Harness packages are declared in the repository's `agent/settings.json`, not in
-`package.json`. Pi installs and loads them through its native global package
-scope.
+Deployment-default harness packages are declared in the repository's
+`agent/settings.json`, not in `package.json`. Deployment provisions them into
+Pi's native global package scope before workers start.
 
 ## Pi runtime
 
@@ -29,10 +29,14 @@ The tg-bot2 repository pins Pi `0.85.0` independently of personal Pi:
 
 ## Native Pi scope layout
 
-The host's shared state is `$DATA_DIR/agent/`, mounted into every worker as
-`/app/agent`. The repository files `agent/settings.json` and `agent/AGENTS.md`
-are overlaid read-only at those paths. Package caches and the shared `auth.json`
-remain in `$DATA_DIR/agent/`.
+The deployment-owned Pi profile is `$DATA_DIR/agent/`, mounted entirely
+read-only into every worker as `/app/agent`. Deployment initialization must create
+its `npm/` and `git/` stores, provision `settings.json` and `AGENTS.md`, and
+materialize every configured package before workers start. The repository's
+`agent/` files are defaults for that explicit provisioning step; runtime code does
+not seed, install, or update profile resources. Package caches and the shared
+`auth.json` remain in `$DATA_DIR/agent/`; package updates are explicit host
+maintenance (`PI_CODING_AGENT_DIR="$DATA_DIR/agent" ./node_modules/.bin/pi update --extensions`) followed by a worker restart.
 
 Each bot workspace uses native project scope:
 

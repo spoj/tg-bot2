@@ -190,19 +190,10 @@ function buildExtensionArgs(hostToolsExtension: string | undefined, hostTools: s
   return { mountArgs, cliArgs };
 }
 
-async function buildAgentMountArgs(appRoot: string, agentDir: string | undefined): Promise<string[]> {
+async function buildAgentMountArgs(agentDir: string | undefined): Promise<string[]> {
   if (agentDir === undefined) return [];
-  const [settings, agents, directory] = await Promise.all([
-    requireRealFile(path.join(appRoot, "agent", "settings.json"), "Harness Pi settings"),
-    requireRealFile(path.join(appRoot, "agent", "AGENTS.md"), "Harness Pi instructions"),
-    requireRealDirectory(agentDir, "Harness Pi agent directory", path.resolve(agentDir)),
-  ]);
-  return [
-    "--dir", "/app/agent",
-    "--bind", directory, "/app/agent",
-    "--ro-bind", settings, "/app/agent/settings.json",
-    "--ro-bind", agents, "/app/agent/AGENTS.md",
-  ];
+  const directory = await requireRealDirectory(agentDir, "Harness Pi agent directory", path.resolve(agentDir));
+  return ["--ro-bind", directory, "/app/agent"];
 }
 
 function buildAgentEnvironment(agentDir: string | undefined): string[] {
@@ -250,7 +241,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   const hostToolsExtension = paths.hostTools === undefined
     ? undefined
     : await requireHostToolsExtension(appRoot);
-  const agentMountArgs = await buildAgentMountArgs(appRoot, paths.agentDir);
+  const agentMountArgs = await buildAgentMountArgs(paths.agentDir);
   const { mountArgs, cliArgs } = buildExtensionArgs(hostToolsExtension, paths.hostTools);
   const nodePath = await requireExecutable("node");
   const runtimePaths = [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
@@ -281,13 +272,14 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   args.push(
     ...chromeSupportPaths.flatMap((entry) => ["--ro-bind", entry, entry]),
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-    "--dir", "/app",
+    "--tmpfs", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
     ...agentMountArgs,
     "--bind", workspace, "/workspace",
     "--ro-bind", nodeModules, "/workspace/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
     ...mountArgs,
+    "--remount-ro", "/app",
     ...(hostSocketDir === undefined ? [] : ["--bind", hostSocketDir, "/run"]),
     ...(hostAttachments === undefined ? [] : ["--ro-bind", hostAttachments, "/run/attachments"]),
     ...(hostTimeline === undefined ? [] : ["--ro-bind", hostTimeline, "/run/timeline.jsonl"]),

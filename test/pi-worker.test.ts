@@ -90,6 +90,24 @@ describe("PiWorker", () => {
       await rm(f.root, { recursive: true, force: true });
     }
   });
+  it("does not create a missing host agent profile", async () => {
+    const f = await fixture();
+    const agentDir = path.join(f.root, "agent");
+    try {
+      const { spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({
+        workspace: f.workspace,
+        appRoot: f.appRoot,
+        agentDir,
+        spawnProcess: spawn,
+        terminateProcessGroup: terminate,
+      });
+      await expect(worker.start()).rejects.toThrow("ENOENT");
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
   it("passes the canonical timeline path to bwrap without fd inheritance", async () => {
     const f = await fixture();
     const timeline = path.join(f.root, "timeline.jsonl");

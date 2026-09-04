@@ -144,7 +144,7 @@ async function ensurePromptFile(appRoot: string, content: string): Promise<strin
   return promptFile;
 }
 
-async function prepareWorkspace(workspace: string, agentDir?: string): Promise<void> {
+async function prepareWorkspace(workspace: string): Promise<void> {
   await ensurePrivateDirectory(workspace);
   for (const relative of [
     ".pi",
@@ -160,11 +160,6 @@ async function prepareWorkspace(workspace: string, agentDir?: string): Promise<v
     ".python",
   ]) {
     await ensurePrivateDirectory(path.join(workspace, relative));
-  }
-  if (agentDir !== undefined) {
-    for (const relative of ["", "npm", "git"]) {
-      await ensurePrivateDirectory(path.join(agentDir, relative));
-    }
   }
 }
 
@@ -286,7 +281,7 @@ export class PiWorker {
     this.lastActivity = "";
     this.isBusyState = false;
 
-    await prepareWorkspace(this.options.workspace, this.options.agentDir);
+    await prepareWorkspace(this.options.workspace);
     this.ensureStartAllowed();
     const promptFile = this.options.appendSystemPrompt !== undefined
       ? await ensurePromptFile(this.options.appRoot, this.options.appendSystemPrompt)

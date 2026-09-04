@@ -137,6 +137,11 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
       await realpath(node),
       "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
       "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
+      "--extension", "/app/node_modules/pi-agent-browser",
+      "--extension", "/app/node_modules/pi-exa",
+      "--extension", "/app/node_modules/pi-tiny-fork",
+      "--extension", "/app/node_modules/pi-tiny-monitor",
+      "--extension", "/app/node_modules/pi-tiny-ask",
       "--model", "anthropic/claude", "--thinking", "high",
     ]);
     const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });
@@ -280,27 +285,22 @@ it("rejects a missing host-tools extension before building argv", async () => {
     await rm(f.root, { recursive: true, force: true });
   }
 });
-it("binds the multimodal extension read-only when present", async () => {
+it("loads the harness Pi packages from read-only node_modules", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");
   const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-  const multimodal = path.join(appRoot, "extensions", "multimodal.ts");
   try {
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
-    await mkdir(path.dirname(multimodal), { recursive: true });
-    await writeFile(multimodal, "export default () => {};\n", { mode: 0o600 });
-    const workerArgs = await buildPiRunBwrapArgs({
-      workspace: f.workspace,
-      appRoot,
-    });
-    expect(workerArgs.args).toEqual(expect.arrayContaining([
-      "--dir", "/app/extensions",
-      "--ro-bind", await realpath(multimodal), "/app/extensions/multimodal.ts",
+    const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
+    expect(args).toEqual(expect.arrayContaining([
+      "--extension", "/app/node_modules/pi-agent-browser",
+      "--extension", "/app/node_modules/pi-exa",
+      "--extension", "/app/node_modules/pi-tiny-fork",
+      "--extension", "/app/node_modules/pi-tiny-monitor",
+      "--extension", "/app/node_modules/pi-tiny-ask",
     ]));
-    expect(workerArgs.args).toEqual(expect.arrayContaining([
-      "--extension", "/app/extensions/multimodal.ts",
-    ]));
+    expect(args).not.toContain("/app/extensions/multimodal.ts");
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

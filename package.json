@@ -18,9 +18,15 @@
     "check": "node scripts/ci.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-ai": "0.85.0",
+    "@earendil-works/pi-coding-agent": "0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
     "grammy": "1.45.1",
+    "pi-agent-browser": "0.1.0",
+    "pi-exa": "0.6.1",
+    "pi-tiny-ask": "github:spoj/pi-tiny-ask#487144ddde9179dca6767f77558e55c1f59cd05f",
+    "pi-tiny-fork": "github:spoj/pi-tiny-fork#5c7c3647f4b2f87a3e39fba4b4f20edc7afaa185",
+    "pi-tiny-monitor": "github:spoj/pi-tiny-monitor#ab7fa33eab6af9530f084c19acb286447076737e",
     "puppeteer-core": "^25.8.0",
     "typebox": "1.3.7",
     "ws": "^8.21.3"

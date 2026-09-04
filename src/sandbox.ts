@@ -178,28 +178,24 @@ async function requireRealFile(candidate: string, label: string): Promise<string
   return canonical;
 }
 
-type ExtensionConfig = {
-  hostToolsExtension: string | undefined;
-  hostTools: string | undefined;
-  multimodalExtension: string | undefined;
-};
+const HARNESS_PI_PACKAGES = [
+  "pi-agent-browser",
+  "pi-exa",
+  "pi-tiny-fork",
+  "pi-tiny-monitor",
+  "pi-tiny-ask",
+] as const;
 
-function buildExtensionMountArgs(config: ExtensionConfig): { mountArgs: string[]; cliArgs: string[] } {
+function buildExtensionArgs(hostToolsExtension: string | undefined, hostTools: string | undefined): { mountArgs: string[]; cliArgs: string[] } {
   const mountArgs: string[] = [];
-  const cliArgs: string[] = [];
-  if (config.hostToolsExtension !== undefined || config.multimodalExtension !== undefined) {
-    mountArgs.push("--dir", "/app/extensions");
-  }
-  if (config.hostToolsExtension !== undefined) {
+  const cliArgs = HARNESS_PI_PACKAGES.flatMap((name) => ["--extension", `/app/node_modules/${name}`]);
+  if (hostToolsExtension !== undefined) {
     mountArgs.push(
-      "--ro-bind", config.hostToolsExtension, "/app/extensions/host-tools.ts",
-      "--setenv", "PI_HOST_TOOLS", config.hostTools!,
+      "--dir", "/app/extensions",
+      "--ro-bind", hostToolsExtension, "/app/extensions/host-tools.ts",
+      "--setenv", "PI_HOST_TOOLS", hostTools!,
     );
     cliArgs.push("--extension", "/app/extensions/host-tools.ts");
-  }
-  if (config.multimodalExtension !== undefined) {
-    mountArgs.push("--ro-bind", config.multimodalExtension, "/app/extensions/multimodal.ts");
-    cliArgs.push("--extension", "/app/extensions/multimodal.ts");
   }
   return { mountArgs, cliArgs };
 }
@@ -245,12 +241,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   const hostToolsExtension = paths.hostTools === undefined
     ? undefined
     : await requireHostToolsExtension(appRoot);
-  const multimodalExtension = await findExtension(appRoot, "multimodal.ts");
-  const { mountArgs, cliArgs } = buildExtensionMountArgs({
-    hostToolsExtension,
-    hostTools: paths.hostTools,
-    multimodalExtension,
-  });
+  const { mountArgs, cliArgs } = buildExtensionArgs(hostToolsExtension, paths.hostTools);
   const nodePath = await requireExecutable("node");
   const runtimePaths = [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
   const hostSocketDir = paths.hostSocketDir === undefined
@@ -335,22 +326,6 @@ async function requireHostToolsExtension(appRoot: string): Promise<string> {
   }
   return await realpath(extensionPath);
 }
-async function findExtension(appRoot: string, name: string): Promise<string | undefined> {
-  const extensionPath = path.join(appRoot, "extensions", name);
-  try {
-    const stat = await lstat(extensionPath);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      return undefined;
-    }
-    return await realpath(extensionPath);
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
 function outputCapture(limit: number): {
   stdout: { add(chunk: Buffer): void; buffer(): Buffer; text(): string };
   stderr: { add(chunk: Buffer): void; text(): string };

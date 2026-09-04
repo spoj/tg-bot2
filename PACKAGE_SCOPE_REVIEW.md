@@ -30,13 +30,15 @@ The tg-bot2 repository pins Pi `0.85.0` independently of personal Pi:
 ## Native Pi scope layout
 
 The deployment-owned Pi profile is `$DATA_DIR/agent/`, mounted entirely
-read-only into every worker as `/app/agent`. Deployment initialization must create
-its `npm/` and `git/` stores, provision `settings.json` and `AGENTS.md`, and
-materialize every configured package before workers start. The repository's
-`agent/` files are defaults for that explicit provisioning step; runtime code does
-not seed, install, or update profile resources. Package caches and the shared
-`auth.json` remain in `$DATA_DIR/agent/`; package updates are explicit host
-maintenance (`PI_CODING_AGENT_DIR="$DATA_DIR/agent" ./node_modules/.bin/pi update --extensions`) followed by a worker restart.
+read-only into every worker as `/app/agent`. Its top-level resources are also
+mounted read-only into an ephemeral `/runtime/agent` directory whose writable
+parent lets Pi create adjacent lock files while reading profile state. Profile
+files remain immutable and runtime locks disappear with the worker. Deployment initialization must create its `npm/` and `git/` stores,
+provision `settings.json` and `AGENTS.md`, and materialize every configured package
+before workers start. The repository's `agent/` files are defaults for that
+explicit provisioning step; runtime code does not seed, install, or update profile
+resources. Package caches and the shared `auth.json` remain in `$DATA_DIR/agent/`;
+package updates are explicit host maintenance (`PI_CODING_AGENT_DIR="$DATA_DIR/agent" ./node_modules/.bin/pi update --extensions`) followed by a worker restart.
 
 Each bot workspace uses native project scope:
 

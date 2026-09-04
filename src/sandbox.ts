@@ -193,11 +193,19 @@ function buildExtensionArgs(hostToolsExtension: string | undefined, hostTools: s
 async function buildAgentMountArgs(agentDir: string | undefined): Promise<string[]> {
   if (agentDir === undefined) return [];
   const directory = await requireRealDirectory(agentDir, "Harness Pi agent directory", path.resolve(agentDir));
-  return ["--ro-bind", directory, "/app/agent"];
+  const resources = (await readdir(directory)).flatMap((name) => [
+    "--ro-bind", path.join(directory, name), path.posix.join("/runtime/agent", name),
+  ]);
+  return [
+    "--ro-bind", directory, "/app/agent",
+    "--tmpfs", "/runtime",
+    "--dir", "/runtime/agent",
+    ...resources,
+  ];
 }
 
 function buildAgentEnvironment(agentDir: string | undefined): string[] {
-  return agentDir === undefined ? [] : ["--setenv", "PI_CODING_AGENT_DIR", "/app/agent"];
+  return agentDir === undefined ? [] : ["--setenv", "PI_CODING_AGENT_DIR", "/runtime/agent"];
 }
 
 function appendNodeDirectoryMount(args: string[], nodePath: string, runtimePaths: readonly string[]): void {

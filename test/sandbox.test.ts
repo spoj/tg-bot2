@@ -289,10 +289,14 @@ it("mounts the shared agent profile read-only as one complete profile", async ()
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
     await mkdir(agentDir);
+    await writeFile(path.join(agentDir, "settings.json"), "{}\n");
     const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, agentDir });
     expect(args).toEqual(expect.arrayContaining([
       "--ro-bind", agentDir, "/app/agent",
-      "--setenv", "PI_CODING_AGENT_DIR", "/app/agent",
+      "--tmpfs", "/runtime",
+      "--dir", "/runtime/agent",
+      "--ro-bind", path.join(agentDir, "settings.json"), "/runtime/agent/settings.json",
+      "--setenv", "PI_CODING_AGENT_DIR", "/runtime/agent",
     ]));
     expect(args[args.indexOf(agentDir) - 1]).toBe("--ro-bind");
     expect(args).toEqual(expect.arrayContaining(["--remount-ro", "/app"]));

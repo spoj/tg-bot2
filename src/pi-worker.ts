@@ -445,7 +445,7 @@ export class PiWorker {
 
   private handleStdoutLine(line: string): void {
     try {
-      const event = JSON.parse(line) as { id?: unknown; type?: unknown; success?: unknown; error?: unknown; steering?: unknown };
+      const event = JSON.parse(line) as { id?: unknown; type?: unknown; method?: unknown; success?: unknown; error?: unknown; steering?: unknown };
       if (event.type === "response") {
         if (typeof event.id !== "string") return;
         const pending = this.pendingResponses.get(event.id);
@@ -454,6 +454,12 @@ export class PiWorker {
         if (event.success === true) pending.resolve();
         else pending.reject(new Error(typeof event.error === "string" ? event.error : "Pi RPC request failed"));
         return;
+      }
+      if (event.type === "extension_ui_request" && typeof event.id === "string") {
+        if (event.method === "confirm") this.writeJson({ type: "extension_ui_response", id: event.id, confirmed: false });
+        else if (event.method === "select" || event.method === "input" || event.method === "editor") {
+          this.writeJson({ type: "extension_ui_response", id: event.id, cancelled: true });
+        }
       }
       if (event.type === "queue_update" && Array.isArray(event.steering) && event.steering.length === 0) {
         this.clearSteerWaitTimer();

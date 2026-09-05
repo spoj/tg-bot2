@@ -276,10 +276,12 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   const chromeSupportPaths = [
     "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl", "/etc/pki",
     "/etc/ca-certificates", "/etc/fonts", "/usr/share/fonts", "/usr/share/fontconfig",
+    "/opt/google/chrome",
   ].filter((candidate) => existsSync(candidate));
   args.push(
     ...chromeSupportPaths.flatMap((entry) => ["--ro-bind", entry, entry]),
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    "--dir", "/tmp/agent-browser",
     "--tmpfs", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
     ...agentMountArgs,
@@ -295,7 +297,8 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     ...(hostSocketDir === undefined ? [] : ["--setenv", "PI_HOST_SOCKET", "/run/host.sock"]),
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
-    "--setenv", "PATH", "/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "XDG_RUNTIME_DIR", "/tmp/agent-browser",
+    "--setenv", "PATH", `${paths.agentDir === undefined ? "" : "/app/agent/bin:"}/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin`,
     ...buildAgentEnvironment(paths.agentDir),
     "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
     "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",

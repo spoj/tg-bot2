@@ -202,6 +202,30 @@ describe("PiWorker", () => {
     }
   });
 
+  it("immediately declines interactive extension UI requests", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+      child.stdin.write.mockClear();
+
+      child.stdout.emit("data", `${JSON.stringify({ type: "extension_ui_request", id: "confirm-1", method: "confirm" })}\n`);
+      child.stdout.emit("data", `${JSON.stringify({ type: "extension_ui_request", id: "input-1", method: "input" })}\n`);
+
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        `${JSON.stringify({ type: "extension_ui_response", id: "confirm-1", confirmed: false })}\n`,
+        "utf8",
+      );
+      expect(child.stdin.write).toHaveBeenCalledWith(
+        `${JSON.stringify({ type: "extension_ui_response", id: "input-1", cancelled: true })}\n`,
+        "utf8",
+      );
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a prompt when the RPC worker rejects it", async () => {
     const f = await fixture();
     try {

@@ -297,6 +297,8 @@ it("mounts the shared agent profile read-only as one complete profile", async ()
       "--dir", "/runtime/agent",
       "--ro-bind", path.join(agentDir, "settings.json"), "/runtime/agent/settings.json",
       "--setenv", "PI_CODING_AGENT_DIR", "/runtime/agent",
+      "--setenv", "XDG_RUNTIME_DIR", "/tmp/agent-browser",
+      "--setenv", "PATH", "/app/agent/bin:/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
     ]));
     expect(args[args.indexOf(agentDir) - 1]).toBe("--ro-bind");
     expect(args).toEqual(expect.arrayContaining(["--remount-ro", "/app"]));

@@ -420,7 +420,7 @@ describe("PiWorker", () => {
       const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
       await worker.start();
 
-      child.stdout.emit("data", "x".repeat(32 * 1024 * 1024 + 1));
+      child.stdout.emit("data", "x".repeat(128 * 1024 * 1024 + 1));
 
       await expect(worker.prompt("must be rejected")).rejects.toThrow("Pi RPC stdout line exceeded");
       await expect(worker.waitForSettled()).rejects.toThrow("Pi RPC stdout line exceeded");

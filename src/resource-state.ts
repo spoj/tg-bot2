@@ -19,8 +19,8 @@ type ResourceStateFile = {
   resources: ResourceOwnership[];
 };
 
-const MAX_RESOURCE_STATE_BYTES = 4 * 1024 * 1024;
-const MAX_RESOURCE_ENTRIES = 8_192;
+const MAX_RESOURCE_STATE_BYTES = 32 * 1024 * 1024;
+const MAX_RESOURCE_ENTRIES = 65_536;
 const READ_FILE = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
 
 function mapKey(connectorId: string, kind: ResourceKind, key: string): string {

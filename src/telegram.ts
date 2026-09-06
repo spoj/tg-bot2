@@ -11,7 +11,7 @@ import { SerialQueue } from "./queue.js";
 import type { WorkspaceOutboxRequest, WorkspaceOutboxDispatchResult } from "./outbox-protocol.js";
 import { WorkspaceResources } from "./resource-state.js";
 import { telegramAddress, telegramConversation } from "./telegram-ref.js";
-const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
+const ATTACHMENT_FETCH_TIMEOUT_MS = 2 * 60_000;
 const ATTACHMENT_RETRY_FALLBACK_MS = 100;
 const MAX_ATTACHMENT_RETRY_AFTER_MS = 60_000;
 const MAX_ATTACHMENT_ATTEMPTS = 3;

@@ -56,7 +56,7 @@ describe("WorkspaceResources", () => {
     const dataDir = await temporaryDirectory();
     const filePath = path.join(dataDir, "run", "resources.json");
     const resources = new WorkspaceResources(filePath);
-    const seed = Array.from({ length: 10_000 }, (_, index) => {
+    const seed = Array.from({ length: 70_000 }, (_, index) => {
       const owner = conversationAgent("custom:owner", `channel-${index}`, { channel: `channel-${index}` });
       return { connectorId: owner.connectorId, kind: "message" as const, key: `message-${index}`, owner };
     });
@@ -64,9 +64,9 @@ describe("WorkspaceResources", () => {
     await resources.start(seed);
 
     expect(resources.owner("custom:owner", "message", "message-0")).toBeUndefined();
-    expect(resources.owner("custom:owner", "message", "message-9999")).toEqual(seed.at(-1)!.owner);
+    expect(resources.owner("custom:owner", "message", "message-69999")).toEqual(seed.at(-1)!.owner);
     const persisted = JSON.parse(await readFile(filePath, "utf8")) as { resources: unknown[] };
-    expect(persisted.resources).toHaveLength(8_192);
+    expect(persisted.resources).toHaveLength(65_536);
   });
 
   it("treats the newest duplicate row as the newest ownership", async () => {
@@ -78,7 +78,7 @@ describe("WorkspaceResources", () => {
     const resources = new WorkspaceResources(filePath);
     const rows = [
       { connectorId: oldOwner.connectorId, kind: "message" as const, key: "duplicate", owner: oldOwner },
-      ...Array.from({ length: 8_192 }, (_, index) => {
+      ...Array.from({ length: 65_536 }, (_, index) => {
         const owner = conversationAgent("custom:owner", `channel-${index}`, { channel: `channel-${index}` });
         return { connectorId: owner.connectorId, kind: "message" as const, key: `message-${index}`, owner };
       }),
@@ -90,7 +90,7 @@ describe("WorkspaceResources", () => {
 
     expect(resources.owner("custom:duplicate", "message", "duplicate")).toEqual(newestOwner);
     expect(resources.owner("custom:owner", "message", "message-0")).toBeUndefined();
-    expect(JSON.parse(await readFile(filePath, "utf8")).resources).toHaveLength(8_192);
+    expect(JSON.parse(await readFile(filePath, "utf8")).resources).toHaveLength(65_536);
   });
 
   it("rolls back set when the serialized state exceeds its size limit", async () => {
@@ -101,7 +101,7 @@ describe("WorkspaceResources", () => {
 
     await resources.start([{ connectorId: original.connectorId, kind: "message", key: "message-1", owner: original }]);
     const before = await readFile(filePath, "utf8");
-    const oversized = conversationAgent("custom:oversized", "channel-oversized", { value: "x".repeat(4 * 1024 * 1024) });
+    const oversized = conversationAgent("custom:oversized", "channel-oversized", { value: "x".repeat(32 * 1024 * 1024) });
 
     await expect(resources.set({ connectorId: oversized.connectorId, kind: "message", key: "message-oversized", owner: oversized })).rejects.toThrow("Resource state exceeds");
     expect(resources.owner(original.connectorId, "message", "message-1")).toBe(original);
@@ -118,7 +118,7 @@ describe("WorkspaceResources", () => {
 
     await resources.start([{ connectorId: original.connectorId, kind: "message", key: "message-1", owner: original }]);
     const before = await readFile(filePath, "utf8");
-    const oversized = conversationAgent("custom:oversized", "channel-oversized", { value: "x".repeat(4 * 1024 * 1024) });
+    const oversized = conversationAgent("custom:oversized", "channel-oversized", { value: "x".repeat(32 * 1024 * 1024) });
 
     await expect(resources.setMany([
       { connectorId: original.connectorId, kind: "message", key: "message-1", owner: replacement },

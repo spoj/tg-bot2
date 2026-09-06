@@ -26,7 +26,6 @@ TimeoutStopSec=10s
 # Aggregate limits for the application and all child Bubblewrap processes.
 # EDIT REQUIRED: tune these values for the deployment.
 CPUQuota=200%
-MemoryMax=1G
 TasksMax=256
 
 [Install]

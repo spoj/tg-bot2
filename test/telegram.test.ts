@@ -1178,7 +1178,7 @@ describe("Telegram ingress and native event preservation", () => {
     const directory = path.join(test.config.attachments, "42", "2023-11-14", "17");
     await expect(readdir(directory)).resolves.toEqual([expect.stringMatching(/^\.stalled\.bin\..+\.part$/)]);
 
-    vi.advanceTimersByTime(30_000);
+    vi.advanceTimersByTime(2 * 60_000);
     await Promise.resolve();
     await Promise.resolve();
     expect(cancellationStarted).toBe(true);
@@ -1306,7 +1306,7 @@ describe("Telegram ingress and native event preservation", () => {
       },
     } as never);
     await waitForRetryTimer();
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
     expect(signals).toHaveLength(1);
     expect(signals[0]?.aborted).toBe(true);
     await vi.advanceTimersByTimeAsync(99);

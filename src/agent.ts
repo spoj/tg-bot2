@@ -89,7 +89,7 @@ const NOTIFICATION_COMPACTION_THRESHOLD = 128;
 const MAX_PENDING_NOTIFICATIONS = 1_024;
 const TIMELINE_RETRY_BASE_MS = 1_000;
 const TIMELINE_RETRY_MAX_MS = 30_000;
-const WORKER_SHUTDOWN_ACTION_CAP_MS = 1_000;
+const WORKER_SHUTDOWN_ACTION_CAP_MS = 10_000;
 function managerShutdownError(): Error {
   const error = new Error("Agent manager is shutting down");
   error.name = "AbortError";

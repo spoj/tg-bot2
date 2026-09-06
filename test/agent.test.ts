@@ -5,6 +5,7 @@ import { expect, it, vi, type Mock } from "vitest";
 import {
   AgentEventRouter,
   AgentManager,
+  runtimePrompt,
   USER_INTERRUPT_MAX_WAIT_MS,
   type AgentNotifier,
   type AgentWorker,
@@ -16,6 +17,15 @@ import { ConnectorRegistry, type WorkspaceConnector } from "../src/connector.js"
 import type { TimelineRecord } from "../src/events.js";
 import { AgentCredentials } from "../src/host-bridge.js";
 import { telegramConversation } from "../src/telegram-ref.js";
+
+it("builds the enforced runtime prompt around connector-specific instructions", () => {
+  const prompt = runtimePrompt("connector instructions", "/workspace/.pi/sessions/chat/notifications.json");
+  expect(prompt).toContain("Assistant text is not delivered; communicate through send.");
+  expect(prompt).toContain("/run/timeline.jsonl");
+  expect(prompt).toContain("schedule_add");
+  expect(prompt).toContain("connector instructions");
+  expect(prompt).toContain("/workspace/.pi/sessions/chat/notifications.json");
+});
 
 type FakeWorker = AgentWorker & {
   options: AgentWorkerOptions;

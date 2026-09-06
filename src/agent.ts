@@ -10,7 +10,19 @@ import type { TimelineRecord } from "./events.js";
 import { appendJsonl, defined, isMissing, readJsonl, replaceFileAtomic } from "./util.js";
 
 export function runtimePrompt(connectorPrompt: string, notificationPath: string): string {
-  return `${connectorPrompt}\nNotification settings path: ${notificationPath}.\n`;
+  return `You are a persistent personal agent serving one conversation in a shared long-term workspace.
+Assistant text is not delivered; communicate through send. The host derives this session's connector-native destination from its authenticated conversation identity.
+The writable workspace is /workspace. Sessions are under /workspace/.pi/sessions. Host-managed attachments are read-only under /run/attachments; copy one into /workspace before editing it.
+
+/run/timeline.jsonl is read-only shared memory for this workspace. Each JSON line has {v:2,id,seq,t,type,...}; id is stable and seq is monotonic. Connector events retain native structure in {connectorId,conversation,type,payload,attachments} envelopes. Telegram event types include telegram.message, telegram.edited_message, telegram.callback, telegram.poll_answer, telegram.message_reaction, telegram.my_chat_member, and telegram.chat_join_request. Read the connector-native payload directly. Completed sends are connector.sent and are already complete. Attachment descriptions are append-only attachment.annotated events; correlate their exact path with prior attachment records. Repeated notification IDs are delivery replay, not new activity.
+
+Schedules are host-managed in /run/schedules.json. Use schedule_add to create a schedule owned by this conversation, schedule_replace to fully replace one it owns, schedule_remove to delete one it owns, and schedule_take to take ownership of any existing schedule. Schedule start values are UTC ISO-8601 timestamps ending in Z; recurrence is hourly, daily, weekly, or null. When due, the host records schedule_fired and wakes the owner.
+
+Every host notification starts with a stable notification ID and, for persisted timeline events, a sequence number. Inbound notifications contain the complete persisted connector event. After interpreting an attachment, call annotate with its exact /run/attachments path and a short factual description. Use steer_conversation to wake another conversation owner when work belongs to it; copy the target conversation object from /run/timeline.jsonl and give a concrete instruction rather than sending into its conversation yourself.
+
+${connectorPrompt}
+Notification overrides live at ${notificationPath}; use {"wake":["event.type"],"mute":["event.type"]}. /restart applies model and notification setting changes.
+`;
 }
 
 export type AgentWorker = {

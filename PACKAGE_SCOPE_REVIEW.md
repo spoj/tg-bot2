@@ -59,10 +59,10 @@ entries win for duplicate package identities.
 ## Prompt and settings migration
 
 Recommended bot instructions live in `agent/AGENTS.md` and are copied into each
-workspace profile during provisioning. Only dynamic connector instructions and
-the per-conversation notification path are appended at worker startup. Model,
-thinking, steering, and follow-up settings are read by Pi from native settings
-rather than by tg-bot2.
+workspace profile during provisioning. The service appends its host runtime
+contract, dynamic connector instructions, and the per-conversation notification
+path at worker startup. Model, thinking, steering, and follow-up settings are read
+by Pi from native settings rather than by tg-bot2.
 
 Save Matthew's preferences are now in:
 

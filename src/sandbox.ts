@@ -136,8 +136,6 @@ export type PiRunSandboxPaths = {
   appRoot: string;
   cliPath?: string;
   appendSystemPrompt?: string;
-  /** Host directory for the shared Pi global profile. */
-  agentDir?: string;
   /** In-sandbox directory for session files; defaults to /workspace/.pi/sessions. */
   sessionDir?: string;
   /** Continue the latest session in sessionDir instead of creating a new session. */
@@ -190,24 +188,6 @@ function buildExtensionArgs(hostToolsExtension: string | undefined, hostTools: s
   return { mountArgs, cliArgs };
 }
 
-async function buildAgentMountArgs(agentDir: string | undefined): Promise<string[]> {
-  if (agentDir === undefined) return [];
-  const directory = await requireRealDirectory(agentDir, "Harness Pi agent directory", path.resolve(agentDir));
-  const resources = (await readdir(directory)).flatMap((name) => [
-    "--ro-bind", path.join(directory, name), path.posix.join("/runtime/agent", name),
-  ]);
-  return [
-    "--ro-bind", directory, "/app/agent",
-    "--tmpfs", "/runtime",
-    "--dir", "/runtime/agent",
-    ...resources,
-  ];
-}
-
-function buildAgentEnvironment(agentDir: string | undefined): string[] {
-  return agentDir === undefined ? [] : ["--setenv", "PI_CODING_AGENT_DIR", "/runtime/agent"];
-}
-
 function appendNodeDirectoryMount(args: string[], nodePath: string, runtimePaths: readonly string[]): void {
   // requireExecutable returns the canonical realpath, so dirname() is the real parent
   // dir even through symlink chains; skip when an already-bound prefix covers it.
@@ -249,7 +229,6 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   const hostToolsExtension = paths.hostTools === undefined
     ? undefined
     : await requireHostToolsExtension(appRoot);
-  const agentMountArgs = await buildAgentMountArgs(paths.agentDir);
   const { mountArgs, cliArgs } = buildExtensionArgs(hostToolsExtension, paths.hostTools);
   const nodePath = await requireExecutable("node");
   const runtimePaths = [...(await existing(["/bin"])), ...(await runtimeLibraryPaths())];
@@ -284,7 +263,6 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--dir", "/tmp/agent-browser",
     "--tmpfs", "/app",
     "--ro-bind", nodeModules, "/app/node_modules",
-    ...agentMountArgs,
     "--bind", workspace, "/workspace",
     "--ro-bind", nodeModules, "/workspace/node_modules",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--ro-bind", paths.appendSystemPrompt, "/app/append-system-prompt.md"]),
@@ -298,8 +276,8 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--setenv", "HOME", "/workspace",
     "--setenv", "TMPDIR", "/tmp",
     "--setenv", "XDG_RUNTIME_DIR", "/tmp/agent-browser",
-    "--setenv", "PATH", `${paths.agentDir === undefined ? "" : "/app/agent/bin:"}/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin`,
-    ...buildAgentEnvironment(paths.agentDir),
+    "--setenv", "PATH", "/workspace/.pi/agent/bin:/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
     "--setenv", "NPM_CONFIG_CACHE", "/workspace/.cache/npm",
     "--setenv", "NPM_CONFIG_PREFIX", "/workspace/.local",
     "--setenv", "UV_CACHE_DIR", "/workspace/.cache/uv",

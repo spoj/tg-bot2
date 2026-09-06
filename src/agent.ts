@@ -26,7 +26,6 @@ export type AgentWorker = {
 export type AgentWorkerOptions = {
   workspace: string;
   sessionDir: string;
-  agentDir: string;
   appRoot: string;
   bwrapPath?: string;
   appendSystemPrompt?: string;
@@ -50,7 +49,6 @@ export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | 
 
 export type AgentManagerOptions = {
   appRoot: string;
-  agentDir: string;
   credentials: AgentCredentials;
   notificationsPath: string;
   connectorPrompt: (connectorId: string) => string;
@@ -156,7 +154,6 @@ function parseQueuedNotification(value: unknown): PendingNotification {
 export class AgentManager {
   private readonly workspace: string;
   private readonly appRoot: string;
-  private readonly agentDir: string;
   private readonly credentials: AgentCredentials;
   private readonly notificationsPath: string;
   private readonly connectorPrompt: (connectorId: string) => string;
@@ -196,7 +193,6 @@ export class AgentManager {
   constructor(config: { workspace: string }, options: AgentManagerOptions) {
     this.workspace = config.workspace;
     this.appRoot = options.appRoot;
-    this.agentDir = options.agentDir;
     this.credentials = options.credentials;
     this.notificationsPath = path.resolve(options.notificationsPath);
     this.connectorPrompt = options.connectorPrompt;
@@ -744,7 +740,6 @@ export class AgentManager {
         workspace: this.workspace,
         sessionDir,
         appRoot: this.appRoot,
-        agentDir: this.agentDir,
         agentToken: token,
         now: this.now,
         ...defined({

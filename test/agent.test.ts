@@ -108,7 +108,6 @@ const CHAT = telegramConversation(CONNECTOR_ID, 123);
 function managerOptions(dataDir: string, overrides: Record<string, unknown> = {}): ConstructorParameters<typeof AgentManager>[1] {
   return {
     appRoot: "/tmp/tg-bot2-app",
-    agentDir: path.join(dataDir, "agent"),
     credentials: new AgentCredentials(),
     notificationsPath: path.join(dataDir, "notifications.jsonl"),
     connectorPrompt: () => CONNECTOR_PROMPT,

@@ -15,21 +15,22 @@ pnpm install
 mkdir -p ~/.local/share/tg-bot2/workspaces/main/connectors
 echo '{"token": "<TG_BOT_TOKEN>"}' > ~/.local/share/tg-bot2/workspaces/main/connectors/telegram-<botId>.json
 chmod 600 ~/.local/share/tg-bot2/workspaces/main/connectors/telegram-<botId>.json
-# Provision the shared Pi profile before starting workers.
+# Provision this workspace's writable Pi profile before starting workers.
 DATA_DIR="${DATA_DIR:-$HOME/.local/share/tg-bot2}"
-mkdir -p "$DATA_DIR/agent/npm" "$DATA_DIR/agent/git"
-[ -s "$DATA_DIR/agent/settings.json" ] || cp agent/settings.json "$DATA_DIR/agent/settings.json"
-[ -s "$DATA_DIR/agent/AGENTS.md" ] || cp agent/AGENTS.md "$DATA_DIR/agent/AGENTS.md"
-PI_CODING_AGENT_DIR="$DATA_DIR/agent" ./node_modules/.bin/pi update --extensions
-npm install --global --prefix "$DATA_DIR/agent" --allow-scripts=agent-browser agent-browser@0.36.0
-agent_browser_bin="$(readlink -f "$DATA_DIR/agent/bin/agent-browser")"
-install -m 0755 "$agent_browser_bin" "$DATA_DIR/agent/bin/agent-browser.tmp"
-mv "$DATA_DIR/agent/bin/agent-browser.tmp" "$DATA_DIR/agent/bin/agent-browser"
+AGENT_DIR="$DATA_DIR/workspaces/main/workspace/.pi/agent"
+mkdir -p "$AGENT_DIR/npm" "$AGENT_DIR/git"
+[ -s "$AGENT_DIR/settings.json" ] || cp agent/settings.json "$AGENT_DIR/settings.json"
+[ -s "$AGENT_DIR/AGENTS.md" ] || cp agent/AGENTS.md "$AGENT_DIR/AGENTS.md"
+PI_CODING_AGENT_DIR="$AGENT_DIR" ./node_modules/.bin/pi update --extensions
+npm install --global --prefix "$AGENT_DIR" --allow-scripts=agent-browser agent-browser@0.36.0
+agent_browser_bin="$(readlink -f "$AGENT_DIR/bin/agent-browser")"
+install -m 0755 "$agent_browser_bin" "$AGENT_DIR/bin/agent-browser.tmp"
+mv "$AGENT_DIR/bin/agent-browser.tmp" "$AGENT_DIR/bin/agent-browser"
 pnpm build
 pnpm start
 ```
 
-A single host loads every workspace under `$DATA_DIR/workspaces/` (defaults to `~/.local/share/tg-bot2`). Connector instances configured in one workspace share its writable `workspace/`, timeline, and schedules. Pi's shared harness profile and deployment-owned executables live under `$DATA_DIR/agent/` and must be provisioned before workers start. Workers receive them read-only as `/app/agent`, with `/app/agent/bin` on `PATH`. Install `agent-browser` there as shown above; the final copy replaces npm's host-absolute symlink with a sandbox-safe executable. Browser daemon sockets use the worker-private `/tmp/agent-browser`. The profile's top-level resources are also mounted read-only into an ephemeral `/runtime/agent` directory whose writable parent lets Pi create adjacent lock files while reading profile state. Profile files remain immutable and runtime locks disappear with the worker. The repository's `agent/` files are deployment defaults, not runtime fallbacks. Run explicit package maintenance on the host with `PI_CODING_AGENT_DIR="$DATA_DIR/agent" ./node_modules/.bin/pi update --extensions`, then restart workers. Workspace-level Pi settings and packages live under `/workspace/.pi/`. A systemd unit example lives at `deploy/tg-bot2.service.example`. Only the workspace-first layout is supported.
+A single host loads every workspace under `$DATA_DIR/workspaces/` (defaults to `~/.local/share/tg-bot2`). Connector instances configured in one workspace share its writable `workspace/`, timeline, schedules, and Pi profile at `workspace/.pi/agent/`. The repository's `agent/` files seed recommended instructions and packages when a workspace is provisioned; after that, each bot owns and may update its profile independently, including `pi update --models` and `pi update --extensions`. Install `agent-browser` there as shown above; the final copy replaces npm's host-absolute symlink with a sandbox-safe executable. Browser daemon sockets use the worker-private `/tmp/agent-browser`. Service-enforced host tools remain outside the profile: the host mounts `extensions/host-tools.ts` read-only and loads it explicitly for every worker. Project-level Pi settings and packages remain directly under `/workspace/.pi/`. A systemd unit example lives at `deploy/tg-bot2.service.example`. Only the workspace-first layout is supported.
 
 Attachment files live under `DATA_DIR/workspaces/<workspaceId>/attachments/`, in connector-specific subdirectories. The whole attachment tree, including partial downloads, has a 50 GiB hard cap. New attachments are rejected when they would exceed it, while completed files are never evicted automatically; remove old files manually when space is needed. Failed staging and failed Telegram deliveries clean up only the new staged files.
 

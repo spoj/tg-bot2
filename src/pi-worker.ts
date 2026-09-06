@@ -148,6 +148,7 @@ async function prepareWorkspace(workspace: string): Promise<void> {
   await ensurePrivateDirectory(workspace);
   for (const relative of [
     ".pi",
+    ".pi/agent",
     ".pi/npm",
     ".pi/git",
     ".pi/sessions",
@@ -293,7 +294,6 @@ export class PiWorker {
       ...defined({
         cliPath: this.options.cliPath,
         appendSystemPrompt: promptFile,
-        agentDir: this.options.agentDir,
         sessionDir: this.options.sessionDir,
         continueSession: this.options.continueSession,
         hostTools: this.options.hostTools,

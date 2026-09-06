@@ -15,9 +15,9 @@ This migration does not change `~/.pi/agent/`.
 | `git:github.com/spoj/pi-show-herdr` | Not added |
 | `npm:@gregjohnso/pi-monitor` | Removed from Save Matthew |
 
-Deployment-default harness packages are declared in the repository's
-`agent/settings.json`, not in `package.json`. Deployment provisions them into
-Pi's native global package scope before workers start.
+Recommended packages are declared in the repository's `agent/settings.json`,
+not in `package.json`. Deployment uses these defaults to provision each
+workspace-owned Pi profile before workers start.
 
 ## Pi runtime
 
@@ -29,36 +29,40 @@ The tg-bot2 repository pins Pi `0.85.0` independently of personal Pi:
 
 ## Native Pi scope layout
 
-The deployment-owned Pi profile is `$DATA_DIR/agent/`, mounted entirely
-read-only into every worker as `/app/agent`. Its top-level resources are also
-mounted read-only into an ephemeral `/runtime/agent` directory whose writable
-parent lets Pi create adjacent lock files while reading profile state. Profile
-files remain immutable and runtime locks disappear with the worker. Deployment initialization must create its `npm/` and `git/` stores,
-provision `settings.json` and `AGENTS.md`, and materialize every configured package
-before workers start. The repository's `agent/` files are defaults for that
-explicit provisioning step; runtime code does not seed, install, or update profile
-resources. Package caches and the shared `auth.json` remain in `$DATA_DIR/agent/`;
-package updates are explicit host maintenance (`PI_CODING_AGENT_DIR="$DATA_DIR/agent" ./node_modules/.bin/pi update --extensions`) followed by a worker restart.
+Each bot owns a writable Pi profile at
+`$DATA_DIR/workspaces/<workspaceId>/workspace/.pi/agent/`, exposed inside its
+workers at `/workspace/.pi/agent/`. Deployment initialization must create its
+`npm/` and `git/` stores, provision `settings.json`, `AGENTS.md`, and credentials,
+and materialize the recommended packages before workers start. The repository's
+`agent/` files are defaults for that explicit per-workspace provisioning step.
+After provisioning, the bot may update its own model catalog and packages without
+affecting another workspace.
 
-Each bot workspace uses native project scope:
+Service-enforced host tools do not live in the writable profile. The host mounts
+`extensions/host-tools.ts` read-only under `/app/extensions/`, loads it with an
+explicit `--extension` argument, and limits it with authenticated host capabilities.
+
+Each bot workspace uses these native Pi scopes:
 
 ```text
-/workspace/.pi/settings.json
-/workspace/.pi/npm/
-/workspace/.pi/git/
+/workspace/.pi/agent/          # writable user profile, catalog, and recommended packages
+/workspace/.pi/settings.json   # project settings
+/workspace/.pi/npm/            # project packages
+/workspace/.pi/git/            # project packages
 /workspace/.pi/sessions/
 ```
 
 Project settings can add packages with `pi install -l <source>`. Pi combines
-`/app/agent/settings.json` with `/workspace/.pi/settings.json`; project entries
-win for duplicate package identities.
+`/workspace/.pi/agent/settings.json` with `/workspace/.pi/settings.json`; project
+entries win for duplicate package identities.
 
 ## Prompt and settings migration
 
-Static harness instructions live in `agent/AGENTS.md`. Only dynamic connector
-instructions and the per-conversation notification path are appended at worker
-startup. Model, thinking, steering, and follow-up settings are read by Pi from
-native settings rather than by tg-bot2.
+Recommended bot instructions live in `agent/AGENTS.md` and are copied into each
+workspace profile during provisioning. Only dynamic connector instructions and
+the per-conversation notification path are appended at worker startup. Model,
+thinking, steering, and follow-up settings are read by Pi from native settings
+rather than by tg-bot2.
 
 Save Matthew's preferences are now in:
 
@@ -66,6 +70,8 @@ Save Matthew's preferences are now in:
 $DATA_DIR/workspaces/8442941973/workspace/.pi/settings.json
 ```
 
-The obsolete `$DATA_DIR/workspaces/8442941973/workspace/.pi/agent/` directory
-was removed. The existing Save Matthew `auth.json` was moved to the shared
-`$DATA_DIR/agent/auth.json` profile as agreed.
+Save Matthew's Pi profile, including its credentials and model catalog, lives at:
+
+```text
+$DATA_DIR/workspaces/8442941973/workspace/.pi/agent/
+```

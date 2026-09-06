@@ -280,30 +280,22 @@ it("rejects a missing host-tools extension before building argv", async () => {
     await rm(f.root, { recursive: true, force: true });
   }
 });
-it("mounts the shared agent profile read-only as one complete profile", async () => {
+it("uses the writable workspace Pi profile", async () => {
   const f = await fixture();
   const appRoot = path.join(f.root, "app");
   const cli = path.join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-  const agentDir = path.join(f.root, "agent-state");
   try {
     await mkdir(path.dirname(cli), { recursive: true });
     await writeFile(cli, "#!/bin/sh\n", { mode: 0o700 });
-    await mkdir(agentDir);
-    await writeFile(path.join(agentDir, "settings.json"), "{}\n");
-    const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot, agentDir });
+    const { args } = await buildPiRunBwrapArgs({ workspace: f.workspace, appRoot });
     expect(args).toEqual(expect.arrayContaining([
-      "--ro-bind", agentDir, "/app/agent",
-      "--tmpfs", "/runtime",
-      "--dir", "/runtime/agent",
-      "--ro-bind", path.join(agentDir, "settings.json"), "/runtime/agent/settings.json",
-      "--setenv", "PI_CODING_AGENT_DIR", "/runtime/agent",
+      "--setenv", "PI_CODING_AGENT_DIR", "/workspace/.pi/agent",
       "--setenv", "XDG_RUNTIME_DIR", "/tmp/agent-browser",
-      "--setenv", "PATH", "/app/agent/bin:/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
+      "--setenv", "PATH", "/workspace/.pi/agent/bin:/workspace/.local/bin:/app/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
     ]));
-    expect(args[args.indexOf(agentDir) - 1]).toBe("--ro-bind");
     expect(args).toEqual(expect.arrayContaining(["--remount-ro", "/app"]));
-    expect(args).not.toContain("/app/agent/settings.json");
-    expect(args).not.toContain("/app/agent/AGENTS.md");
+    expect(args).not.toContain("/app/agent");
+    expect(args).not.toContain("/runtime/agent");
     expect(args).not.toContain("/app/node_modules/pi-exa");
   } finally {
     await rm(f.root, { recursive: true, force: true });

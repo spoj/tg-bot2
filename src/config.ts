@@ -22,7 +22,6 @@ export type Config = TelegramConnectorConfig;
 export type WorkspaceConfig = {
   id: string;
   paths: WorkspacePaths;
-  agentDir: string;
   connectors: TelegramConnectorConfig[];
 };
 
@@ -149,7 +148,6 @@ export async function loadConfig(options: { dataDir?: string; env?: NodeJS.Proce
       workspaces.push({
         id: entry.name,
         paths,
-        agentDir: path.join(dataDir, "agent"),
         connectors: loadedConnectors.map(({ config }) => config),
       });
     }

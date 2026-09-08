@@ -63,7 +63,7 @@ Before deploying the single-profile runtime:
 1. Merge the old `.pi/settings.json` into `.pi/agent/settings.json`, preserving the old project values where they override profile values. Remove `.pi/settings.json` afterward.
 2. Move project-local packages into the profile. For other Pi resources, move them under the profile or explicitly register their existing paths in the profile settings. Rebase any project-relative paths.
 3. Review existing `AGENTS.md` files for obsolete settings paths or copied host instructions. Preserve agent-specific behavior and user preferences; do not replace the profile wholesale.
-4. With workers stopped, merge `.pi/sessions/` into `.pi/agent/sessions/` without overwriting files. Preserve filenames and subdirectories, update absolute `parentSession` paths in session headers, and rebuild any derived history indices. Remove the old directory.
+4. With workers stopped, merge `.pi/sessions/` into `.pi/agent/sessions/` without overwriting files. Preserve filenames and subdirectories and update absolute `parentSession` paths in session headers. Remove the old directory.
 
 Auth, catalogs, sessions, and other workspace data need no reset. Sessions use Pi's native timestamp-and-UUID filenames inside the per-conversation directories; the conversation path is base64url-encoded connector ID and conversation key. There is no automatic migration or subsequent synchronization with repository files.
 

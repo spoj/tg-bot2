@@ -1049,6 +1049,26 @@ it("routes schedules directly to generic conversation owners", async () => {
   );
 });
 
+it.each(["schedule_added", "schedule_replaced", "schedule_removed"])("keeps %s audit events silent", async (type) => {
+  const followup = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => undefined);
+  const markTimelineProcessed = vi.fn(async () => undefined);
+  const { connector, connectors } = fakeTelegramConnector();
+  const router = new AgentEventRouter({ followup, interrupt, markTimelineProcessed }, { workspace: "/nonexistent/tg-bot2-router", connectors });
+  const actor = telegramConversation(CONNECTOR_ID, 42, 7);
+  const record: TimelineRecord = {
+    v: 2, id: "audit-event", seq: 12, t: "2026-08-24T00:00:00.000Z",
+    type, conversation: actor, actor, scheduleId: "schedule-1",
+  };
+
+  await router.onEvent(record, JSON.stringify(record));
+
+  expect(interrupt).not.toHaveBeenCalled();
+  expect(followup).not.toHaveBeenCalled();
+  expect(connector.attention).not.toHaveBeenCalled();
+  expect(markTimelineProcessed).toHaveBeenCalledWith(12);
+});
+
 it("connector edited events remain silent without waking the agent", async () => {
   const followup = vi.fn(async () => undefined);
   const interrupt = vi.fn(async () => undefined);

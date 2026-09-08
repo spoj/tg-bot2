@@ -31,9 +31,10 @@ async function fixture(): Promise<string> {
   return dataDir;
 }
 
-async function timeline(dataDir: string): Promise<Array<Record<string, unknown>>> {
+async function timeline(dataDir: string, type?: string): Promise<Array<Record<string, unknown>>> {
   const raw = await readFile(path.join(dataDir, "timeline.jsonl"), "utf8");
-  return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  const records = raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  return type === undefined ? records : records.filter((record) => record.type === type);
 }
 
 type SchedulerState = {
@@ -72,7 +73,7 @@ describe("WorkspaceScheduler", () => {
     expect((await schedules(dataDir)).schedules).toEqual([created]);
 
     await first.poll(NOW);
-    expect(await timeline(dataDir)).toMatchObject([{
+    expect(await timeline(dataDir, "schedule_fired")).toMatchObject([{
       type: "schedule_fired",
       scheduleId: created.id,
       occurrenceId: expect.any(String),
@@ -84,8 +85,78 @@ describe("WorkspaceScheduler", () => {
 
     await first.poll(NOW);
     await makeScheduler(dataDir).scheduler.poll(NOW);
-    expect(await timeline(dataDir)).toHaveLength(1);
+    expect(await timeline(dataDir, "schedule_fired")).toHaveLength(1);
   });
+  it("records the actor and before/after state for additions, replacements, and removals", async () => {
+    const dataDir = await fixture();
+    const scheduler = makeScheduler(dataDir).scheduler;
+    const created = await scheduler.add(input, OWNER);
+    const replacement = await scheduler.replace({ ...created, prompt: "water the garden" }, OWNER);
+    await scheduler.remove({ id: created.id }, OWNER);
+
+    const records = await timeline(dataDir);
+    expect(records).toMatchObject([
+      { type: "schedule_added", scheduleId: created.id, actor: OWNER, conversation: OWNER, before: null, after: created },
+      { type: "schedule_replaced", scheduleId: created.id, actor: OWNER, conversation: OWNER, before: created, after: replacement },
+      { type: "schedule_removed", scheduleId: created.id, actor: OWNER, conversation: OWNER, before: replacement, after: null },
+    ]);
+    for (const record of records) {
+      expect(record).toMatchObject({ v: 2, id: expect.any(String), seq: expect.any(Number), t: expect.any(String) });
+      expect(Number.isFinite(Date.parse(record.t as string))).toBe(true);
+    }
+    expect((await schedules(dataDir)).schedules).toEqual([]);
+
+    await makeScheduler(dataDir).scheduler.poll(NOW);
+    expect(await timeline(dataDir)).toEqual(records);
+  });
+
+  it("does not record rejected schedule changes", async () => {
+    const dataDir = await fixture();
+    const scheduler = makeScheduler(dataDir).scheduler;
+    await expect(scheduler.add({ ...input, prompt: "" }, OWNER)).rejects.toThrow("invalid prompt");
+    const created = await scheduler.add(input, OWNER);
+    const records = await timeline(dataDir);
+    expect(records).toHaveLength(1);
+    const other = telegramConversation(CONNECTOR_ID, 99);
+
+    await expect(scheduler.replace({ ...created, prompt: "stolen" }, other)).rejects.toThrow("not owned");
+    await expect(scheduler.remove({ id: created.id }, other)).rejects.toThrow("not owned");
+    await expect(scheduler.replace({ ...created, start: "invalid" }, OWNER)).rejects.toThrow("invalid start");
+    await expect(scheduler.remove({ id: "missing" }, OWNER)).rejects.toThrow("does not exist");
+
+    expect(await timeline(dataDir)).toEqual(records);
+    expect((await schedules(dataDir)).schedules).toEqual([created]);
+  });
+
+  it("does not publish a change when saving schedule state fails", async () => {
+    const dataDir = await fixture();
+    const scheduler = makeScheduler(dataDir).scheduler;
+    const created = await scheduler.add(input, OWNER);
+    const records = await timeline(dataDir);
+    const schedulePath = path.join(dataDir, "run", "schedules.json");
+    await rm(schedulePath);
+    await mkdir(schedulePath);
+
+    await expect(scheduler.replace({ ...created, prompt: "unsaved" }, OWNER)).rejects.toThrow();
+    expect(await timeline(dataDir)).toEqual(records);
+
+    await rm(schedulePath, { recursive: true });
+    const replacement = await scheduler.replace({ ...created, prompt: "saved" }, OWNER);
+    expect(await timeline(dataDir, "schedule_replaced")).toMatchObject([{ before: created, after: replacement }]);
+    expect((await schedules(dataDir)).schedules).toEqual([replacement]);
+  });
+
+  it("reports saved state explicitly if the audit publication fails", async () => {
+    const dataDir = await fixture();
+    const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
+    const { scheduler } = makeScheduler(dataDir, { timeline: workspaceTimeline });
+    vi.spyOn(workspaceTimeline, "publish").mockRejectedValueOnce(new Error("timeline unavailable"));
+
+    await expect(scheduler.add(input, OWNER)).rejects.toThrow("Schedule state saved, but timeline publication failed");
+    expect((await schedules(dataDir)).schedules).toMatchObject([{ ...input, owner: OWNER }]);
+    expect(await timeline(dataDir)).toEqual([]);
+  });
+
   it("loads legacy schedule state without a pending journal", async () => {
     const dataDir = await fixture();
     await writeFile(path.join(dataDir, "run", "schedules.json"), JSON.stringify({
@@ -145,14 +216,14 @@ describe("WorkspaceScheduler", () => {
     const dataDir = await fixture();
     const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
     const publish = vi.spyOn(workspaceTimeline, "publish");
-    publish.mockRejectedValueOnce(new Error("timeline unavailable"));
     const { scheduler, errors } = makeScheduler(dataDir, { timeline: workspaceTimeline });
     const created = await scheduler.add(input, OWNER);
+    publish.mockRejectedValueOnce(new Error("timeline unavailable"));
 
     await scheduler.poll(NOW);
 
     expect(errors).toHaveLength(1);
-    expect(await timeline(dataDir)).toEqual([]);
+    expect(await timeline(dataDir, "schedule_fired")).toEqual([]);
     const failedState = await schedules(dataDir);
     expect(failedState.schedules[0]).toMatchObject({ id: created.id, next_due_at: input.start });
     expect(failedState.pending).toHaveLength(1);
@@ -160,7 +231,7 @@ describe("WorkspaceScheduler", () => {
     expect(occurrenceId).toEqual(expect.any(String));
 
     await scheduler.poll(NOW);
-    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, occurrenceId, dueAt: input.start }]);
+    expect(await timeline(dataDir, "schedule_fired")).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, occurrenceId, dueAt: input.start }]);
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: null });
     expect((await schedules(dataDir)).pending).toEqual([]);
   });
@@ -169,14 +240,14 @@ describe("WorkspaceScheduler", () => {
     const dataDir = await fixture();
     const workspaceTimeline = new WorkspaceTimeline(path.join(dataDir, "timeline.jsonl"));
     const publish = vi.spyOn(workspaceTimeline, "publish");
-    publish.mockRejectedValueOnce(new Error("timeline unavailable"));
     const { scheduler, errors } = makeScheduler(dataDir, { timeline: workspaceTimeline });
     const created = await scheduler.add({ ...input, start: "2026-01-08T12:00:00.000Z", recurrence: "daily" }, OWNER);
+    publish.mockRejectedValueOnce(new Error("timeline unavailable"));
 
     await scheduler.poll(NOW);
 
     expect(errors).toHaveLength(1);
-    expect(await timeline(dataDir)).toEqual([]);
+    expect(await timeline(dataDir, "schedule_fired")).toEqual([]);
     const failedState = await schedules(dataDir);
     expect(failedState.schedules[0]).toMatchObject({ id: created.id, next_due_at: created.start });
     expect(failedState.pending).toHaveLength(1);
@@ -184,7 +255,7 @@ describe("WorkspaceScheduler", () => {
     expect(occurrenceId).toEqual(expect.any(String));
 
     await scheduler.poll(NOW);
-    expect(await timeline(dataDir)).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, occurrenceId, dueAt: created.start }]);
+    expect(await timeline(dataDir, "schedule_fired")).toMatchObject([{ type: "schedule_fired", scheduleId: created.id, occurrenceId, dueAt: created.start }]);
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: "2026-01-11T12:00:00.000Z" });
     expect((await schedules(dataDir)).pending).toEqual([]);
   });
@@ -195,7 +266,7 @@ describe("WorkspaceScheduler", () => {
     let failAcknowledgement = true;
     vi.spyOn(workspaceTimeline, "publish").mockImplementation(async (event) => {
       const line = await originalPublish(event);
-      if (failAcknowledgement) {
+      if (event.type === "schedule_fired" && failAcknowledgement) {
         failAcknowledgement = false;
         throw new Error("process interrupted after publication");
       }
@@ -207,7 +278,7 @@ describe("WorkspaceScheduler", () => {
     await scheduler.poll(NOW);
 
     expect(errors).toHaveLength(1);
-    const firstRecord = (await timeline(dataDir))[0];
+    const firstRecord = (await timeline(dataDir, "schedule_fired"))[0];
     expect(firstRecord).toMatchObject({ type: "schedule_fired", scheduleId: created.id, occurrenceId: expect.any(String) });
     const failedState = await schedules(dataDir);
     expect(failedState.pending).toMatchObject([{ scheduleId: created.id, occurrenceId: firstRecord?.occurrenceId }]);
@@ -217,7 +288,7 @@ describe("WorkspaceScheduler", () => {
     const restarted = makeScheduler(dataDir, { timeline: restartedTimeline }).scheduler;
     await restarted.poll(NOW);
 
-    const records = await timeline(dataDir);
+    const records = await timeline(dataDir, "schedule_fired");
     expect(records).toHaveLength(1);
     expect(records[0]).toMatchObject({
       type: "schedule_fired",
@@ -248,8 +319,8 @@ describe("WorkspaceScheduler", () => {
     await scheduler.poll(NOW);
 
     expect(errors).toHaveLength(1);
-    const firstBatch = await timeline(dataDir);
-    expect(firstBatch.filter((record) => record.type === "schedule_fired")).toHaveLength(1);
+    const firstBatch = await timeline(dataDir, "schedule_fired");
+    expect(firstBatch).toHaveLength(1);
     const failedState = await schedules(dataDir);
     expect(failedState.schedules).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: first.id, next_due_at: null }),
@@ -260,8 +331,8 @@ describe("WorkspaceScheduler", () => {
 
     await scheduler.poll(NOW);
 
-    const records = await timeline(dataDir);
-    expect(records.filter((record) => record.type === "schedule_fired")).toHaveLength(2);
+    const records = await timeline(dataDir, "schedule_fired");
+    expect(records).toHaveLength(2);
     expect(records[1]).toMatchObject({ scheduleId: second.id, occurrenceId: pending?.occurrenceId, id: pending?.occurrenceId });
     expect((await schedules(dataDir)).pending).toEqual([]);
   });
@@ -277,7 +348,7 @@ describe("WorkspaceScheduler", () => {
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, recurrence: "daily", next_due_at: "2026-01-11T11:00:00.000Z" });
 
     await scheduler.poll(Date.parse("2026-01-11T11:00:00.000Z"));
-    expect(await timeline(dataDir)).toHaveLength(2);
+    expect(await timeline(dataDir, "schedule_fired")).toHaveLength(2);
   });
 
 
@@ -289,7 +360,7 @@ describe("WorkspaceScheduler", () => {
     await scheduler.poll(NOW);
     expect((await schedules(dataDir)).schedules[0]).toMatchObject({ id: created.id, next_due_at: "2026-01-11T12:00:00.000Z" });
     await scheduler.poll(Date.parse("2026-01-11T12:00:00.000Z"));
-    expect(await timeline(dataDir)).toHaveLength(2);
+    expect(await timeline(dataDir, "schedule_fired")).toHaveLength(2);
   });
 
   it("replaces owned definitions while only a changed start resets next due", async () => {
@@ -322,7 +393,7 @@ describe("WorkspaceScheduler", () => {
 
     const taken = await scheduler.take({ id: created.id }, taker);
     expect(taken).toEqual({ ...created, owner: taker });
-    expect(await timeline(dataDir)).toMatchObject([{
+    expect(await timeline(dataDir, "schedule_taken")).toMatchObject([{
       type: "schedule_taken",
       scheduleId: created.id,
       previousOwner: OWNER,
@@ -340,7 +411,7 @@ describe("WorkspaceScheduler", () => {
 
     await scheduler.take({ id: created.id }, taker);
     await scheduler.poll(NOW);
-    expect((await timeline(dataDir)).filter((event) => event.type === "schedule_fired")).toMatchObject([{ conversation: taker }]);
+    expect(await timeline(dataDir, "schedule_fired")).toMatchObject([{ conversation: taker }]);
   });
 
 
@@ -360,7 +431,7 @@ describe("WorkspaceScheduler", () => {
     const scheduler = makeScheduler(dataDir).scheduler;
     await scheduler.add(input, OWNER);
     await Promise.all([scheduler.poll(NOW), scheduler.poll(NOW), scheduler.poll(NOW)]);
-    expect((await timeline(dataDir)).filter((event) => event.type === "schedule_fired")).toHaveLength(1);
+    expect(await timeline(dataDir, "schedule_fired")).toHaveLength(1);
   });
 
   it("rejects invalid poll intervals", async () => {

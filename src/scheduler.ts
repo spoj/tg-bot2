@@ -3,7 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { sameConversation, type ConversationAgentRef } from "./agent-ref.js";
-import type { WorkspaceTimeline } from "./events.js";
+import type { TimelineEvent, WorkspaceTimeline } from "./events.js";
 import { SerialQueue } from "./queue.js";
 import type { Recurrence, Schedule, ScheduleInput } from "./schedule-protocol.js";
 import { isMissing, readFileBounded } from "./util.js";
@@ -186,7 +186,10 @@ export class WorkspaceScheduler {
       await this.loadState();
       const input = validateInput(params, "schedule_add");
       const schedule: Schedule = { id: randomUUID(), ...input, owner, next_due_at: input.start };
-      await this.commit(() => this.schedules.set(schedule.id, schedule));
+      await this.commit(() => this.schedules.set(schedule.id, schedule), {
+        type: "schedule_added", conversation: owner, actor: owner, scheduleId: schedule.id,
+        before: null, after: schedule,
+      });
       return cloneSchedule(schedule);
     });
   }
@@ -206,6 +209,9 @@ export class WorkspaceScheduler {
       await this.commit(() => {
         this.schedules.set(id, replacement);
         if (input.start !== current.start) this.pending.delete(id);
+      }, {
+        type: "schedule_replaced", conversation: actor, actor, scheduleId: id,
+        before: current, after: replacement,
       });
       return cloneSchedule(replacement);
     });
@@ -216,10 +222,13 @@ export class WorkspaceScheduler {
     return this.writes.run(async () => {
       await this.loadState();
       const id = validateId(params.id);
-      this.ownedSchedule(id, actor);
+      const current = this.ownedSchedule(id, actor);
       await this.commit(() => {
         this.schedules.delete(id);
         this.pending.delete(id);
+      }, {
+        type: "schedule_removed", conversation: actor, actor, scheduleId: id,
+        before: current, after: null,
       });
       return id;
     });
@@ -233,8 +242,9 @@ export class WorkspaceScheduler {
       if (sameConversation(current.owner, actor)) return cloneSchedule(current);
       const previousOwner = current.owner;
       const taken = { ...current, owner: actor };
-      await this.commit(() => this.schedules.set(id, taken));
-      await this.timeline.publish({ type: "schedule_taken", conversation: actor, scheduleId: id, previousOwner });
+      await this.commit(() => this.schedules.set(id, taken), {
+        type: "schedule_taken", conversation: actor, scheduleId: id, previousOwner,
+      });
       return cloneSchedule(taken);
     });
   }
@@ -374,7 +384,7 @@ export class WorkspaceScheduler {
     return schedule;
   }
 
-  private async commit(change: () => unknown): Promise<void> {
+  private async commit(change: () => unknown, event: TimelineEvent): Promise<void> {
     const previousSchedules = new Map(this.schedules);
     const previousPending = new Map(this.pending);
     change();
@@ -383,6 +393,11 @@ export class WorkspaceScheduler {
     } catch (error) {
       this.restore(previousSchedules, previousPending);
       throw error;
+    }
+    try {
+      await this.timeline.publish(event);
+    } catch (error) {
+      throw new Error("Schedule state saved, but timeline publication failed. Check /run/schedules.json and /run/timeline.jsonl before retrying.", { cause: error });
     }
   }
 

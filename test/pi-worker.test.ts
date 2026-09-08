@@ -74,7 +74,7 @@ describe("PiWorker", () => {
       expect(args).toContain("--mode");
       expect(args).toContain("rpc");
       expect(args).toContain("--session-dir");
-      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/sessions");
+      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/agent/sessions");
       expect(args).toContain("--continue");
       expect(args).not.toContain("--model");
       expect(args).not.toContain("--thinking");
@@ -577,13 +577,13 @@ describe("PiWorker", () => {
       const worker = new PiWorker({
         workspace: f.workspace,
         appRoot: f.appRoot,
-        sessionDir: "/workspace/.pi/subagents/alpha/sessions",
+        sessionDir: "/workspace/.pi/agent/subagents/alpha/sessions",
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
       });
       await worker.start();
       const args = spawn.mock.calls[0]?.[1] ?? [];
-      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/subagents/alpha/sessions");
+      expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/agent/subagents/alpha/sessions");
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

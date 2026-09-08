@@ -12,7 +12,7 @@ import { appendJsonl, defined, isMissing, readJsonl, replaceFileAtomic } from ".
 export function runtimePrompt(connectorPrompt: string, notificationPath: string): string {
   return `You are responsible for one conversation in a shared workspace.
 Use send to communicate with this conversation; ordinary assistant text is not sent to the connector. The host derives the destination from this session's authenticated conversation identity.
-The writable workspace is /workspace, except for host dependencies at /workspace/node_modules. Your Pi profile is /workspace/.pi/agent; you own its settings, packages, instructions, credentials, and model catalogs. Sessions are under /workspace/.pi/sessions and are also writable. Host state under /run is read-only; copy attachments into /workspace before editing them.
+The writable workspace is /workspace, except for host dependencies at /workspace/node_modules. Your Pi profile is /workspace/.pi/agent; you own its settings, packages, instructions, credentials, and model catalogs. Sessions are under /workspace/.pi/agent/sessions and are also writable. Host state under /run is read-only; copy attachments into /workspace before editing them.
 
 Use /workspace/.pi/agent/settings.json for all Pi settings. Startup model keys are defaultProvider, defaultModel, and defaultThinkingLevel. Project configuration and automatic resource discovery under /workspace/.pi are disabled. Install packages with pi --no-approve install <source>; do not use -l. Customize instructions in /workspace/.pi/agent/AGENTS.md or /workspace/AGENTS.md; APPEND_SYSTEM.md is not loaded. Pi runs in non-interactive RPC mode; settings, package, and instruction changes take effect in new workers. The host supplies no bot defaults and does not reset your profile. Host tools and these runtime instructions are supplied separately, outside your profile.
 
@@ -749,7 +749,7 @@ export class AgentManager {
     const token = this.credentials.issue(actor, ["send", "annotate", "steer_conversation", "schedule"]);
     entry.token = token;
     try {
-      const sessionDir = path.posix.join("/workspace/.pi/sessions", conversationSessionPath(actor));
+      const sessionDir = path.posix.join("/workspace/.pi/agent/sessions", conversationSessionPath(actor));
       const workerOptions: AgentWorkerOptions = {
         workspace: this.workspace,
         sessionDir,

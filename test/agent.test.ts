@@ -19,7 +19,7 @@ import { AgentCredentials } from "../src/host-bridge.js";
 import { telegramConversation } from "../src/telegram-ref.js";
 
 it("describes the host contract and the agent-owned profile", () => {
-  const prompt = runtimePrompt("connector instructions", "/workspace/.pi/sessions/chat/notifications.json");
+  const prompt = runtimePrompt("connector instructions", "/workspace/.pi/agent/sessions/chat/notifications.json");
   expect(prompt).toContain("ordinary assistant text is not sent to the connector");
   expect(prompt).toContain("Use /workspace/.pi/agent/settings.json for all Pi settings.");
   expect(prompt).toContain("The host supplies no bot defaults");
@@ -27,7 +27,7 @@ it("describes the host contract and the agent-owned profile", () => {
   expect(prompt).toContain("/run/timeline.jsonl");
   expect(prompt).toContain("schedule_add");
   expect(prompt).toContain("connector instructions");
-  expect(prompt).toContain("/workspace/.pi/sessions/chat/notifications.json");
+  expect(prompt).toContain("/workspace/.pi/agent/sessions/chat/notifications.json");
 });
 
 type FakeWorker = AgentWorker & {
@@ -718,7 +718,7 @@ it("restartAll closes active workers and respawns them on the next message", asy
     await manager.followup("one", CHAT);
     expect(workers).toHaveLength(1);
 
-    const sessions = path.join(dataDir, "workspace", ".pi", "sessions");
+    const sessions = path.join(dataDir, "workspace", ".pi", "agent", "sessions");
     await mkdir(sessions, { recursive: true });
     await writeFile(path.join(sessions, "recent.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: "recent" })}\n`, "utf8");
 
@@ -848,15 +848,15 @@ it("manages independent workers and session directories for generic conversation
 
     await manager.followup("Matthew general", matthew);
     expect(workers).toHaveLength(1);
-    expect(workers[0]?.options.sessionDir).toBe(`/workspace/.pi/sessions/${conversationSessionPath(matthew)}`);
+    expect(workers[0]?.options.sessionDir).toBe(`/workspace/.pi/agent/sessions/${conversationSessionPath(matthew)}`);
 
     await manager.followup("Daisy general", daisy);
     expect(workers).toHaveLength(2);
-    expect(workers[1]?.options.sessionDir).toBe(`/workspace/.pi/sessions/${conversationSessionPath(daisy)}`);
+    expect(workers[1]?.options.sessionDir).toBe(`/workspace/.pi/agent/sessions/${conversationSessionPath(daisy)}`);
 
     await manager.followup("Same key, other connector", mirroredKey);
     expect(workers).toHaveLength(3);
-    expect(workers[2]?.options.sessionDir).toBe(`/workspace/.pi/sessions/${conversationSessionPath(mirroredKey)}`);
+    expect(workers[2]?.options.sessionDir).toBe(`/workspace/.pi/agent/sessions/${conversationSessionPath(mirroredKey)}`);
 
     await manager.followup("Matthew follow up", matthew);
     expect(workers).toHaveLength(3);
@@ -1078,7 +1078,7 @@ it("loads attention overrides from the owning conversation session", async () =>
   await withDataDir(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
     const target = telegramConversation(CONNECTOR_ID, 42, 7);
-    const settingsPath = path.join(workspace, ".pi", "sessions", conversationSessionPath(target), "notifications.json");
+    const settingsPath = path.join(workspace, ".pi", "agent", "sessions", conversationSessionPath(target), "notifications.json");
     await mkdir(path.dirname(settingsPath), { recursive: true });
     await writeFile(settingsPath, JSON.stringify({ wake: ["telegram.edited_message"] }), "utf8");
     const interrupt = vi.fn(async () => undefined);
@@ -1108,7 +1108,7 @@ it("falls back when notification settings are a symlink to a special file", asyn
   await withDataDir(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
     const target = telegramConversation(CONNECTOR_ID, 42, 7);
-    const settingsPath = path.join(workspace, ".pi", "sessions", conversationSessionPath(target), "notifications.json");
+    const settingsPath = path.join(workspace, ".pi", "agent", "sessions", conversationSessionPath(target), "notifications.json");
     await mkdir(path.dirname(settingsPath), { recursive: true });
     await symlink("/dev/zero", settingsPath);
     const { connector, connectors } = fakeTelegramConnector();
@@ -1133,11 +1133,11 @@ it("falls back when an intermediate notification settings directory is a symlink
   await withDataDir(async (dataDir) => {
     const workspace = path.join(dataDir, "workspace");
     const target = telegramConversation(CONNECTOR_ID, 42, 7);
-    const outside = path.join(dataDir, "outside", "sessions", conversationSessionPath(target));
+    const outside = path.join(dataDir, "outside", "agent", "sessions", conversationSessionPath(target));
     await mkdir(outside, { recursive: true });
     await writeFile(path.join(outside, "notifications.json"), JSON.stringify({ wake: ["telegram.edited_message"] }), "utf8");
-    await mkdir(path.join(workspace, ".pi"), { recursive: true });
-    await symlink(path.join(dataDir, "outside", "sessions"), path.join(workspace, ".pi", "sessions"));
+    await mkdir(path.join(workspace, ".pi", "agent"), { recursive: true });
+    await symlink(path.join(dataDir, "outside", "agent", "sessions"), path.join(workspace, ".pi", "agent", "sessions"));
 
     const { connector, connectors } = fakeTelegramConnector();
     const router = new AgentEventRouter({ interrupt: vi.fn(async () => undefined), followup: vi.fn(async () => undefined) }, { workspace, connectors });

@@ -37,7 +37,7 @@ Inside a worker, `HOME=/workspace` and `PI_CODING_AGENT_DIR=/workspace/.pi/agent
 | `/workspace/.pi/agent/AGENTS.md`, `/workspace/AGENTS.md` | Agent-owned instructions; Pi loads both when present |
 | `/workspace/.pi/agent/extensions`, `skills`, `prompts`, `themes` | Agent-owned Pi resources |
 | `/workspace/.pi/agent/npm`, `git` | Installed Pi packages |
-| `/workspace/.pi/sessions/` | Writable conversation sessions and per-conversation `notifications.json` |
+| `/workspace/.pi/agent/sessions/` | Writable conversation sessions and per-conversation `notifications.json` |
 
 There are **no tg-bot2 bot defaults or seed files**. Absent configuration uses Pi's built-in defaults. The host creates runtime directories, but does not copy instructions, install a recommended package set, migrate settings, or force model, thinking, steering, or follow-up preferences.
 
@@ -63,8 +63,9 @@ Before deploying the single-profile runtime:
 1. Merge the old `.pi/settings.json` into `.pi/agent/settings.json`, preserving the old project values where they override profile values. Remove `.pi/settings.json` afterward.
 2. Move project-local packages into the profile. For other Pi resources, move them under the profile or explicitly register their existing paths in the profile settings. Rebase any project-relative paths.
 3. Review existing `AGENTS.md` files for obsolete settings paths or copied host instructions. Preserve agent-specific behavior and user preferences; do not replace the profile wholesale.
+4. With workers stopped, merge `.pi/sessions/` into `.pi/agent/sessions/` without overwriting files. Preserve filenames and subdirectories, update absolute `parentSession` paths in session headers, and rebuild any derived history indices. Remove the old directory.
 
-Auth, catalogs, sessions, and other workspace data need no reset. There is no automatic migration or subsequent synchronization with repository files.
+Auth, catalogs, sessions, and other workspace data need no reset. Sessions use Pi's native timestamp-and-UUID filenames inside the per-conversation directories; the conversation path is base64url-encoded connector ID and conversation key. There is no automatic migration or subsequent synchronization with repository files.
 
 ## Chat access and attachments
 

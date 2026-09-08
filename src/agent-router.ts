@@ -8,7 +8,7 @@ import { readRegularFileBounded } from "./util.js";
 const NOTIFICATION_SETTINGS_MAX_BYTES = 1 * 1024 * 1024;
 
 async function loadNotificationSettings(workspace: string, target: ConversationAgentRef): Promise<Record<string, unknown>> {
-  const filePath = path.join(workspace, ".pi", "sessions", conversationSessionPath(target), "notifications.json");
+  const filePath = path.join(workspace, ".pi", "agent", "sessions", conversationSessionPath(target), "notifications.json");
   try {
     const value: unknown = JSON.parse((await readRegularFileBounded(filePath, NOTIFICATION_SETTINGS_MAX_BYTES)).toString("utf8"));
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};

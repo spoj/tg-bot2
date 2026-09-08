@@ -136,7 +136,7 @@ export type PiRunSandboxPaths = {
   appRoot: string;
   cliPath?: string;
   appendSystemPrompt?: string;
-  /** In-sandbox directory for session files; defaults to /workspace/.pi/sessions. */
+  /** In-sandbox directory for session files; defaults to /workspace/.pi/agent/sessions. */
   sessionDir?: string;
   /** Continue the latest session in sessionDir instead of creating a new session. */
   continueSession?: boolean;
@@ -288,7 +288,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
   );
   const piArgs = [
     "--mode", "rpc",
-    "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
+    "--session-dir", paths.sessionDir ?? "/workspace/.pi/agent/sessions",
     ...(paths.continueSession === true ? ["--continue"] : []),
     "--no-approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),

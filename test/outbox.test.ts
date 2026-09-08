@@ -7,6 +7,7 @@ import { ConnectorRegistry } from "../src/connector.js";
 import { WorkspaceTimeline } from "../src/events.js";
 import { WorkspaceOutbox } from "../src/outbox.js";
 import { telegramConversation } from "../src/telegram-ref.js";
+import { OUTBOX_PROMPT } from "../src/outbox-protocol.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -42,6 +43,18 @@ async function events(timelinePath: string): Promise<Array<Record<string, unknow
 }
 
 describe("WorkspaceOutbox", () => {
+  it("documents Telegram HTML for text and captions", () => {
+    expect(OUTBOX_PROMPT).toContain('parse_mode: "HTML"');
+    expect(OUTBOX_PROMPT).toContain("sendMediaGroup");
+    expect(OUTBOX_PROMPT).toContain("each media item");
+    expect(OUTBOX_PROMPT).toContain("&amp;");
+    expect(OUTBOX_PROMPT).toContain("&lt;");
+    expect(OUTBOX_PROMPT).toContain("&gt;");
+    expect(OUTBOX_PROMPT).toContain("not \`<br>\`");
+    expect(OUTBOX_PROMPT).toContain('send({method: "sendMessage", text: "<b>Today</b>\\n• Task — <i>Ted</i>", parse_mode: "HTML"})');
+    expect(OUTBOX_PROMPT).toContain("does not convert Markdown, validate HTML, or silently fall back");
+  });
+
   it("dispatches through the actor's connector and records the connector result", async () => {
     const attachment = "/run/attachments/dGVsZWdyYW06OTk5/42/2026-08-24/request/report.txt";
     const send = vi.fn<WorkspaceConnector["send"]>(async () => ({

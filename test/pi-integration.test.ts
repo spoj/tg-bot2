@@ -10,7 +10,7 @@ import { checkSandboxEnvironment, spawnProcess, terminateProcessGroup } from "..
 const integration = process.env.RUN_BWRAP_TESTS === "1" ? describe : describe.skip;
 
 integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
-  it("boots in bwrap, configures modes, and handles prompt lifecycle without credentials", async () => {
+  it("boots in bwrap, waits for RPC readiness, and handles prompt lifecycle without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "tg-pi-rpc-"));
     const workspace = path.join(root, "workspace");
     await mkdir(workspace, { recursive: true, mode: 0o700 });

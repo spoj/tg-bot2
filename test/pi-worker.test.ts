@@ -55,7 +55,7 @@ async function fixture(): Promise<{ root: string; workspace: string; appRoot: st
 }
 
 describe("PiWorker", () => {
-  it("spawns bwrap with continuation and configures queue modes over RPC", async () => {
+  it("spawns bwrap with continuation and waits for RPC readiness", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
@@ -79,11 +79,15 @@ describe("PiWorker", () => {
       expect(args).not.toContain("--model");
       expect(args).not.toContain("--thinking");
       expect(child.stdin.write).toHaveBeenCalledWith(
-        expect.stringContaining('"type":"set_steering_mode","mode":"all"'),
+        expect.stringContaining('"type":"get_state"'),
         "utf8",
       );
-      expect(child.stdin.write).toHaveBeenCalledWith(
-        expect.stringContaining('"type":"set_follow_up_mode","mode":"all"'),
+      expect(child.stdin.write).not.toHaveBeenCalledWith(
+        expect.stringContaining('"type":"set_steering_mode"'),
+        "utf8",
+      );
+      expect(child.stdin.write).not.toHaveBeenCalledWith(
+        expect.stringContaining('"type":"set_follow_up_mode"'),
         "utf8",
       );
     } finally {
@@ -700,8 +704,8 @@ describe("PiWorker", () => {
       child.stdin.write = vi.fn((chunk: string) => {
         const command = JSON.parse(chunk) as { id?: string; type?: string };
         queueMicrotask(() => {
-          if (command.id === "init-steer") {
-            child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", command: command.type, success: false, error: "failed to set steering" })}\n`);
+          if (command.id === "init-state") {
+            child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", command: command.type, success: false, error: "failed to read state" })}\n`);
           } else {
             child.stdout.emit("data", `${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: {} })}\n`);
           }
@@ -717,7 +721,7 @@ describe("PiWorker", () => {
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
       });
-      await expect(worker.start()).rejects.toThrow("failed to set steering");
+      await expect(worker.start()).rejects.toThrow("failed to read state");
       expect(terminate).toHaveBeenCalledWith(child, "SIGTERM");
       expect(worker.isAlive()).toBe(false);
     } finally {

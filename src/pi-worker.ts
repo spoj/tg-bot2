@@ -398,9 +398,7 @@ export class PiWorker {
     }
 
     try {
-      await this.request({ id: "init-steer", type: "set_steering_mode", mode: "all" });
-      this.ensureStartAllowed();
-      await this.request({ id: "init-followup", type: "set_follow_up_mode", mode: "all" });
+      await this.request({ id: "init-state", type: "get_state" });
       this.ensureStartAllowed();
     } catch (error) {
       await this.terminateOnce(child).catch(() => {});

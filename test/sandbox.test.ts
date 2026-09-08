@@ -136,7 +136,7 @@ it("returns canonical data and validated Bubblewrap path after probing with alte
     expect(workerArgs.args.slice(workerArgs.args.indexOf("--") + 1)).toEqual([
       await realpath(node),
       "/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-      "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--approve",
+      "--mode", "rpc", "--session-dir", "/workspace/.pi/sessions", "--no-approve",
 
     ]);
     const result = await checkSandboxEnvironment(linked, { bwrapPath: bwrap });

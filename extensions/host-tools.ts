@@ -136,7 +136,7 @@ const HOST_TOOLS = {
   },
   annotate: {
     label: "Annotate timeline attachment",
-    description: "Retroactively add or replace a short, searchable description beside a sent or received attachment in /run/timeline.jsonl.",
+    description: "Append a searchable attachment.annotated event to /run/timeline.jsonl. The latest description for an attachment path supersedes earlier descriptions; existing records are unchanged.",
     parameters: Type.Object({
       attachment: Type.String({ description: "Exact /run/attachments/... path recorded in the timeline" }),
       description: Type.String({ minLength: 1, maxLength: 500, description: "Short factual description of the attachment's content" }),

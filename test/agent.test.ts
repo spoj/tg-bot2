@@ -18,9 +18,12 @@ import type { TimelineRecord } from "../src/events.js";
 import { AgentCredentials } from "../src/host-bridge.js";
 import { telegramConversation } from "../src/telegram-ref.js";
 
-it("builds the enforced runtime prompt around connector-specific instructions", () => {
+it("describes the host contract and the agent-owned profile", () => {
   const prompt = runtimePrompt("connector instructions", "/workspace/.pi/sessions/chat/notifications.json");
-  expect(prompt).toContain("Assistant text is not delivered; communicate through send.");
+  expect(prompt).toContain("ordinary assistant text is not sent to the connector");
+  expect(prompt).toContain("Use /workspace/.pi/agent/settings.json for all Pi settings.");
+  expect(prompt).toContain("The host supplies no bot defaults");
+  expect(prompt).toContain("no restart is needed");
   expect(prompt).toContain("/run/timeline.jsonl");
   expect(prompt).toContain("schedule_add");
   expect(prompt).toContain("connector instructions");

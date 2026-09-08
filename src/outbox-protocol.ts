@@ -73,6 +73,7 @@ Allowed methods: ${TELEGRAM_METHODS.join(", ")}.
 Host conveniences:
 - For upload methods, use an absolute /workspace/... path in the normal Telegram media field (photo, audio, video, animation, voice, video_note, or document). The host copies it into read-only /run/attachments before delivery and records that stable path.
 - sendMediaGroup applies the same substitution to each media item.
-- sendMessage may include topic_name; after delivering the message, the host renames this conversation's topic in the same tool call.
+- sendMessage may include topic_name; after delivering the message, the host attempts to rename this conversation's topic. Rename failure does not fail the send.
 All other parameters, including reply_markup keyboards and request_location/contact/poll/web_app buttons, pass through unchanged. Message mutations are allowed only for messages recorded as owned by this conversation. The host validates ownership and local files, delivers synchronously, and records successful calls in /run/timeline.jsonl.
+After changing Pi settings, packages, or instructions, tell the user to run /restart. This closes all workers in this workspace; the next input starts a fresh session with the updated profile. /model, /thinking, and other interactive Pi commands are not Telegram commands.
 `;

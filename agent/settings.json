@@ -1,9 +1,0 @@
-{
-  "packages": [
-    "npm:pi-agent-browser",
-    "npm:pi-exa",
-    "git:github.com/spoj/pi-tiny-fork",
-    "git:github.com/spoj/pi-tiny-monitor",
-    "git:github.com/spoj/pi-tiny-ask"
-  ]
-}

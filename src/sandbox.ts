@@ -290,7 +290,7 @@ export async function buildPiRunBwrapArgs(paths: PiRunSandboxPaths): Promise<PiR
     "--mode", "rpc",
     "--session-dir", paths.sessionDir ?? "/workspace/.pi/sessions",
     ...(paths.continueSession === true ? ["--continue"] : []),
-    "--approve",
+    "--no-approve",
     ...(paths.appendSystemPrompt === undefined ? [] : ["--append-system-prompt", "/app/append-system-prompt.md"]),
     ...cliArgs,
   ];

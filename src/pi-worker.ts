@@ -149,8 +149,6 @@ async function prepareWorkspace(workspace: string): Promise<void> {
   for (const relative of [
     ".pi",
     ".pi/agent",
-    ".pi/npm",
-    ".pi/git",
     ".pi/sessions",
     ".cache",
     ".cache/npm",

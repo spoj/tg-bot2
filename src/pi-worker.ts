@@ -349,7 +349,10 @@ export class PiWorker {
         this.clearSteerWaitTimer();
         this.isBusyState = false;
         this.process = undefined;
-        const exitError = new Error(`Pi RPC exited before responding (code ${code ?? "unknown"}, signal ${signal ?? "none"})`);
+        const stderrDetail = this.stderr.trim();
+        const exitError = new Error(
+          `Pi RPC exited before responding (code ${code ?? "unknown"}, signal ${signal ?? "none"})${stderrDetail.length === 0 ? "" : `: ${stderrDetail}`}`,
+        );
         for (const pending of this.pendingResponses.values()) pending.reject(exitError);
         this.pendingResponses.clear();
         const result: PiRunResult = { code, signal, stderr: this.stderr, stdout: this.stdout };

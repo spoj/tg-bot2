@@ -430,6 +430,25 @@ describe("PiWorker", () => {
     }
   });
 
+  it("includes captured stderr when the worker exits before responding", async () => {
+    const f = await fixture();
+    try {
+      const { child, spawn, terminate } = fakeChildFixture();
+      const worker = new PiWorker({ workspace: f.workspace, appRoot: f.appRoot, spawnProcess: spawn, terminateProcessGroup: terminate });
+      await worker.start();
+      child.stdin.write.mockImplementation(() => true);
+
+      const prompt = worker.prompt("complete instruction");
+      await Promise.resolve();
+      child.stderr.emit("data", "Error: Cannot find module '@earendil-works/pi-server'\n");
+      child.emit("close", 1, null);
+
+      await expect(prompt).rejects.toThrow("Pi RPC exited before responding (code 1, signal none): Error: Cannot find module '@earendil-works/pi-server'");
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("reaps the idle worker after idleTimeoutMs", async () => {
     vi.useFakeTimers();
     try {

@@ -55,7 +55,7 @@ async function fixture(): Promise<{ root: string; workspace: string; appRoot: st
 }
 
 describe("PiWorker", () => {
-  it("spawns bwrap with continuation and waits for RPC readiness", async () => {
+  it("spawns bwrap and waits for RPC readiness", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
@@ -64,7 +64,6 @@ describe("PiWorker", () => {
         appRoot: f.appRoot,
         spawnProcess: spawn,
         terminateProcessGroup: terminate,
-        continueSession: true,
       });
       await worker.start();
       expect(spawn).toHaveBeenCalledOnce();
@@ -75,7 +74,7 @@ describe("PiWorker", () => {
       expect(args).toContain("rpc");
       expect(args).toContain("--session-dir");
       expect(args[args.indexOf("--session-dir") + 1]).toBe("/workspace/.pi/agent/sessions");
-      expect(args).toContain("--continue");
+      expect(args).not.toContain("--continue");
       expect(args).not.toContain("--model");
       expect(args).not.toContain("--thinking");
       expect(child.stdin.write).toHaveBeenCalledWith(
@@ -157,7 +156,7 @@ describe("PiWorker", () => {
   });
 
 
-  it("prompt sends a prompt command with streamingBehavior and touches activity", async () => {
+  it("prompt sends a prompt command with streamingBehavior", async () => {
     const f = await fixture();
     try {
       const { child, spawn, terminate } = fakeChildFixture();
@@ -172,8 +171,6 @@ describe("PiWorker", () => {
         expect.stringContaining('"type":"prompt","message":"hello world","streamingBehavior":"steer"'),
         "utf8",
       );
-      expect(worker.isBusy()).toBe(true);
-      expect(worker.activity().text).toBe("hello world");
 
       await worker.prompt("later task", "followUp");
       expect(child.stdin.write).toHaveBeenCalledWith(
@@ -264,7 +261,6 @@ describe("PiWorker", () => {
 
       await expect(prompt).rejects.toBe(stdinError);
       await expect(settled).rejects.toBe(stdinError);
-      expect(worker.isBusy()).toBe(false);
       expect(terminate).toHaveBeenCalledWith(child, "SIGTERM");
       child.emit("close", null, "SIGTERM");
     } finally {
@@ -342,29 +338,6 @@ describe("PiWorker", () => {
       expect(child.stdin.write).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
-      await rm(f.root, { recursive: true, force: true });
-    }
-  });
-
-  it("tracks isBusy state across agent_start and agent_settled events", async () => {
-    const f = await fixture();
-    try {
-      const { child, spawn, terminate } = fakeChildFixture();
-      const worker = new PiWorker({
-        workspace: f.workspace,
-        appRoot: f.appRoot,
-        spawnProcess: spawn,
-        terminateProcessGroup: terminate,
-      });
-      await worker.start();
-      expect(worker.isBusy()).toBe(false);
-
-      child.stdout.emit("data", `${JSON.stringify({ type: "agent_start" })}\n`);
-      expect(worker.isBusy()).toBe(true);
-
-      child.stdout.emit("data", `${JSON.stringify({ type: "agent_settled" })}\n`);
-      expect(worker.isBusy()).toBe(false);
-    } finally {
       await rm(f.root, { recursive: true, force: true });
     }
   });
@@ -604,54 +577,6 @@ describe("PiWorker", () => {
       const args = spawn.mock.calls[0]?.[1] ?? [];
       expect(args).toContain("--append-system-prompt");
       expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("/app/append-system-prompt.md");
-    } finally {
-      await rm(f.root, { recursive: true, force: true });
-    }
-  });
-
-
-
-
-  it("uses the injected clock for activity timestamps", async () => {
-    const f = await fixture();
-    try {
-      const { spawn, terminate } = fakeChildFixture();
-      const worker = new PiWorker({
-        workspace: f.workspace,
-        appRoot: f.appRoot,
-        now: () => 42_000,
-        spawnProcess: spawn,
-        terminateProcessGroup: terminate,
-      });
-      await worker.prompt("hello");
-      expect(worker.activity()).toEqual({ at: 42_000, text: "hello" });
-    } finally {
-      await rm(f.root, { recursive: true, force: true });
-    }
-  });
-
-  it("fires onInitialPromptWritten once after the first successful prompt write", async () => {
-    const f = await fixture();
-    try {
-      const { child, spawn, terminate } = fakeChildFixture();
-      const onInitialPromptWritten = vi.fn();
-      const worker = new PiWorker({
-        workspace: f.workspace,
-        appRoot: f.appRoot,
-        spawnProcess: spawn,
-        terminateProcessGroup: terminate,
-        onInitialPromptWritten,
-      });
-      await worker.prompt("initial prompt");
-      expect(onInitialPromptWritten).toHaveBeenCalledOnce();
-
-      await worker.prompt("steer", "steer");
-      await worker.prompt("follow up", "followUp");
-      expect(onInitialPromptWritten).toHaveBeenCalledOnce();
-      expect(child.stdin.write).toHaveBeenCalledWith(
-        expect.stringContaining('"type":"prompt","message":"initial prompt"'),
-        "utf8",
-      );
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

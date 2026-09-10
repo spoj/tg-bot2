@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { sameConversation, type ConversationAgentRef } from "./agent-ref.js";
+import { parseConversationRef, sameConversation, type ConversationAgentRef } from "./agent-ref.js";
 import type { TimelineEvent, WorkspaceTimeline } from "./events.js";
 import { SerialQueue } from "./queue.js";
 import type { Recurrence, Schedule, ScheduleInput } from "./schedule-protocol.js";
@@ -44,22 +44,6 @@ function invalid(message: string): never {
   throw new Error(`Invalid schedule: ${message}`);
 }
 
-function validateConversation(value: unknown, context: string): ConversationAgentRef {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) invalid(`${context} has an invalid owner`);
-  const owner = value as Record<string, unknown>;
-  if (owner.kind !== "conversation" || typeof owner.connectorId !== "string" || typeof owner.conversationKey !== "string") {
-    invalid(`${context} has an invalid owner`);
-  }
-  if (owner.address === null || typeof owner.address !== "object" || Array.isArray(owner.address)) invalid(`${context} has an invalid owner address`);
-  return {
-    kind: "conversation",
-    connectorId: owner.connectorId,
-    conversationKey: owner.conversationKey,
-    address: owner.address as Record<string, unknown>,
-  };
-}
-
-
 function validateInput(value: unknown, context: string): ScheduleInput {
   if (value === null || typeof value !== "object" || Array.isArray(value)) invalid(`${context} must be an object`);
   const input = value as Record<string, unknown>;
@@ -91,7 +75,7 @@ function validateScheduleFile(value: unknown): ScheduleFile {
     return {
       id,
       ...input,
-      owner: validateConversation(row.owner, context),
+      owner: parseConversationRef(row.owner, `Invalid schedule: ${context} has an invalid owner`),
       next_due_at: row.next_due_at as string | null,
     };
   });

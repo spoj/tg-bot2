@@ -69,7 +69,6 @@ describe("WorkspaceOutbox", () => {
     const result = await outbox.send(request, actor);
 
     expect(result).toMatchObject({
-      requestId: expect.any(String),
       method: "sendDocument",
       messageId: 9001,
       attachments: [attachment],
@@ -131,7 +130,6 @@ describe("WorkspaceOutbox", () => {
     const result = await outbox.send({ method: "sendMessage", text: "hello" }, actor);
 
     expect(result).toMatchObject({
-      requestId: expect.any(String),
       method: "sendMessage",
       messageId: 9002,
       uncertain: true,

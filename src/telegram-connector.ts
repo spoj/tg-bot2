@@ -128,7 +128,7 @@ export class TelegramConnector implements WorkspaceConnector {
 
   constructor(
     readonly config: Config,
-    private readonly timeline: WorkspaceTimeline,
+    timeline: WorkspaceTimeline,
     private readonly resources: WorkspaceResources,
   ) {
     this.id = config.id;

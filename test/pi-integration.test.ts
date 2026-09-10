@@ -37,7 +37,6 @@ integration("Pi RPC integration in bwrap (requires RUN_BWRAP_TESTS=1)", () => {
       expect(worker.isAlive()).toBe(true);
 
       await expect(worker.prompt("hi")).rejects.toThrow("No API key found");
-      expect(worker.isBusy()).toBe(false);
 
       await worker.close();
       expect(worker.isAlive()).toBe(false);

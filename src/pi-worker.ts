@@ -25,11 +25,8 @@ export type PiWorkerOptions = PiRunSandboxPaths & {
   stopGraceMs?: number;
   idleTimeoutMs?: number;
   now?: () => number;
-  onInitialPromptWritten?: () => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
-  setInterval?: typeof setInterval;
-  clearInterval?: typeof clearInterval;
 };
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours of idle: settled and waiting for a prompt. Busy turns are not bounded by this (the idle timer is disarmed until the agent settles), so workers — and any subprocesses they keep — die only after being idle this long.
@@ -37,7 +34,6 @@ const DEFAULT_STOP_GRACE_MS = 10_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_PROTOCOL_LINE_BYTES = 128 * 1024 * 1024;
 const MAX_SIGNAL_TIMEOUT_MS = 2_147_483_647;
-const MAX_ACTIVITY_TEXT = 240;
 const DIRECTORY_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
 
 function asError(error: unknown): Error {
@@ -175,13 +171,9 @@ export class PiWorker {
   private readonly now: () => number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
-  private readonly setIntervalFn: typeof setInterval;
-  private readonly clearIntervalFn: typeof clearInterval;
   private process: PiWorkerChildProcess | undefined;
   private stdout = "";
   private stderr = "";
-  private lastActivityAt = 0;
-  private lastActivity = "";
   private isBusyState = false;
   private idleTimer: NodeJS.Timeout | undefined;
   private steerWaitTimer: NodeJS.Timeout | undefined;
@@ -201,7 +193,6 @@ export class PiWorker {
   private closing = false;
   private stopped = false;
   private protocolLineError: Error | undefined;
-  private initialPromptWritten = false;
 
   constructor(options: PiWorkerOptions) {
     this.options = options;
@@ -222,32 +213,13 @@ export class PiWorker {
     this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
-    this.setIntervalFn = options.setInterval ?? setInterval;
-    this.clearIntervalFn = options.clearInterval ?? clearInterval;
   }
   isAlive(): boolean {
     return this.protocolLineError === undefined && this.process !== undefined && this.process.exitCode === null && this.process.signalCode === null;
   }
 
-  isBusy(): boolean {
-    return this.isBusyState;
-  }
-
-  activity(): { at: number; text: string } {
-    return { at: this.lastActivityAt, text: this.lastActivity };
-  }
-
   onReaped(callback: () => void): void {
     this.reapedCallback = callback;
-  }
-
-  private noteActivity(chunk: string | Buffer): void {
-    this.lastActivityAt = this.now();
-    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    const trimmed = text.trim();
-    if (trimmed.length > 0) {
-      this.lastActivity = trimmed.length <= MAX_ACTIVITY_TEXT ? trimmed : `${trimmed.slice(0, MAX_ACTIVITY_TEXT - 1)}…`;
-    }
   }
   async start(): Promise<void> {
     if (this.protocolLineError) throw this.protocolLineError;
@@ -276,8 +248,6 @@ export class PiWorker {
     this.ensureStartAllowed();
     this.stdout = "";
     this.stderr = "";
-    this.lastActivityAt = 0;
-    this.lastActivity = "";
     this.isBusyState = false;
 
     await prepareWorkspace(this.options.workspace);
@@ -293,7 +263,6 @@ export class PiWorker {
         cliPath: this.options.cliPath,
         appendSystemPrompt: promptFile,
         sessionDir: this.options.sessionDir,
-        continueSession: this.options.continueSession,
         hostTools: this.options.hostTools,
         agentToken: this.options.agentToken,
         hostSocketDir: this.options.hostSocketDir,
@@ -347,7 +316,6 @@ export class PiWorker {
       };
       const consumeStderr = (text: string): void => {
         if (text.length === 0) return;
-        this.noteActivity(text);
         this.stderr = boundedCapture(this.stderr, text);
       };
       child.stdout?.on("data", (chunk: Buffer | string) => {
@@ -460,7 +428,6 @@ export class PiWorker {
       if (event.type === "queue_update" && Array.isArray(event.steering) && event.steering.length === 0) {
         this.clearSteerWaitTimer();
       }
-      this.noteActivity(line);
       if (event.type === "agent_start" || event.type === "turn_start") {
         this.isBusyState = true;
         this.clearIdleTimer();
@@ -471,7 +438,7 @@ export class PiWorker {
         this.resolveSettled({ code: 0, signal: null, stderr: this.stderr, stdout: this.stdout });
       }
     } catch {
-      this.noteActivity(line);
+      // Ignore non-JSON output.
     }
   }
 
@@ -508,7 +475,6 @@ export class PiWorker {
     const queued = wasBusy && streamingBehavior === "steer";
     this.isBusyState = true;
     this.clearIdleTimer();
-    this.noteActivity(message);
     const id = randomUUID();
     try {
       await this.request({
@@ -525,10 +491,6 @@ export class PiWorker {
       throw error;
     }
     if (queued && maxWaitMs !== undefined) this.armSteerWaitTimer(maxWaitMs);
-    if (!this.initialPromptWritten) {
-      this.initialPromptWritten = true;
-      this.options.onInitialPromptWritten?.();
-    }
   }
 
   private armSteerWaitTimer(maxWaitMs: number): void {

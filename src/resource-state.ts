@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { ConversationAgentRef } from "./agent-ref.js";
+import { parseConversationRef, type ConversationAgentRef } from "./agent-ref.js";
 import { SerialQueue } from "./queue.js";
 import { closeQuietly, isMissing, readFileBounded } from "./util.js";
 
@@ -27,21 +27,6 @@ function mapKey(connectorId: string, kind: ResourceKind, key: string): string {
   return JSON.stringify([connectorId, kind, key]);
 }
 
-function validateConversation(value: unknown): ConversationAgentRef {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid resource owner");
-  const owner = value as Record<string, unknown>;
-  if (owner.kind !== "conversation" || typeof owner.connectorId !== "string" || typeof owner.conversationKey !== "string") {
-    throw new Error("Invalid resource owner");
-  }
-  if (owner.address === null || typeof owner.address !== "object" || Array.isArray(owner.address)) throw new Error("Invalid resource owner address");
-  return {
-    kind: "conversation",
-    connectorId: owner.connectorId,
-    conversationKey: owner.conversationKey,
-    address: owner.address as Record<string, unknown>,
-  };
-}
-
 function validateState(value: unknown): ResourceStateFile {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid resource state");
   const file = value as Record<string, unknown>;
@@ -52,7 +37,7 @@ function validateState(value: unknown): ResourceStateFile {
     if (typeof row.connectorId !== "string" || row.connectorId.length === 0) throw new Error("Invalid resource connectorId");
     if (row.kind !== "message" && row.kind !== "poll") throw new Error("Invalid resource kind");
     if (typeof row.key !== "string" || row.key.length === 0) throw new Error("Invalid resource key");
-    return { connectorId: row.connectorId, kind: row.kind, key: row.key, owner: validateConversation(row.owner) };
+    return { connectorId: row.connectorId, kind: row.kind, key: row.key, owner: parseConversationRef(row.owner, "Invalid resource owner") };
   });
   return { version: 1, resources };
 }

@@ -94,33 +94,6 @@ export function connectorPathSegment(connectorId: string): string {
   return Buffer.from(connectorId).toString("base64url");
 }
 
-export type PinnedDirectory = {
-  handle: FileHandle;
-  path: string;
-  realPath: string;
-};
-
-/**
- * Opens a directory directly with O_NOFOLLOW, pinning the inode so later path
- * swaps cannot redirect the handle. The fd realpath is the canonical path.
- */
-export async function openPinnedDirectory(directory: string, expectedRealPath?: string): Promise<PinnedDirectory> {
-  const handle = await open(directory, fsConstants.O_RDONLY | DIRECTORY | NO_FOLLOW);
-  try {
-    const openedStat = await handle.stat();
-    if (!openedStat.isDirectory()) throw new Error(`Directory changed while opening: ${directory}`);
-    const fdPath = `/proc/self/fd/${handle.fd}`;
-    const realPath = await realpath(fdPath);
-    if (expectedRealPath !== undefined && realPath !== expectedRealPath) {
-      throw new Error(`Directory is not stable: ${directory}`);
-    }
-    return { handle, path: fdPath, realPath };
-  } catch (error) {
-    await handle.close().catch(() => {});
-    throw error;
-  }
-}
-
 const DIRECTORY = fsConstants.O_DIRECTORY;
 const NO_FOLLOW = fsConstants.O_NOFOLLOW;
 const NON_BLOCKING = fsConstants.O_NONBLOCK;

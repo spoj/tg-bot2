@@ -15,7 +15,7 @@ export interface WorkspaceConnector {
   parseConversation(value: unknown): ConversationAgentRef;
   authorizeConversation(target: ConversationAgentRef): Promise<void>;
   notificationText(record: TimelineRecord, rawLine: string): string;
-  attention?(record: TimelineRecord, settings: Record<string, unknown>): "interrupt" | "followup" | undefined;
+  attention?(record: TimelineRecord, settings: Record<string, unknown>): "interrupt" | undefined;
 }
 
 export class ConnectorRegistry {

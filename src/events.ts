@@ -9,7 +9,6 @@ export type TimelineAttachment = {
   mimeType?: string | undefined;
   originalName?: string | undefined;
   failure?: string | undefined;
-  description?: string | undefined;
 };
 
 export type TimelineEvent = {

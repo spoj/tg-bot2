@@ -101,7 +101,6 @@ function fakeWorkerFactory(
         settleHold = hold;
       },
       isAlive: () => alive,
-      isBusy: () => busy,
       prompt,
       waitForSettled,
       close,

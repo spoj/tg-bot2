@@ -64,11 +64,7 @@ export class AgentEventRouter {
       return;
     }
     const prompt = connector.notificationText(record, rawLine);
-    if (attention === "followup") {
-      await this.agents.followup(prompt, target, identity);
-    } else {
-      await this.agents.interrupt(prompt, target, USER_INTERRUPT_MAX_WAIT_MS, identity);
-    }
+    await this.agents.interrupt(prompt, target, USER_INTERRUPT_MAX_WAIT_MS, identity);
     await this.markProcessed(record);
   }
 

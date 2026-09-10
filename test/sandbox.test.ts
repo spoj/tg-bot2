@@ -1,11 +1,10 @@
 import { spawnSync, type ChildProcess } from "node:child_process";
-import { access, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildBwrapArgs, buildPiRunBwrapArgs, checkSandboxEnvironment, runSandbox, spawnProcess, terminateProcessGroup } from "../src/sandbox.js";
-import { openPinnedDirectory } from "../src/util.js";
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-test-"));
@@ -380,28 +379,6 @@ it("does not follow or clobber a write-probe symlink", async () => {
     expect((await lstat(probe)).isSymbolicLink()).toBe(true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
-
-it("pins a directory against a later path swap", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "tg-agent-pin-test-"));
-  const original = path.join(root, "original");
-  const moved = path.join(root, "original-moved");
-  const replacement = path.join(root, "replacement");
-  try {
-    await mkdir(original);
-    await mkdir(replacement);
-    const pinned = await openPinnedDirectory(original);
-    const before = await pinned.handle.stat();
-    await rename(original, moved);
-    await rename(replacement, original);
-    const after = await pinned.handle.stat();
-    expect(after.ino).toBe(before.ino);
-    expect(after.ino).not.toBe((await lstat(original)).ino);
-    expect(pinned.realPath).toBe(original);
-    expect(await realpath(pinned.path)).toBe(moved);
-    await pinned.handle.close();
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
-
 
 const integration = process.env.RUN_BWRAP_TESTS === "1" && bwrapAvailable() ? describe : describe.skip;
 integration("Bubblewrap integration", () => {

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { AgentRef } from "./agent-ref.js";
 import type { ConnectorRegistry } from "./connector.js";
 import { errorMessage } from "./util.js";
@@ -10,7 +9,6 @@ export type WorkspaceOutboxOptions = {
 };
 
 export type OutboxSendResult = {
-  requestId: string;
   [key: string]: unknown;
 };
 
@@ -30,7 +28,6 @@ export class WorkspaceOutbox {
     const raw = JSON.stringify(request);
     if (Buffer.byteLength(raw, "utf8") > MAX_REQUEST_BYTES) throw new Error(`Connector request exceeds ${MAX_REQUEST_BYTES} bytes`);
     const connector = this.connectors.get(actor.connectorId);
-    const requestId = randomUUID();
     const result = await connector.send(request, actor);
     const summary = result.summary ?? {};
     const connectorPersistenceError = typeof summary.persistenceError === "string" ? summary.persistenceError : undefined;
@@ -53,13 +50,12 @@ export class WorkspaceOutbox {
       const timelinePersistenceError = `Failed to persist connector timeline event: ${errorMessage(error)}`;
       const persistenceErrors = [connectorPersistenceError, timelinePersistenceError].filter((value): value is string => value !== undefined);
       return {
-        requestId,
         ...summary,
         uncertain: true,
         deliveryStatus: "delivered_timeline_persistence_failed",
         persistenceError: persistenceErrors.join("; "),
       };
     }
-    return { requestId, ...summary };
+    return summary;
   }
 }

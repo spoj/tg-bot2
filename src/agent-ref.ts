@@ -19,6 +19,21 @@ export function conversationAgent(
   return { kind: "conversation", connectorId, conversationKey, address };
 }
 
+export function parseConversationRef(value: unknown, message: string): ConversationAgentRef {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
+  const raw = value as Record<string, unknown>;
+  if (raw.kind !== "conversation" || typeof raw.connectorId !== "string" || typeof raw.conversationKey !== "string") {
+    throw new Error(message);
+  }
+  if (raw.address === null || typeof raw.address !== "object" || Array.isArray(raw.address)) throw new Error(message);
+  return {
+    kind: "conversation",
+    connectorId: raw.connectorId,
+    conversationKey: raw.conversationKey,
+    address: raw.address as Record<string, unknown>,
+  };
+}
+
 export function sameConversation(left: ConversationAgentRef, right: ConversationAgentRef): boolean {
   return left.connectorId === right.connectorId && left.conversationKey === right.conversationKey;
 }

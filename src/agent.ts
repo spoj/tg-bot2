@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { conversationId, conversationSessionPath, type ConversationAgentRef } from "./agent-ref.js";
+import { conversationId, conversationSessionPath, parseConversationRef, sameConversation, type ConversationAgentRef } from "./agent-ref.js";
 import type { AgentCredentials } from "./host-bridge.js";
 import { PiWorker } from "./pi-worker.js";
 import { SerialQueue } from "./queue.js";
@@ -29,7 +29,6 @@ Notification overrides live at ${notificationPath}; use {"wake":["event.type"],"
 
 export type AgentWorker = {
   isAlive(): boolean;
-  isBusy(): boolean;
   prompt(message: string, streamingBehavior?: "steer" | "followUp", maxWaitMs?: number): Promise<void>;
   waitForSettled(): Promise<unknown>;
   close(): Promise<void>;
@@ -55,8 +54,6 @@ export type AgentWorkerOptions = {
   terminateProcessGroup: (child: PiWorkerChildProcess, signal: NodeJS.Signals) => void;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
-  setInterval?: typeof setInterval;
-  clearInterval?: typeof clearInterval;
 };
 
 export type AgentWorkerFactory = (options: AgentWorkerOptions) => AgentWorker | Promise<AgentWorker>;
@@ -78,8 +75,6 @@ export type AgentManagerOptions = {
   now?: () => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
-  setInterval?: typeof setInterval;
-  clearInterval?: typeof clearInterval;
 };
 
 export type NotificationIdentity = { id: string; sequence?: number | undefined };
@@ -138,20 +133,6 @@ function notificationPrompt(notification: PendingNotification): string {
   return `[notification id=${notification.id}${sequence}]\n${notification.text}`;
 }
 
-function validateNotificationTarget(value: unknown): ConversationAgentRef {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid notification target");
-  const target = value as Record<string, unknown>;
-  if (target.kind !== "conversation" || typeof target.connectorId !== "string" || typeof target.conversationKey !== "string"
-    || target.address === null || typeof target.address !== "object" || Array.isArray(target.address)) {
-    throw new Error("Invalid notification target");
-  }
-  return {
-    kind: "conversation",
-    connectorId: target.connectorId,
-    conversationKey: target.conversationKey,
-    address: target.address as Record<string, unknown>,
-  };
-}
 function parseQueuedNotification(value: unknown): PendingNotification {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Malformed queued notification");
@@ -161,7 +142,7 @@ function parseQueuedNotification(value: unknown): PendingNotification {
   if (raw.sequence !== undefined && (!Number.isSafeInteger(raw.sequence) || (raw.sequence as number) < 1)) {
     throw new Error("Malformed queued notification sequence");
   }
-  return { ...raw, target: validateNotificationTarget(raw.target) } as PendingNotification;
+  return { ...raw, target: parseConversationRef(raw.target, "Invalid notification target") } as PendingNotification;
 }
 
 
@@ -179,8 +160,6 @@ export class AgentManager {
   private readonly now: () => number;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
-  private readonly setIntervalFn: typeof setInterval | undefined;
-  private readonly clearIntervalFn: typeof clearInterval | undefined;
   private readonly workerFactory: AgentWorkerFactory;
   private readonly hostSocketDir: string | undefined;
   private readonly hostTimeline: string | undefined;
@@ -218,8 +197,6 @@ export class AgentManager {
     this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeout ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout;
-    this.setIntervalFn = options.setInterval;
-    this.clearIntervalFn = options.clearInterval;
     this.workerFactory = options.workerFactory ?? ((workerOptions) => new PiWorker(workerOptions));
     this.shutdownSignal = new Promise<void>((resolve) => { this.resolveShutdownSignal = resolve; });
     this.hostSocketDir = options.hostSocketDir;
@@ -402,7 +379,7 @@ export class AgentManager {
 
   private async deliverPending(entry: ConversationWorkerEntry): Promise<void> {
     for (;;) {
-      const notification = [...this.pendingNotifications.values()].find((candidate) => sameTarget(candidate.target, entry.actor));
+      const notification = [...this.pendingNotifications.values()].find((candidate) => sameConversation(candidate.target, entry.actor));
       if (!notification) return;
       const worker = await this.ensureWorker(entry);
       if (this.shuttingDown) throw managerShutdownError();
@@ -765,8 +742,6 @@ export class AgentManager {
           hostAttachments: this.hostAttachments,
           setTimeout: this.setTimeoutFn,
           clearTimeout: this.clearTimeoutFn,
-          setInterval: this.setIntervalFn,
-          clearInterval: this.clearIntervalFn,
         }),
         appendSystemPrompt: runtimePrompt(this.connectorPrompt(actor.connectorId), path.posix.join(sessionDir, "notifications.json")),
         hostTools: "send,annotate,steer_conversation,schedule_add,schedule_replace,schedule_remove,schedule_take",
@@ -803,7 +778,4 @@ export class AgentManager {
   }
 }
 
-function sameTarget(left: ConversationAgentRef, right: ConversationAgentRef): boolean {
-  return left.connectorId === right.connectorId && left.conversationKey === right.conversationKey;
-}
 export { AgentEventRouter } from "./agent-router.js";
